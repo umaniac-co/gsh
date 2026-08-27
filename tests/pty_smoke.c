@@ -304,6 +304,15 @@ static int start_session(pty_session *session, const char *executable,
         (void)setenv("PS2", "GSH_MORE> ", 1);
         (void)setenv("PROMPT", "$gsh> ", 1);
         (void)setenv("RPROMPT", "", 1);
+        if (kind == SHELL_GSH) {
+            const char *managed = getenv("GSH_HARNESS_MANAGED");
+
+            if (managed != NULL && strcmp(managed, "1") == 0) {
+                (void)unsetenv("GSH_REPL");
+            } else {
+                (void)setenv("GSH_REPL", "classic", 1);
+            }
+        }
         {
             const char *limit_text = getenv("GSH_HARNESS_NOFILE");
 
@@ -421,6 +430,20 @@ static int start_session(pty_session *session, const char *executable,
     session->pid = pid;
     session->master = master;
     return 0;
+}
+
+static int start_managed_session(pty_session *session,
+                                 const char *executable,
+                                 const char *directory)
+{
+    int result;
+
+    if (setenv("GSH_HARNESS_MANAGED", "1", 1) == -1) {
+        return -1;
+    }
+    result = start_session(session, executable, directory, SHELL_GSH);
+    (void)unsetenv("GSH_HARNESS_MANAGED");
+    return result;
 }
 
 static int wait_for_output(pty_session *session, const char *marker,
@@ -561,6 +584,24 @@ static bool terminal_was_restored(const pty_session *session)
     return restored;
 }
 
+static int resize_session(const pty_session *session, unsigned short rows,
+                          unsigned short columns)
+{
+    struct winsize size;
+    int slave = open(session->slave_name, O_RDWR | O_NOCTTY);
+    int result;
+
+    if (slave == -1) {
+        return -1;
+    }
+    memset(&size, 0, sizeof(size));
+    size.ws_row = rows;
+    size.ws_col = columns;
+    result = ioctl(slave, TIOCSWINSZ, &size);
+    close(slave);
+    return result;
+}
+
 static int stop_session(pty_session *session)
 {
     pid_t children[256];
@@ -586,6 +627,7 @@ static int stop_session(pty_session *session)
             break;
         }
         if (monotonic_ns() >= deadline) {
+            fprintf(stderr, "pty stop: shell exit deadline exceeded\n");
             (void)kill(session->pid, SIGKILL);
             (void)waitpid(session->pid, &status, 0);
             status = -1;
@@ -625,6 +667,8 @@ static int stop_session(pty_session *session)
 
             for (index = 0; index < child_count; index++) {
                 if (kill(children[index], 0) == 0 || errno != ESRCH) {
+                    fprintf(stderr, "pty stop: child %ld survived shutdown\n",
+                            (long)children[index]);
                     (void)kill(children[index], SIGKILL);
                 }
             }
@@ -632,6 +676,7 @@ static int stop_session(pty_session *session)
         }
     }
     if (!terminal_was_restored(session)) {
+        fprintf(stderr, "pty stop: terminal modes were not restored\n");
         status = -1;
     }
     close(session->master);
@@ -955,6 +1000,249 @@ static int ordinary_flow(const char *executable)
         failed = 1;
     }
     remove_fixture(fixture);
+    return failed;
+}
+
+static int managed_repl_concurrency(pty_session *session)
+{
+    uint64_t start;
+
+    if (send_text(session, "/bin/sleep 1\r") == -1 ||
+        consume_through(session,
+                        "/bin/sleep 1\r\n\r\n$gsh> ",
+                        TEST_TIMEOUT_MS) == -1) {
+        return -1;
+    }
+    start = monotonic_ns();
+    if (send_text(session, "/usr/bin/printf FAST\r") == -1 ||
+        consume_through(session, "/usr/bin/printf FAST\r\nFAST",
+                        TEST_TIMEOUT_MS) == -1) {
+        return -1;
+    }
+    if (monotonic_ns() - start >= 800000000ULL) {
+        errno = ETIMEDOUT;
+        return -1;
+    }
+    return 0;
+}
+
+static int managed_repl_compound_overtake(pty_session *session)
+{
+    static const char loop[] =
+        "for GSH_ASYNC_I in 1; do /bin/sleep 1; "
+        "echo \"TICK $GSH_ASYNC_I\"; done\r";
+    uint64_t start;
+
+    if (send_text(session, loop) == -1 ||
+        consume_through(session, "done\r\n\r\n$gsh> ",
+                        TEST_TIMEOUT_MS) == -1) {
+        return -1;
+    }
+    start = monotonic_ns();
+    if (send_text(session, "/usr/bin/printf COMPOUND_FAST\r") == -1 ||
+        consume_through(session,
+                        "/usr/bin/printf COMPOUND_FAST\r\nCOMPOUND_FAST",
+                        TEST_TIMEOUT_MS) == -1 ||
+        monotonic_ns() - start >= 800000000ULL ||
+        consume_through(session, "TICK 1", TEST_TIMEOUT_MS) == -1) {
+        errno = ETIMEDOUT;
+        return -1;
+    }
+    return 0;
+}
+
+static int managed_repl_launch_state_fence(pty_session *session)
+{
+    static const char loop[] =
+        "for GSH_ASYNC_J in 1; do /bin/sleep 1; cd .; done\r";
+    uint64_t start;
+
+    if (send_text(session, loop) == -1 ||
+        consume_through(session, "done\r\n\r\n$gsh> ",
+                        TEST_TIMEOUT_MS) == -1) {
+        return -1;
+    }
+    start = monotonic_ns();
+    if (send_text(session, "/bin/pwd\r") == -1 ||
+        consume_through(session, "/bin/pwd\r\n/", TEST_TIMEOUT_MS) == -1 ||
+        monotonic_ns() - start < 700000000ULL) {
+        errno = ETIMEDOUT;
+        return -1;
+    }
+    return 0;
+}
+
+static int managed_repl_preserves_edit(pty_session *session)
+{
+    if (send_text(session,
+                  "/bin/sh -c 'sleep 0.2; printf LATE'\r") == -1 ||
+        consume_through(session,
+                        "printf LATE'\r\n\r\n$gsh> ",
+                        TEST_TIMEOUT_MS) == -1 ||
+        send_text(session, "PRESERVED") == -1 ||
+        consume_through(session, "LATE", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(session, "$gsh> PRESERVED", TEST_TIMEOUT_MS) == -1 ||
+        send_bytes(session, "\025", 1) == -1) {
+        return -1;
+    }
+    return 0;
+}
+
+static int managed_repl_focus(pty_session *session)
+{
+    if (send_text(session, "/usr/bin/seq 1 6\r") == -1 ||
+        consume_through(session, "\r\n1\r\n2\r\n3\r\n4\r\n5\r\n6",
+                        TEST_TIMEOUT_MS) == -1 ||
+        send_text(session, "/bin/cat\r") == -1 ||
+        consume_through(session,
+                        "/bin/cat\r\n\r\n$gsh> ",
+                        TEST_TIMEOUT_MS) == -1 ||
+        send_text(session, "fg\r") == -1 ||
+        consume_through(session, "[focused cell ", TEST_TIMEOUT_MS) == -1 ||
+        send_text(session, "BEFORE_STOP\r") == -1 ||
+        consume_through(session, "BEFORE_STOP",
+                        TEST_TIMEOUT_MS) == -1 ||
+        send_bytes(session, "\032", 1) == -1 ||
+        consume_through(session, "[stopped]", TEST_TIMEOUT_MS) == -1 ||
+        send_text(session, "bg\r") == -1 ||
+        consume_through(session, "[continued]",
+                        TEST_TIMEOUT_MS) == -1 ||
+        send_text(session, "fg\r") == -1 ||
+        consume_through(session, "[focused cell ", TEST_TIMEOUT_MS) == -1 ||
+        send_text(session, "AFTER_CONTINUE\r") == -1 ||
+        consume_through(session, "AFTER_CONTINUE",
+                        TEST_TIMEOUT_MS) == -1 ||
+        send_bytes(session, "\004\035", 2) == -1) {
+        return -1;
+    }
+    return 0;
+}
+
+static int managed_repl_pipeline(pty_session *session)
+{
+    uint64_t start;
+
+    if (send_text(session,
+                  "/bin/sh -c 'sleep 1; printf PIPE_SLOW' | /bin/cat\r") ==
+            -1 ||
+        consume_through(session,
+                        "| /bin/cat\r\n\r\n$gsh> ",
+                        TEST_TIMEOUT_MS) == -1) {
+        return -1;
+    }
+    start = monotonic_ns();
+    if (send_text(session, "/usr/bin/printf PIPE_FAST\r") == -1 ||
+        consume_through(session, "/usr/bin/printf PIPE_FAST\r\nPIPE_FAST",
+                        TEST_TIMEOUT_MS) == -1 ||
+        monotonic_ns() - start >= 800000000ULL ||
+        consume_through(session, "PIPE_SLOW", TEST_TIMEOUT_MS) == -1) {
+        errno = ETIMEDOUT;
+        return -1;
+    }
+    return 0;
+}
+
+static int managed_repl_ordering(pty_session *session)
+{
+    if (send_text(session,
+                  "/bin/sh -c 'sleep 0.3; printf ORDER_FIRST'\r") == -1 ||
+        send_text(session, "cd /\r") == -1 ||
+        send_text(session,
+                  "/usr/bin/printf 'ORDER_STATE=%s' \"$PWD\"\r") == -1 ||
+        consume_through(session, "\r\nORDER_FIRST", TEST_TIMEOUT_MS) ==
+            -1 ||
+        consume_through(session, "\r\nORDER_STATE=/",
+                        TEST_TIMEOUT_MS) == -1 ||
+        send_text(session, "/usr/bin/false\r") == -1 ||
+        send_text(session,
+                  "/usr/bin/printf 'ORDER_STATUS=%s' \"$?\"\r") == -1 ||
+        consume_through(session, "\r\nORDER_STATUS=1",
+                        TEST_TIMEOUT_MS) == -1) {
+        return -1;
+    }
+    return 0;
+}
+
+static int managed_repl_contains_output(pty_session *session)
+{
+    if (send_text(session,
+                  "/usr/bin/printf '\033[2JFORGED\033[H'\r") == -1 ||
+        consume_through(session, "\r\nFORGED", TEST_TIMEOUT_MS) == -1) {
+        return -1;
+    }
+    return 0;
+}
+
+static int managed_repl_resize(pty_session *session)
+{
+    if (send_text(session, "RESIZE_KEEP") == -1 ||
+        consume_through(session, "$gsh> RESIZE_KEEP",
+                        TEST_TIMEOUT_MS) == -1 ||
+        resize_session(session, 12, 40) == -1 ||
+        consume_through(session, "$gsh> RESIZE_KEEP",
+                        TEST_TIMEOUT_MS) == -1 ||
+        resize_session(session, 24, 80) == -1 ||
+        consume_through(session, "$gsh> RESIZE_KEEP",
+                        TEST_TIMEOUT_MS) == -1 ||
+        send_bytes(session, "\025", 1) == -1) {
+        return -1;
+    }
+    return 0;
+}
+
+static int managed_repl_saturation(pty_session *session)
+{
+    unsigned int submission;
+
+    for (submission = 0; submission < 15U; submission++) {
+        if (send_text(session, "/bin/sleep 30\r") == -1 ||
+            consume_through(session, "/bin/sleep 30\r\n",
+                            TEST_TIMEOUT_MS) == -1) {
+            return -1;
+        }
+    }
+    if (send_text(session, "/bin/sleep 30\r") == -1 ||
+        consume_through(session, "\a", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(session, "$gsh> /bin/sleep 30",
+                        TEST_TIMEOUT_MS) == -1 ||
+        send_bytes(session, "\025", 1) == -1) {
+        return -1;
+    }
+    return 0;
+}
+
+static int managed_async_repl_flow(const char *executable)
+{
+    char fixture[] = "/tmp/gsh-pty-managed-XXXXXX";
+    pty_session session;
+    int failed = 0;
+
+    if (mkdtemp(fixture) == NULL ||
+        start_managed_session(&session, executable, fixture) == -1) {
+        perror("pty managed: setup");
+        (void)rmdir(fixture);
+        return 1;
+    }
+    if (consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        managed_repl_concurrency(&session) == -1 ||
+        managed_repl_compound_overtake(&session) == -1 ||
+        managed_repl_launch_state_fence(&session) == -1 ||
+        managed_repl_preserves_edit(&session) == -1 ||
+        managed_repl_focus(&session) == -1 ||
+        managed_repl_pipeline(&session) == -1 ||
+        managed_repl_ordering(&session) == -1 ||
+        managed_repl_contains_output(&session) == -1 ||
+        managed_repl_resize(&session) == -1 ||
+        managed_repl_saturation(&session) == -1) {
+        perror("pty managed: flow");
+        dump_capture(&session);
+        failed = 1;
+    }
+    if (stop_session(&session) == -1) {
+        fprintf(stderr, "pty managed: shell did not exit cleanly\n");
+        failed = 1;
+    }
+    (void)rmdir(fixture);
     return failed;
 }
 
@@ -4401,6 +4689,7 @@ int main(int argc, char **argv)
     }
 
     if (ordinary_flow(executable) != 0 ||
+        managed_async_repl_flow(executable) != 0 ||
         variable_builtin_flow(executable) != 0 ||
         alias_builtin_flow(executable) != 0 ||
         function_builtin_flow(executable) != 0 ||
@@ -4410,7 +4699,7 @@ int main(int argc, char **argv)
         stalled_worker_flow(executable) != 0) {
         return 1;
     }
-    puts("pty smoke: exec paths, job control, async prompt/redirection, "
-         "cancellation, and worker deadline passed");
+    puts("pty smoke: exec paths, managed async REPL, job control, async "
+         "prompt/redirection, cancellation, and worker deadline passed");
     return 0;
 }

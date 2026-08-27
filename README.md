@@ -2,8 +2,9 @@
 
 `gsh` is a generative shell. This repository currently contains
 a deliberately small C MVP of its soft real-time interactive core, following
-principles 000–002 in [`specs/0001.principles.md`](specs/0001.principles.md) and
-the architecture in [`specs/0002.real_time.md`](specs/0002.real_time.md).
+the principles in [`specs/0001.principles.md`](specs/0001.principles.md) and
+the architectures in [`specs/0002.real_time.md`](specs/0002.real_time.md) and
+[`specs/0008.async_repl.md`](specs/0008.async_repl.md).
 
 ## Project quality criteria
 
@@ -48,8 +49,9 @@ The MVP already follows the central shape described by
 - terminal and signal events are handled in bounded batches;
 - signal handlers only set flags and notify the reactor through a nonblocking
   self-pipe;
-- foreground jobs run in their own process group and receive the controlling
-  terminal directly;
+- the default managed REPL keeps the physical terminal in the reactor, gives
+  each command job its own PTY and cell, and exposes the next editor
+  immediately; classic mode retains direct foreground terminal handoff;
 - child transitions are collected with nonblocking `waitpid()` calls;
 - asynchronous AND-OR lists use a bounded direct-child registry; `$!` and
   reactor-driven `wait` stay with the process that actually owns those PIDs;
@@ -62,6 +64,16 @@ The MVP already follows the central shape described by
   stale results are discarded and a stalled or malformed worker is disabled;
 - a redirection worker blocked in the kernel remains cancellable: `Ctrl-C`
   terminates it, the reactor reaps it, and a fresh worker is started.
+
+The `gsh` core is intentionally single-threaded and multi-process. One reactor
+thread is the sole owner of mutable shell state, editing, scheduling, and
+physical-terminal rendering. Concurrent commands run in isolated child
+processes, which the operating system may execute in parallel across CPU cores.
+This design avoids locks and data races in the trusted core while process
+boundaries provide explicit communication, signals, lifecycle control, and
+failure containment. Future AI providers and local model runtimes follow the
+same boundary: they may use threads internally, but they do not share mutable
+shell state and cannot become additional owners of the reactor.
 
 This is an architectural MVP, not yet a complete POSIX shell. It now has a
 bounded Issue 8 lexer and recursive-descent parser plus a conservative native
@@ -149,9 +161,11 @@ permission copying and the initial-mode semantics of `X`. An unredirected
 standalone invocation of either environment builtin changes the current shell,
 while a pipeline stage remains isolated. The editor is intentionally limited
 to insertion at the end of the line, bounded multiline input with `PS2`,
-UTF-8-aware backspace, `Ctrl-U`, `Ctrl-L`, `Ctrl-C`, and `Ctrl-D`. Foreground
-job control remains single-job; the separate bounded async registry holds 128
-direct children.
+UTF-8-aware backspace, `Ctrl-U`, `Ctrl-L`, `Ctrl-C`, and `Ctrl-D`. The managed
+REPL retains 16 bounded cells and runs at most 8 PTY command jobs concurrently;
+`fg` focuses the newest live job, and `Ctrl-]` returns keyboard ownership to
+the editor. The separate POSIX asynchronous-list registry holds 128 direct
+children.
 
 ## Requirements
 
@@ -322,6 +336,8 @@ Start the interactive shell from a terminal:
 For example:
 
 ```text
+$gsh> long-running-command
+
 $gsh> printf 'hello\n' | tr a-z A-Z
 HELLO
 $gsh> cd /tmp
@@ -332,8 +348,29 @@ $gsh> sleep 1 &
 $gsh> wait "$!" && printf 'done\n'
 done
 $gsh> rt
-reactor cycles=... max=...ms deadline=5.000ms misses=... dispatches=... dispatch_max=...ms dispatch_misses=... overloads=... direct=... native=... shell=... parsed=... parse_failures=... job=idle worker=on busy=0 timeouts=... failures=... stale=...
+reactor cycles=... async_jobs=... focus=editor ...
 ```
+
+Enter freezes the submitted prompt and command into a cell with one initial
+output row. The cell grows when additional output rows arrive. The fresh editor
+at the bottom accepts input immediately while independent cells run and finish
+in any order. Shell-state mutations and `$?` dependencies remain ordered. A
+terminal program receives input only after
+`fg`; `Ctrl-]` detaches it without stopping it. The cell and PTY limits are
+fixed, and saturation rejects new work instead of allocating without bound.
+Long loops and other compound commands do not fence unrelated external work:
+a literal command such as `git status` starts immediately when the running
+compound command has no pending mutation that can alter its launch state.
+
+Programs that require traditional direct ownership of the physical terminal
+can use classic mode:
+
+```sh
+GSH_REPL=classic ./build/gsh
+```
+
+The future `?` steering and `??` AI queue described by specification 0008 are
+not implemented yet; ordinary shell operation does not depend on an LLM.
 
 `rt` exposes the bounded reactor's local service-time diagnostics. Its 5 ms
 deadline applies only to work performed by the interactive core after `poll()`

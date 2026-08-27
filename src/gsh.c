@@ -21,6 +21,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -37,6 +38,7 @@
 #include "builtin_variables.h"
 #include "builtin_set.h"
 #include "builtin_shift.h"
+#include "async_repl.h"
 #include "background_jobs.h"
 #include "alias_expansion.h"
 #include "native_plan.h"
@@ -52,7 +54,7 @@ extern char **environ;
 
 enum {
     LINE_CAP = 4096,
-    OUTPUT_CAP = 16384,
+    OUTPUT_CAP = 65536,
     MAX_SIGNAL_REAPS = 16,
     SIMPLE_ARG_CAP = 128,
     EXEC_PATH_CAP = 4096,
@@ -160,6 +162,10 @@ typedef struct {
     char output[OUTPUT_CAP];
     size_t output_offset;
     size_t output_len;
+    gsh_async_repl *async_repl;
+    int async_capture_cell;
+    int async_state_cell;
+    int async_dispatch_cell;
 
     job current_job;
     gsh_background_table background_jobs;
@@ -246,12 +252,19 @@ typedef struct {
 static int g_signal_write_fd = -1;
 static volatile sig_atomic_t g_sigchld_pending = 0;
 static volatile sig_atomic_t g_sigint_pending = 0;
+static volatile sig_atomic_t g_sigtstp_pending = 0;
 static volatile sig_atomic_t g_sigwinch_pending = 0;
 static volatile sig_atomic_t g_shutdown_pending = 0;
 static gsh_positional_store g_interactive_positionals;
 
+typedef struct pipeline_expansion_scope pipeline_expansion_scope;
+
 static void reset_child_signals(void);
 static void start_external(shell_state *state, simple_command *direct);
+static void start_async_external(shell_state *state, simple_command *direct);
+static void start_async_native_pipeline(
+    shell_state *state, const gsh_native_pipeline *pipeline,
+    const pipeline_expansion_scope *scope);
 static bool native_command_is_supported(shell_state *state);
 static bool try_native_reactor_compound(shell_state *state);
 static void start_native_compound(shell_state *state, size_t node_index);
@@ -431,6 +444,8 @@ static void signal_handler(int signo)
         g_sigchld_pending = 1;
     } else if (signo == SIGINT) {
         g_sigint_pending = 1;
+    } else if (signo == SIGTSTP) {
+        g_sigtstp_pending = 1;
     } else if (signo == SIGWINCH) {
         g_sigwinch_pending = 1;
     } else {
@@ -476,7 +491,8 @@ static int make_pipe(int descriptors[2], bool nonblocking,
     return 0;
 }
 
-static bool output_push(shell_state *state, const char *data, size_t length)
+static bool raw_output_push(shell_state *state, const char *data,
+                            size_t length)
 {
     if (length > OUTPUT_CAP - state->output_len) {
         state->overloads++;
@@ -492,6 +508,17 @@ static bool output_push(shell_state *state, const char *data, size_t length)
            length);
     state->output_len += length;
     return true;
+}
+
+static bool output_push(shell_state *state, const char *data, size_t length)
+{
+    if (state->async_repl != NULL && state->async_repl->enabled &&
+        state->async_capture_cell >= 0) {
+        return gsh_async_repl_append(state->async_repl,
+                                     state->async_capture_cell, data,
+                                     length) >= 0;
+    }
+    return raw_output_push(state, data, length);
 }
 
 static int reactor_builtin_output(void *opaque, int descriptor,
@@ -564,6 +591,10 @@ static void flush_output(shell_state *state)
 
 static void queue_prompt(shell_state *state)
 {
+    if (state->async_repl != NULL && state->async_repl->enabled) {
+        state->async_repl->render_pending = true;
+        return;
+    }
     if (state->continuation_prompt) {
         const char *secondary = getenv("PS2");
         size_t length = 0;
@@ -592,15 +623,90 @@ static void queue_prompt(shell_state *state)
 
 static void queue_redraw(shell_state *state)
 {
+    if (state->async_repl != NULL && state->async_repl->enabled) {
+        state->async_repl->render_pending = true;
+        return;
+    }
     (void)output_text(state, "\r\033[2K");
     queue_prompt(state);
     (void)output_push(state, state->line, state->line_len);
+}
+
+static size_t active_prompt_text(shell_state *state,
+                                 char prompt[GSH_ASYNC_PROMPT_CAP])
+{
+    size_t length = 0;
+    const char *secondary;
+
+    if (state->continuation_prompt) {
+        secondary = getenv("PS2");
+        if (secondary == NULL) {
+            secondary = "> ";
+        }
+        length = strlen(secondary);
+        if (length >= GSH_ASYNC_PROMPT_CAP) {
+            secondary = "> ";
+            length = 2;
+        }
+        memcpy(prompt, secondary, length);
+    } else {
+        if (state->prompt_branch[0] != '\0') {
+            int written = snprintf(prompt, GSH_ASYNC_PROMPT_CAP,
+                                   "[%s] ", state->prompt_branch);
+
+            if (written < 0 || written >= GSH_ASYNC_PROMPT_CAP) {
+                length = 0;
+            } else {
+                length = (size_t)written;
+            }
+        }
+        if (sizeof(PROMPT) - 1U <= GSH_ASYNC_PROMPT_CAP - length) {
+            memcpy(prompt + length, PROMPT, sizeof(PROMPT) - 1U);
+            length += sizeof(PROMPT) - 1U;
+        }
+    }
+    prompt[length] = '\0';
+    return length;
+}
+
+static void prepare_managed_render(shell_state *state)
+{
+    char prompt[GSH_ASYNC_PROMPT_CAP];
+    const char *render;
+    size_t length;
+
+    if (state->async_repl == NULL || !state->async_repl->enabled ||
+        !state->async_repl->render_pending || state->output_len != 0) {
+        return;
+    }
+    (void)active_prompt_text(state, prompt);
+    if (gsh_async_repl_prepare_render(state->async_repl, prompt,
+                                      state->line, state->line_len) == -1) {
+        state->last_status = 1;
+        state->running = false;
+        return;
+    }
+    render = gsh_async_repl_render_data(state->async_repl);
+    length = gsh_async_repl_render_length(state->async_repl);
+    if (!raw_output_push(state, render, length)) {
+        state->running = false;
+        return;
+    }
+    gsh_async_repl_rendered(state->async_repl);
 }
 
 static void make_editor_modes(shell_state *state)
 {
     state->editor_modes = state->original_modes;
     state->editor_modes.c_lflag &= (tcflag_t)~(ICANON | ECHO);
+    if (state->async_repl != NULL && state->async_repl->enabled) {
+        state->editor_modes.c_lflag &= (tcflag_t)~ISIG;
+        state->editor_modes.c_cc[VINTR] = _POSIX_VDISABLE;
+        state->editor_modes.c_cc[VSUSP] = _POSIX_VDISABLE;
+#ifdef VDSUSP
+        state->editor_modes.c_cc[VDSUSP] = _POSIX_VDISABLE;
+#endif
+    }
     state->editor_modes.c_iflag &= (tcflag_t)~(ICRNL | IXON);
     state->editor_modes.c_cc[VMIN] = 1;
     state->editor_modes.c_cc[VTIME] = 0;
@@ -648,13 +754,35 @@ static int install_signal_handlers(void)
         install_handler(SIGHUP, signal_handler, 0) == -1 ||
         install_handler(SIGTERM, signal_handler, 0) == -1 ||
         install_handler(SIGQUIT, SIG_IGN, 0) == -1 ||
-        install_handler(SIGTSTP, SIG_IGN, 0) == -1 ||
+        install_handler(SIGTSTP, signal_handler, 0) == -1 ||
         install_handler(SIGTTIN, SIG_IGN, 0) == -1 ||
         install_handler(SIGTTOU, SIG_IGN, 0) == -1 ||
         install_handler(SIGPIPE, SIG_IGN, 0) == -1) {
         return -1;
     }
     return 0;
+}
+
+static bool managed_repl_requested(void)
+{
+    const char *mode = getenv("GSH_REPL");
+
+    return mode == NULL || strcmp(mode, "classic") != 0;
+}
+
+static void initialize_repl_size(shell_state *state)
+{
+    struct winsize size;
+
+    if (state->async_repl == NULL || !state->async_repl->enabled) {
+        return;
+    }
+    memset(&size, 0, sizeof(size));
+    if (ioctl(state->tty_fd, TIOCGWINSZ, &size) == -1) {
+        gsh_async_repl_resize(state->async_repl, 24, 80);
+        return;
+    }
+    gsh_async_repl_resize(state->async_repl, size.ws_row, size.ws_col);
 }
 
 static int initialize_interactive(shell_state *state)
@@ -674,6 +802,9 @@ static int initialize_interactive(shell_state *state)
     state->variable_commit_fd = -1;
     state->directory_commit_socket = -1;
     state->directory_commit_fd = -1;
+    state->async_capture_cell = -1;
+    state->async_state_cell = -1;
+    state->async_dispatch_cell = -1;
     state->running = true;
     state->last_status = 0;
     gsh_options_initialize(&state->options, true);
@@ -707,12 +838,17 @@ static int initialize_interactive(shell_state *state)
     state->pipeline_changes = fault_should_fail("allocation", ENOMEM)
                                   ? NULL
                                   : malloc(sizeof(*state->pipeline_changes));
+    state->async_repl = fault_should_fail("allocation", ENOMEM)
+                            ? NULL
+                            : malloc(sizeof(*state->async_repl));
     if (state->variables == NULL || state->variable_scratch == NULL ||
         state->pipeline_variables == NULL ||
         state->variable_commit == NULL || state->pipeline_changes == NULL ||
+        state->async_repl == NULL ||
         gsh_variables_import(state->variables, environ) == -1) {
         return -1;
     }
+    gsh_async_repl_initialize(state->async_repl, managed_repl_requested());
     state->variable_generation = 1;
     state->alias_generation = 1;
     state->function_generation = 1;
@@ -777,6 +913,7 @@ static int initialize_interactive(shell_state *state)
     if (install_signal_handlers() == -1 || enter_editor(state) == -1) {
         return -1;
     }
+    initialize_repl_size(state);
     return 0;
 }
 
@@ -1795,6 +1932,11 @@ static void finish_job(shell_state *state)
     }
     state->last_status = status;
 
+    if (state->async_repl != NULL && state->async_repl->enabled &&
+        state->async_state_cell >= 0) {
+        (void)gsh_async_repl_reap(state->async_repl, pid, wait_status);
+    }
+
     if (was_foreground) {
         reclaim_terminal(state, false);
         if (state->current_job.pipeline_status_known &&
@@ -1893,6 +2035,11 @@ static void reap_children(shell_state *state)
         pid_t pid = waitpid(-1, &status, options);
 
         if (pid > 0) {
+            int async_cell = state->async_repl == NULL
+                                 ? -1
+                                 : gsh_async_repl_cell_for_pid(
+                                       state->async_repl, pid);
+
             if (pid == state->prompt_worker_pid) {
                 bool unexpected = state->prompt_worker_alive;
                 bool command = state->mode == MODE_ASYNC_WORKER;
@@ -1920,6 +2067,19 @@ static void reap_children(shell_state *state)
                        find_job_member(&state->current_job, pid) !=
                            GSH_NATIVE_JOB_MEMBER_CAP) {
                 update_job_state(state, pid, status);
+            } else if (async_cell >= 0) {
+                if (WIFSTOPPED(status)) {
+                    gsh_async_repl_mark_stopped(state->async_repl,
+                                                async_cell);
+#ifdef WIFCONTINUED
+                } else if (WIFCONTINUED(status)) {
+                    gsh_async_repl_mark_running(state->async_repl,
+                                                async_cell);
+#endif
+                } else if (WIFEXITED(status) || WIFSIGNALED(status)) {
+                    (void)gsh_async_repl_reap(state->async_repl, pid,
+                                              status);
+                }
             } else if ((WIFEXITED(status) || WIFSIGNALED(status)) &&
                        gsh_background_record(&state->background_jobs, pid,
                                              status)) {
@@ -1942,6 +2102,31 @@ static void reap_children(shell_state *state)
     }
 }
 
+static void resize_managed_jobs(shell_state *state)
+{
+    struct winsize size;
+    int index;
+
+    if (state->async_repl == NULL || !state->async_repl->enabled) {
+        return;
+    }
+    memset(&size, 0, sizeof(size));
+    if (ioctl(state->tty_fd, TIOCGWINSZ, &size) == -1) {
+        return;
+    }
+    gsh_async_repl_resize(state->async_repl, size.ws_row, size.ws_col);
+    for (index = 0; index < GSH_ASYNC_CELL_CAP; index++) {
+        gsh_async_cell *cell = &state->async_repl->cells[index];
+
+        if (cell->occupied && cell->pty_fd >= 0) {
+            (void)ioctl(cell->pty_fd, TIOCSWINSZ, &size);
+            if (cell->pgid > 0) {
+                (void)kill(-cell->pgid, SIGWINCH);
+            }
+        }
+    }
+}
+
 static void drain_signal_pipe(shell_state *state)
 {
     unsigned char bytes[256];
@@ -1960,8 +2145,61 @@ static void cancel_editor_line(shell_state *state)
     reset_pending_input(state);
     state->continuation_prompt = false;
     state->escape_state = 0;
-    (void)output_text(state, "^C\r\n");
+    if (state->async_repl == NULL || !state->async_repl->enabled) {
+        (void)output_text(state, "^C\r\n");
+    }
     queue_prompt(state);
+}
+
+/* ── Managed Ctrl-Z Uses an Unconditional Stop ───────────────────
+ * Each managed PTY job is a session leader, so its process group is orphaned.
+ * POSIX permits an orphaned group to discard the terminal stop signal SIGTSTP.
+ * The physical terminal never belongs to that group and cannot stop it for us.
+ * SIGSTOP supplies the required managed Ctrl-Z transition deterministically.
+ * TIOCSIG addresses the whole PTY group when cross-session kill is unavailable.
+ * A leader fallback covers the short interval before that group is observable.
+ * SIGCONT through bg or fg retains the ordinary observable resume behavior.
+ * ─────────────────────────────────────────────────────────────── */
+static pid_t managed_job_group(shell_state *state, int cell_index)
+{
+    gsh_async_cell *cell = &state->async_repl->cells[cell_index];
+    pid_t foreground = cell->pty_fd < 0 ? -1 : tcgetpgrp(cell->pty_fd);
+
+    if (foreground > 0) {
+        cell->pgid = foreground;
+    }
+    return cell->pgid;
+}
+
+static int signal_managed_job(shell_state *state, int cell_index,
+                              int signal_number)
+{
+    gsh_async_cell *cell = &state->async_repl->cells[cell_index];
+    pid_t pgid = managed_job_group(state, cell_index);
+
+#ifdef TIOCSIG
+    if (cell->pty_fd >= 0 &&
+        ioctl(cell->pty_fd, TIOCSIG, signal_number) == 0) {
+        return 0;
+    }
+#endif
+    if (pgid > 0 && kill(-pgid, signal_number) == 0) {
+        return 0;
+    }
+    if (cell->pid > 0) {
+        return kill(cell->pid, signal_number);
+    }
+    errno = ESRCH;
+    return -1;
+}
+
+static void stop_managed_job(shell_state *state, int cell_index)
+{
+    if (signal_managed_job(state, cell_index, SIGSTOP) == 0) {
+        gsh_async_repl_mark_stopped(state->async_repl, cell_index);
+    } else {
+        gsh_async_repl_unfocus(state->async_repl);
+    }
 }
 
 static void process_pending_signals(shell_state *state)
@@ -1970,12 +2208,14 @@ static void process_pending_signals(shell_state *state)
     sigset_t previous;
     bool child;
     bool interrupt;
+    bool suspend;
     bool resize;
     bool shutdown;
 
     sigemptyset(&signals);
     sigaddset(&signals, SIGCHLD);
     sigaddset(&signals, SIGINT);
+    sigaddset(&signals, SIGTSTP);
     sigaddset(&signals, SIGWINCH);
     sigaddset(&signals, SIGHUP);
     sigaddset(&signals, SIGTERM);
@@ -1983,10 +2223,12 @@ static void process_pending_signals(shell_state *state)
 
     child = g_sigchld_pending != 0;
     interrupt = g_sigint_pending != 0;
+    suspend = g_sigtstp_pending != 0;
     resize = g_sigwinch_pending != 0;
     shutdown = g_shutdown_pending != 0;
     g_sigchld_pending = 0;
     g_sigint_pending = 0;
+    g_sigtstp_pending = 0;
     g_sigwinch_pending = 0;
     g_shutdown_pending = 0;
 
@@ -1995,7 +2237,16 @@ static void process_pending_signals(shell_state *state)
     if (child) {
         reap_children(state);
     }
-    if (interrupt && state->mode == MODE_EDITOR) {
+    if (interrupt && state->async_repl != NULL &&
+        state->async_repl->enabled) {
+        int focused = gsh_async_repl_focused_job(state->async_repl);
+
+        if (focused >= 0) {
+            (void)signal_managed_job(state, focused, SIGINT);
+        } else {
+            cancel_editor_line(state);
+        }
+    } else if (interrupt && state->mode == MODE_EDITOR) {
         cancel_editor_line(state);
     } else if (interrupt && state->mode == MODE_DISPATCH) {
         state->mode = MODE_EDITOR;
@@ -2018,8 +2269,20 @@ static void process_pending_signals(shell_state *state)
         abandon_pending_list(state);
         cancel_editor_line(state);
     }
-    if (resize && state->mode == MODE_EDITOR) {
-        queue_redraw(state);
+    if (resize) {
+        if (state->async_repl != NULL && state->async_repl->enabled) {
+            resize_managed_jobs(state);
+        } else if (state->mode == MODE_EDITOR) {
+            queue_redraw(state);
+        }
+    }
+    if (suspend && state->async_repl != NULL &&
+        state->async_repl->enabled) {
+        int focused = gsh_async_repl_focused_job(state->async_repl);
+
+        if (focused >= 0) {
+            stop_managed_job(state, focused);
+        }
     }
     if (shutdown) {
         state->running = false;
@@ -2756,12 +3019,12 @@ static char *const *child_command_environment(
     return storage;
 }
 
-typedef struct {
+struct pipeline_expansion_scope {
     const gsh_variable_store *base;
     gsh_variable_journal *changes;
     size_t command_count;
     size_t current_scope;
-} pipeline_expansion_scope;
+};
 
 static const char *store_path_value(const gsh_variable_store *variables,
                                     const char *default_path);
@@ -3521,6 +3784,10 @@ static void start_native_pipeline(shell_state *state,
     sigset_t previous;
     size_t index;
 
+    if (state->async_repl != NULL && state->async_repl->enabled) {
+        start_async_native_pipeline(state, pipeline, scope);
+        return;
+    }
     initialize_pipeline_descriptors(pipes);
     initialize_heredoc_descriptors(heredoc_pipes);
     if (state->current_job.active) {
@@ -3825,6 +4092,229 @@ static void start_native_pipeline(shell_state *state,
     (void)sigprocmask(SIG_SETMASK, &previous, NULL);
 }
 
+typedef struct {
+    int master;
+    int slave_hold;
+    char slave[PATH_MAX];
+} managed_pty;
+
+/* ── A Held Slave Closes the PTY Startup Race ────────────────────
+ * A new master reports hangup while no slave descriptor is open.
+ * The reactor could observe that window before a forked child attached.
+ * Opening one no-ctty slave before fork keeps the pair alive across startup.
+ * The child closes the inherited hold only after its controlling slave works.
+ * The parent can then poll immediately without mistaking startup for exit.
+ * ─────────────────────────────────────────────────────────────── */
+
+static int open_managed_pty(managed_pty *pty)
+{
+    const char *name;
+
+    if (pty == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+    pty->master = posix_openpt(O_RDWR | O_NOCTTY | O_NONBLOCK);
+    if (pty->master == -1 || grantpt(pty->master) == -1 ||
+        unlockpt(pty->master) == -1) {
+        if (pty->master >= 0) {
+            (void)close(pty->master);
+        }
+        pty->master = -1;
+        return -1;
+    }
+    name = ptsname(pty->master);
+    if (name == NULL || strlen(name) + 1U > sizeof(pty->slave)) {
+        (void)close(pty->master);
+        pty->master = -1;
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    memcpy(pty->slave, name, strlen(name) + 1U);
+    pty->slave_hold = open(pty->slave, O_RDWR | O_NOCTTY | O_CLOEXEC);
+    if (pty->slave_hold == -1 ||
+        set_fd_flags(pty->master, F_GETFD, FD_CLOEXEC) == -1) {
+        int saved_errno = errno;
+
+        if (pty->slave_hold >= 0) {
+            (void)close(pty->slave_hold);
+        }
+        (void)close(pty->master);
+        pty->master = -1;
+        pty->slave_hold = -1;
+        errno = saved_errno;
+        return -1;
+    }
+    return 0;
+}
+
+static void close_child_reactor_descriptors(shell_state *state,
+                                            int retained)
+{
+    int index;
+
+    if (state->tty_fd >= 0 && state->tty_fd != retained) {
+        (void)close(state->tty_fd);
+    }
+    (void)close(state->signal_pipe[0]);
+    (void)close(state->signal_pipe[1]);
+    if (state->prompt_worker_fd >= 0) {
+        (void)close(state->prompt_worker_fd);
+    }
+    if (state->async_repl == NULL) {
+        return;
+    }
+    for (index = 0; index < GSH_ASYNC_CELL_CAP; index++) {
+        int descriptor = state->async_repl->cells[index].pty_fd;
+
+        if (descriptor >= 0 && descriptor != retained) {
+            (void)close(descriptor);
+        }
+    }
+}
+
+static int attach_child_pty(shell_state *state, const managed_pty *pty)
+{
+    struct winsize size;
+    int slave;
+
+    if (setsid() == -1) {
+        return -1;
+    }
+    slave = open(pty->slave, O_RDWR);
+    if (slave == -1) {
+        return -1;
+    }
+#ifdef TIOCSCTTY
+    if (ioctl(slave, TIOCSCTTY, 0) == -1 && errno != EINVAL) {
+        (void)close(slave);
+        return -1;
+    }
+#endif
+    memset(&size, 0, sizeof(size));
+    if (ioctl(state->tty_fd, TIOCGWINSZ, &size) == 0) {
+        (void)ioctl(slave, TIOCSWINSZ, &size);
+    }
+    if (tcsetattr(slave, TCSANOW, &state->original_modes) == -1 ||
+        tcsetpgrp(slave, getpgrp()) == -1 ||
+        dup2(slave, STDIN_FILENO) == -1 ||
+        dup2(slave, STDOUT_FILENO) == -1 ||
+        dup2(slave, STDERR_FILENO) == -1) {
+        (void)close(slave);
+        return -1;
+    }
+    if (slave > STDERR_FILENO) {
+        (void)close(slave);
+    }
+    if (pty->slave_hold >= 0) {
+        (void)close(pty->slave_hold);
+    }
+    return 0;
+}
+
+static void child_exec_managed_external(shell_state *state,
+                                        simple_command *direct)
+{
+    char *environment_storage[CHILD_ENVIRONMENT_CAP];
+    char *const *environment = child_command_environment(
+        state->variables, NULL, environment_storage);
+    char *shell_arguments[] = {(char *)"sh", (char *)"-c",
+                               (char *)state->pending_input, NULL};
+
+    if (direct != NULL) {
+        child_exec_direct(direct->argv,
+                          store_path_value(state->variables,
+                                           state->default_path),
+                          environment);
+    }
+    execve("/bin/sh", shell_arguments, environment);
+    child_exec_error("/bin/sh", errno);
+}
+
+static void managed_external_child(shell_state *state, managed_pty *pty,
+                                   int gate_read, int gate_write,
+                                   const sigset_t *previous,
+                                   simple_command *direct)
+{
+    char release;
+
+    (void)close(gate_write);
+    (void)close(pty->master);
+    reset_child_signals();
+    if (attach_child_pty(state, pty) == -1) {
+        child_exec_error("managed PTY", errno);
+    }
+    (void)sigprocmask(SIG_SETMASK, previous, NULL);
+    close_child_reactor_descriptors(state, -1);
+    while (read(gate_read, &release, sizeof(release)) == -1 &&
+           errno == EINTR) {
+    }
+    (void)close(gate_read);
+    child_exec_managed_external(state, direct);
+}
+
+static void start_async_external(shell_state *state, simple_command *direct)
+{
+    managed_pty pty = {.master = -1, .slave_hold = -1};
+    int gate[2] = {-1, -1};
+    sigset_t blocked;
+    sigset_t previous;
+    pid_t pid;
+
+    if (open_managed_pty(&pty) == -1 ||
+        make_pipe(gate, false, "job-pipe") == -1) {
+        output_format(state, "gsh: managed launch: %s\r\n",
+                      strerror(errno));
+        if (pty.master >= 0) {
+            (void)close(pty.master);
+        }
+        if (pty.slave_hold >= 0) {
+            (void)close(pty.slave_hold);
+        }
+        state->mode = MODE_EDITOR;
+        return;
+    }
+    sigemptyset(&blocked);
+    sigaddset(&blocked, SIGCHLD);
+    if (sigprocmask(SIG_BLOCK, &blocked, &previous) == -1) {
+        output_format(state, "gsh: managed sigprocmask: %s\r\n",
+                      strerror(errno));
+        (void)close(pty.master);
+        (void)close(pty.slave_hold);
+        (void)close(gate[0]);
+        (void)close(gate[1]);
+        state->mode = MODE_EDITOR;
+        return;
+    }
+    pid = fork();
+    if (pid == 0) {
+        managed_external_child(state, &pty, gate[0], gate[1], &previous,
+                               direct);
+        _exit(127);
+    }
+    (void)close(pty.slave_hold);
+    pty.slave_hold = -1;
+    (void)close(gate[0]);
+    if (pid == -1 || gsh_async_repl_attach(
+                         state->async_repl, state->async_dispatch_cell, pid,
+                         pid, pty.master) == -1) {
+        int saved_errno = errno;
+
+        if (pid > 0) {
+            (void)kill(pid, SIGKILL);
+        }
+        (void)close(pty.master);
+        output_format(state, "gsh: managed fork: %s\r\n",
+                      strerror(saved_errno));
+        gsh_async_repl_finish(state->async_repl,
+                              state->async_dispatch_cell, 125 << 8, false);
+    }
+    (void)close(gate[1]);
+    (void)sigprocmask(SIG_SETMASK, &previous, NULL);
+    state->mode = MODE_EDITOR;
+    queue_prompt(state);
+}
+
 static void start_external(shell_state *state, simple_command *direct)
 {
     int gate[2];
@@ -3836,6 +4326,10 @@ static void start_external(shell_state *state, simple_command *direct)
 
     if (direct != NULL && !direct_path_is_bounded(direct, path_value)) {
         direct = NULL;
+    }
+    if (state->async_repl != NULL && state->async_repl->enabled) {
+        start_async_external(state, direct);
+        return;
     }
 
     if (state->current_job.active) {
@@ -4491,6 +4985,31 @@ static bool run_planned_main_builtin(shell_state *state,
 
 static void run_fg(shell_state *state)
 {
+    if (state->async_repl != NULL && state->async_repl->enabled) {
+        int cell_index = gsh_async_repl_latest_job(state->async_repl);
+
+        if (cell_index < 0 ||
+            gsh_async_repl_focus(state->async_repl, cell_index) == -1) {
+            output_text(state, "gsh: fg: no current job\r\n");
+            state->last_status = 1;
+        } else {
+            gsh_async_cell *cell = &state->async_repl->cells[cell_index];
+
+            if (cell->state == GSH_ASYNC_STOPPED) {
+                (void)signal_managed_job(state, cell_index, SIGCONT);
+                gsh_async_repl_mark_running(state->async_repl, cell_index);
+                (void)gsh_async_repl_focus(state->async_repl, cell_index);
+            }
+            output_format(state,
+                          "[focused cell %llu; Ctrl-] returns to editor]"
+                          "\r\n",
+                          (unsigned long long)cell->id);
+            state->last_status = 0;
+        }
+        state->mode = MODE_EDITOR;
+        queue_prompt(state);
+        return;
+    }
     if (!state->current_job.active) {
         output_text(state, "gsh: fg: no current job\r\n");
         state->last_status = 1;
@@ -4525,6 +5044,23 @@ static void run_fg(shell_state *state)
 
 static void run_bg(shell_state *state)
 {
+    if (state->async_repl != NULL && state->async_repl->enabled) {
+        int cell_index = gsh_async_repl_latest_job(state->async_repl);
+
+        if (cell_index < 0 ||
+            state->async_repl->cells[cell_index].state !=
+                GSH_ASYNC_STOPPED) {
+            output_text(state, "gsh: bg: no stopped job\r\n");
+            state->last_status = 1;
+        } else {
+            (void)signal_managed_job(state, cell_index, SIGCONT);
+            gsh_async_repl_mark_running(state->async_repl, cell_index);
+            state->last_status = 0;
+        }
+        state->mode = MODE_EDITOR;
+        queue_prompt(state);
+        return;
+    }
     if (!state->current_job.active || !state->current_job.stopped) {
         output_text(state, "gsh: bg: no stopped job\r\n");
         state->last_status = 1;
@@ -4805,7 +5341,8 @@ static void dispatch_pending(shell_state *state)
                       "native=%llu "
                       "shell=%llu "
                       "parsed=%llu parse_failures=%llu job=%s worker=%s "
-                      "busy=%u timeouts=%llu failures=%llu stale=%llu\r\n",
+                      "busy=%u timeouts=%llu failures=%llu stale=%llu "
+                      "async_jobs=%zu focus=%s\r\n",
                       (unsigned long long)state->reactor_cycles,
                       (double)state->reactor_max_ns / 1000000.0,
                       (unsigned long long)state->reactor_misses,
@@ -4823,7 +5360,11 @@ static void dispatch_pending(shell_state *state)
                       state->prompt_worker_busy ? 1U : 0U,
                       (unsigned long long)state->prompt_worker_timeouts,
                       (unsigned long long)state->prompt_worker_failures,
-                      (unsigned long long)state->prompt_stale_results);
+                      (unsigned long long)state->prompt_stale_results,
+                      gsh_async_repl_job_count(state->async_repl),
+                      gsh_async_repl_focused_job(state->async_repl) >= 0
+                          ? "job"
+                          : "editor");
         state->last_status = 0;
         state->mode = MODE_EDITOR;
         queue_prompt(state);
@@ -4980,6 +5521,364 @@ static void dispatch_pending(shell_state *state)
     start_external(state, NULL);
 }
 
+static bool command_has_status_dependency(const char *command,
+                                          size_t length)
+{
+    size_t offset;
+    bool single_quoted = false;
+
+    for (offset = 0; offset + 1U < length; offset++) {
+        unsigned char byte = (unsigned char)command[offset];
+
+        if (byte == '\\' && !single_quoted) {
+            offset++;
+            continue;
+        }
+        if (byte == '\'') {
+            single_quoted = !single_quoted;
+            continue;
+        }
+        if (!single_quoted && byte == '$' && command[offset + 1U] == '?') {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool command_has_isolated_execution(const shell_state *state)
+{
+    size_t node_index = state->pending_parse.root;
+    unsigned int depth;
+
+    for (depth = 0; depth < 6U; depth++) {
+        const gsh_ast_node *node;
+        size_t child;
+
+        if (node_index == GSH_AST_NONE ||
+            node_index >= state->parse_storage->node_count) {
+            return false;
+        }
+        node = &state->parse_storage->nodes[node_index];
+        if ((node->flags & GSH_AST_FLAG_ASYNC) != 0) {
+            return false;
+        }
+        if (node->kind == GSH_AST_SUBSHELL) {
+            return true;
+        }
+        if (node->kind != GSH_AST_PROGRAM && node->kind != GSH_AST_LIST &&
+            node->kind != GSH_AST_AND_OR && node->kind != GSH_AST_PIPELINE) {
+            return false;
+        }
+        child = node->first_child;
+        if (child == GSH_AST_NONE ||
+            child >= state->parse_storage->node_count) {
+            return false;
+        }
+        if (state->parse_storage->nodes[child].next_sibling != GSH_AST_NONE) {
+            return node->kind == GSH_AST_PIPELINE;
+        }
+        node_index = child;
+    }
+    return false;
+}
+
+static size_t managed_assignment_name_length(const char *input,
+                                             gsh_word_ref word)
+{
+    size_t offset;
+
+    for (offset = word.begin; offset < word.end; offset++) {
+        if (input[offset] == '=') {
+            size_t length = offset - word.begin;
+
+            return gsh_variable_name_is_valid(input + word.begin, length)
+                       ? length
+                       : 0;
+        }
+    }
+    return 0;
+}
+
+static bool managed_plain_word(const char *input, gsh_word_ref word)
+{
+    size_t offset;
+
+    if (word.begin >= word.end) {
+        return false;
+    }
+    for (offset = word.begin; offset < word.end; offset++) {
+        unsigned char byte = (unsigned char)input[offset];
+
+        if (byte == '\\' || byte == '\'' || byte == '"' || byte == '$' ||
+            byte == 0x60U || byte == '~') {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool managed_word_is(const char *input, gsh_word_ref word,
+                            const char *text)
+{
+    size_t length = strlen(text);
+
+    return managed_plain_word(input, word) &&
+           word.end - word.begin == length &&
+           memcmp(input + word.begin, text, length) == 0;
+}
+
+static bool managed_variable_affects_launch(const shell_state *state,
+                                            gsh_word_ref word,
+                                            size_t name_length)
+{
+    bool is_set;
+    unsigned int attributes;
+    const char *name = state->pending_input + word.begin;
+
+    if (name_length == 4U && memcmp(name, "PATH", 4) == 0) {
+        return true;
+    }
+    if (gsh_options_enabled(&state->options, GSH_OPTION_ALLEXPORT)) {
+        return true;
+    }
+    return gsh_variables_get_state(state->variables, name, name_length,
+                                   &is_set, &attributes) &&
+           (attributes & GSH_VARIABLE_EXPORTED) != 0;
+}
+
+static bool managed_simple_blocks_independent(const shell_state *state,
+                                              const gsh_ast_node *node)
+{
+    static const char *const launch_mutators[] = {
+        ".",       "alias",  "cd",       "command", "eval",
+        "exec",    "export", "getopts",  "read",    "readonly",
+        "set",     "shift",  "trap",     "ulimit",  "umask",
+        "unalias", "unset",
+    };
+    size_t assignment_count = 0;
+    size_t index;
+    gsh_word_ref command;
+    bool assignment_blocks = false;
+
+    if (node->first_word > state->parse_storage->word_count ||
+        node->word_count >
+            state->parse_storage->word_count - node->first_word) {
+        return true;
+    }
+    while (assignment_count < node->word_count) {
+        gsh_word_ref word = state->parse_storage->words[
+            node->first_word + assignment_count];
+
+        if (word.begin > word.end ||
+            word.end > state->pending_input_length) {
+            return true;
+        }
+        {
+            size_t name_length = managed_assignment_name_length(
+                state->pending_input, word);
+
+            if (name_length == 0) {
+                break;
+            }
+            if (managed_variable_affects_launch(state, word,
+                                                name_length)) {
+                assignment_blocks = true;
+            }
+        }
+        assignment_count++;
+    }
+    if (assignment_count == node->word_count) {
+        return assignment_blocks;
+    }
+    if (assignment_blocks) {
+        return true;
+    }
+    command = state->parse_storage->words[
+        node->first_word + assignment_count];
+    if (!managed_plain_word(state->pending_input, command)) {
+        return true;
+    }
+    for (index = 0;
+         index < sizeof(launch_mutators) / sizeof(launch_mutators[0]);
+         index++) {
+        if (managed_word_is(state->pending_input, command,
+                            launch_mutators[index])) {
+            return true;
+        }
+    }
+    return gsh_functions_lookup(
+               state->functions, state->pending_input + command.begin,
+               command.end - command.begin) != NULL;
+}
+
+static bool command_blocks_independent(shell_state *state)
+{
+    size_t stack[GSH_PARSE_NODE_CAP];
+    size_t stack_count = 0;
+    size_t visited = 0;
+
+    if (state->pending_parse.status != GSH_PARSE_OK ||
+        state->pending_alias_expanded ||
+        state->pending_parse.root >= state->parse_storage->node_count) {
+        return true;
+    }
+    stack[stack_count++] = state->pending_parse.root;
+    while (stack_count != 0 && visited++ < GSH_PARSE_NODE_CAP) {
+        size_t node_index = stack[--stack_count];
+        const gsh_ast_node *node;
+        size_t child;
+        size_t sibling_count = 0;
+
+        if (node_index >= state->parse_storage->node_count) {
+            return true;
+        }
+        node = &state->parse_storage->nodes[node_index];
+        if ((node->flags & GSH_AST_FLAG_ASYNC) != 0 ||
+            node->kind == GSH_AST_SUBSHELL) {
+            continue;
+        }
+        if (node->kind == GSH_AST_FUNCTION) {
+            return true;
+        }
+        if (node->kind == GSH_AST_FOR) {
+            gsh_word_ref name;
+            size_t name_length;
+
+            if (node->word_count == 0 ||
+                node->first_word >= state->parse_storage->word_count) {
+                return true;
+            }
+            name = state->parse_storage->words[node->first_word];
+            if (name.begin > name.end ||
+                name.end > state->pending_input_length) {
+                return true;
+            }
+            name_length = name.end - name.begin;
+            if (managed_variable_affects_launch(state, name,
+                                                name_length)) {
+                return true;
+            }
+        }
+        if (node->kind == GSH_AST_SIMPLE &&
+            managed_simple_blocks_independent(state, node)) {
+            return true;
+        }
+        if (node->kind == GSH_AST_PIPELINE &&
+            node->first_child != GSH_AST_NONE &&
+            node->first_child >= state->parse_storage->node_count) {
+            return true;
+        }
+        if (node->kind == GSH_AST_PIPELINE &&
+            node->first_child != GSH_AST_NONE &&
+            state->parse_storage->nodes[node->first_child].next_sibling !=
+                GSH_AST_NONE) {
+            continue;
+        }
+        child = node->first_child;
+        while (child != GSH_AST_NONE &&
+               sibling_count++ < GSH_PARSE_NODE_CAP) {
+            if (child >= state->parse_storage->node_count ||
+                stack_count == GSH_PARSE_NODE_CAP) {
+                return true;
+            }
+            stack[stack_count++] = child;
+            child = state->parse_storage->nodes[child].next_sibling;
+        }
+        if (child != GSH_AST_NONE) {
+            return true;
+        }
+    }
+    return stack_count != 0;
+}
+
+/* ── Control Bypasses Work, State Commits Stay Ordered ───────────
+ * Completion order cannot decide the shell's directory or variable state.
+ * Barrier cells therefore wait for every older cell before they can commit.
+ * A compound form alone is not a fence for independent external work.
+ * Only a pending mutation that can alter launch state blocks that later work.
+ * REPL controls such as fg must still reach the job that causes that wait.
+ * Their explicit control class bypasses work dependencies without mutating them.
+ * ─────────────────────────────────────────────────────────────── */
+
+static bool command_is_session_barrier(shell_state *state)
+{
+    char storage[LINE_CAP];
+    simple_command command = {0};
+
+    if (state->pending_parse.status != GSH_PARSE_OK ||
+        state->pending_alias_expanded) {
+        return true;
+    }
+    if (command_has_isolated_execution(state)) {
+        return false;
+    }
+    if (!prepare_simple_command(state->pending_input, storage, &command)) {
+        return true;
+    }
+    return gsh_functions_lookup(state->functions, command.argv[0],
+                                strlen(command.argv[0])) != NULL;
+}
+
+static bool command_is_managed_control(const char *command, size_t length)
+{
+    static const char *const controls[] = {"fg", "bg", "rt"};
+    size_t begin = 0;
+    size_t end = length;
+    size_t index;
+
+    while (begin < end &&
+           (command[begin] == ' ' || command[begin] == '\t')) {
+        begin++;
+    }
+    while (end > begin &&
+           (command[end - 1U] == ' ' || command[end - 1U] == '\t')) {
+        end--;
+    }
+    if (end - begin >= 4U && memcmp(command + begin, "exit", 4) == 0 &&
+        (end - begin == 4U || command[begin + 4U] == ' ' ||
+         command[begin + 4U] == '\t')) {
+        return true;
+    }
+    for (index = 0; index < sizeof(controls) / sizeof(controls[0]); index++) {
+        size_t control_length = strlen(controls[index]);
+
+        if (end - begin == control_length &&
+            memcmp(command + begin, controls[index], control_length) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static int accept_managed_submission(shell_state *state,
+                                     size_t command_length)
+{
+    char prompt[GSH_ASYNC_PROMPT_CAP];
+    bool status_dependency;
+    bool barrier;
+    bool blocks_independent;
+    bool control;
+    int cell_index;
+
+    (void)active_prompt_text(state, prompt);
+    status_dependency = command_has_status_dependency(
+        state->pending_line, command_length);
+    control = command_is_managed_control(state->pending_line,
+                                         command_length);
+    barrier = !control &&
+              (status_dependency || command_is_session_barrier(state));
+    blocks_independent = barrier && command_blocks_independent(state);
+    cell_index = gsh_async_repl_accept(
+        state->async_repl, prompt, state->pending_line, command_length,
+        barrier, blocks_independent, status_dependency, control);
+    if (cell_index < 0) {
+        state->overloads++;
+        state->last_status = 125;
+        return -1;
+    }
+    return cell_index;
+}
+
 static void accept_line(shell_state *state)
 {
     size_t candidate_length = state->pending_len + state->line_len;
@@ -5042,6 +5941,24 @@ static void accept_line(shell_state *state)
     }
     state->pending_len = 0;
     state->continuation_prompt = false;
+    if (state->async_repl != NULL && state->async_repl->enabled) {
+        if (candidate_length == 0) {
+            queue_prompt(state);
+            return;
+        }
+        if (accept_managed_submission(state, candidate_length) == -1) {
+            (void)raw_output_push(state, "\a", 1);
+            if (memchr(state->pending_line, '\n', candidate_length) == NULL) {
+                memcpy(state->line, state->pending_line,
+                       candidate_length + 1U);
+                state->line_len = candidate_length;
+            }
+        }
+        state->pending_line[0] = '\0';
+        reset_pending_input(state);
+        queue_prompt(state);
+        return;
+    }
     state->mode = MODE_DISPATCH;
 }
 
@@ -5064,6 +5981,7 @@ static void process_input(shell_state *state)
 {
     unsigned char byte;
     ssize_t count = read(state->tty_fd, &byte, sizeof(byte));
+    int focused;
 
     if (count == 0) {
         state->running = false;
@@ -5073,6 +5991,37 @@ static void process_input(shell_state *state)
         if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
             state->running = false;
         }
+        return;
+    }
+
+    focused = state->async_repl == NULL
+                  ? -1
+                  : gsh_async_repl_focused_job(state->async_repl);
+    if (focused >= 0) {
+        if (byte == 0x1dU) {
+            gsh_async_repl_unfocus(state->async_repl);
+            queue_redraw(state);
+        } else if (byte == 0x03U) {
+            (void)signal_managed_job(state, focused, SIGINT);
+        } else if (byte == 0x1aU) {
+            stop_managed_job(state, focused);
+        } else if (gsh_async_repl_queue_input(
+                       state->async_repl, focused, (const char *)&byte,
+                       sizeof(byte)) == -1) {
+            gsh_async_repl_unfocus(state->async_repl);
+            (void)raw_output_push(state, "\a", 1);
+        }
+        return;
+    }
+
+    if (state->async_repl != NULL && state->async_repl->enabled &&
+        byte == 0x03U) {
+        cancel_editor_line(state);
+        return;
+    }
+    if (state->async_repl != NULL && state->async_repl->enabled &&
+        byte == 0x1aU) {
+        (void)raw_output_push(state, "\a", 1);
         return;
     }
 
@@ -5100,7 +6049,8 @@ static void process_input(shell_state *state)
                 cancel_editor_line(state);
                 return;
             }
-            if (state->current_job.active) {
+            if (state->current_job.active ||
+                gsh_async_repl_job_count(state->async_repl) != 0) {
                 output_text(state, "\r\ngsh: a job is still active\r\n");
                 queue_prompt(state);
             } else {
@@ -5120,6 +6070,10 @@ static void process_input(shell_state *state)
         return;
     }
     if (byte == 0x0cU) {
+        if (state->async_repl != NULL && state->async_repl->enabled) {
+            state->async_repl->render_pending = true;
+            return;
+        }
         (void)output_text(state, "\033[2J\033[H");
         queue_prompt(state);
         (void)output_push(state, state->line, state->line_len);
@@ -5128,11 +6082,261 @@ static void process_input(shell_state *state)
     if ((byte >= 0x20U || byte == '\t') && state->line_len < LINE_CAP - 1) {
         state->line[state->line_len++] = (char)byte;
         state->line[state->line_len] = '\0';
-        (void)output_push(state, (const char *)&byte, 1);
+        if (state->async_repl != NULL && state->async_repl->enabled) {
+            state->async_repl->render_pending = true;
+        } else {
+            (void)output_push(state, (const char *)&byte, 1);
+        }
     } else if (state->line_len >= LINE_CAP - 1) {
         state->overloads++;
         (void)output_text(state, "\a");
     }
+}
+
+static int load_managed_submission(shell_state *state, int cell_index)
+{
+    const gsh_async_cell *cell = &state->async_repl->cells[cell_index];
+
+    if (!cell->occupied || cell->command_length >= sizeof(state->pending_line)) {
+        errno = EINVAL;
+        return -1;
+    }
+    memcpy(state->pending_line, cell->command, cell->command_length + 1U);
+    state->pending_len = 0;
+    if (gsh_aliases_count(state->aliases) != 0) {
+        state->pending_parse = gsh_alias_parse(
+            state->pending_line, cell->command_length, state->aliases,
+            state->alias_expansion, GSH_ALIAS_EXPANSION_CAP,
+            state->parse_storage, &state->pending_input,
+            &state->pending_input_length);
+        state->pending_alias_expanded =
+            state->pending_input_length != cell->command_length ||
+            memcmp(state->pending_input, state->pending_line,
+                   cell->command_length) != 0;
+    } else {
+        reset_pending_input(state);
+        state->pending_parse = gsh_parse(
+            state->pending_line, cell->command_length,
+            state->parse_storage);
+    }
+    return 0;
+}
+
+static bool managed_state_lane_busy(const shell_state *state)
+{
+    return state->async_state_cell >= 0 || state->current_job.active ||
+           state->mode == MODE_ASYNC_WORKER || state->mode == MODE_WAIT ||
+           state->pending_list_active || state->pending_and_or_active;
+}
+
+static void finish_managed_state_cell(shell_state *state)
+{
+    int cell_index = state->async_state_cell;
+
+    if (cell_index < 0 || state->mode != MODE_EDITOR ||
+        state->current_job.active || state->mode == MODE_ASYNC_WORKER ||
+        state->mode == MODE_WAIT || state->pending_list_active ||
+        state->pending_and_or_active) {
+        return;
+    }
+    if (state->async_repl->cells[cell_index].state == GSH_ASYNC_STARTING) {
+        gsh_async_repl_finish(state->async_repl, cell_index,
+                              state->last_status << 8, true);
+    }
+    state->async_state_cell = -1;
+    state->async_capture_cell = -1;
+    state->async_dispatch_cell = -1;
+}
+
+static void record_dispatch_duration(shell_state *state, uint64_t start)
+{
+    uint64_t end = monotonic_ns();
+    uint64_t duration = end >= start ? end - start : 0;
+
+    state->dispatch_cycles++;
+    if (duration > state->dispatch_max_ns) {
+        state->dispatch_max_ns = duration;
+    }
+    if (duration > REACTOR_DEADLINE_NS) {
+        state->dispatch_misses++;
+    }
+}
+
+static bool managed_cell_terminal(const gsh_async_cell *cell)
+{
+    return cell->state == GSH_ASYNC_DONE ||
+           cell->state == GSH_ASYNC_FAILED ||
+           cell->state == GSH_ASYNC_CANCELLED ||
+           cell->state == GSH_ASYNC_REJECTED;
+}
+
+static void finalize_managed_dispatch(shell_state *state, int cell_index)
+{
+    gsh_async_cell *cell = &state->async_repl->cells[cell_index];
+
+    if (state->current_job.active &&
+        state->current_job.pid == cell->pid) {
+        state->async_state_cell = cell_index;
+        return;
+    }
+    if (cell->state == GSH_ASYNC_RUNNING || managed_cell_terminal(cell)) {
+        state->async_capture_cell = -1;
+        state->async_dispatch_cell = -1;
+        return;
+    }
+    if (state->mode == MODE_EDITOR && !state->current_job.active) {
+        gsh_async_repl_finish(state->async_repl, cell_index,
+                              state->last_status << 8, true);
+        state->async_capture_cell = -1;
+        state->async_dispatch_cell = -1;
+        return;
+    }
+    state->async_state_cell = cell_index;
+}
+
+static void dispatch_managed_cell(shell_state *state, int cell_index)
+{
+    int prior_state_cell = state->async_state_cell;
+    int previous_status;
+    uint64_t start;
+
+    gsh_async_repl_starting(state->async_repl, cell_index);
+    state->async_dispatch_cell = cell_index;
+    state->async_capture_cell = cell_index;
+    if (state->async_repl->cells[cell_index].status_dependency &&
+        gsh_async_repl_previous_status(state->async_repl, cell_index,
+                                       &previous_status) == 0) {
+        state->last_status = previous_status;
+    }
+    if (load_managed_submission(state, cell_index) == -1) {
+        output_text(state, "gsh: invalid managed submission\r\n");
+        state->last_status = 125;
+        state->mode = MODE_EDITOR;
+        finalize_managed_dispatch(state, cell_index);
+        return;
+    }
+    state->mode = MODE_DISPATCH;
+    start = monotonic_ns();
+    dispatch_pending(state);
+    record_dispatch_duration(state, start);
+    finalize_managed_dispatch(state, cell_index);
+    if (prior_state_cell >= 0 && state->async_state_cell == prior_state_cell) {
+        state->async_capture_cell = prior_state_cell;
+    }
+}
+
+static void schedule_managed_submissions(shell_state *state)
+{
+    unsigned int dispatched;
+
+    if (state->async_repl == NULL || !state->async_repl->enabled) {
+        return;
+    }
+    finish_managed_state_cell(state);
+    for (dispatched = 0; dispatched < 4U; dispatched++) {
+        int cell_index;
+
+        if (state->mode != MODE_EDITOR) {
+            break;
+        }
+        cell_index = gsh_async_repl_next(
+            state->async_repl, managed_state_lane_busy(state));
+        if (cell_index < 0) {
+            break;
+        }
+        dispatch_managed_cell(state, cell_index);
+    }
+}
+
+static size_t add_managed_poll_descriptors(
+    shell_state *state, struct pollfd descriptors[4 + GSH_ASYNC_CELL_CAP])
+{
+    size_t count = 4;
+    int index;
+
+    if (state->async_repl == NULL || !state->async_repl->enabled) {
+        return count;
+    }
+    for (index = 0; index < GSH_ASYNC_CELL_CAP; index++) {
+        int descriptor = state->async_repl->cells[index].pty_fd;
+
+        if (descriptor < 0) {
+            continue;
+        }
+        descriptors[count].fd = descriptor;
+        descriptors[count].events = POLLIN;
+        if (gsh_async_repl_input_pending(state->async_repl, index)) {
+            descriptors[count].events |= POLLOUT;
+        }
+        descriptors[count].revents = 0;
+        count++;
+    }
+    return count;
+}
+
+static void read_managed_output(shell_state *state, struct pollfd *descriptor)
+{
+    char bytes[4096];
+    int cell_index = gsh_async_repl_cell_for_fd(
+        state->async_repl, descriptor->fd);
+    unsigned int reads;
+
+    if (cell_index < 0) {
+        return;
+    }
+    for (reads = 0; reads < 4U; reads++) {
+        ssize_t count = read(descriptor->fd, bytes, sizeof(bytes));
+
+        if (count > 0) {
+            (void)gsh_async_repl_append(state->async_repl, cell_index,
+                                        bytes, (size_t)count);
+            continue;
+        }
+        if (count == -1 && errno == EINTR) {
+            continue;
+        }
+        if (count == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            return;
+        }
+        gsh_async_repl_close_output(state->async_repl, cell_index);
+        return;
+    }
+}
+
+static void process_managed_descriptors(
+    shell_state *state,
+    struct pollfd descriptors[4 + GSH_ASYNC_CELL_CAP], size_t count)
+{
+    size_t index;
+
+    if (state->async_repl == NULL || !state->async_repl->enabled) {
+        return;
+    }
+    for (index = 4; index < count; index++) {
+        short events = descriptors[index].revents;
+
+        if ((events & (POLLIN | POLLERR | POLLHUP | POLLNVAL)) != 0) {
+            read_managed_output(state, &descriptors[index]);
+        }
+        if ((events & POLLOUT) != 0) {
+            int cell_index = gsh_async_repl_cell_for_fd(
+                state->async_repl, descriptors[index].fd);
+
+            if (cell_index >= 0 &&
+                gsh_async_repl_flush_input(state->async_repl,
+                                           cell_index) == -1) {
+                state->async_repl->cells[cell_index].focused = false;
+                gsh_async_repl_close_output(state->async_repl, cell_index);
+            }
+        }
+    }
+}
+
+static bool editor_accepts_input(const shell_state *state)
+{
+    return state->async_repl != NULL && state->async_repl->enabled
+               ? true
+               : state->mode == MODE_EDITOR;
 }
 
 static int run_reactor(shell_state *state)
@@ -5140,13 +6344,18 @@ static int run_reactor(shell_state *state)
     queue_prompt(state);
 
     while (state->running) {
-        struct pollfd descriptors[4];
+        struct pollfd descriptors[4 + GSH_ASYNC_CELL_CAP];
+        size_t descriptor_count;
         int result;
         uint64_t service_start;
         uint64_t service_end;
         uint64_t service_duration;
 
-        if (state->mode == MODE_DISPATCH && state->output_len == 0) {
+        schedule_managed_submissions(state);
+        prepare_managed_render(state);
+
+        if ((state->async_repl == NULL || !state->async_repl->enabled) &&
+            state->mode == MODE_DISPATCH && state->output_len == 0) {
             uint64_t dispatch_start = monotonic_ns();
             uint64_t dispatch_end;
             uint64_t dispatch_duration;
@@ -5172,7 +6381,7 @@ static int run_reactor(shell_state *state)
         descriptors[1].fd = state->tty_fd;
         descriptors[1].events = 0;
         descriptors[1].revents = 0;
-        if (state->mode == MODE_EDITOR) {
+        if (editor_accepts_input(state)) {
             descriptors[1].events |= POLLIN;
         }
         if (state->output_len > 0) {
@@ -5189,10 +6398,12 @@ static int run_reactor(shell_state *state)
                                 : -1;
         descriptors[3].events = state->variable_commit_active ? POLLIN : 0;
         descriptors[3].revents = 0;
+        descriptor_count = add_managed_poll_descriptors(state, descriptors);
 
         result = fault_should_fail("poll", EIO)
                      ? -1
-                     : poll(descriptors, 4, prompt_poll_timeout(state));
+                     : poll(descriptors, descriptor_count,
+                            prompt_poll_timeout(state));
         if (result == -1) {
             if (errno == EINTR) {
                 continue;
@@ -5212,14 +6423,15 @@ static int run_reactor(shell_state *state)
             drain_signal_pipe(state);
             process_pending_signals(state);
         }
-        if (state->mode == MODE_EDITOR &&
+        if (editor_accepts_input(state) &&
             (descriptors[1].revents & POLLIN) != 0) {
             process_input(state);
         }
-        if (state->mode == MODE_EDITOR &&
+        if (editor_accepts_input(state) &&
             (descriptors[1].revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
             state->running = false;
         }
+        process_managed_descriptors(state, descriptors, descriptor_count);
         if (state->prompt_worker_alive &&
             (descriptors[2].revents & POLLIN) != 0) {
             receive_prompt_result(state);
@@ -5239,6 +6451,8 @@ static int run_reactor(shell_state *state)
             }
         }
         enforce_prompt_deadline(state);
+        schedule_managed_submissions(state);
+        prepare_managed_render(state);
         if (state->output_len > 0) {
             flush_output(state);
         }
@@ -5259,14 +6473,111 @@ static int run_reactor(shell_state *state)
     return state->last_status;
 }
 
+static void leave_managed_screen(shell_state *state)
+{
+    static const char sequence[] = "\033[?1049l";
+    unsigned int attempts;
+
+    if (state->async_repl == NULL ||
+        !state->async_repl->alternate_screen_entered || state->tty_fd < 0) {
+        return;
+    }
+    for (attempts = 0; attempts < 2U; attempts++) {
+        ssize_t written = write(state->tty_fd, sequence,
+                                sizeof(sequence) - 1U);
+
+        if (written == (ssize_t)(sizeof(sequence) - 1U) ||
+            (written == -1 && errno != EINTR)) {
+            break;
+        }
+    }
+}
+
+static size_t reap_managed_children(pid_t pids[GSH_ASYNC_CELL_CAP])
+{
+    size_t remaining = 0;
+    int index;
+
+    for (index = 0; index < GSH_ASYNC_CELL_CAP; index++) {
+        pid_t result;
+
+        if (pids[index] <= 0) {
+            continue;
+        }
+        result = waitpid(pids[index], NULL, WNOHANG);
+        if (result == pids[index] ||
+            (result == -1 && errno == ECHILD)) {
+            pids[index] = 0;
+        } else {
+            remaining++;
+        }
+    }
+    return remaining;
+}
+
+static void terminate_managed_children(
+    pid_t pids[GSH_ASYNC_CELL_CAP],
+    const pid_t original_groups[GSH_ASYNC_CELL_CAP],
+    const pid_t terminal_groups[GSH_ASYNC_CELL_CAP])
+{
+    uint64_t deadline = monotonic_ns() + 100000000ULL;
+    int index;
+
+    for (index = 0; index < GSH_ASYNC_CELL_CAP; index++) {
+        if (pids[index] > 0) {
+            (void)kill(pids[index], SIGHUP);
+            (void)kill(pids[index], SIGCONT);
+        }
+    }
+    while (reap_managed_children(pids) != 0 &&
+           monotonic_ns() < deadline) {
+        (void)poll(NULL, 0, 1);
+    }
+    for (index = 0; index < GSH_ASYNC_CELL_CAP; index++) {
+        if (pids[index] <= 0) {
+            continue;
+        }
+        if (original_groups[index] > 0) {
+            (void)kill(-original_groups[index], SIGKILL);
+        }
+        if (terminal_groups[index] > 0 &&
+            terminal_groups[index] != original_groups[index]) {
+            (void)kill(-terminal_groups[index], SIGKILL);
+        }
+        (void)kill(pids[index], SIGKILL);
+    }
+    deadline = monotonic_ns() + 500000000ULL;
+    while (reap_managed_children(pids) != 0 &&
+           monotonic_ns() < deadline) {
+        (void)poll(NULL, 0, 1);
+    }
+}
+
 static void cleanup(shell_state *state)
 {
     pid_t worker_pid = state->prompt_worker_pid;
+    pid_t managed_pids[GSH_ASYNC_CELL_CAP] = {0};
+    pid_t managed_groups[GSH_ASYNC_CELL_CAP] = {0};
+    pid_t managed_terminal_groups[GSH_ASYNC_CELL_CAP] = {0};
     pid_t background_pids[GSH_BACKGROUND_CAP];
     size_t background_count = gsh_background_snapshot(
         &state->background_jobs, background_pids);
     size_t background;
+    int managed;
 
+    if (state->async_repl != NULL) {
+        for (managed = 0; managed < GSH_ASYNC_CELL_CAP; managed++) {
+            managed_pids[managed] =
+                state->async_repl->cells[managed].pid;
+            managed_groups[managed] =
+                state->async_repl->cells[managed].pgid;
+        }
+        gsh_async_repl_close(state->async_repl);
+        for (managed = 0; managed < GSH_ASYNC_CELL_CAP; managed++) {
+            managed_terminal_groups[managed] =
+                state->async_repl->cells[managed].pgid;
+        }
+    }
     if (state->current_job.active) {
         (void)kill(-state->current_job.pgid, SIGHUP);
         if (state->current_job.stopped) {
@@ -5282,11 +6593,14 @@ static void cleanup(shell_state *state)
     state->prompt_worker_restart_pending = false;
     disable_prompt_worker(state, true);
     close_variable_commit(state);
+    terminate_managed_children(managed_pids, managed_groups,
+                               managed_terminal_groups);
     if (worker_pid > 0) {
         while (waitpid(worker_pid, NULL, 0) == -1 && errno == EINTR) {
         }
         state->prompt_worker_pid = -1;
     }
+    leave_managed_screen(state);
     restore_terminal(state);
     g_signal_write_fd = -1;
     if (state->signal_pipe[0] >= 0) {
@@ -5312,6 +6626,8 @@ static void cleanup(shell_state *state)
     state->variable_commit = NULL;
     free(state->pipeline_changes);
     state->pipeline_changes = NULL;
+    free(state->async_repl);
+    state->async_repl = NULL;
     free(state->alias_expansion);
     state->alias_expansion = NULL;
     free(state->aliases);
@@ -7815,6 +9131,111 @@ static void initialize_interactive_evaluator(native_evaluator *evaluator,
     evaluator->backgrounds = &state->background_jobs;
 }
 
+static void managed_pipeline_child(
+    shell_state *state, managed_pty *pty, int gate_read, int gate_write,
+    const sigset_t *previous, const gsh_native_pipeline *pipeline,
+    const pipeline_expansion_scope *scope)
+{
+    native_evaluator evaluator;
+    gsh_background_table backgrounds;
+    gsh_shell_options options = state->options;
+    char release;
+    int status;
+
+    (void)close(gate_write);
+    (void)close(pty->master);
+    reset_child_signals();
+    if (attach_child_pty(state, pty) == -1) {
+        child_exec_error("managed pipeline PTY", errno);
+    }
+    (void)sigprocmask(SIG_SETMASK, previous, NULL);
+    close_child_reactor_descriptors(state, -1);
+    while (read(gate_read, &release, sizeof(release)) == -1 &&
+           errno == EINTR) {
+    }
+    (void)close(gate_read);
+    initialize_interactive_evaluator(&evaluator, state, state->variables);
+    gsh_background_initialize(&backgrounds);
+    evaluator.backgrounds = &backgrounds;
+    status = run_native_noninteractive_pipeline(
+        (gsh_native_pipeline *)pipeline, state->default_path,
+        state->variables, NULL, state->aliases, NULL, scope,
+        state->positionals, &options, &evaluator);
+    _exit(status & 255);
+}
+
+static void managed_pipeline_parent(shell_state *state, managed_pty *pty,
+                                    int gate_write, pid_t pid,
+                                    const sigset_t *previous)
+{
+    if (pid == -1 ||
+        gsh_async_repl_attach(state->async_repl,
+                              state->async_dispatch_cell, pid, pid,
+                              pty->master) == -1) {
+        int saved_errno = errno;
+
+        if (pid > 0) {
+            (void)kill(pid, SIGKILL);
+        }
+        (void)close(pty->master);
+        output_format(state, "gsh: managed pipeline fork: %s\r\n",
+                      strerror(saved_errno));
+        gsh_async_repl_finish(state->async_repl,
+                              state->async_dispatch_cell, 125 << 8, false);
+    }
+    (void)close(gate_write);
+    (void)sigprocmask(SIG_SETMASK, previous, NULL);
+    state->mode = MODE_EDITOR;
+    queue_prompt(state);
+}
+
+static void start_async_native_pipeline(
+    shell_state *state, const gsh_native_pipeline *pipeline,
+    const pipeline_expansion_scope *scope)
+{
+    managed_pty pty = {.master = -1, .slave_hold = -1};
+    int gate[2] = {-1, -1};
+    sigset_t blocked;
+    sigset_t previous;
+    pid_t pid;
+
+    if (open_managed_pty(&pty) == -1 ||
+        make_pipe(gate, false, "job-pipe") == -1) {
+        output_format(state, "gsh: managed pipeline: %s\r\n",
+                      strerror(errno));
+        if (pty.master >= 0) {
+            (void)close(pty.master);
+        }
+        if (pty.slave_hold >= 0) {
+            (void)close(pty.slave_hold);
+        }
+        state->mode = MODE_EDITOR;
+        return;
+    }
+    sigemptyset(&blocked);
+    sigaddset(&blocked, SIGCHLD);
+    if (sigprocmask(SIG_BLOCK, &blocked, &previous) == -1) {
+        output_format(state, "gsh: managed pipeline mask: %s\r\n",
+                      strerror(errno));
+        (void)close(pty.master);
+        (void)close(pty.slave_hold);
+        (void)close(gate[0]);
+        (void)close(gate[1]);
+        state->mode = MODE_EDITOR;
+        return;
+    }
+    pid = fork();
+    if (pid == 0) {
+        managed_pipeline_child(state, &pty, gate[0], gate[1], &previous,
+                               pipeline, scope);
+        _exit(125);
+    }
+    (void)close(pty.slave_hold);
+    pty.slave_hold = -1;
+    (void)close(gate[0]);
+    managed_pipeline_parent(state, &pty, gate[1], pid, &previous);
+}
+
 static bool native_pipeline_node_is_wait(const shell_state *state,
                                          size_t pipeline)
 {
@@ -8363,6 +9784,8 @@ static void start_native_compound(shell_state *state, size_t node_index)
     int gate[2];
     int commit[2] = {-1, -1};
     int directory[2] = {-1, -1};
+    managed_pty pty = {.master = -1, .slave_hold = -1};
+    bool managed = state->async_repl != NULL && state->async_repl->enabled;
     sigset_t blocked;
     sigset_t previous;
     pid_t pid;
@@ -8518,7 +9941,10 @@ static void start_native_compound(shell_state *state, size_t node_index)
                    sizeof(*state->positional_commit));
         }
     }
-    pid = fault_should_fail("evaluator-fork", EAGAIN) ? -1 : fork();
+    pid = managed && open_managed_pty(&pty) == -1
+              ? -1
+              : (fault_should_fail("evaluator-fork", EAGAIN) ? -1
+                                                               : fork());
     if (pid == 0) {
         char release;
         native_evaluator evaluator;
@@ -8531,19 +9957,21 @@ static void start_native_compound(shell_state *state, size_t node_index)
         if (directory[0] >= 0) {
             close(directory[0]);
         }
-        (void)setpgid(0, 0);
+        if (managed) {
+            (void)close(pty.master);
+            if (attach_child_pty(state, &pty) == -1) {
+                child_exec_error("managed evaluator PTY", errno);
+            }
+        } else {
+            (void)setpgid(0, 0);
+        }
         reset_child_signals();
         (void)sigprocmask(SIG_SETMASK, &previous, NULL);
         while (read(gate[0], &release, sizeof(release)) == -1 &&
                errno == EINTR) {
         }
         close(gate[0]);
-        close(state->tty_fd);
-        close(state->signal_pipe[0]);
-        close(state->signal_pipe[1]);
-        if (state->prompt_worker_fd >= 0) {
-            close(state->prompt_worker_fd);
-        }
+        close_child_reactor_descriptors(state, -1);
         evaluator.input = state->pending_input;
         evaluator.input_length = state->pending_input_length;
         evaluator.storage = state->parse_storage;
@@ -8612,6 +10040,12 @@ static void start_native_compound(shell_state *state, size_t node_index)
 
         close(gate[1]);
         close(commit[0]);
+        if (pty.master >= 0) {
+            (void)close(pty.master);
+        }
+        if (pty.slave_hold >= 0) {
+            (void)close(pty.slave_hold);
+        }
         if (directory[0] >= 0) {
             close(directory[0]);
         }
@@ -8634,6 +10068,11 @@ static void start_native_compound(shell_state *state, size_t node_index)
         return;
     }
 
+    if (managed && pty.slave_hold >= 0) {
+        (void)close(pty.slave_hold);
+        pty.slave_hold = -1;
+    }
+
     state->variable_commit_fd = commit[0];
     state->directory_commit_socket = directory[0];
     state->variable_commit_received = 0;
@@ -8653,6 +10092,34 @@ static void start_native_compound(shell_state *state, size_t node_index)
 
     initialize_job(&state->current_job, pid, pid, &pid, 1, true, false);
     state->current_job.modes = state->original_modes;
+    if (managed) {
+        state->current_job.foreground = false;
+        state->current_job.silent = true;
+        if (gsh_async_repl_attach(state->async_repl,
+                                  state->async_dispatch_cell, pid, pid,
+                                  pty.master) == -1) {
+            int saved_errno = errno;
+
+            (void)kill(pid, SIGKILL);
+            close(gate[1]);
+            close_variable_commit(state);
+            (void)sigprocmask(SIG_SETMASK, &previous, NULL);
+            output_format(state, "gsh: managed evaluator: %s\r\n",
+                          strerror(saved_errno));
+            gsh_async_repl_finish(state->async_repl,
+                                  state->async_dispatch_cell, 125 << 8,
+                                  false);
+            state->current_job.active = false;
+            state->mode = MODE_EDITOR;
+            abandon_pending_list(state);
+            return;
+        }
+        state->mode = MODE_EDITOR;
+        close(gate[1]);
+        (void)sigprocmask(SIG_SETMASK, &previous, NULL);
+        queue_prompt(state);
+        return;
+    }
     (void)setpgid(pid, pid);
     if (fault_should_fail("terminal-handoff", EIO) ||
         tcsetattr(state->tty_fd, TCSANOW, &state->original_modes) == -1 ||
