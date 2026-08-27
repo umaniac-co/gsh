@@ -1,0 +1,118 @@
+#ifndef GSH_ASYNC_REPL_H
+#define GSH_ASYNC_REPL_H
+
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <sys/types.h>
+
+enum {
+    GSH_ASYNC_CELL_CAP = 16,
+    GSH_ASYNC_JOB_CAP = 8,
+    GSH_ASYNC_COMMAND_CAP = 4096,
+    GSH_ASYNC_PROMPT_CAP = 160,
+    GSH_ASYNC_CELL_INPUT_CAP = 4096,
+    GSH_ASYNC_CELL_OUTPUT_CAP = 16384,
+    GSH_ASYNC_VIEW_ROWS = 64,
+    GSH_ASYNC_VIEW_COLUMNS = 256,
+    GSH_ASYNC_RENDER_CAP = 32768,
+};
+
+typedef enum {
+    GSH_ASYNC_UNUSED,
+    GSH_ASYNC_QUEUED,
+    GSH_ASYNC_STARTING,
+    GSH_ASYNC_RUNNING,
+    GSH_ASYNC_STOPPED,
+    GSH_ASYNC_DONE,
+    GSH_ASYNC_FAILED,
+    GSH_ASYNC_CANCELLED,
+    GSH_ASYNC_REJECTED,
+} gsh_async_cell_state;
+
+typedef struct {
+    bool occupied;
+    bool barrier;
+    bool blocks_independent;
+    bool status_dependency;
+    bool control;
+    bool output_closed;
+    bool output_truncated;
+    bool last_was_cr;
+    bool focused;
+    unsigned char escape_state;
+    uint64_t id;
+    gsh_async_cell_state state;
+    pid_t pid;
+    pid_t pgid;
+    int pty_fd;
+    int wait_status;
+    char prompt[GSH_ASYNC_PROMPT_CAP];
+    size_t prompt_length;
+    char command[GSH_ASYNC_COMMAND_CAP];
+    size_t command_length;
+    char input[GSH_ASYNC_CELL_INPUT_CAP];
+    size_t input_offset;
+    size_t input_length;
+    char output[GSH_ASYNC_CELL_OUTPUT_CAP];
+    size_t output_length;
+} gsh_async_cell;
+
+typedef struct {
+    bool enabled;
+    bool alternate_screen_entered;
+    bool render_pending;
+    uint64_t next_id;
+    size_t terminal_rows;
+    size_t terminal_columns;
+    gsh_async_cell cells[GSH_ASYNC_CELL_CAP];
+    char view[GSH_ASYNC_VIEW_ROWS][GSH_ASYNC_VIEW_COLUMNS + 1U];
+    size_t view_lengths[GSH_ASYNC_VIEW_ROWS];
+    size_t view_start;
+    size_t view_count;
+    char render[GSH_ASYNC_RENDER_CAP];
+    size_t render_length;
+} gsh_async_repl;
+
+void gsh_async_repl_initialize(gsh_async_repl *repl, bool enabled);
+void gsh_async_repl_resize(gsh_async_repl *repl, size_t rows,
+                           size_t columns);
+int gsh_async_repl_accept(gsh_async_repl *repl, const char *prompt,
+                          const char *command, size_t command_length,
+                          bool barrier, bool blocks_independent,
+                          bool status_dependency, bool control);
+int gsh_async_repl_next(gsh_async_repl *repl, bool state_lane_busy);
+void gsh_async_repl_starting(gsh_async_repl *repl, int cell_index);
+int gsh_async_repl_attach(gsh_async_repl *repl, int cell_index, pid_t pid,
+                          pid_t pgid, int pty_fd);
+void gsh_async_repl_finish(gsh_async_repl *repl, int cell_index,
+                           int wait_status, bool launched);
+int gsh_async_repl_reap(gsh_async_repl *repl, pid_t pid, int wait_status);
+int gsh_async_repl_cell_for_pid(const gsh_async_repl *repl, pid_t pid);
+int gsh_async_repl_cell_for_fd(const gsh_async_repl *repl, int descriptor);
+int gsh_async_repl_append(gsh_async_repl *repl, int cell_index,
+                          const char *bytes, size_t length);
+int gsh_async_repl_queue_input(gsh_async_repl *repl, int cell_index,
+                               const char *bytes, size_t length);
+bool gsh_async_repl_input_pending(const gsh_async_repl *repl,
+                                  int cell_index);
+int gsh_async_repl_flush_input(gsh_async_repl *repl, int cell_index);
+void gsh_async_repl_close_output(gsh_async_repl *repl, int cell_index);
+size_t gsh_async_repl_job_count(const gsh_async_repl *repl);
+int gsh_async_repl_latest_job(const gsh_async_repl *repl);
+int gsh_async_repl_focused_job(const gsh_async_repl *repl);
+int gsh_async_repl_focus(gsh_async_repl *repl, int cell_index);
+void gsh_async_repl_unfocus(gsh_async_repl *repl);
+void gsh_async_repl_mark_stopped(gsh_async_repl *repl, int cell_index);
+void gsh_async_repl_mark_running(gsh_async_repl *repl, int cell_index);
+int gsh_async_repl_previous_status(const gsh_async_repl *repl,
+                                   int cell_index, int *status);
+int gsh_async_repl_prepare_render(gsh_async_repl *repl,
+                                  const char *active_prompt,
+                                  const char *editor, size_t editor_length);
+const char *gsh_async_repl_render_data(const gsh_async_repl *repl);
+size_t gsh_async_repl_render_length(const gsh_async_repl *repl);
+void gsh_async_repl_rendered(gsh_async_repl *repl);
+void gsh_async_repl_close(gsh_async_repl *repl);
+
+#endif
