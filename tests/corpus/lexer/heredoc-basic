@@ -1,0 +1,3 @@
+/bin/cat <<EOF
+value $VALUE
+EOF

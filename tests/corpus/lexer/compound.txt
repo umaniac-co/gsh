@@ -1,0 +1,1 @@
+if true; then case atom in a*) :;; atom) false ;& *) true;; esac; else false; fi

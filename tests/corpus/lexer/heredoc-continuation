@@ -1,0 +1,5 @@
+/bin/cat <<EOF
+joined\
+EOF
+body
+EOF

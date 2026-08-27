@@ -1,0 +1,3 @@
+for item in pre"$@"post "$*" "$0" "$#" "$1" "${10}"; do
+    printf '<%s>\n' "$item"
+done

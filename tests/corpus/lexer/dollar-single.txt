@@ -1,0 +1,1 @@
+printf '%s\n' $'line\nhex=\x41 octal=\101 control=\c?'

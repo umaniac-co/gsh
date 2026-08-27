@@ -54,5 +54,11 @@ dkms.conf
 # debug information files
 *.dwo
 
+# Local build artifacts
+build/
+
+# Local development reports and evidence
+dev/
+
 # maintainer knowledge and notes
-kb/*
+kb/

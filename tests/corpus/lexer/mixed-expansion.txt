@@ -1,0 +1,1 @@
+printf '<%s>\n' "prefix"${VALUE:-${FALLBACK:-a b}}[ab]'*'"suffix" $((1 + 2 * 3))
