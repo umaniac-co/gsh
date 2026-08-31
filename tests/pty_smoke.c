@@ -4186,6 +4186,46 @@ static int benchmark_prompt_command(
     return 0;
 }
 
+static int benchmark_synchronized_prompt_command(
+    pty_session sessions[BENCH_SHELLS],
+    const shell_spec specs[BENCH_SHELLS],
+    uint64_t samples[BENCH_SHELLS][BENCH_EXEC_SAMPLES],
+    const char *setup, const char *command, const char *label)
+{
+    static const char marker[] = "__GSH_BENCH_SYNC__";
+    size_t sample;
+    size_t offset;
+
+    for (sample = 0; sample < BENCH_EXEC_SAMPLES; sample++) {
+        for (offset = 0; offset < BENCH_SHELLS; offset++) {
+            size_t shell = (sample + offset) % BENCH_SHELLS;
+            uint64_t start;
+
+            discard_ready_output(&sessions[shell]);
+            if (send_text(&sessions[shell], setup) == -1 ||
+                consume_through(&sessions[shell], marker,
+                                TEST_TIMEOUT_MS) == -1 ||
+                consume_through(&sessions[shell], specs[shell].prompt,
+                                TEST_TIMEOUT_MS) == -1) {
+                fprintf(stderr, "pty benchmark: %s %s setup failed\n",
+                        specs[shell].name, label);
+                return -1;
+            }
+            discard_ready_output(&sessions[shell]);
+            start = monotonic_ns();
+            if (send_text(&sessions[shell], command) == -1 ||
+                consume_through(&sessions[shell], specs[shell].prompt,
+                                TEST_TIMEOUT_MS) == -1) {
+                fprintf(stderr, "pty benchmark: %s %s sample failed\n",
+                        specs[shell].name, label);
+                return -1;
+            }
+            samples[shell][sample] = monotonic_ns() - start;
+        }
+    }
+    return 0;
+}
+
 static void print_raw_samples(const char *shell, const char *metric,
                               const uint64_t *samples, size_t count)
 {
@@ -4723,16 +4763,20 @@ static int latency_benchmark(const char *gsh, const char *bash,
         started[offset] = true;
     }
     if (
-        benchmark_prompt_command(
-            sessions, specs, async_launch, "wait\r", ": &\r",
+        benchmark_synchronized_prompt_command(
+            sessions, specs, async_launch,
+            "wait; /usr/bin/printf __GSH_BENCH_SYNC__\r", ": &\r",
             "asynchronous builtin launch") == -1 ||
-        benchmark_prompt_command(
-            sessions, specs, async_external_launch, "wait\r",
-            "/bin/sleep 0.01 &\r",
+        benchmark_synchronized_prompt_command(
+            sessions, specs, async_external_launch,
+            "wait; /usr/bin/printf __GSH_BENCH_SYNC__\r",
+            "/bin/sleep 0.05 &\r",
             "asynchronous held external launch") == -1 ||
-        benchmark_prompt_command(
+        benchmark_synchronized_prompt_command(
             sessions, specs, wait_completed,
-            ": & /bin/sleep 0.01\r", "wait\r",
+            "wait; : & /bin/sleep 0.01; "
+            "/usr/bin/printf __GSH_BENCH_SYNC__\r",
+            "wait\r",
             "wait completed job") ==
             -1) {
         failed = 1;

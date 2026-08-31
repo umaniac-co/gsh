@@ -1766,6 +1766,52 @@ int main(int argc, char **argv)
          "/usr/bin/printf '%s%s\\n' \"$outer\" \"$inner\"; "
          "done; done",
          0, "a1\na2\nb1\nb2\n"},
+        {"break", "break leaves the current loop",
+         "for item in a b; do "
+         "/usr/bin/printf '<%s>' \"$item\"; break; "
+         "/usr/bin/printf BAD; done; /usr/bin/printf END",
+         0, "<a>END"},
+        {"continue", "continue skips the remaining loop body",
+         "for item in a b; do /usr/bin/printf '<%s>' \"$item\"; "
+         "continue; /usr/bin/printf BAD; done; /usr/bin/printf END",
+         0, "<a><b>END"},
+        {"break", "oversized break count leaves the outermost loop",
+         "for outer in a b; do for inner in 1 2; do "
+         "/usr/bin/printf '<%s%s>' \"$outer\" \"$inner\"; break 99; "
+         "done; /usr/bin/printf BAD; done; /usr/bin/printf END",
+         0, "<a1>END"},
+        {"continue", "continue count advances the selected outer loop",
+         "for outer in a b; do for inner in 1 2; do "
+         "/usr/bin/printf '<%s%s>' \"$outer\" \"$inner\"; continue 2; "
+         "done; /usr/bin/printf BAD; done; /usr/bin/printf END",
+         0, "<a1><b1>END"},
+        {"break", "break assignment persists in the shell",
+         "for item in one; do GSH_BREAK_STATE=value break; done; "
+         "/usr/bin/printf '%s' \"$GSH_BREAK_STATE\"",
+         0, "value"},
+        {"break", "break applies and restores redirections",
+         "GSH_BREAK_PATH=/tmp/gsh-break-redirection-$$; "
+         "for item in one; do break >\"$GSH_BREAK_PATH\"; done; "
+         "/bin/test -f \"$GSH_BREAK_PATH\"; GSH_BREAK_FILE_STATUS=$?; "
+         "/bin/rm -f \"$GSH_BREAK_PATH\"; "
+         "/bin/test \"$GSH_BREAK_FILE_STATUS\" -eq 0",
+         0, NULL},
+        {"continue", "continue propagates through conditional lists",
+         "for item in a b; do /usr/bin/true && continue; "
+         "/usr/bin/printf BAD; done; /usr/bin/printf END",
+         0, "END"},
+        {"continue", "continue advances a while loop",
+         "GSH_WHILE_COUNT=0; while /bin/test \"$GSH_WHILE_COUNT\" -lt 3; "
+         "do GSH_WHILE_COUNT=$((GSH_WHILE_COUNT + 1)); "
+         "if /bin/test \"$GSH_WHILE_COUNT\" -eq 2; then continue; fi; "
+         "/usr/bin/printf '<%s>' \"$GSH_WHILE_COUNT\"; done; "
+         "/usr/bin/printf END",
+         0, "<1><3>END"},
+        {"break", "function-local break leaves a function-local loop",
+         "stop_first() { for item in a b; do "
+         "/usr/bin/printf '<%s>' \"$item\"; break; done; }; "
+         "stop_first; /usr/bin/printf END",
+         0, "<a>END"},
         {"2.9.4.3", "native case wildcard",
          "case atom in a*) /usr/bin/true;; *) /usr/bin/false;; esac", 0,
          NULL},

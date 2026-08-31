@@ -133,7 +133,11 @@ Explicit-list `for` and the implicit `for name` form are native. A finite
 literal loop with a provably pure `:`, `true`, or `false` body can be reduced
 inside the reactor under a 16-operation admission budget; loops with expansion,
 I/O, nesting beyond that budget, or other bodies use the isolated native
-evaluator. POSIX aliases are native: a lazy fixed-capacity hash and compact
+evaluator. The `break` and `continue` special builtins are native for `for`,
+`while`, and `until`, including positive decimal nesting counts, oversized
+counts selecting the outermost lexical loop, assignment and redirection
+semantics, conditional-list propagation, and function-local loop scope.
+POSIX aliases are native: a lazy fixed-capacity hash and compact
 arena provide allocation-free steady-state lookup, parser-guided recursive
 substitution preserves token provenance, and `alias`/`unalias` changes become
 visible in complete-command order. Subshell and asynchronous changes remain
@@ -153,9 +157,10 @@ before `gsh` can claim POSIX.1-2024 shell-language conformance.
 
 The builtins implemented in `gsh` itself include `cd`, `exit`, `pwd`, `export`,
 `readonly`, `unset`, `ulimit`, `umask`, `:`, `true`, `false`, `fg`, `bg`,
-`set`, `shift`, `wait`, `alias`, `unalias`, `help`, and `rt` within their
-currently documented contexts. The exact standalone interactive control
-submission `/async` toggles the managed REPL for the current session.
+`set`, `shift`, `wait`, `break`, `continue`, `alias`, `unalias`, `help`, and
+`rt` within their currently documented contexts. The exact standalone
+interactive control submission `/async` toggles the managed REPL for the
+current session.
 `ulimit` implements the POSIX.1-2024 `-H`,
 `-S`, `-a`, `-c`, `-d`, `-f`, `-n`, `-s`, `-t`, and `-v` resource interface.
 `umask` implements octal masks, `-S`, and POSIX symbolic masks including
