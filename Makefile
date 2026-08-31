@@ -5,8 +5,10 @@ CFLAGS += -std=c17 -Wall -Wextra -Wpedantic -Werror
 LDFLAGS ?=
 
 TARGET := build/gsh
+HISTORY_AGENT_TARGET := build/gsh-history-agent
 SOURCES := src/gsh.c src/async_repl.c src/posix_lexer.c \
 	src/posix_parser.c src/native_plan.c \
+	src/history_client.c src/history_store.c src/shell_config.c \
 	src/shell_variables.c src/builtin_common.c src/builtin_cd.c src/builtin_ulimit.c \
 	src/builtin_umask.c src/builtin_variables.c src/shell_aliases.c \
 	src/alias_expansion.c src/builtin_alias.c src/builtin_unalias.c \
@@ -29,6 +31,7 @@ BACKGROUND_TEST_TARGET := build/background-jobs-test
 ALIAS_TEST_TARGET := build/shell-aliases-test
 FUNCTION_TEST_TARGET := build/shell-functions-test
 FUNCTION_SANITIZE_TEST_TARGET := build/shell-functions-test-sanitize
+CONFIG_TEST_TARGET := build/shell-config-test
 BASH_BIN ?= $(shell command -v bash)
 ZSH_BIN ?= $(shell command -v zsh)
 SOAK_SECONDS ?= 60
@@ -42,16 +45,29 @@ FUZZ_WORK_CORPUS ?= dev/fuzz/lexer
 PERFORMANCE_DIR ?= dev/performance
 BENCH_OUTPUT ?= $(PERFORMANCE_DIR)/current.raw.txt
 ALIAS_BENCH_OUTPUT ?= $(PERFORMANCE_DIR)/current-alias.raw.txt
+SODIUM_PREFIX := $(shell if command -v brew >/dev/null 2>&1; then \
+	brew --prefix libsodium 2>/dev/null; fi)
+SODIUM_CFLAGS := $(shell if command -v pkg-config >/dev/null 2>&1; then \
+	pkg-config --cflags libsodium 2>/dev/null; elif test -n "$(SODIUM_PREFIX)"; \
+	then echo -I$(SODIUM_PREFIX)/include; fi)
+SODIUM_LIBS := $(shell if command -v pkg-config >/dev/null 2>&1; then \
+	pkg-config --libs libsodium 2>/dev/null; elif test -n "$(SODIUM_PREFIX)"; \
+	then echo -L$(SODIUM_PREFIX)/lib -lsodium; else echo -lsodium; fi)
 
 .PHONY: all analyze bench bench-record bench-alias bench-alias-record check check-fault check-resource check-sanitize clean
-.PHONY: check-aliases check-background check-functions check-positionals check-variables conformance fuzz-libfuzzer fuzz-pty fuzz-pty-sanitize fuzz-sanitize
+.PHONY: check-aliases check-background check-config check-functions check-positionals check-variables conformance fuzz-libfuzzer fuzz-pty fuzz-pty-sanitize fuzz-sanitize
 .PHONY: fuzz-smoke policy soak
 .PHONY: verify-fast
 
-all: $(TARGET)
+all: $(TARGET) $(HISTORY_AGENT_TARGET)
 
 $(TARGET): $(SOURCES) | build
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(SOURCES) $(LDFLAGS) -o $@
+
+$(HISTORY_AGENT_TARGET): src/history_agent.c src/history_store.c | build
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(SODIUM_CFLAGS) \
+		src/history_agent.c src/history_store.c $(LDFLAGS) \
+		$(SODIUM_LIBS) -o $@
 
 $(TEST_TARGET): $(TEST_SOURCE) | build
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(TEST_SOURCE) $(LDFLAGS) -o $@
@@ -118,7 +134,11 @@ $(FUNCTION_SANITIZE_TEST_TARGET): tests/shell_functions_test.c \
 		tests/shell_functions_test.c src/shell_functions.c \
 		src/posix_lexer.c src/posix_parser.c $(LDFLAGS) -o $@
 
-check: $(TARGET) $(TEST_TARGET) $(PROBE_TARGET)
+$(CONFIG_TEST_TARGET): tests/shell_config_test.c src/shell_config.c | build
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/shell_config_test.c \
+		src/shell_config.c $(LDFLAGS) -o $@
+
+check: $(TARGET) $(HISTORY_AGENT_TARGET) $(TEST_TARGET) $(PROBE_TARGET)
 	./$(TEST_TARGET) $(abspath $(TARGET))
 
 check-fault: $(FAULT_TARGET) $(TEST_TARGET)
@@ -127,7 +147,7 @@ check-fault: $(FAULT_TARGET) $(TEST_TARGET)
 check-resource: $(TARGET) $(TEST_TARGET)
 	./$(TEST_TARGET) --resource $(abspath $(TARGET))
 
-check-sanitize: $(SANITIZE_TARGET) $(FUNCTION_SANITIZE_TEST_TARGET) \
+check-sanitize: $(SANITIZE_TARGET) $(HISTORY_AGENT_TARGET) $(FUNCTION_SANITIZE_TEST_TARGET) \
 		$(TEST_TARGET) $(PROBE_TARGET)
 	ASAN_OPTIONS=abort_on_error=1 UBSAN_OPTIONS=halt_on_error=1 \
 		./$(TEST_TARGET) $(abspath $(SANITIZE_TARGET))
@@ -172,6 +192,8 @@ analyze:
 		$(ANALYZE_CC) $(CPPFLAGS) $(CFLAGS) --analyze "$$source" \
 			-o /dev/null; \
 	done
+	$(ANALYZE_CC) $(CPPFLAGS) $(CFLAGS) $(SODIUM_CFLAGS) --analyze \
+		src/history_agent.c -o /dev/null
 
 conformance: $(TARGET) $(CONFORMANCE_TARGET)
 	./$(CONFORMANCE_TARGET) $(abspath $(TARGET))
@@ -191,6 +213,9 @@ check-aliases: $(ALIAS_TEST_TARGET)
 check-functions: $(FUNCTION_TEST_TARGET)
 	./$(FUNCTION_TEST_TARGET)
 
+check-config: $(CONFIG_TEST_TARGET)
+	./$(CONFIG_TEST_TARGET)
+
 soak: $(TARGET) $(TEST_TARGET)
 	./$(TEST_TARGET) --soak $(abspath $(TARGET)) $(SOAK_SECONDS)
 
@@ -202,6 +227,7 @@ verify-fast:
 	$(MAKE) -j1 check-variables
 	$(MAKE) -j1 check-positionals
 	$(MAKE) -j1 check-background
+	$(MAKE) -j1 check-config
 	$(MAKE) -j1 check-aliases
 	$(MAKE) -j1 check-functions
 	$(MAKE) -j1 check-fault
@@ -236,7 +262,7 @@ build:
 	mkdir -p $@
 
 clean:
-	rm -f $(TARGET) $(TEST_TARGET) $(PROBE_TARGET) $(FAULT_TARGET)
+	rm -f $(TARGET) $(HISTORY_AGENT_TARGET) $(TEST_TARGET) $(PROBE_TARGET) $(FAULT_TARGET)
 	rm -f $(SANITIZE_TARGET) $(FUZZ_SMOKE_TARGET) $(FUZZ_TARGET) $(POLICY_TARGET)
 	rm -f $(CONFORMANCE_TARGET)
 	rm -f $(VARIABLE_TEST_TARGET)

@@ -41,6 +41,9 @@
 #include "async_repl.h"
 #include "background_jobs.h"
 #include "alias_expansion.h"
+#include "history_client.h"
+#include "history_protocol.h"
+#include "history_store.h"
 #include "native_plan.h"
 #include "positional_parameters.h"
 #include "posix_lexer.h"
@@ -49,6 +52,7 @@
 #include "shell_aliases.h"
 #include "shell_functions.h"
 #include "shell_options.h"
+#include "shell_config.h"
 
 extern char **environ;
 
@@ -78,6 +82,10 @@ _Static_assert((unsigned int)GSH_POSITIONAL_TEXT_CAP ==
                "positional and native text limits must match");
 
 static const char PROMPT[] = "$gsh> ";
+static const char PROMPT_MUTED[] = "\033[90m";
+static const char PROMPT_RESET[] = "\033[0m";
+static const char ASYNC_SETTLED_INDICATOR[] = "[●]";
+static const char ASYNC_PENDING_INDICATOR[] = "[○]";
 static const uint64_t REACTOR_DEADLINE_NS = 5U * 1000U * 1000U;
 static const uint64_t PROMPT_WORKER_DEADLINE_NS = 100U * 1000U * 1000U;
 
@@ -148,6 +156,22 @@ typedef struct {
     char line[LINE_CAP];
     size_t line_len;
     unsigned int escape_state;
+    gsh_history_store *history;
+    gsh_history_client history_client;
+    gsh_shell_config config;
+    bool config_error;
+    bool history_persistent;
+    bool history_navigation;
+    size_t history_position;
+    char history_draft[LINE_CAP];
+    size_t history_draft_length;
+    bool history_search;
+    char history_search_query[LINE_CAP];
+    size_t history_search_query_length;
+    size_t history_search_position;
+    char history_search_draft[LINE_CAP];
+    size_t history_search_draft_length;
+    uint64_t history_reminder_deadline_ns;
     char pending_line[LINE_CAP];
     size_t pending_len;
     const char *pending_input;
@@ -166,6 +190,8 @@ typedef struct {
     int async_capture_cell;
     int async_state_cell;
     int async_dispatch_cell;
+    bool async_desired;
+    bool async_transition_pending;
 
     job current_job;
     gsh_background_table background_jobs;
@@ -274,6 +300,9 @@ static bool begin_native_list(shell_state *state);
 static bool native_list_node_is_wait(const shell_state *state,
                                      size_t node_index);
 static void abandon_pending_list(shell_state *state);
+static void queue_redraw(shell_state *state);
+static bool async_transition_can_start_now(const shell_state *state);
+static void leave_managed_fullscreen(shell_state *state, int cell_index);
 static const char *store_path_value(const gsh_variable_store *variables,
                                     const char *default_path);
 static int open_redirect_path(const char *target,
@@ -589,10 +618,302 @@ static void flush_output(shell_state *state)
     }
 }
 
+/* ── Reminder Reauthentication Never Expires the Key ───────────
+ * A time-to-live would make long-running shells unexpectedly lose history.
+ * The agent therefore keeps its derived key until logout or explicit death.
+ * A randomized timer asks for the passphrase only as a memory reminder.
+ * A wrong or cancelled reminder leaves the already-unlocked key untouched.
+ * Secret input remains unechoed and is wiped immediately after each request.
+ * ─────────────────────────────────────────────────────────────── */
+static void wipe_secret(char *secret, size_t capacity)
+{
+    volatile unsigned char *bytes = (volatile unsigned char *)secret;
+    size_t index;
+
+    for (index = 0; index < capacity; index++) {
+        bytes[index] = 0;
+    }
+}
+
+static void flush_secret_prompt(shell_state *state)
+{
+    unsigned int attempt;
+
+    for (attempt = 0; attempt < 20U && state->output_len != 0; attempt++) {
+        flush_output(state);
+        if (state->output_len != 0) {
+            (void)poll(NULL, 0, 1);
+        }
+    }
+}
+
+static int read_secret_line(shell_state *state, const char *prompt,
+                            char secret[GSH_HISTORY_SECRET_CAP],
+                            size_t *secret_length)
+{
+    bool reading = true;
+    size_t length = 0;
+
+    (void)output_text(state, prompt);
+    flush_secret_prompt(state);
+    while (reading) {
+        unsigned char byte;
+        struct pollfd descriptor = {.fd = state->tty_fd, .events = POLLIN};
+        int ready = poll(&descriptor, 1, 250);
+
+        if (ready < 0 && errno != EINTR) {
+            return -1;
+        }
+        if (ready <= 0 || (descriptor.revents & POLLIN) == 0) {
+            if (g_shutdown_pending != 0) {
+                errno = EINTR;
+                return -1;
+            }
+            continue;
+        }
+        if (read(state->tty_fd, &byte, 1) != 1) {
+            if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
+                return -1;
+            }
+            continue;
+        }
+        if (byte == '\r' || byte == '\n') {
+            reading = false;
+        } else if (byte == 0x03U) {
+            (void)output_text(state, "^C\r\n");
+            flush_secret_prompt(state);
+            errno = ECANCELED;
+            return -1;
+        } else if ((byte == 0x7fU || byte == 0x08U) && length != 0) {
+            length--;
+        } else if (byte >= 0x20U && length + 1U < GSH_HISTORY_SECRET_CAP) {
+            secret[length++] = (char)byte;
+        }
+    }
+    secret[length] = '\0';
+    *secret_length = length;
+    (void)output_text(state, "\r\n");
+    flush_secret_prompt(state);
+    return 0;
+}
+
+static void schedule_history_reminder(shell_state *state,
+                                      uint64_t interval_ns)
+{
+    uint64_t now = monotonic_ns();
+
+    if (interval_ns == 0) {
+        state->history_reminder_deadline_ns = now;
+    } else if (UINT64_MAX - now < interval_ns) {
+        state->history_reminder_deadline_ns = UINT64_MAX;
+    } else {
+        state->history_reminder_deadline_ns = now + interval_ns;
+    }
+}
+
+static int create_history_passphrase(shell_state *state, bool reset)
+{
+    char first[GSH_HISTORY_SECRET_CAP] = {0};
+    char second[GSH_HISTORY_SECRET_CAP] = {0};
+    size_t first_length = 0;
+    size_t second_length = 0;
+    uint64_t reminder = 0;
+    int result = -1;
+
+    errno = EINVAL;
+    if (read_secret_line(state, "New history passphrase: ", first,
+                         &first_length) == 0 &&
+        read_secret_line(state, "Confirm history passphrase: ", second,
+                         &second_length) == 0 &&
+        first_length == second_length && first_length != 0 &&
+        memcmp(first, second, first_length) == 0 &&
+        gsh_history_client_unlock(
+            &state->history_client, first, first_length,
+            state->config.history_reminder_min_ns,
+            state->config.history_reminder_max_ns, reset, state->history,
+            &reminder) == 0) {
+        state->history_persistent = true;
+        schedule_history_reminder(state, reminder);
+        result = 0;
+    } else if (errno != ECANCELED) {
+        (void)output_text(state,
+                          "gsh: passphrases do not match or are invalid\r\n");
+        flush_secret_prompt(state);
+    }
+    wipe_secret(first, sizeof(first));
+    wipe_secret(second, sizeof(second));
+    return result;
+}
+
+static int unlock_history(shell_state *state)
+{
+    char secret[GSH_HISTORY_SECRET_CAP] = {0};
+    unsigned int attempt;
+    int result = -1;
+
+    for (attempt = 0; attempt < 3U && result == -1; attempt++) {
+        size_t length = 0;
+        uint64_t reminder = 0;
+
+        if (read_secret_line(state, "History passphrase: ", secret,
+                             &length) == -1) {
+            break;
+        }
+        if (gsh_history_client_unlock(
+                &state->history_client, secret, length,
+                state->config.history_reminder_min_ns,
+                state->config.history_reminder_max_ns, false,
+                state->history, &reminder) == 0) {
+            state->history_persistent = true;
+            schedule_history_reminder(state, reminder);
+            result = 0;
+        } else {
+            (void)output_text(state, "gsh: incorrect passphrase\r\n");
+            flush_secret_prompt(state);
+        }
+        wipe_secret(secret, sizeof(secret));
+    }
+    wipe_secret(secret, sizeof(secret));
+    return result;
+}
+
+static void offer_history_reset(shell_state *state)
+{
+    char answer[GSH_HISTORY_SECRET_CAP] = {0};
+    size_t length = 0;
+
+    if (read_secret_line(
+            state,
+            "Reset encrypted history? Old entries will be lost [y/N]: ",
+            answer, &length) == 0 && length == 1U &&
+        (answer[0] == 'y' || answer[0] == 'Y')) {
+        (void)create_history_passphrase(state, true);
+    }
+    wipe_secret(answer, sizeof(answer));
+}
+
+static void initialize_history(shell_state *state)
+{
+    int status = GSH_HISTORY_STATUS_LOCKED;
+    uint64_t reminder = 0;
+    unsigned int attempt;
+
+    if (state->config_error) {
+        (void)output_format(state, "gsh: %s; history disabled\r\n",
+                            state->config.diagnostic);
+        flush_secret_prompt(state);
+        return;
+    }
+    if (!state->config.history_enabled || state->history == NULL) {
+        return;
+    }
+    if (gsh_history_client_initialize(&state->history_client,
+                                      getenv("HOME"),
+                                      state->parameter_zero) == -1 ||
+        gsh_history_client_status(
+            &state->history_client,
+            state->config.history_reminder_min_ns,
+            state->config.history_reminder_max_ns, state->history, &status,
+            &reminder) == -1) {
+        (void)output_text(
+            state,
+            "gsh: encrypted history unavailable; using session history\r\n");
+        flush_secret_prompt(state);
+        return;
+    }
+    if (status == GSH_HISTORY_STATUS_OK) {
+        state->history_persistent = true;
+        schedule_history_reminder(state, reminder);
+    } else if (status == GSH_HISTORY_STATUS_NEW) {
+        for (attempt = 0; attempt < 3U && !state->history_persistent;
+             attempt++) {
+            if (create_history_passphrase(state, false) == -1 &&
+                errno == ECANCELED) {
+                break;
+            }
+        }
+    } else if (status == GSH_HISTORY_STATUS_LOCKED &&
+               unlock_history(state) == -1 && errno != ECANCELED) {
+        offer_history_reset(state);
+    }
+}
+
+static void verify_history_reminder(shell_state *state)
+{
+    char secret[GSH_HISTORY_SECRET_CAP] = {0};
+    size_t length = 0;
+    uint64_t reminder = state->config.history_reminder_min_ns;
+
+    (void)output_text(state, "\r\n");
+    if (read_secret_line(state, "History reminder — passphrase: ", secret,
+                         &length) == 0) {
+        if (gsh_history_client_verify(
+                &state->history_client, secret, length,
+                state->config.history_reminder_min_ns,
+                state->config.history_reminder_max_ns, &reminder) == -1) {
+            (void)output_text(
+                state,
+                "gsh: incorrect passphrase; history remains unlocked\r\n");
+        } else {
+            (void)output_text(state, "gsh: passphrase remembered\r\n");
+        }
+    }
+    wipe_secret(secret, sizeof(secret));
+    schedule_history_reminder(state, reminder);
+    queue_redraw(state);
+}
+
+static size_t primary_prompt_text(const shell_state *state, char *prompt,
+                                  size_t capacity, bool include_indicator)
+{
+    const char *indicator = NULL;
+    int written;
+
+    if (include_indicator) {
+        indicator = gsh_async_repl_all_settled(state->async_repl)
+                        ? ASYNC_SETTLED_INDICATOR
+                        : ASYNC_PENDING_INDICATOR;
+    }
+    if (state->prompt_branch[0] != '\0' && indicator != NULL) {
+        written = snprintf(prompt, capacity, "%s[%s] %s%s %s",
+                           PROMPT_MUTED, state->prompt_branch, indicator,
+                           PROMPT_RESET, PROMPT);
+    } else if (state->prompt_branch[0] != '\0') {
+        written = snprintf(prompt, capacity, "%s[%s]%s %s", PROMPT_MUTED,
+                           state->prompt_branch, PROMPT_RESET, PROMPT);
+    } else if (indicator != NULL) {
+        written = snprintf(prompt, capacity, "%s%s%s %s", PROMPT_MUTED,
+                           indicator, PROMPT_RESET, PROMPT);
+    } else {
+        written = snprintf(prompt, capacity, "%s", PROMPT);
+    }
+    if (written < 0 || (size_t)written >= capacity) {
+        size_t fallback = sizeof(PROMPT) - 1U;
+
+        if (fallback >= capacity) {
+            return 0;
+        }
+        memcpy(prompt, PROMPT, fallback + 1U);
+        return fallback;
+    }
+    return (size_t)written;
+}
+
 static void queue_prompt(shell_state *state)
 {
     if (state->async_repl != NULL && state->async_repl->enabled) {
         state->async_repl->render_pending = true;
+        return;
+    }
+    if (state->history_search) {
+        size_t length = state->history_search_query_length;
+
+        if (length > 96U) {
+            length = 96U;
+        }
+        (void)output_text(state, "(reverse-i-search)`");
+        (void)output_push(state, state->history_search_query, length);
+        (void)output_text(state, "': ");
         return;
     }
     if (state->continuation_prompt) {
@@ -613,12 +934,13 @@ static void queue_prompt(shell_state *state)
         (void)output_push(state, secondary, length);
         return;
     }
-    if (state->prompt_branch[0] != '\0') {
-        (void)output_text(state, "[");
-        (void)output_text(state, state->prompt_branch);
-        (void)output_text(state, "] ");
+    {
+        char prompt[GSH_ASYNC_PROMPT_CAP];
+        size_t length = primary_prompt_text(state, prompt, sizeof(prompt),
+                                            false);
+
+        (void)output_push(state, prompt, length);
     }
-    (void)output_text(state, PROMPT);
 }
 
 static void queue_redraw(shell_state *state)
@@ -638,7 +960,15 @@ static size_t active_prompt_text(shell_state *state,
     size_t length = 0;
     const char *secondary;
 
-    if (state->continuation_prompt) {
+    if (state->history_search) {
+        int written = snprintf(prompt, GSH_ASYNC_PROMPT_CAP,
+                               "(reverse-i-search)`%.*s': ", 96,
+                               state->history_search_query);
+
+        length = written > 0 && written < GSH_ASYNC_PROMPT_CAP
+                     ? (size_t)written
+                     : 0;
+    } else if (state->continuation_prompt) {
         secondary = getenv("PS2");
         if (secondary == NULL) {
             secondary = "> ";
@@ -650,20 +980,9 @@ static size_t active_prompt_text(shell_state *state,
         }
         memcpy(prompt, secondary, length);
     } else {
-        if (state->prompt_branch[0] != '\0') {
-            int written = snprintf(prompt, GSH_ASYNC_PROMPT_CAP,
-                                   "[%s] ", state->prompt_branch);
-
-            if (written < 0 || written >= GSH_ASYNC_PROMPT_CAP) {
-                length = 0;
-            } else {
-                length = (size_t)written;
-            }
-        }
-        if (sizeof(PROMPT) - 1U <= GSH_ASYNC_PROMPT_CAP - length) {
-            memcpy(prompt + length, PROMPT, sizeof(PROMPT) - 1U);
-            length += sizeof(PROMPT) - 1U;
-        }
+        length = primary_prompt_text(state, prompt, GSH_ASYNC_PROMPT_CAP,
+                                     state->async_repl != NULL &&
+                                         state->async_repl->enabled);
     }
     prompt[length] = '\0';
     return length;
@@ -674,9 +993,15 @@ static void prepare_managed_render(shell_state *state)
     char prompt[GSH_ASYNC_PROMPT_CAP];
     const char *render;
     size_t length;
+    int focused;
 
     if (state->async_repl == NULL || !state->async_repl->enabled ||
         !state->async_repl->render_pending || state->output_len != 0) {
+        return;
+    }
+    focused = gsh_async_repl_focused_job(state->async_repl);
+    if (focused >= 0 && state->async_repl->cells[focused].fullscreen &&
+        state->async_repl->cells[focused].fullscreen_presented) {
         return;
     }
     (void)active_prompt_text(state, prompt);
@@ -763,11 +1088,14 @@ static int install_signal_handlers(void)
     return 0;
 }
 
-static bool managed_repl_requested(void)
+static bool managed_repl_requested(const gsh_shell_config *config)
 {
     const char *mode = getenv("GSH_REPL");
 
-    return mode == NULL || strcmp(mode, "classic") != 0;
+    if (mode != NULL) {
+        return strcmp(mode, "classic") != 0;
+    }
+    return config->async_repl_enabled;
 }
 
 static void initialize_repl_size(shell_state *state)
@@ -785,14 +1113,18 @@ static void initialize_repl_size(shell_state *state)
     gsh_async_repl_resize(state->async_repl, size.ws_row, size.ws_col);
 }
 
-static int initialize_interactive(shell_state *state)
+static int initialize_interactive(shell_state *state,
+                                  const char *program_path)
 {
     const char *terminal_name;
+    const char *history_override;
+    const char *home;
     size_t default_path_size;
     pid_t foreground_group;
     pid_t current_group;
 
     memset(state, 0, sizeof(*state));
+    state->parameter_zero = program_path;
     state->pending_input = state->pending_line;
     state->tty_fd = -1;
     state->signal_pipe[0] = -1;
@@ -805,8 +1137,34 @@ static int initialize_interactive(shell_state *state)
     state->async_capture_cell = -1;
     state->async_state_cell = -1;
     state->async_dispatch_cell = -1;
+    state->history_client.descriptor = -1;
     state->running = true;
     state->last_status = 0;
+    gsh_config_defaults(&state->config);
+    history_override = getenv("GSH_HISTORY");
+    home = getenv("HOME");
+    if (history_override != NULL && strcmp(history_override, "off") == 0) {
+        state->config.history_enabled = false;
+    } else if (home == NULL || home[0] != '/') {
+        state->config_error = true;
+        state->config.history_enabled = false;
+        (void)snprintf(state->config.diagnostic,
+                       sizeof(state->config.diagnostic),
+                       "HOME is not an absolute path");
+    } else if (gsh_config_load(&state->config, home, true) == -1) {
+        state->config_error = true;
+        state->config.history_enabled = false;
+    }
+    if (state->config.history_enabled) {
+        state->history = fault_should_fail("history-allocation", ENOMEM)
+                             ? NULL
+                             : malloc(sizeof(*state->history));
+        if (state->history != NULL) {
+            gsh_history_initialize(state->history);
+        } else {
+            state->config.history_enabled = false;
+        }
+    }
     gsh_options_initialize(&state->options, true);
     gsh_background_initialize(&state->background_jobs);
     state->prompt_generation = 1;
@@ -848,7 +1206,8 @@ static int initialize_interactive(shell_state *state)
         gsh_variables_import(state->variables, environ) == -1) {
         return -1;
     }
-    gsh_async_repl_initialize(state->async_repl, managed_repl_requested());
+    state->async_desired = managed_repl_requested(&state->config);
+    gsh_async_repl_initialize(state->async_repl, state->async_desired);
     state->variable_generation = 1;
     state->alias_generation = 1;
     state->function_generation = 1;
@@ -1301,24 +1660,52 @@ static void receive_prompt_result(shell_state *state)
 
 static int prompt_poll_timeout(const shell_state *state)
 {
+    bool prompt_deadline =
+        state->prompt_worker_busy &&
+        state->prompt_active_request_type != PROMPT_REQUEST_REDIRECTION;
+    bool history_deadline =
+        state->history_persistent &&
+        state->history_reminder_deadline_ns != 0 &&
+        state->mode == MODE_EDITOR &&
+        gsh_async_repl_job_count(state->async_repl) == 0 &&
+        gsh_async_repl_focused_job(state->async_repl) < 0;
     uint64_t now;
     uint64_t remaining;
     uint64_t milliseconds;
+    int timeout = -1;
 
-    if (!state->prompt_worker_busy) {
-        return -1;
-    }
-    if (state->prompt_active_request_type ==
-        PROMPT_REQUEST_REDIRECTION) {
+    if (!prompt_deadline && !history_deadline) {
         return -1;
     }
     now = monotonic_ns();
-    if (now >= state->prompt_worker_deadline_ns) {
-        return 0;
+    if (prompt_deadline) {
+        if (now >= state->prompt_worker_deadline_ns) {
+            timeout = 0;
+        } else {
+            remaining = state->prompt_worker_deadline_ns - now;
+            milliseconds = (remaining + 999999U) / 1000000U;
+            timeout = milliseconds > (uint64_t)INT_MAX
+                          ? INT_MAX
+                          : (int)milliseconds;
+        }
     }
-    remaining = state->prompt_worker_deadline_ns - now;
-    milliseconds = (remaining + 999999U) / 1000000U;
-    return milliseconds > (uint64_t)INT_MAX ? INT_MAX : (int)milliseconds;
+    if (history_deadline) {
+        int history_timeout;
+
+        if (now >= state->history_reminder_deadline_ns) {
+            history_timeout = 0;
+        } else {
+            remaining = state->history_reminder_deadline_ns - now;
+            milliseconds = (remaining + 999999U) / 1000000U;
+            history_timeout = milliseconds > (uint64_t)INT_MAX
+                                  ? INT_MAX
+                                  : (int)milliseconds;
+        }
+        if (timeout < 0 || history_timeout < timeout) {
+            timeout = history_timeout;
+        }
+    }
+    return timeout;
 }
 
 static void enforce_prompt_deadline(shell_state *state)
@@ -1934,6 +2321,7 @@ static void finish_job(shell_state *state)
 
     if (state->async_repl != NULL && state->async_repl->enabled &&
         state->async_state_cell >= 0) {
+        leave_managed_fullscreen(state, state->async_state_cell);
         (void)gsh_async_repl_reap(state->async_repl, pid, wait_status);
     }
 
@@ -2069,6 +2457,7 @@ static void reap_children(shell_state *state)
                 update_job_state(state, pid, status);
             } else if (async_cell >= 0) {
                 if (WIFSTOPPED(status)) {
+                    leave_managed_fullscreen(state, async_cell);
                     gsh_async_repl_mark_stopped(state->async_repl,
                                                 async_cell);
 #ifdef WIFCONTINUED
@@ -2077,6 +2466,7 @@ static void reap_children(shell_state *state)
                                                 async_cell);
 #endif
                 } else if (WIFEXITED(status) || WIFSIGNALED(status)) {
+                    leave_managed_fullscreen(state, async_cell);
                     (void)gsh_async_repl_reap(state->async_repl, pid,
                                               status);
                 }
@@ -2136,6 +2526,160 @@ static void drain_signal_pipe(shell_state *state)
     (void)drained;
 }
 
+/* ── One Editor State Machine Owns Recall and Search ────────────
+ * Escape sequences were previously consumed without changing the editor.
+ * Recall now saves the draft once, then moves through a newest-first ring.
+ * Incremental search keeps a separate query and draft while showing a match.
+ * Accepting a match returns it to ordinary editing; cancellation restores text.
+ * All copies share the 4096-byte input bound and never allocate while typing.
+ * ─────────────────────────────────────────────────────────────── */
+static size_t available_history(const shell_state *state)
+{
+    size_t available;
+
+    if (state->history == NULL || !state->config.history_enabled) {
+        return 0;
+    }
+    available = state->history->count;
+    if (available > state->config.history_max_entries) {
+        available = state->config.history_max_entries;
+    }
+    return available;
+}
+
+static bool load_history_position(shell_state *state, size_t position)
+{
+    size_t length = 0;
+    const char *entry = gsh_history_from_newest(state->history, position,
+                                                &length);
+
+    if (entry == NULL || length >= sizeof(state->line)) {
+        return false;
+    }
+    memcpy(state->line, entry, length);
+    state->line[length] = '\0';
+    state->line_len = length;
+    return true;
+}
+
+static void reset_history_editor(shell_state *state)
+{
+    state->history_navigation = false;
+    state->history_position = 0;
+    state->history_draft_length = 0;
+    state->history_draft[0] = '\0';
+    state->history_search = false;
+    state->history_search_query_length = 0;
+    state->history_search_query[0] = '\0';
+    state->history_search_position = 0;
+    state->history_search_draft_length = 0;
+    state->history_search_draft[0] = '\0';
+}
+
+static void history_previous(shell_state *state)
+{
+    size_t available = available_history(state);
+
+    if (available == 0) {
+        (void)output_text(state, "\a");
+        return;
+    }
+    if (!state->history_navigation) {
+        memcpy(state->history_draft, state->line, state->line_len + 1U);
+        state->history_draft_length = state->line_len;
+        state->history_position = 0;
+        state->history_navigation = true;
+    } else if (state->history_position + 1U < available) {
+        state->history_position++;
+    } else {
+        (void)output_text(state, "\a");
+    }
+    (void)load_history_position(state, state->history_position);
+    queue_redraw(state);
+}
+
+static void history_next(shell_state *state)
+{
+    if (!state->history_navigation) {
+        (void)output_text(state, "\a");
+        return;
+    }
+    if (state->history_position != 0) {
+        state->history_position--;
+        (void)load_history_position(state, state->history_position);
+    } else {
+        memcpy(state->line, state->history_draft,
+               state->history_draft_length + 1U);
+        state->line_len = state->history_draft_length;
+        state->history_navigation = false;
+    }
+    queue_redraw(state);
+}
+
+static bool find_history_match(shell_state *state, size_t before)
+{
+    size_t position;
+
+    if (gsh_history_search_reverse(
+            state->history, state->history_search_query,
+            state->history_search_query_length, before, &position) == -1 ||
+        position >= available_history(state) ||
+        !load_history_position(state, position)) {
+        (void)output_text(state, "\a");
+        return false;
+    }
+    state->history_search_position = position;
+    return true;
+}
+
+static void search_history(shell_state *state)
+{
+    size_t before = 0;
+
+    if (available_history(state) == 0) {
+        (void)output_text(state, "\a");
+        return;
+    }
+    if (!state->history_search) {
+        memcpy(state->history_search_draft, state->line,
+               state->line_len + 1U);
+        state->history_search_draft_length = state->line_len;
+        state->history_search_query_length = 0;
+        state->history_search_query[0] = '\0';
+        state->history_search = true;
+    } else {
+        before = state->history_search_position + 1U;
+    }
+    (void)find_history_match(state, before);
+    queue_redraw(state);
+}
+
+static void update_history_search(shell_state *state)
+{
+    (void)find_history_match(state, 0);
+    queue_redraw(state);
+}
+
+static void cancel_history_search(shell_state *state)
+{
+    memcpy(state->line, state->history_search_draft,
+           state->history_search_draft_length + 1U);
+    state->line_len = state->history_search_draft_length;
+    state->history_search = false;
+    state->history_search_query_length = 0;
+    state->history_search_query[0] = '\0';
+    queue_redraw(state);
+}
+
+static void accept_history_search(shell_state *state)
+{
+    state->history_search = false;
+    state->history_search_query_length = 0;
+    state->history_search_query[0] = '\0';
+    state->history_navigation = false;
+    queue_redraw(state);
+}
+
 static void cancel_editor_line(shell_state *state)
 {
     state->line_len = 0;
@@ -2145,6 +2689,7 @@ static void cancel_editor_line(shell_state *state)
     reset_pending_input(state);
     state->continuation_prompt = false;
     state->escape_state = 0;
+    reset_history_editor(state);
     if (state->async_repl == NULL || !state->async_repl->enabled) {
         (void)output_text(state, "^C\r\n");
     }
@@ -2329,7 +2874,8 @@ static bool is_native_command_name(const char *name)
         "cd",     "command", "continue", "echo",     "eval",
         "exec",   "exit",    "export",   "false",    "fc",
         "fg",
-        "getopts", "hash",   "help",     "jobs",     "kill",
+        "getopts", "hash",   "help",     "history",  "jobs",
+        "kill",
         "printf", "pwd",     "read",     "readonly", "return",
         "rt",     "set",     "shift",    "test",     "times",
         "trap",   "true",    "type",
@@ -5000,6 +5546,9 @@ static void run_fg(shell_state *state)
                 gsh_async_repl_mark_running(state->async_repl, cell_index);
                 (void)gsh_async_repl_focus(state->async_repl, cell_index);
             }
+            if (cell->fullscreen) {
+                (void)signal_managed_job(state, cell_index, SIGWINCH);
+            }
             output_format(state,
                           "[focused cell %llu; Ctrl-] returns to editor]"
                           "\r\n",
@@ -5313,6 +5862,34 @@ static bool run_pure_function(shell_state *state,
     return true;
 }
 
+static void request_async_transition(shell_state *state)
+{
+    bool effective = state->async_repl != NULL &&
+                     state->async_repl->enabled;
+    bool immediate = false;
+
+    if (state->async_transition_pending) {
+        state->async_desired = effective;
+        state->async_transition_pending = false;
+        output_format(state,
+                      "async repl: transition cancelled; remains %s\r\n",
+                      effective ? "on" : "off");
+    } else {
+        state->async_desired = !effective;
+        state->async_transition_pending = true;
+        immediate = async_transition_can_start_now(state);
+        if (!immediate) {
+            output_format(state, "async repl: %s pending\r\n",
+                          state->async_desired ? "on" : "off");
+        }
+    }
+    state->last_status = 0;
+    state->mode = MODE_EDITOR;
+    if (!immediate) {
+        queue_prompt(state);
+    }
+}
+
 static void dispatch_pending(shell_state *state)
 {
     char direct_storage[LINE_CAP];
@@ -5325,12 +5902,68 @@ static void dispatch_pending(shell_state *state)
         return;
     }
 
+    if (!state->pending_alias_expanded &&
+        state->pending_input == state->pending_line &&
+        strcmp(state->pending_line, "/async") == 0) {
+        request_async_transition(state);
+        return;
+    }
+
     if (strcmp(command, "fg") == 0) {
         run_fg(state);
         return;
     }
     if (strcmp(command, "bg") == 0) {
         run_bg(state);
+        return;
+    }
+    if (strcmp(command, "history status") == 0 ||
+        strcmp(command, "history") == 0) {
+        output_format(state,
+                      "history enabled=%s persistent=%s entries=%zu "
+                      "max=%zu unlock=infinite reminder=%lluh-%lluh\r\n",
+                      state->config.history_enabled ? "yes" : "no",
+                      state->history_persistent ? "yes" : "no",
+                      state->history == NULL ? 0U : state->history->count,
+                      state->config.history_max_entries,
+                      (unsigned long long)(
+                          state->config.history_reminder_min_ns /
+                          (60ULL * 60ULL * 1000000000ULL)),
+                      (unsigned long long)(
+                          state->config.history_reminder_max_ns /
+                          (60ULL * 60ULL * 1000000000ULL)));
+        state->last_status = 0;
+        state->mode = MODE_EDITOR;
+        queue_prompt(state);
+        return;
+    }
+    if (strcmp(command, "history lock") == 0 ||
+        strcmp(command, "history shutdown") == 0) {
+        bool shutdown = strcmp(command, "history shutdown") == 0;
+        int result = state->history_persistent
+                         ? gsh_history_client_control(
+                               &state->history_client, shutdown)
+                         : -1;
+
+        state->last_status = result == 0 ? 0 : 1;
+        state->history_persistent = false;
+        state->history_reminder_deadline_ns = 0;
+        if (state->history != NULL) {
+            gsh_history_clear(state->history);
+        }
+        output_format(state, "history %s%s\r\n",
+                      shutdown ? "agent stopped" : "locked",
+                      result == 0 ? "" : " (not connected)");
+        state->mode = MODE_EDITOR;
+        queue_prompt(state);
+        return;
+    }
+    if (strncmp(command, "history ", 8) == 0) {
+        output_text(state,
+                    "usage: history [status|lock|shutdown]\r\n");
+        state->last_status = 2;
+        state->mode = MODE_EDITOR;
+        queue_prompt(state);
         return;
     }
     if (strcmp(command, "rt") == 0) {
@@ -5372,7 +6005,11 @@ static void dispatch_pending(shell_state *state)
     }
     if (strcmp(command, "help") == 0) {
         output_text(state,
-                    "builtins: cd [path], exit [status], fg, bg, rt, help\r\n"
+                    "builtins: cd [path], exit [status], fg, bg, rt, help, "
+                    "/async, "
+                    "history [status|lock|shutdown]\r\n"
+                    "non-canonical PTYs receive contained full-screen focus; "
+                    "Ctrl-] returns to the editor\r\n"
                     "simple commands use native execve; shell syntax falls "
                     "back to /bin/sh -c\r\n");
         state->last_status = 0;
@@ -5826,6 +6463,11 @@ static bool command_is_managed_control(const char *command, size_t length)
     size_t end = length;
     size_t index;
 
+    if (length == sizeof("/async") - 1U &&
+        memcmp(command, "/async", sizeof("/async") - 1U) == 0) {
+        return true;
+    }
+
     while (begin < end &&
            (command[begin] == ' ' || command[begin] == '\t')) {
         begin++;
@@ -5879,6 +6521,36 @@ static int accept_managed_submission(shell_state *state,
     return cell_index;
 }
 
+static bool history_submission_is_private(const shell_state *state,
+                                          size_t length)
+{
+    return state->config.history_ignore_space && length >= 2U &&
+           state->pending_line[0] == ' ' &&
+           state->pending_line[length - 1U] == ' ';
+}
+
+static void record_history_submission(shell_state *state, size_t length,
+                                      gsh_parse_status parse_status)
+{
+    int added;
+
+    if (state->history == NULL || !state->config.history_enabled ||
+        length == 0 || length >= GSH_HISTORY_ENTRY_CAP ||
+        history_submission_is_private(state, length) ||
+        (!state->config.history_store_failed &&
+         parse_status != GSH_PARSE_OK)) {
+        return;
+    }
+    added = gsh_history_add(state->history, state->pending_line, length,
+                            state->config.history_deduplicate);
+    if (added > 0 && state->history_persistent &&
+        gsh_history_client_add(&state->history_client,
+                               state->pending_line, length) == -1) {
+        state->history_persistent = false;
+        state->history_reminder_deadline_ns = 0;
+    }
+}
+
 static void accept_line(shell_state *state)
 {
     size_t candidate_length = state->pending_len + state->line_len;
@@ -5919,6 +6591,7 @@ static void accept_line(shell_state *state)
     state->line_len = 0;
     state->line[0] = '\0';
     state->escape_state = 0;
+    reset_history_editor(state);
     (void)output_text(state, "\r\n");
     if (parsed.status == GSH_PARSE_INCOMPLETE) {
         if (candidate_length + 1U >= sizeof(state->pending_line)) {
@@ -5953,12 +6626,16 @@ static void accept_line(shell_state *state)
                        candidate_length + 1U);
                 state->line_len = candidate_length;
             }
+        } else {
+            record_history_submission(state, candidate_length,
+                                      parsed.status);
         }
         state->pending_line[0] = '\0';
         reset_pending_input(state);
         queue_prompt(state);
         return;
     }
+    record_history_submission(state, candidate_length, parsed.status);
     state->mode = MODE_DISPATCH;
 }
 
@@ -5977,77 +6654,156 @@ static void erase_last_character(shell_state *state)
     queue_redraw(state);
 }
 
-static void process_input(shell_state *state)
+static bool route_focused_input(shell_state *state, unsigned char byte)
 {
-    unsigned char byte;
-    ssize_t count = read(state->tty_fd, &byte, sizeof(byte));
-    int focused;
+    int focused = state->async_repl == NULL
+                      ? -1
+                      : gsh_async_repl_focused_job(state->async_repl);
 
-    if (count == 0) {
-        state->running = false;
-        return;
+    if (focused < 0) {
+        return false;
     }
-    if (count == -1) {
-        if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
-            state->running = false;
-        }
-        return;
-    }
-
-    focused = state->async_repl == NULL
-                  ? -1
-                  : gsh_async_repl_focused_job(state->async_repl);
-    if (focused >= 0) {
-        if (byte == 0x1dU) {
-            gsh_async_repl_unfocus(state->async_repl);
-            queue_redraw(state);
-        } else if (byte == 0x03U) {
-            (void)signal_managed_job(state, focused, SIGINT);
-        } else if (byte == 0x1aU) {
-            stop_managed_job(state, focused);
-        } else if (gsh_async_repl_queue_input(
-                       state->async_repl, focused, (const char *)&byte,
-                       sizeof(byte)) == -1) {
-            gsh_async_repl_unfocus(state->async_repl);
-            (void)raw_output_push(state, "\a", 1);
-        }
-        return;
-    }
-
-    if (state->async_repl != NULL && state->async_repl->enabled &&
-        byte == 0x03U) {
-        cancel_editor_line(state);
-        return;
-    }
-    if (state->async_repl != NULL && state->async_repl->enabled &&
-        byte == 0x1aU) {
+    if (byte == 0x1dU) {
+        leave_managed_fullscreen(state, focused);
+        gsh_async_repl_unfocus(state->async_repl);
+        queue_redraw(state);
+    } else if (byte == 0x03U) {
+        (void)signal_managed_job(state, focused, SIGINT);
+    } else if (byte == 0x1aU) {
+        leave_managed_fullscreen(state, focused);
+        stop_managed_job(state, focused);
+    } else if (gsh_async_repl_queue_input(
+                   state->async_repl, focused, (const char *)&byte,
+                   sizeof(byte)) == -1) {
+        gsh_async_repl_unfocus(state->async_repl);
         (void)raw_output_push(state, "\a", 1);
-        return;
     }
+    return true;
+}
 
+static bool process_managed_editor_signal(shell_state *state,
+                                          unsigned char byte)
+{
+    if (state->async_repl == NULL || !state->async_repl->enabled) {
+        return false;
+    }
+    if (byte == 0x03U) {
+        cancel_editor_line(state);
+        return true;
+    }
+    if (byte == 0x1aU) {
+        (void)raw_output_push(state, "\a", 1);
+        return true;
+    }
+    return false;
+}
+
+static bool process_escape_input(shell_state *state, unsigned char byte)
+{
     if (state->escape_state == 1) {
-        state->escape_state = (byte == '[' || byte == 'O') ? 2U : 0U;
-        return;
+        if (byte == '[' || byte == 'O') {
+            state->escape_state = 2U;
+        } else {
+            state->escape_state = 0;
+            if (state->history_search) {
+                cancel_history_search(state);
+            }
+        }
+        return true;
     }
     if (state->escape_state == 2) {
         if (byte >= 0x40U && byte <= 0x7eU) {
             state->escape_state = 0;
+            if (byte == 'A') {
+                if (state->history_search) {
+                    search_history(state);
+                } else {
+                    history_previous(state);
+                }
+            } else if (byte == 'B') {
+                if (state->history_search) {
+                    accept_history_search(state);
+                } else {
+                    history_next(state);
+                }
+            } else if (byte == 'C' && state->history_search) {
+                accept_history_search(state);
+            }
         }
+        return true;
+    }
+    return false;
+}
+
+static void erase_history_query(shell_state *state)
+{
+    if (state->history_search_query_length == 0) {
+        (void)output_text(state, "\a");
         return;
     }
+    state->history_search_query_length--;
+    while (state->history_search_query_length != 0 &&
+           ((unsigned char)state->history_search_query[
+                state->history_search_query_length] &
+            0xc0U) == 0x80U) {
+        state->history_search_query_length--;
+    }
+    state->history_search_query[state->history_search_query_length] = '\0';
+    update_history_search(state);
+}
+
+static bool process_history_search_input(shell_state *state,
+                                         unsigned char byte)
+{
+    if (byte == 0x12U) {
+        search_history(state);
+        return true;
+    }
+    if (!state->history_search) {
+        return false;
+    }
+    if (byte == '\r' || byte == '\n') {
+        state->history_search = false;
+        state->history_search_query_length = 0;
+        state->history_search_query[0] = '\0';
+        accept_line(state);
+    } else if (byte == 0x7fU || byte == 0x08U) {
+        erase_history_query(state);
+    } else if (byte == 0x15U) {
+        state->history_search_query_length = 0;
+        state->history_search_query[0] = '\0';
+        update_history_search(state);
+    } else if (byte >= 0x20U || byte == '\t') {
+        if (state->history_search_query_length < LINE_CAP - 1U) {
+            state->history_search_query[
+                state->history_search_query_length++] = (char)byte;
+            state->history_search_query[
+                state->history_search_query_length] = '\0';
+            update_history_search(state);
+        } else {
+            (void)output_text(state, "\a");
+        }
+    } else {
+        return false;
+    }
+    return true;
+}
+
+static bool process_editor_control(shell_state *state, unsigned char byte)
+{
     if (byte == 0x1bU) {
         state->escape_state = 1;
-        return;
+        return true;
     }
     if (byte == '\r' || byte == '\n') {
         accept_line(state);
-        return;
+        return true;
     }
     if (byte == 0x04U) {
         if (state->line_len == 0) {
             if (state->continuation_prompt) {
                 cancel_editor_line(state);
-                return;
+                return true;
             }
             if (state->current_job.active ||
                 gsh_async_repl_job_count(state->async_repl) != 0) {
@@ -6057,28 +6813,33 @@ static void process_input(shell_state *state)
                 state->running = false;
             }
         }
-        return;
+        return true;
     }
     if (byte == 0x7fU || byte == 0x08U) {
         erase_last_character(state);
-        return;
+        return true;
     }
     if (byte == 0x15U) {
         state->line_len = 0;
         state->line[0] = '\0';
         queue_redraw(state);
-        return;
+        return true;
     }
     if (byte == 0x0cU) {
         if (state->async_repl != NULL && state->async_repl->enabled) {
             state->async_repl->render_pending = true;
-            return;
+            return true;
         }
         (void)output_text(state, "\033[2J\033[H");
         queue_prompt(state);
         (void)output_push(state, state->line, state->line_len);
-        return;
+        return true;
     }
+    return false;
+}
+
+static void insert_editor_byte(shell_state *state, unsigned char byte)
+{
     if ((byte >= 0x20U || byte == '\t') && state->line_len < LINE_CAP - 1) {
         state->line[state->line_len++] = (char)byte;
         state->line[state->line_len] = '\0';
@@ -6091,6 +6852,31 @@ static void process_input(shell_state *state)
         state->overloads++;
         (void)output_text(state, "\a");
     }
+}
+
+static void process_input(shell_state *state)
+{
+    unsigned char byte;
+    ssize_t count = read(state->tty_fd, &byte, sizeof(byte));
+
+    if (count == 0) {
+        state->running = false;
+        return;
+    }
+    if (count == -1) {
+        if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
+            state->running = false;
+        }
+        return;
+    }
+    if (route_focused_input(state, byte) ||
+        process_managed_editor_signal(state, byte) ||
+        process_escape_input(state, byte) ||
+        process_history_search_input(state, byte) ||
+        process_editor_control(state, byte)) {
+        return;
+    }
+    insert_editor_byte(state, byte);
 }
 
 static int load_managed_submission(shell_state *state, int cell_index)
@@ -6232,6 +7018,7 @@ static void schedule_managed_submissions(shell_state *state)
     if (state->async_repl == NULL || !state->async_repl->enabled) {
         return;
     }
+    (void)gsh_async_repl_autofocus(state->async_repl);
     finish_managed_state_cell(state);
     for (dispatched = 0; dispatched < 4U; dispatched++) {
         int cell_index;
@@ -6274,9 +7061,128 @@ static size_t add_managed_poll_descriptors(
     return count;
 }
 
+static void note_managed_private_input(shell_state *state, int cell_index)
+{
+    gsh_async_cell *cell;
+    struct termios modes;
+    const char *slave_name;
+    int probe = -1;
+    bool echo_disabled = false;
+    bool noncanonical = false;
+
+    if (cell_index < 0) {
+        return;
+    }
+    cell = &state->async_repl->cells[cell_index];
+    if (cell->pty_fd < 0 ||
+        (cell->fullscreen &&
+         (cell->input_requested || cell->autofocus_suppressed))) {
+        return;
+    }
+    if (tcgetattr(cell->pty_fd, &modes) == 0) {
+        echo_disabled = (modes.c_lflag & ECHO) == 0;
+        noncanonical = (modes.c_lflag & ICANON) == 0;
+    } else {
+        slave_name = ptsname(cell->pty_fd);
+        if (slave_name != NULL) {
+            probe = open(slave_name,
+                         O_RDONLY | O_NOCTTY | O_NONBLOCK | O_CLOEXEC);
+        }
+        if (probe >= 0) {
+            if (tcgetattr(probe, &modes) == 0) {
+                echo_disabled = (modes.c_lflag & ECHO) == 0;
+                noncanonical = (modes.c_lflag & ICANON) == 0;
+            }
+            (void)close(probe);
+        }
+    }
+    if (echo_disabled || noncanonical) {
+        (void)gsh_async_repl_request_input(state->async_repl, cell_index,
+                                           noncanonical);
+        cell->input_probe_pending = false;
+    }
+}
+
+static void leave_managed_fullscreen(shell_state *state, int cell_index)
+{
+    static const char restore[] =
+        "\033[0m\033[?25h\033[?1000l\033[?1002l\033[?1003l"
+        "\033[?1004l\033[?1006l\033[?1015l\033[?2004l\033[?2026l"
+        "\033[>4;0m\033[<u\033>\033[H\033[2J";
+    gsh_async_cell *cell;
+
+    if (state->async_repl == NULL || cell_index < 0 ||
+        cell_index >= GSH_ASYNC_CELL_CAP) {
+        return;
+    }
+    cell = &state->async_repl->cells[cell_index];
+    if (!cell->fullscreen_presented) {
+        return;
+    }
+    (void)raw_output_push(state, restore, sizeof(restore) - 1U);
+    cell->fullscreen_presented = false;
+    cell->passthrough_state = 0;
+    cell->passthrough_utf8_length = 0;
+    cell->passthrough_utf8_expected = 0;
+    cell->passthrough_sequence_length = 0;
+    state->async_repl->render_pending = true;
+}
+
+static void present_managed_fullscreen(shell_state *state, int cell_index,
+                                       const char *bytes, size_t length)
+{
+    static const char begin[] = "\033[0m\033[H\033[2J";
+    char filtered[4096 + GSH_ASYNC_PASSTHROUGH_SEQUENCE_CAP];
+    gsh_async_cell *cell = &state->async_repl->cells[cell_index];
+    size_t filtered_length = 0;
+
+    if (!cell->focused || !cell->fullscreen) {
+        return;
+    }
+    if (!cell->fullscreen_presented) {
+        if (!raw_output_push(state, begin, sizeof(begin) - 1U)) {
+            return;
+        }
+        cell->fullscreen_presented = true;
+    }
+    if (gsh_async_repl_filter_fullscreen(
+            state->async_repl, cell_index, bytes, length, filtered,
+            sizeof(filtered), &filtered_length) == 0 &&
+        filtered_length != 0) {
+        (void)raw_output_push(state, filtered, filtered_length);
+    }
+}
+
+static void preflight_managed_input_focus(
+    shell_state *state,
+    struct pollfd descriptors[4 + GSH_ASYNC_CELL_CAP], size_t count)
+{
+    size_t index;
+
+    if (state->async_repl == NULL || !state->async_repl->enabled) {
+        return;
+    }
+    for (index = 4; index < count; index++) {
+        int cell_index = gsh_async_repl_cell_for_fd(
+            state->async_repl, descriptors[index].fd);
+
+        if (cell_index >= 0 &&
+            ((descriptors[index].revents & POLLIN) != 0 ||
+             state->async_repl->cells[cell_index].input_probe_pending)) {
+            note_managed_private_input(state, cell_index);
+            if (!state->async_repl->cells[cell_index].input_requested) {
+                state->async_repl->cells[cell_index].input_probe_pending =
+                    false;
+            }
+        }
+    }
+    (void)gsh_async_repl_autofocus(state->async_repl);
+}
+
 static void read_managed_output(shell_state *state, struct pollfd *descriptor)
 {
     char bytes[4096];
+    gsh_async_cell *cell;
     int cell_index = gsh_async_repl_cell_for_fd(
         state->async_repl, descriptor->fd);
     unsigned int reads;
@@ -6288,18 +7194,35 @@ static void read_managed_output(shell_state *state, struct pollfd *descriptor)
         ssize_t count = read(descriptor->fd, bytes, sizeof(bytes));
 
         if (count > 0) {
-            (void)gsh_async_repl_append(state->async_repl, cell_index,
-                                        bytes, (size_t)count);
+            note_managed_private_input(state, cell_index);
+            (void)gsh_async_repl_autofocus(state->async_repl);
+            cell = &state->async_repl->cells[cell_index];
+            if (cell->fullscreen) {
+                present_managed_fullscreen(state, cell_index, bytes,
+                                           (size_t)count);
+            } else {
+                (void)gsh_async_repl_append(state->async_repl, cell_index,
+                                            bytes, (size_t)count);
+            }
             continue;
         }
         if (count == -1 && errno == EINTR) {
             continue;
         }
         if (count == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            return;
+            break;
         }
+        leave_managed_fullscreen(state, cell_index);
         gsh_async_repl_close_output(state->async_repl, cell_index);
-        return;
+        break;
+    }
+    cell = &state->async_repl->cells[cell_index];
+    if (cell->pty_fd >= 0 && !cell->fullscreen) {
+        /* A private terminal read disables echo before presenting its prompt.
+         * Probe once per bounded PTY service turn: no text matching, no thread,
+         * and no periodic wakeup or unbounded scan on the editor path. */
+        cell->input_probe_pending = true;
+        note_managed_private_input(state, cell_index);
     }
 }
 
@@ -6325,11 +7248,13 @@ static void process_managed_descriptors(
             if (cell_index >= 0 &&
                 gsh_async_repl_flush_input(state->async_repl,
                                            cell_index) == -1) {
+                leave_managed_fullscreen(state, cell_index);
                 state->async_repl->cells[cell_index].focused = false;
                 gsh_async_repl_close_output(state->async_repl, cell_index);
             }
         }
     }
+    (void)gsh_async_repl_autofocus(state->async_repl);
 }
 
 static bool editor_accepts_input(const shell_state *state)
@@ -6337,6 +7262,146 @@ static bool editor_accepts_input(const shell_state *state)
     return state->async_repl != NULL && state->async_repl->enabled
                ? true
                : state->mode == MODE_EDITOR;
+}
+
+static bool async_transition_has_live_shell_state(const shell_state *state)
+{
+    return state->current_job.active ||
+           gsh_background_active_count(&state->background_jobs) != 0 ||
+           state->async_state_cell >= 0 || state->variable_commit_active ||
+           state->variable_commit_fd >= 0 ||
+           state->directory_commit_socket >= 0 ||
+           state->directory_commit_fd >= 0 || state->pending_list_active ||
+           state->pending_and_or_active || state->wait_target_count != 0 ||
+           state->wait_all || state->pending_positional_commit ||
+           state->pending_alias_commit || state->pending_function_commit ||
+           state->pending_directory_commit ||
+           state->positional_commit_expected || state->alias_commit_expected ||
+           state->function_commit_expected ||
+           state->directory_commit_expected;
+}
+
+static bool async_transition_can_start_now(const shell_state *state)
+{
+    bool managed = state->async_repl != NULL && state->async_repl->enabled;
+    int control_cell = managed ? state->async_dispatch_cell : -1;
+
+    if (async_transition_has_live_shell_state(state)) {
+        return false;
+    }
+    if (!managed) {
+        return state->async_capture_cell < 0 &&
+               state->async_dispatch_cell < 0;
+    }
+    if (control_cell < 0 || control_cell >= GSH_ASYNC_CELL_CAP ||
+        state->async_capture_cell != control_cell ||
+        !state->async_repl->cells[control_cell].control) {
+        return false;
+    }
+    return gsh_async_repl_all_settled_except(state->async_repl,
+                                              control_cell);
+}
+
+static bool async_transition_quiescent(const shell_state *state)
+{
+    bool managed = state->async_repl != NULL &&
+                   state->async_repl->enabled;
+
+    if (state->mode != MODE_EDITOR || state->output_len != 0 ||
+        async_transition_has_live_shell_state(state) ||
+        state->async_capture_cell >= 0 || state->async_state_cell >= 0 ||
+        state->async_dispatch_cell >= 0) {
+        return false;
+    }
+    return !managed ||
+           (gsh_async_repl_all_settled(state->async_repl) &&
+            !state->async_repl->render_pending);
+}
+
+static int seed_async_enabled_notice(shell_state *state)
+{
+    static const char command[] = "/async";
+    static const char notice[] = "async repl: on\n";
+    char prompt[GSH_ASYNC_PROMPT_CAP];
+    int cell_index;
+
+    (void)active_prompt_text(state, prompt);
+    cell_index = gsh_async_repl_accept(
+        state->async_repl, prompt, command, sizeof(command) - 1U,
+        false, false, false, true);
+    if (cell_index < 0) {
+        return -1;
+    }
+    gsh_async_repl_starting(state->async_repl, cell_index);
+    if (gsh_async_repl_append(state->async_repl, cell_index, notice,
+                              sizeof(notice) - 1U) == -1) {
+        return -1;
+    }
+    gsh_async_repl_finish(state->async_repl, cell_index, 0, true);
+    return 0;
+}
+
+static void apply_async_transition(shell_state *state)
+{
+    static const char leave_screen[] = "\033[?1049l";
+
+    if (!state->async_transition_pending ||
+        !async_transition_quiescent(state)) {
+        return;
+    }
+    if (!state->async_desired) {
+        (void)raw_output_push(state, leave_screen,
+                              sizeof(leave_screen) - 1U);
+        gsh_async_repl_initialize(state->async_repl, false);
+        state->async_capture_cell = -1;
+        state->async_state_cell = -1;
+        state->async_dispatch_cell = -1;
+        state->async_transition_pending = false;
+        make_editor_modes(state);
+        if (enter_editor(state) == -1) {
+            state->last_status = 1;
+            state->running = false;
+            return;
+        }
+        (void)raw_output_push(state, "async repl: off\r\n", 17);
+        queue_redraw(state);
+        return;
+    }
+
+    gsh_async_repl_initialize(state->async_repl, true);
+    initialize_repl_size(state);
+    make_editor_modes(state);
+    if (enter_editor(state) == -1 || seed_async_enabled_notice(state) == -1) {
+        int saved_errno = errno;
+
+        gsh_async_repl_initialize(state->async_repl, false);
+        state->async_desired = false;
+        state->async_transition_pending = false;
+        make_editor_modes(state);
+        if (enter_editor(state) == -1) {
+            state->running = false;
+            return;
+        }
+        output_format(state, "gsh: cannot enable async repl: %s\r\n",
+                      strerror(saved_errno));
+        state->last_status = 1;
+        queue_redraw(state);
+        return;
+    }
+    state->async_transition_pending = false;
+    state->async_repl->render_pending = true;
+}
+
+static void maybe_verify_history(shell_state *state)
+{
+    if (state->history_persistent &&
+        state->history_reminder_deadline_ns != 0 &&
+        monotonic_ns() >= state->history_reminder_deadline_ns &&
+        state->mode == MODE_EDITOR &&
+        gsh_async_repl_job_count(state->async_repl) == 0 &&
+        gsh_async_repl_focused_job(state->async_repl) < 0) {
+        verify_history_reminder(state);
+    }
 }
 
 static int run_reactor(shell_state *state)
@@ -6351,7 +7416,9 @@ static int run_reactor(shell_state *state)
         uint64_t service_end;
         uint64_t service_duration;
 
+        maybe_verify_history(state);
         schedule_managed_submissions(state);
+        apply_async_transition(state);
         prepare_managed_render(state);
 
         if ((state->async_repl == NULL || !state->async_repl->enabled) &&
@@ -6425,6 +7492,10 @@ static int run_reactor(shell_state *state)
         }
         if (editor_accepts_input(state) &&
             (descriptors[1].revents & POLLIN) != 0) {
+            /* Preflight only ownership, not output: this closes the race with
+             * a private PTY while keeping editor latency ahead of job drains. */
+            preflight_managed_input_focus(state, descriptors,
+                                          descriptor_count);
             process_input(state);
         }
         if (editor_accepts_input(state) &&
@@ -6452,6 +7523,7 @@ static int run_reactor(shell_state *state)
         }
         enforce_prompt_deadline(state);
         schedule_managed_submissions(state);
+        apply_async_transition(state);
         prepare_managed_render(state);
         if (state->output_len > 0) {
             flush_output(state);
@@ -6612,6 +7684,10 @@ static void cleanup(shell_state *state)
     if (state->tty_fd >= 0) {
         close(state->tty_fd);
     }
+    gsh_history_client_close(&state->history_client);
+    gsh_history_clear(state->history);
+    free(state->history);
+    state->history = NULL;
     free(state->parse_storage);
     state->parse_storage = NULL;
     free(state->native_pipeline);
@@ -6654,7 +7730,12 @@ static void print_usage(FILE *stream)
             "       gsh -n -c command\n"
             "       gsh --native-only -c command\n\n"
             "Run the minimal interactive gsh reactor, or execute one command "
-            "non-interactively.\n");
+            "non-interactively.\n"
+            "The async REPL is enabled by default; set GSH_REPL=classic or "
+            "shell.async_repl.enabled=false in ~/.gshrc to start in classic "
+            "mode.\n"
+            "Enter /async as an exact interactive line to toggle it for the "
+            "current session.\n");
 }
 
 static int check_native_syntax(const char *input)
@@ -10503,12 +11584,12 @@ int main(int argc, char **argv)
     if (argc != 1 || !isatty(STDIN_FILENO)) {
         return exec_noninteractive(argc, argv);
     }
-    if (initialize_interactive(&state) == -1) {
+    if (initialize_interactive(&state, argv[0]) == -1) {
         perror("gsh: interactive initialization");
         cleanup(&state);
         return 1;
     }
-    state.parameter_zero = argv[0];
+    initialize_history(&state);
     if (start_prompt_worker(&state) == -1) {
         state.prompt_worker_failures++;
     }

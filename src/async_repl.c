@@ -255,6 +255,32 @@ size_t gsh_async_repl_job_count(const gsh_async_repl *repl)
     return count;
 }
 
+bool gsh_async_repl_all_settled_except(const gsh_async_repl *repl,
+                                       int ignored_cell)
+{
+    int index;
+
+    if (repl == NULL) {
+        return true;
+    }
+    for (index = 0; index < GSH_ASYNC_CELL_CAP; index++) {
+        const gsh_async_cell *cell = &repl->cells[index];
+
+        if (index != ignored_cell && cell->occupied &&
+            (!cell_terminal(cell) || !cell->output_closed ||
+             cell->pty_fd >= 0 || cell->input_offset < cell->input_length ||
+             cell->input_requested || cell->input_probe_pending)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool gsh_async_repl_all_settled(const gsh_async_repl *repl)
+{
+    return gsh_async_repl_all_settled_except(repl, -1);
+}
+
 int gsh_async_repl_next(gsh_async_repl *repl, bool state_lane_busy)
 {
     uint64_t selected_id = UINT64_MAX;
@@ -383,6 +409,16 @@ int gsh_async_repl_reap(gsh_async_repl *repl, pid_t pid, int wait_status)
                       ? GSH_ASYNC_DONE
                       : GSH_ASYNC_FAILED;
     cell->focused = false;
+    cell->input_requested = false;
+    cell->input_probe_pending = false;
+    cell->fullscreen_presented = false;
+    cell->passthrough_state = 0;
+    cell->passthrough_utf8_length = 0;
+    cell->passthrough_utf8_expected = 0;
+    cell->passthrough_sequence_length = 0;
+    memset(cell->input, 0, sizeof(cell->input));
+    cell->input_offset = 0;
+    cell->input_length = 0;
     cell->pid = 0;
     cell->pgid = 0;
     cell->output_closed = cell->pty_fd < 0;
@@ -480,9 +516,13 @@ int gsh_async_repl_queue_input(gsh_async_repl *repl, int cell_index,
     }
     if (length > sizeof(cell->input) - cell->input_length &&
         cell->input_offset > 0) {
+        size_t remaining = cell->input_length - cell->input_offset;
+
         memmove(cell->input, cell->input + cell->input_offset,
-                cell->input_length - cell->input_offset);
-        cell->input_length -= cell->input_offset;
+                remaining);
+        memset(cell->input + remaining, 0,
+               cell->input_length - remaining);
+        cell->input_length = remaining;
         cell->input_offset = 0;
     }
     if (length > sizeof(cell->input) - cell->input_length) {
@@ -515,6 +555,7 @@ int gsh_async_repl_flush_input(gsh_async_repl *repl, int cell_index)
     written = write(cell->pty_fd, cell->input + cell->input_offset,
                     cell->input_length - cell->input_offset);
     if (written > 0) {
+        memset(cell->input + cell->input_offset, 0, (size_t)written);
         cell->input_offset += (size_t)written;
         if (cell->input_offset == cell->input_length) {
             cell->input_offset = 0;
@@ -543,6 +584,15 @@ void gsh_async_repl_close_output(gsh_async_repl *repl, int cell_index)
         cell->pty_fd = -1;
     }
     cell->output_closed = true;
+    cell->focused = false;
+    cell->input_requested = false;
+    cell->input_probe_pending = false;
+    cell->fullscreen_presented = false;
+    cell->passthrough_state = 0;
+    cell->passthrough_utf8_length = 0;
+    cell->passthrough_utf8_expected = 0;
+    cell->passthrough_sequence_length = 0;
+    memset(cell->input, 0, sizeof(cell->input));
     cell->input_offset = 0;
     cell->input_length = 0;
     repl->render_pending = true;
@@ -598,9 +648,377 @@ int gsh_async_repl_focus(gsh_async_repl *repl, int cell_index)
     }
     if (focused >= 0) {
         repl->cells[focused].focused = false;
+        repl->cells[focused].input_requested = false;
+        repl->cells[focused].autofocus_suppressed = true;
+        repl->cells[focused].fullscreen_presented = false;
     }
     repl->cells[cell_index].focused = true;
+    repl->cells[cell_index].input_requested = true;
+    repl->cells[cell_index].autofocus_suppressed = false;
+    repl->cells[cell_index].fullscreen_presented = false;
+    repl->cells[cell_index].passthrough_state = 0;
+    repl->cells[cell_index].passthrough_utf8_length = 0;
+    repl->cells[cell_index].passthrough_utf8_expected = 0;
+    repl->cells[cell_index].passthrough_sequence_length = 0;
     repl->render_pending = true;
+    return 0;
+}
+
+int gsh_async_repl_autofocus(gsh_async_repl *repl)
+{
+    uint64_t oldest = UINT64_MAX;
+    int selected = -1;
+    int index;
+
+    if (repl == NULL) {
+        return -1;
+    }
+    index = gsh_async_repl_focused_job(repl);
+    if (index >= 0) {
+        return index;
+    }
+    for (index = 0; index < GSH_ASYNC_CELL_CAP; index++) {
+        const gsh_async_cell *cell = &repl->cells[index];
+
+        if (cell->occupied && cell->input_requested &&
+            cell->state == GSH_ASYNC_RUNNING && cell->pgid > 0 &&
+            cell->id < oldest) {
+            oldest = cell->id;
+            selected = index;
+        }
+    }
+    if (selected >= 0 && gsh_async_repl_focus(repl, selected) == -1) {
+        return -1;
+    }
+    return selected;
+}
+
+int gsh_async_repl_request_input(gsh_async_repl *repl, int cell_index,
+                                 bool fullscreen)
+{
+    static const char marker[] = "[full-screen session]\n";
+    gsh_async_cell *cell;
+
+    if (repl == NULL || !cell_index_valid(cell_index)) {
+        errno = EINVAL;
+        return -1;
+    }
+    cell = &repl->cells[cell_index];
+    if (!cell->occupied || cell->state != GSH_ASYNC_RUNNING ||
+        cell->pgid <= 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (!cell->autofocus_suppressed) {
+        cell->input_requested = true;
+    }
+    if (fullscreen) {
+        cell->fullscreen = true;
+        if (!cell->fullscreen_recorded) {
+            size_t offset;
+
+            cell->output_length = 0;
+            cell->output[0] = '\0';
+            cell->output_truncated = false;
+            cell->escape_state = 0;
+            cell->last_was_cr = false;
+            for (offset = 0; offset < sizeof(marker) - 1U; offset++) {
+                (void)append_visible_byte(cell,
+                                          (unsigned char)marker[offset]);
+            }
+            cell->fullscreen_recorded = true;
+        }
+    }
+    repl->render_pending = true;
+    return 0;
+}
+
+static bool fullscreen_csi_blocked(const char *sequence, size_t length)
+{
+    size_t offset;
+    unsigned int parameter = 0;
+    bool private_mode;
+    unsigned char final;
+
+    if (sequence == NULL || length < 3U || sequence[0] != '\033' ||
+        sequence[1] != '[') {
+        return true;
+    }
+    final = (unsigned char)sequence[length - 1U];
+    if (final == 't') {
+        return true;
+    }
+    private_mode = length > 3U && sequence[2] == '?';
+    if (!private_mode || (final != 'h' && final != 'l')) {
+        return false;
+    }
+    for (offset = 3U;
+         offset + 1U < length &&
+         offset < GSH_ASYNC_PASSTHROUGH_SEQUENCE_CAP;
+         offset++) {
+        unsigned char byte = (unsigned char)sequence[offset];
+
+        if (byte >= '0' && byte <= '9') {
+            parameter = parameter * 10U + (unsigned int)(byte - '0');
+        } else if (byte == ';') {
+            if (parameter == 3U || parameter == 40U || parameter == 47U ||
+                parameter == 1047U || parameter == 1049U) {
+                return true;
+            }
+            parameter = 0;
+        } else {
+            return true;
+        }
+    }
+    return parameter == 3U || parameter == 40U || parameter == 47U ||
+           parameter == 1047U || parameter == 1049U;
+}
+
+static int fullscreen_emit(char *output, size_t output_capacity,
+                           size_t *used, const char *bytes, size_t length)
+{
+    if (*used > output_capacity || length > output_capacity - *used) {
+        errno = ENOBUFS;
+        return -1;
+    }
+    memcpy(output + *used, bytes, length);
+    *used += length;
+    return 0;
+}
+
+static unsigned char fullscreen_utf8_expected(unsigned char byte)
+{
+    if (byte >= 0xc2U && byte <= 0xdfU) {
+        return 2U;
+    }
+    if (byte >= 0xe0U && byte <= 0xefU) {
+        return 3U;
+    }
+    if (byte >= 0xf0U && byte <= 0xf4U) {
+        return 4U;
+    }
+    return 0U;
+}
+
+static bool fullscreen_utf8_continuation(const gsh_async_cell *cell,
+                                         unsigned char byte)
+{
+    unsigned char lead;
+
+    if (cell == NULL || cell->passthrough_utf8_length == 0U ||
+        (byte & 0xc0U) != 0x80U) {
+        return false;
+    }
+    if (cell->passthrough_utf8_length != 1U) {
+        return true;
+    }
+    lead = (unsigned char)cell->passthrough_utf8[0];
+    return !((lead == 0xe0U && byte < 0xa0U) ||
+             (lead == 0xedU && byte > 0x9fU) ||
+             (lead == 0xf0U && byte < 0x90U) ||
+             (lead == 0xf4U && byte > 0x8fU));
+}
+
+static int fullscreen_consume_utf8(gsh_async_cell *cell,
+                                   unsigned char byte, char *output,
+                                   size_t output_capacity, size_t *used,
+                                   bool relay)
+{
+    unsigned char expected;
+
+    if (cell == NULL || output == NULL || used == NULL ||
+        (cell->passthrough_utf8_length == 0U) !=
+            (cell->passthrough_utf8_expected == 0U) ||
+        cell->passthrough_utf8_expected > sizeof(cell->passthrough_utf8) ||
+        (cell->passthrough_utf8_length != 0U &&
+         cell->passthrough_utf8_length >=
+             cell->passthrough_utf8_expected)) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (cell->passthrough_utf8_length != 0U) {
+        if (fullscreen_utf8_continuation(cell, byte)) {
+            cell->passthrough_utf8[cell->passthrough_utf8_length++] =
+                (char)byte;
+            if (cell->passthrough_utf8_length ==
+                cell->passthrough_utf8_expected) {
+                bool c1 = (unsigned char)cell->passthrough_utf8[0] == 0xc2U &&
+                          (unsigned char)cell->passthrough_utf8[1] <= 0x9fU;
+                int result = c1 || !relay ? 0 : fullscreen_emit(
+                    output, output_capacity, used, cell->passthrough_utf8,
+                    cell->passthrough_utf8_length);
+
+                cell->passthrough_utf8_length = 0;
+                cell->passthrough_utf8_expected = 0;
+                return result == -1 ? -1 : 1;
+            }
+            return 1;
+        }
+        cell->passthrough_utf8_length = 0;
+        cell->passthrough_utf8_expected = 0;
+    }
+    expected = fullscreen_utf8_expected(byte);
+    if (expected == 0U) {
+        return 0;
+    }
+    cell->passthrough_utf8[0] = (char)byte;
+    cell->passthrough_utf8_length = 1U;
+    cell->passthrough_utf8_expected = expected;
+    return 1;
+}
+
+static bool fullscreen_discard_control(gsh_async_cell *cell,
+                                       unsigned char byte)
+{
+    if (cell->passthrough_state == 3U ||
+        cell->passthrough_state == 4U) {
+        if (byte == 0x07U || byte == 0x9cU ||
+            (cell->passthrough_state == 4U && byte == '\\')) {
+            cell->passthrough_state = 0U;
+        } else {
+            cell->passthrough_state = byte == 0x1bU ? 4U : 3U;
+        }
+        return true;
+    }
+    if (cell->passthrough_state == 5U) {
+        if (byte >= 0x40U && byte <= 0x7eU) {
+            cell->passthrough_state = 0U;
+        }
+        return true;
+    }
+    return false;
+}
+
+static int fullscreen_consume_escape(gsh_async_cell *cell,
+                                     unsigned char byte, char *output,
+                                     size_t output_capacity, size_t *used)
+{
+    if (cell->passthrough_sequence_length >=
+        sizeof(cell->passthrough_sequence)) {
+        cell->passthrough_sequence_length = 0;
+        cell->passthrough_state = 5U;
+        return 0;
+    }
+    cell->passthrough_sequence[cell->passthrough_sequence_length++] =
+        (char)byte;
+    if (cell->passthrough_state == 1U) {
+        if (byte == '[') {
+            cell->passthrough_state = 2U;
+        } else if (byte == ']' || byte == 'P' || byte == 'X' ||
+                   byte == '^' || byte == '_') {
+            cell->passthrough_sequence_length = 0;
+            cell->passthrough_state = 3U;
+        } else if (byte == 'c') {
+            cell->passthrough_sequence_length = 0;
+            cell->passthrough_state = 0U;
+        } else {
+            if (fullscreen_emit(output, output_capacity, used,
+                                cell->passthrough_sequence,
+                                cell->passthrough_sequence_length) == -1) {
+                return -1;
+            }
+            cell->passthrough_sequence_length = 0;
+            cell->passthrough_state = 0U;
+        }
+    } else if (byte >= 0x40U && byte <= 0x7eU) {
+        if (!fullscreen_csi_blocked(cell->passthrough_sequence,
+                                    cell->passthrough_sequence_length) &&
+            fullscreen_emit(output, output_capacity, used,
+                            cell->passthrough_sequence,
+                            cell->passthrough_sequence_length) == -1) {
+            return -1;
+        }
+        cell->passthrough_sequence_length = 0;
+        cell->passthrough_state = 0U;
+    }
+    return 0;
+}
+
+/* ── Raw Focus Preserves TUIs Without Giving Away the Terminal ────
+ * Cell rendering originally erased the cursor protocol emitted by curses apps.
+ * Direct terminal handoff would restore the TUI but break concurrent ownership.
+ * Raw focus instead relays one bounded PTY batch while the reactor keeps input.
+ * UTF-8 scalars remain atomic across reads, so continuation bytes are not C1.
+ * OSC, DCS, window operations, and alternate-screen changes are discarded.
+ * Exit restoration then makes the managed compositor authoritative again.
+ * ─────────────────────────────────────────────── */
+int gsh_async_repl_filter_fullscreen(gsh_async_repl *repl, int cell_index,
+                                     const char *bytes, size_t length,
+                                     char *output, size_t output_capacity,
+                                     size_t *output_length)
+{
+    gsh_async_cell *cell;
+    size_t used = 0;
+    size_t offset;
+
+    if (repl == NULL || !cell_index_valid(cell_index) || bytes == NULL ||
+        output == NULL || output_length == NULL ||
+        length > GSH_ASYNC_CELL_INPUT_CAP ||
+        length > output_capacity ||
+        output_capacity - length < GSH_ASYNC_PASSTHROUGH_SEQUENCE_CAP) {
+        errno = EINVAL;
+        return -1;
+    }
+    cell = &repl->cells[cell_index];
+    if (!cell->occupied || !cell->fullscreen) {
+        errno = EINVAL;
+        return -1;
+    }
+    for (offset = 0;
+         offset < length && offset < GSH_ASYNC_CELL_INPUT_CAP; offset++) {
+        unsigned char byte = (unsigned char)bytes[offset];
+
+        if (cell->passthrough_state == 0U) {
+            int utf8 = fullscreen_consume_utf8(
+                cell, byte, output, output_capacity, &used, true);
+
+            if (utf8 == -1) {
+                return -1;
+            }
+            if (utf8 == 1) {
+                continue;
+            }
+            if (byte == 0x1bU) {
+                cell->passthrough_sequence[0] = (char)byte;
+                cell->passthrough_sequence_length = 1U;
+                cell->passthrough_state = 1U;
+            } else if (byte == 0x9bU) {
+                cell->passthrough_sequence[0] = '\033';
+                cell->passthrough_sequence[1] = '[';
+                cell->passthrough_sequence_length = 2U;
+                cell->passthrough_state = 2U;
+            } else if (byte >= 0x80U && byte <= 0x9fU) {
+                if (byte == 0x90U || byte == 0x98U || byte == 0x9dU ||
+                    byte == 0x9eU || byte == 0x9fU) {
+                    cell->passthrough_state = 3U;
+                }
+            } else if (fullscreen_emit(output, output_capacity, &used,
+                                       bytes + offset, 1U) == -1) {
+                return -1;
+            }
+            continue;
+        }
+        if (cell->passthrough_state == 3U ||
+            cell->passthrough_state == 4U) {
+            int utf8 = fullscreen_consume_utf8(
+                cell, byte, output, output_capacity, &used, false);
+
+            if (utf8 == -1) {
+                return -1;
+            }
+            if (utf8 == 1) {
+                continue;
+            }
+        }
+        if (fullscreen_discard_control(cell, byte)) {
+            continue;
+        }
+        if (fullscreen_consume_escape(cell, byte, output, output_capacity,
+                                      &used) == -1) {
+            return -1;
+        }
+    }
+    *output_length = used;
     return 0;
 }
 
@@ -611,7 +1029,14 @@ void gsh_async_repl_unfocus(gsh_async_repl *repl)
     if (repl == NULL || focused < 0) {
         return;
     }
+    repl->cells[focused].input_requested = false;
     repl->cells[focused].focused = false;
+    repl->cells[focused].autofocus_suppressed = true;
+    repl->cells[focused].fullscreen_presented = false;
+    repl->cells[focused].passthrough_state = 0;
+    repl->cells[focused].passthrough_utf8_length = 0;
+    repl->cells[focused].passthrough_utf8_expected = 0;
+    repl->cells[focused].passthrough_sequence_length = 0;
     repl->render_pending = true;
 }
 
@@ -626,6 +1051,8 @@ void gsh_async_repl_mark_stopped(gsh_async_repl *repl, int cell_index)
     was_stopped = repl->cells[cell_index].state == GSH_ASYNC_STOPPED;
     repl->cells[cell_index].state = GSH_ASYNC_STOPPED;
     repl->cells[cell_index].focused = false;
+    repl->cells[cell_index].input_requested = false;
+    repl->cells[cell_index].autofocus_suppressed = true;
     if (!was_stopped) {
         (void)gsh_async_repl_append(repl, cell_index, marker,
                                     sizeof(marker) - 1U);
@@ -683,13 +1110,109 @@ static void clear_view(gsh_async_repl *repl)
     memset(repl->view_lengths, 0, sizeof(repl->view_lengths));
 }
 
+static size_t ansi_token_length(const char *text, size_t length,
+                                size_t offset, bool *reset)
+{
+    size_t cursor;
+
+    if (text == NULL || reset == NULL || offset >= length ||
+        length - offset < 3U || (unsigned char)text[offset] != 0x1bU ||
+        text[offset + 1U] != '[') {
+        return 0;
+    }
+    for (cursor = offset + 2U; cursor < length; cursor++) {
+        unsigned char byte = (unsigned char)text[cursor];
+
+        if (byte >= 0x40U && byte <= 0x7eU) {
+            if (byte != 'm') {
+                return 0;
+            }
+            *reset = cursor == offset + 3U && text[offset + 2U] == '0';
+            return cursor - offset + 1U;
+        }
+        if (!((byte >= '0' && byte <= '9') || byte == ';')) {
+            return 0;
+        }
+    }
+    return 0;
+}
+
+static size_t utf8_token_length(const char *text, size_t length,
+                                size_t offset)
+{
+    unsigned char first;
+    size_t wanted;
+    size_t index;
+
+    if (text == NULL || offset >= length) {
+        return 0;
+    }
+    first = (unsigned char)text[offset];
+    if (first < 0x80U) {
+        return 1;
+    }
+    if (first >= 0xc2U && first <= 0xdfU) {
+        wanted = 2;
+    } else if (first >= 0xe0U && first <= 0xefU) {
+        wanted = 3;
+    } else if (first >= 0xf0U && first <= 0xf4U) {
+        wanted = 4;
+    } else {
+        return 1;
+    }
+    if (wanted > length - offset) {
+        return 1;
+    }
+    for (index = 1; index < wanted; index++) {
+        if (((unsigned char)text[offset + index] & 0xc0U) != 0x80U) {
+            return 1;
+        }
+    }
+    return wanted;
+}
+
 static void push_view_row(gsh_async_repl *repl, const char *text,
                           size_t length)
 {
+    static const char reset_style[] = "\033[0m";
+    char clipped[GSH_ASYNC_VIEW_BYTES];
+    size_t source = 0;
+    size_t used = 0;
+    size_t columns = 0;
+    size_t tokens = 0;
+    bool style_active = false;
     size_t row;
 
-    if (length > repl->terminal_columns) {
-        length = repl->terminal_columns;
+    while (source < length && tokens < GSH_ASYNC_VIEW_BYTES) {
+        bool reset = false;
+        size_t token = ansi_token_length(text, length, source, &reset);
+        size_t width = 0;
+
+        if (token != 0) {
+            style_active = !reset;
+        } else {
+            token = utf8_token_length(text, length, source);
+            if (token == 0) {
+                break;
+            }
+            width = 1;
+            if (columns + width > repl->terminal_columns) {
+                break;
+            }
+        }
+        if (token > sizeof(clipped) - 1U - used) {
+            break;
+        }
+        memcpy(clipped + used, text + source, token);
+        used += token;
+        source += token;
+        columns += width;
+        tokens++;
+    }
+    if (style_active && sizeof(reset_style) - 1U <=
+                            sizeof(clipped) - 1U - used) {
+        memcpy(clipped + used, reset_style, sizeof(reset_style) - 1U);
+        used += sizeof(reset_style) - 1U;
     }
     if (repl->view_count < GSH_ASYNC_VIEW_ROWS) {
         row = (repl->view_start + repl->view_count) % GSH_ASYNC_VIEW_ROWS;
@@ -698,27 +1221,25 @@ static void push_view_row(gsh_async_repl *repl, const char *text,
         row = repl->view_start;
         repl->view_start = (repl->view_start + 1U) % GSH_ASYNC_VIEW_ROWS;
     }
-    if (length != 0) {
-        memcpy(repl->view[row], text, length);
+    if (used != 0) {
+        memcpy(repl->view[row], clipped, used);
     }
-    repl->view[row][length] = '\0';
-    repl->view_lengths[row] = length;
+    repl->view[row][used] = '\0';
+    repl->view_lengths[row] = used;
 }
 
 static void push_prefixed_row(gsh_async_repl *repl, const char *prefix,
                               const char *text, size_t length)
 {
-    char row[GSH_ASYNC_VIEW_COLUMNS + 1U];
+    char row[GSH_ASYNC_PROMPT_CAP + GSH_ASYNC_COMMAND_CAP] = {0};
     size_t prefix_length = strlen(prefix);
-    size_t available;
 
-    if (prefix_length > repl->terminal_columns) {
-        prefix_length = repl->terminal_columns;
+    if (prefix_length > sizeof(row)) {
+        prefix_length = sizeof(row);
     }
     memcpy(row, prefix, prefix_length);
-    available = repl->terminal_columns - prefix_length;
-    if (length > available) {
-        length = available;
+    if (length > sizeof(row) - prefix_length) {
+        length = sizeof(row) - prefix_length;
     }
     if (length != 0) {
         memcpy(row + prefix_length, text, length);
@@ -750,7 +1271,7 @@ static size_t push_output_rows(gsh_async_repl *repl,
 
 static void push_cell(gsh_async_repl *repl, const gsh_async_cell *cell)
 {
-    char command_row[GSH_ASYNC_VIEW_COLUMNS + 1U];
+    char command_row[GSH_ASYNC_PROMPT_CAP + GSH_ASYNC_COMMAND_CAP] = {0};
     size_t command_length = cell->prompt_length + cell->command_length;
     size_t output_rows;
 

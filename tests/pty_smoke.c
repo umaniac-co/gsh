@@ -306,8 +306,17 @@ static int start_session(pty_session *session, const char *executable,
         (void)setenv("RPROMPT", "", 1);
         if (kind == SHELL_GSH) {
             const char *managed = getenv("GSH_HARNESS_MANAGED");
+            const char *history = getenv("GSH_HARNESS_HISTORY");
+            const char *repl = getenv("GSH_HARNESS_REPL");
 
-            if (managed != NULL && strcmp(managed, "1") == 0) {
+            if (history != NULL && strcmp(history, "1") == 0) {
+                (void)unsetenv("GSH_HISTORY");
+            } else {
+                (void)setenv("GSH_HISTORY", "off", 1);
+            }
+            if (repl != NULL) {
+                (void)setenv("GSH_REPL", repl, 1);
+            } else if (managed != NULL && strcmp(managed, "1") == 0) {
                 (void)unsetenv("GSH_REPL");
             } else {
                 (void)setenv("GSH_REPL", "classic", 1);
@@ -438,11 +447,13 @@ static int start_managed_session(pty_session *session,
 {
     int result;
 
-    if (setenv("GSH_HARNESS_MANAGED", "1", 1) == -1) {
+    if (setenv("GSH_HARNESS_MANAGED", "1", 1) == -1 ||
+        setenv("GSH_HARNESS_REPL", "async", 1) == -1) {
         return -1;
     }
     result = start_session(session, executable, directory, SHELL_GSH);
     (void)unsetenv("GSH_HARNESS_MANAGED");
+    (void)unsetenv("GSH_HARNESS_REPL");
     return result;
 }
 
@@ -840,6 +851,313 @@ static void remove_fixture(const char *root)
     (void)rmdir(root);
 }
 
+static int write_history_config(const char *home)
+{
+    static const char configuration[] =
+        "config.version = 1\n\n"
+        "shell.history.enabled = true\n"
+        "shell.history.max_entries = 1024\n"
+        "shell.history.deduplicate = false\n"
+        "shell.history.store_failed = true\n"
+        "shell.history.ignore_space = true\n"
+        "shell.history.unlock_ttl = infinite\n"
+        "shell.history.reminder_min = 3s\n"
+        "shell.history.reminder_max = 3s\n";
+    char path[PATH_MAX];
+    int descriptor;
+    ssize_t written;
+
+    if (snprintf(path, sizeof(path), "%s/.gshrc", home) >=
+        (int)sizeof(path)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    descriptor = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+    if (descriptor == -1) {
+        return -1;
+    }
+    written = write(descriptor, configuration, sizeof(configuration) - 1U);
+    if (written != (ssize_t)(sizeof(configuration) - 1U) ||
+        fsync(descriptor) == -1 || close(descriptor) == -1) {
+        return -1;
+    }
+    return 0;
+}
+
+static void remove_history_fixture(const char *home)
+{
+    char path[PATH_MAX];
+
+    if (snprintf(path, sizeof(path), "%s/.gsh/history.sock", home) <
+        (int)sizeof(path)) {
+        (void)unlink(path);
+    }
+    if (snprintf(path, sizeof(path), "%s/.gsh/history.sock.lock", home) <
+        (int)sizeof(path)) {
+        (void)unlink(path);
+    }
+    if (snprintf(path, sizeof(path), "%s/.gsh/history.vault", home) <
+        (int)sizeof(path)) {
+        (void)unlink(path);
+    }
+    if (snprintf(path, sizeof(path), "%s/.gsh", home) < (int)sizeof(path)) {
+        (void)rmdir(path);
+    }
+    if (snprintf(path, sizeof(path), "%s/.gshrc", home) <
+        (int)sizeof(path)) {
+        (void)unlink(path);
+    }
+    (void)rmdir(home);
+}
+
+static bool history_vault_is_encrypted(const char *home)
+{
+    static const char plaintext[] = "HISTORY_ALPHA";
+    unsigned char bytes[8192 + sizeof(plaintext)];
+    char path[PATH_MAX];
+    struct stat status;
+    size_t carry = 0;
+    unsigned int reads;
+    int descriptor;
+    bool encrypted = true;
+
+    if (snprintf(path, sizeof(path), "%s/.gsh/history.vault", home) >=
+        (int)sizeof(path)) {
+        return false;
+    }
+    descriptor = open(path, O_RDONLY);
+    if (descriptor == -1 || fstat(descriptor, &status) == -1 ||
+        !S_ISREG(status.st_mode) || status.st_uid != geteuid() ||
+        (status.st_mode & 0077) != 0) {
+        if (descriptor >= 0) {
+            (void)close(descriptor);
+        }
+        return false;
+    }
+    for (reads = 0; reads < 1024U; reads++) {
+        ssize_t count = read(descriptor, bytes + carry, 8192U);
+        size_t total;
+
+        if (count < 0 && errno == EINTR) {
+            continue;
+        }
+        if (count <= 0) {
+            encrypted = count == 0;
+            break;
+        }
+        total = carry + (size_t)count;
+        if (find_bytes(bytes, total, plaintext) != NULL) {
+            encrypted = false;
+            break;
+        }
+        carry = total < sizeof(plaintext) - 1U
+                    ? total
+                    : sizeof(plaintext) - 1U;
+        memmove(bytes, bytes + total - carry, carry);
+    }
+    (void)close(descriptor);
+    return encrypted;
+}
+
+static int create_history_vault(pty_session *session)
+{
+    static const char passphrase[] = "history test passphrase";
+
+    if (consume_through(session, "New history passphrase: ",
+                        TEST_TIMEOUT_MS) == -1 ||
+        send_text(session, "history test passphrase\r") == -1 ||
+        consume_through(session, "Confirm history passphrase: ",
+                        TEST_TIMEOUT_MS) == -1 ||
+        send_text(session, "history test passphrase\r") == -1 ||
+        consume_through(session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        capture_contains(session, passphrase)) {
+        return -1;
+    }
+    return 0;
+}
+
+static int exercise_history_editor(pty_session *session)
+{
+    static const char alpha[] = "/usr/bin/printf 'HISTORY_ALPHA\\n'";
+    static const char beta[] = "/usr/bin/printf 'HISTORY_BETA\\n'";
+
+    if (send_text(session, "/usr/bin/printf 'HISTORY_ALPHA\\n'\r") == -1 ||
+        consume_through(session, "HISTORY_ALPHA\r\n", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        send_text(session, "/usr/bin/printf 'HISTORY_BETA\\n'\r") == -1 ||
+        consume_through(session, "HISTORY_BETA\r\n", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        send_bytes(session, "\033[A", 3) == -1 ||
+        consume_through(session, beta, TEST_TIMEOUT_MS) == -1 ||
+        send_bytes(session, "\033[A", 3) == -1 ||
+        consume_through(session, alpha, TEST_TIMEOUT_MS) == -1 ||
+        send_bytes(session, "\033[B", 3) == -1 ||
+        consume_through(session, beta, TEST_TIMEOUT_MS) == -1 ||
+        send_bytes(session, "\025\022ALPHA", 7) == -1 ||
+        consume_through(session, "(reverse-i-search)`ALPHA': ",
+                        TEST_TIMEOUT_MS) == -1 ||
+        consume_through(session, alpha, TEST_TIMEOUT_MS) == -1 ||
+        send_text(session, "\r") == -1 ||
+        consume_through(session, "HISTORY_ALPHA\r\n", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        send_text(session,
+                  " /usr/bin/printf 'HISTORY_PRIVATE\\n' \r") == -1 ||
+        consume_through(session, "HISTORY_PRIVATE\r\n", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        send_bytes(session, "\033[A", 3) == -1 ||
+        consume_through(session, alpha, TEST_TIMEOUT_MS) == -1 ||
+        send_bytes(session, "\025", 1) == -1 ||
+        send_text(session, "history status\r") == -1 ||
+        consume_through(session, "entries=4 max=1024 unlock=infinite",
+                        TEST_TIMEOUT_MS) == -1 ||
+        consume_through(session, "$gsh> ", TEST_TIMEOUT_MS) == -1) {
+        return -1;
+    }
+    return 0;
+}
+
+static int shutdown_history_agent(pty_session *session)
+{
+    return send_bytes(session, "\025", 1) == -1 ||
+                   send_text(session, "history shutdown\r") == -1 ||
+                   consume_through(session, "history agent stopped",
+                                   TEST_TIMEOUT_MS) == -1
+               ? -1
+               : 0;
+}
+
+static int verify_unlocked_reuse(pty_session *session)
+{
+    if (consume_through(session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        send_bytes(session, "\033[A", 3) == -1 ||
+        consume_through(session, "exit 0", TEST_TIMEOUT_MS) == -1 ||
+        send_bytes(session, "\025\022ALPHA", 7) == -1 ||
+        consume_through(session, "(reverse-i-search)`ALPHA': ",
+                        TEST_TIMEOUT_MS) == -1 ||
+        consume_through(session, "HISTORY_ALPHA", TEST_TIMEOUT_MS) == -1 ||
+        send_bytes(session, "\033x", 2) == -1 ||
+        shutdown_history_agent(session) == -1) {
+        return -1;
+    }
+    return 0;
+}
+
+static int verify_fresh_agent_unlock(pty_session *session)
+{
+    if (consume_through(session, "History passphrase: ",
+                        TEST_TIMEOUT_MS) == -1 ||
+        send_text(session, "history test passphrase\r") == -1 ||
+        consume_through(session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        send_bytes(session, "\033[A", 3) == -1 ||
+        consume_through(session, "history shutdown", TEST_TIMEOUT_MS) == -1 ||
+        shutdown_history_agent(session) == -1) {
+        return -1;
+    }
+    return 0;
+}
+
+static int run_initial_history_session(const char *executable,
+                                       const char *home)
+{
+    pty_session session;
+    int failed = 0;
+
+    if (start_session(&session, executable, home, SHELL_GSH) == -1) {
+        return -1;
+    }
+    if (create_history_vault(&session) == -1 ||
+        exercise_history_editor(&session) == -1 ||
+        send_bytes(&session, "\025", 1) == -1 ||
+        consume_through(&session, "History reminder", 5000) == -1 ||
+        send_text(&session, "wrong history passphrase\r") == -1 ||
+        consume_through(&session, "history remains unlocked",
+                        TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "History reminder", 5000) == -1 ||
+        send_text(&session, "history test passphrase\r") == -1 ||
+        consume_through(&session, "passphrase remembered",
+                        TEST_TIMEOUT_MS) == -1) {
+        failed = -1;
+    }
+    if (stop_session(&session) == -1) {
+        failed = -1;
+    }
+    return failed;
+}
+
+static int run_reused_history_session(const char *executable,
+                                      const char *home)
+{
+    pty_session session;
+    int failed = 0;
+
+    if (start_session(&session, executable, home, SHELL_GSH) == -1) {
+        return -1;
+    }
+    if (verify_unlocked_reuse(&session) == -1) {
+        failed = -1;
+    }
+    if (stop_session(&session) == -1) {
+        failed = -1;
+    }
+    return failed;
+}
+
+static int run_fresh_history_session(const char *executable,
+                                     const char *home)
+{
+    pty_session session;
+    int failed = 0;
+
+    if (start_session(&session, executable, home, SHELL_GSH) == -1) {
+        return -1;
+    }
+    if (verify_fresh_agent_unlock(&session) == -1) {
+        failed = -1;
+    }
+    if (stop_session(&session) == -1) {
+        failed = -1;
+    }
+    return failed;
+}
+
+static int history_flow(const char *executable)
+{
+    char home[] = "/tmp/gsh-history-XXXXXX";
+    char saved_home[PATH_MAX];
+    const char *current_home = getenv("HOME");
+    int failed = 0;
+
+    saved_home[0] = '\0';
+    if (current_home != NULL && strlen(current_home) < sizeof(saved_home)) {
+        memcpy(saved_home, current_home, strlen(current_home) + 1U);
+    }
+    if (mkdtemp(home) == NULL || write_history_config(home) == -1 ||
+        setenv("HOME", home, 1) == -1 ||
+        setenv("GSH_HARNESS_HISTORY", "1", 1) == -1) {
+        failed = 1;
+    } else if (run_initial_history_session(executable, home) == -1 ||
+               !history_vault_is_encrypted(home)) {
+        failed = 1;
+    }
+    if (!failed &&
+        (setenv("GSH_HARNESS_MANAGED", "1", 1) == -1 ||
+         run_reused_history_session(executable, home) == -1)) {
+        failed = 1;
+    }
+    (void)unsetenv("GSH_HARNESS_MANAGED");
+    if (!failed && run_fresh_history_session(executable, home) == -1) {
+        failed = 1;
+    }
+    (void)unsetenv("GSH_HARNESS_HISTORY");
+    if (saved_home[0] != '\0') {
+        (void)setenv("HOME", saved_home, 1);
+    } else {
+        (void)unsetenv("HOME");
+    }
+    remove_history_fixture(home);
+    return failed;
+}
+
 static int ordinary_flow(const char *executable)
 {
     char fixture[] = "/tmp/gsh-pty-flow-XXXXXX";
@@ -880,7 +1198,8 @@ static int ordinary_flow(const char *executable)
     }
 
     if (consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "[bench] $gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "\033[90m[bench]\033[0m $gsh> ",
+                        TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "/usr/bin/true\r") == -1 ||
         consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session,
@@ -1009,7 +1328,7 @@ static int managed_repl_concurrency(pty_session *session)
 
     if (send_text(session, "/bin/sleep 1\r") == -1 ||
         consume_through(session,
-                        "/bin/sleep 1\r\n\r\n$gsh> ",
+                        "/bin/sleep 1\r\n\r\n\033[90m[○]\033[0m $gsh> ",
                         TEST_TIMEOUT_MS) == -1) {
         return -1;
     }
@@ -1026,6 +1345,53 @@ static int managed_repl_concurrency(pty_session *session)
     return 0;
 }
 
+static int managed_repl_indicator(pty_session *session)
+{
+    static const char command[] =
+        "/bin/sh -c 'sleep .3; printf INDICATOR_DONE'\r";
+
+    session->capture_length = 0;
+    if (send_text(session, command) == -1 ||
+        wait_for_output(session, "\033[90m[○]\033[0m $gsh> ",
+                        TEST_TIMEOUT_MS) == -1 ||
+        send_text(session, "STYLE_PRESERVED") == -1 ||
+        wait_for_output(session,
+                        "\033[90m[○]\033[0m $gsh> STYLE_PRESERVED",
+                        TEST_TIMEOUT_MS) == -1 ||
+        send_bytes(session, "\025", 1) == -1 ||
+        wait_for_output(session,
+                        "INDICATOR_DONE\r\n\033[90m[○]\033[0m $gsh> ",
+                        TEST_TIMEOUT_MS) == -1 ||
+        wait_for_output(session,
+                        "INDICATOR_DONE\r\n\033[90m[●]\033[0m $gsh> ",
+                        TEST_TIMEOUT_MS) == -1) {
+        return -1;
+    }
+    return 0;
+}
+
+static int managed_repl_terminal_outcomes(pty_session *session)
+{
+    session->capture_length = 0;
+    if (send_text(session, "/bin/sh -c 'sleep .2; exit 7'\r") == -1 ||
+        wait_for_output(session, "\033[90m[○]\033[0m $gsh> ",
+                        TEST_TIMEOUT_MS) == -1 ||
+        wait_for_output(session, "\033[90m[●]\033[0m $gsh> ",
+                        TEST_TIMEOUT_MS) == -1) {
+        return -1;
+    }
+    session->capture_length = 0;
+    if (send_text(session,
+                  "/bin/sh -c 'sleep .2; kill -TERM $$'\r") == -1 ||
+        wait_for_output(session, "\033[90m[○]\033[0m $gsh> ",
+                        TEST_TIMEOUT_MS) == -1 ||
+        wait_for_output(session, "\033[90m[●]\033[0m $gsh> ",
+                        TEST_TIMEOUT_MS) == -1) {
+        return -1;
+    }
+    return 0;
+}
+
 static int managed_repl_compound_overtake(pty_session *session)
 {
     static const char loop[] =
@@ -1034,7 +1400,8 @@ static int managed_repl_compound_overtake(pty_session *session)
     uint64_t start;
 
     if (send_text(session, loop) == -1 ||
-        consume_through(session, "done\r\n\r\n$gsh> ",
+        consume_through(session,
+                        "done\r\n\r\n\033[90m[○]\033[0m $gsh> ",
                         TEST_TIMEOUT_MS) == -1) {
         return -1;
     }
@@ -1058,7 +1425,8 @@ static int managed_repl_launch_state_fence(pty_session *session)
     uint64_t start;
 
     if (send_text(session, loop) == -1 ||
-        consume_through(session, "done\r\n\r\n$gsh> ",
+        consume_through(session,
+                        "done\r\n\r\n\033[90m[○]\033[0m $gsh> ",
                         TEST_TIMEOUT_MS) == -1) {
         return -1;
     }
@@ -1077,7 +1445,7 @@ static int managed_repl_preserves_edit(pty_session *session)
     if (send_text(session,
                   "/bin/sh -c 'sleep 0.2; printf LATE'\r") == -1 ||
         consume_through(session,
-                        "printf LATE'\r\n\r\n$gsh> ",
+                        "printf LATE'\r\n\r\n\033[90m[○]\033[0m $gsh> ",
                         TEST_TIMEOUT_MS) == -1 ||
         send_text(session, "PRESERVED") == -1 ||
         consume_through(session, "LATE", TEST_TIMEOUT_MS) == -1 ||
@@ -1095,7 +1463,7 @@ static int managed_repl_focus(pty_session *session)
                         TEST_TIMEOUT_MS) == -1 ||
         send_text(session, "/bin/cat\r") == -1 ||
         consume_through(session,
-                        "/bin/cat\r\n\r\n$gsh> ",
+                        "/bin/cat\r\n\r\n\033[90m[○]\033[0m $gsh> ",
                         TEST_TIMEOUT_MS) == -1 ||
         send_text(session, "fg\r") == -1 ||
         consume_through(session, "[focused cell ", TEST_TIMEOUT_MS) == -1 ||
@@ -1104,6 +1472,8 @@ static int managed_repl_focus(pty_session *session)
                         TEST_TIMEOUT_MS) == -1 ||
         send_bytes(session, "\032", 1) == -1 ||
         consume_through(session, "[stopped]", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(session, "\033[90m[○]\033[0m $gsh> ",
+                        TEST_TIMEOUT_MS) == -1 ||
         send_text(session, "bg\r") == -1 ||
         consume_through(session, "[continued]",
                         TEST_TIMEOUT_MS) == -1 ||
@@ -1118,6 +1488,78 @@ static int managed_repl_focus(pty_session *session)
     return 0;
 }
 
+static int managed_repl_private_input_autofocus(pty_session *session)
+{
+    static const char command[] =
+        "/bin/sh -c 'sleep .2; stty -echo; echo PRIVATE_INPUT; read x; "
+        "stty echo; echo PRIVATE_ACCEPTED'\r";
+    static const char secret[] = "PRIVATE_SECRET_42\r";
+
+    session->capture_length = 0;
+    if (send_text(session, command) == -1 ||
+        consume_through(session,
+                        "\r\n\r\n\033[90m[○]\033[0m $gsh> ",
+                        TEST_TIMEOUT_MS) == -1 ||
+        send_text(session, "PRESERVED") == -1 ||
+        wait_for_output(session, "\r\nPRIVATE_INPUT\r\n",
+                        TEST_TIMEOUT_MS) == -1 ||
+        wait_for_output(session,
+                        "\033[90m[○]\033[0m $gsh> PRESERVED",
+                        TEST_TIMEOUT_MS) == -1 ||
+        send_text(session, secret) == -1 ||
+        wait_for_output(session, "PRIVATE_ACCEPTED", TEST_TIMEOUT_MS) == -1 ||
+        capture_contains(session, "PRIVATE_SECRET_42") ||
+        consume_through(session, "PRIVATE_ACCEPTED", TEST_TIMEOUT_MS) == -1 ||
+        wait_for_output(session,
+                        "\n\033[90m[●]\033[0m $gsh> PRESERVED",
+                        TEST_TIMEOUT_MS) == -1 ||
+        send_bytes(session, "\025", 1) == -1 ||
+        send_text(session, "/usr/bin/printf FOCUS_RETURNED\r") == -1 ||
+        consume_through(session, "FOCUS_RETURNED", TEST_TIMEOUT_MS) == -1) {
+        return -1;
+    }
+    return 0;
+}
+
+static int managed_repl_fullscreen_focus(pty_session *session)
+{
+    static const char command[] =
+        "/bin/sh -c 'trap \"\" WINCH; saved=$(/bin/stty -g); "
+        "/bin/stty -echo -icanon min 1 time 0; "
+        "/usr/bin/printf \"\\033[?1049h\\033[31mUTF8=\\342\"; "
+        "/bin/sleep 0.05; "
+        "/usr/bin/printf \"\\225\\255\\342\\224\\200\\342\\225\\256 "
+        "\\342\\200\\242 FULLSCREEN_READY\"; "
+        "/bin/dd of=/dev/null bs=1 count=1 2>/dev/null; "
+        "/bin/stty \"$saved\"; "
+        "/usr/bin/printf \"\\033[0mFULLSCREEN_EXITED\\033[?1049l\"'\r";
+
+    session->capture_length = 0;
+    if (send_text(session, command) == -1 ||
+        wait_for_output(session, "\033[31mUTF8=╭─╮ • FULLSCREEN_READY",
+                        TEST_TIMEOUT_MS) == -1 ||
+        capture_contains(session, "\033[?1049h") ||
+        send_bytes(session, "\035", 1) == -1 ||
+        wait_for_output(session, "[full-screen session]",
+                        TEST_TIMEOUT_MS) == -1 ||
+        send_text(session, "DETACHED_EDITOR") == -1 ||
+        wait_for_output(session, "$gsh> DETACHED_EDITOR",
+                        TEST_TIMEOUT_MS) == -1 ||
+        send_bytes(session, "\025", 1) == -1 ||
+        send_text(session, "fg\r") == -1 ||
+        wait_for_output(session, "[focused cell ", TEST_TIMEOUT_MS) == -1 ||
+        send_text(session, "q") == -1 ||
+        consume_through(session, "FULLSCREEN_EXITED",
+                        TEST_TIMEOUT_MS) == -1 ||
+        wait_for_output(session, "\033[90m[●]\033[0m $gsh> ",
+                        TEST_TIMEOUT_MS) == -1 ||
+        send_text(session, "/usr/bin/printf AFTER_FULLSCREEN\r") == -1 ||
+        wait_for_output(session, "AFTER_FULLSCREEN", TEST_TIMEOUT_MS) == -1) {
+        return -1;
+    }
+    return 0;
+}
+
 static int managed_repl_pipeline(pty_session *session)
 {
     uint64_t start;
@@ -1126,7 +1568,7 @@ static int managed_repl_pipeline(pty_session *session)
                   "/bin/sh -c 'sleep 1; printf PIPE_SLOW' | /bin/cat\r") ==
             -1 ||
         consume_through(session,
-                        "| /bin/cat\r\n\r\n$gsh> ",
+                        "| /bin/cat\r\n\r\n\033[90m[○]\033[0m $gsh> ",
                         TEST_TIMEOUT_MS) == -1) {
         return -1;
     }
@@ -1211,6 +1653,80 @@ static int managed_repl_saturation(pty_session *session)
     return 0;
 }
 
+static int managed_repl_toggle(pty_session *session)
+{
+    uint64_t start;
+
+    session->capture_length = 0;
+    if (send_text(session, "/bin/sleep 2\r") == -1 ||
+        wait_for_output(session, "\033[90m[○]\033[0m $gsh> ",
+                        TEST_TIMEOUT_MS) == -1 ||
+        send_text(session, "/async\r") == -1 ||
+        wait_for_output(session, "async repl: off pending",
+                        TEST_TIMEOUT_MS) == -1) {
+        return -1;
+    }
+    start = monotonic_ns();
+    if (send_text(session, "/usr/bin/printf TOGGLE_FAST\r") == -1 ||
+        wait_for_output(session, "TOGGLE_FAST", TEST_TIMEOUT_MS) == -1 ||
+        monotonic_ns() - start >= 800000000ULL ||
+        send_text(session, "/async\r") == -1 ||
+        wait_for_output(session,
+                        "async repl: transition cancelled; remains on",
+                        TEST_TIMEOUT_MS) == -1 ||
+        send_text(session, "/async\r") == -1 ||
+        wait_for_output(session, "async repl: off pending",
+                        TEST_TIMEOUT_MS) == -1 ||
+        wait_for_output(session, "\033[?1049lasync repl: off",
+                        TEST_TIMEOUT_MS) == -1) {
+        errno = ETIMEDOUT;
+        return -1;
+    }
+    session->capture_length = 0;
+    if (send_text(session, "/async\r") == -1 ||
+        wait_for_output(session, "\033[?1049h", TEST_TIMEOUT_MS) == -1 ||
+        wait_for_output(session, "async repl: on",
+                        TEST_TIMEOUT_MS) == -1 ||
+        wait_for_output(session, "\033[90m[●]\033[0m $gsh> ",
+                        TEST_TIMEOUT_MS) == -1 ||
+        capture_contains(session, "async repl: on pending")) {
+        errno = ETIMEDOUT;
+        return -1;
+    }
+    session->capture_length = 0;
+    if (send_text(session, "/async\r") == -1 ||
+        wait_for_output(session, "\033[?1049lasync repl: off",
+                        TEST_TIMEOUT_MS) == -1 ||
+        capture_contains(session, "async repl: off pending")) {
+        return -1;
+    }
+    session->capture_length = 0;
+    if (send_text(session, "/async\r") == -1 ||
+        wait_for_output(session, "\033[?1049h", TEST_TIMEOUT_MS) == -1 ||
+        wait_for_output(session, "async repl: on", TEST_TIMEOUT_MS) == -1 ||
+        wait_for_output(session, "\033[90m[●]\033[0m $gsh> ",
+                        TEST_TIMEOUT_MS) == -1 ||
+        capture_contains(session, "async repl: on pending")) {
+        return -1;
+    }
+    session->capture_length = 0;
+    if (send_text(session, "/async\r") == -1 ||
+        wait_for_output(session, "\033[?1049lasync repl: off",
+                        TEST_TIMEOUT_MS) == -1 ||
+        send_text(session, "/bin/sleep 1 &\r") == -1 ||
+        wait_for_output(session, "[1] ", TEST_TIMEOUT_MS) == -1 ||
+        send_text(session, "/async\r") == -1 ||
+        wait_for_output(session, "async repl: on pending",
+                        TEST_TIMEOUT_MS) == -1 ||
+        wait_for_output(session, "\033[?1049h", TEST_TIMEOUT_MS) == -1 ||
+        wait_for_output(session, "async repl: on", TEST_TIMEOUT_MS) == -1 ||
+        wait_for_output(session, "\033[90m[●]\033[0m $gsh> ",
+                        TEST_TIMEOUT_MS) == -1) {
+        return -1;
+    }
+    return 0;
+}
+
 static int managed_async_repl_flow(const char *executable)
 {
     char fixture[] = "/tmp/gsh-pty-managed-XXXXXX";
@@ -1223,16 +1739,22 @@ static int managed_async_repl_flow(const char *executable)
         (void)rmdir(fixture);
         return 1;
     }
-    if (consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+    if (consume_through(&session, "\033[90m[●]\033[0m $gsh> ",
+                        TEST_TIMEOUT_MS) == -1 ||
+        managed_repl_indicator(&session) == -1 ||
+        managed_repl_terminal_outcomes(&session) == -1 ||
         managed_repl_concurrency(&session) == -1 ||
         managed_repl_compound_overtake(&session) == -1 ||
         managed_repl_launch_state_fence(&session) == -1 ||
         managed_repl_preserves_edit(&session) == -1 ||
+        managed_repl_private_input_autofocus(&session) == -1 ||
+        managed_repl_fullscreen_focus(&session) == -1 ||
         managed_repl_focus(&session) == -1 ||
         managed_repl_pipeline(&session) == -1 ||
         managed_repl_ordering(&session) == -1 ||
         managed_repl_contains_output(&session) == -1 ||
         managed_repl_resize(&session) == -1 ||
+        managed_repl_toggle(&session) == -1 ||
         managed_repl_saturation(&session) == -1) {
         perror("pty managed: flow");
         dump_capture(&session);
@@ -1241,6 +1763,16 @@ static int managed_async_repl_flow(const char *executable)
     if (stop_session(&session) == -1) {
         fprintf(stderr, "pty managed: shell did not exit cleanly\n");
         failed = 1;
+    }
+    {
+        char config_path[PATH_MAX];
+
+        if (snprintf(config_path, sizeof(config_path), "%s/.gshrc", fixture) >=
+                (int)sizeof(config_path) ||
+            access(config_path, F_OK) == 0 || errno != ENOENT) {
+            fprintf(stderr, "pty managed: /async modified configuration\n");
+            failed = 1;
+        }
     }
     (void)rmdir(fixture);
     return failed;
@@ -3421,7 +3953,8 @@ static int soak_flow(const char *executable, unsigned long seconds)
         return 1;
     }
     if (consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "[bench] $gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "\033[90m[bench]\033[0m $gsh> ",
+                        TEST_TIMEOUT_MS) == -1 ||
         wait_for_diagnostics(&session, "busy=0", "job=idle") == -1) {
         perror("pty soak: initial prompt");
         failed = 1;
@@ -4689,6 +5222,7 @@ int main(int argc, char **argv)
     }
 
     if (ordinary_flow(executable) != 0 ||
+        history_flow(executable) != 0 ||
         managed_async_repl_flow(executable) != 0 ||
         variable_builtin_flow(executable) != 0 ||
         alias_builtin_flow(executable) != 0 ||
@@ -4699,7 +5233,8 @@ int main(int argc, char **argv)
         stalled_worker_flow(executable) != 0) {
         return 1;
     }
-    puts("pty smoke: exec paths, managed async REPL, job control, async "
-         "prompt/redirection, cancellation, and worker deadline passed");
+    puts("pty smoke: exec paths, encrypted history, editor recall/search, "
+         "managed async REPL, job control, async prompt/redirection, "
+         "cancellation, and worker deadline passed");
     return 0;
 }

@@ -28,6 +28,22 @@ bool gsh_background_has_capacity(const gsh_background_table *table)
     return false;
 }
 
+size_t gsh_background_active_count(const gsh_background_table *table)
+{
+    size_t count = 0;
+    size_t index;
+
+    if (table == NULL) {
+        return 0;
+    }
+    for (index = 0; index < GSH_BACKGROUND_CAP; index++) {
+        if (table->entries[index].known && !table->entries[index].done) {
+            count++;
+        }
+    }
+    return count;
+}
+
 int gsh_background_add(gsh_background_table *table, pid_t pid,
                        uint32_t *job_id)
 {

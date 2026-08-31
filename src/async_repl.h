@@ -15,7 +15,10 @@ enum {
     GSH_ASYNC_CELL_OUTPUT_CAP = 16384,
     GSH_ASYNC_VIEW_ROWS = 64,
     GSH_ASYNC_VIEW_COLUMNS = 256,
-    GSH_ASYNC_RENDER_CAP = 32768,
+    GSH_ASYNC_VIEW_BYTES = GSH_ASYNC_VIEW_COLUMNS * 4 + 64,
+    GSH_ASYNC_PASSTHROUGH_SEQUENCE_CAP = 64,
+    GSH_ASYNC_RENDER_CAP =
+        GSH_ASYNC_VIEW_ROWS * (GSH_ASYNC_VIEW_BYTES + 1) + 128,
 };
 
 typedef enum {
@@ -40,7 +43,14 @@ typedef struct {
     bool output_truncated;
     bool last_was_cr;
     bool focused;
+    bool input_requested;
+    bool input_probe_pending;
+    bool fullscreen;
+    bool fullscreen_presented;
+    bool fullscreen_recorded;
+    bool autofocus_suppressed;
     unsigned char escape_state;
+    unsigned char passthrough_state;
     uint64_t id;
     gsh_async_cell_state state;
     pid_t pid;
@@ -56,6 +66,11 @@ typedef struct {
     size_t input_length;
     char output[GSH_ASYNC_CELL_OUTPUT_CAP];
     size_t output_length;
+    char passthrough_utf8[4];
+    unsigned char passthrough_utf8_length;
+    unsigned char passthrough_utf8_expected;
+    char passthrough_sequence[GSH_ASYNC_PASSTHROUGH_SEQUENCE_CAP];
+    size_t passthrough_sequence_length;
 } gsh_async_cell;
 
 typedef struct {
@@ -66,7 +81,7 @@ typedef struct {
     size_t terminal_rows;
     size_t terminal_columns;
     gsh_async_cell cells[GSH_ASYNC_CELL_CAP];
-    char view[GSH_ASYNC_VIEW_ROWS][GSH_ASYNC_VIEW_COLUMNS + 1U];
+    char view[GSH_ASYNC_VIEW_ROWS][GSH_ASYNC_VIEW_BYTES];
     size_t view_lengths[GSH_ASYNC_VIEW_ROWS];
     size_t view_start;
     size_t view_count;
@@ -99,9 +114,19 @@ bool gsh_async_repl_input_pending(const gsh_async_repl *repl,
 int gsh_async_repl_flush_input(gsh_async_repl *repl, int cell_index);
 void gsh_async_repl_close_output(gsh_async_repl *repl, int cell_index);
 size_t gsh_async_repl_job_count(const gsh_async_repl *repl);
+bool gsh_async_repl_all_settled(const gsh_async_repl *repl);
+bool gsh_async_repl_all_settled_except(const gsh_async_repl *repl,
+                                       int ignored_cell);
 int gsh_async_repl_latest_job(const gsh_async_repl *repl);
 int gsh_async_repl_focused_job(const gsh_async_repl *repl);
 int gsh_async_repl_focus(gsh_async_repl *repl, int cell_index);
+int gsh_async_repl_request_input(gsh_async_repl *repl, int cell_index,
+                                 bool fullscreen);
+int gsh_async_repl_autofocus(gsh_async_repl *repl);
+int gsh_async_repl_filter_fullscreen(gsh_async_repl *repl, int cell_index,
+                                     const char *bytes, size_t length,
+                                     char *output, size_t output_capacity,
+                                     size_t *output_length);
 void gsh_async_repl_unfocus(gsh_async_repl *repl);
 void gsh_async_repl_mark_stopped(gsh_async_repl *repl, int cell_index);
 void gsh_async_repl_mark_running(gsh_async_repl *repl, int cell_index);

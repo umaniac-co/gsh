@@ -23,6 +23,7 @@ typedef struct {
 
 void gsh_background_initialize(gsh_background_table *table);
 bool gsh_background_has_capacity(const gsh_background_table *table);
+size_t gsh_background_active_count(const gsh_background_table *table);
 int gsh_background_add(gsh_background_table *table, pid_t pid,
                        uint32_t *job_id);
 bool gsh_background_record(gsh_background_table *table, pid_t pid,

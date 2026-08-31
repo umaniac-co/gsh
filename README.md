@@ -153,7 +153,8 @@ before `gsh` can claim POSIX.1-2024 shell-language conformance.
 The builtins implemented in `gsh` itself include `cd`, `exit`, `pwd`, `export`,
 `readonly`, `unset`, `ulimit`, `umask`, `:`, `true`, `false`, `fg`, `bg`,
 `set`, `shift`, `wait`, `alias`, `unalias`, `help`, and `rt` within their
-currently documented contexts.
+currently documented contexts. The exact standalone interactive control
+submission `/async` toggles the managed REPL for the current session.
 `ulimit` implements the POSIX.1-2024 `-H`,
 `-S`, `-a`, `-c`, `-d`, `-f`, `-n`, `-s`, `-t`, and `-v` resource interface.
 `umask` implements octal masks, `-S`, and POSIX symbolic masks including
@@ -161,17 +162,28 @@ permission copying and the initial-mode semantics of `X`. An unredirected
 standalone invocation of either environment builtin changes the current shell,
 while a pipeline stage remains isolated. The editor is intentionally limited
 to insertion at the end of the line, bounded multiline input with `PS2`,
-UTF-8-aware backspace, `Ctrl-U`, `Ctrl-L`, `Ctrl-C`, and `Ctrl-D`. The managed
-REPL retains 16 bounded cells and runs at most 8 PTY command jobs concurrently;
-`fg` focuses the newest live job, and `Ctrl-]` returns keyboard ownership to
-the editor. The separate POSIX asynchronous-list registry holds 128 direct
-children.
+UTF-8-aware backspace, history arrows, incremental `Ctrl-R`, `Ctrl-U`,
+`Ctrl-L`, `Ctrl-C`, and `Ctrl-D`. The managed
+REPL retains 16 bounded cells and runs at most 8 PTY command jobs concurrently.
+A job that disables terminal echo for private input is focused automatically;
+the preserved editor remains intact and subsequent bytes are routed to that
+job until it releases focus. A job that enters non-canonical terminal mode is
+shown automatically as a contained full-screen session, covering programs such
+as `htop`, editors, pagers, and terminal coding agents without command-specific
+rules. `fg` focuses the newest live job when a program has no detectable
+terminal transition, and `Ctrl-]` remains an explicit emergency return to the
+editor.
+The separate POSIX asynchronous-list registry holds 128 direct children.
 
 ## Requirements
 
 - macOS or Linux
 - a C17 compiler with POSIX APIs (`cc`, Clang, or GCC)
 - `make`
+- libsodium development headers and library
+
+On macOS, install the crypto dependency with `brew install libsodium`. On
+Debian or Ubuntu, install `libsodium-dev`.
 
 The source requests the POSIX.1-2024 feature-test baseline with
 `_POSIX_C_SOURCE=202405L`. Current platform SDKs may still report an older
@@ -184,7 +196,8 @@ on both macOS and Linux and keeps platform capability differences explicit.
 make
 ```
 
-The executable is written to `build/gsh`. To remove it:
+The shell and its per-user history agent are written to `build/gsh` and
+`build/gsh-history-agent`. To remove them:
 
 ```sh
 make clean
@@ -203,7 +216,9 @@ The test and its lifecycle probe are also written in C. They launch the real
 executable through a pseudo-terminal and verify direct execution, shell
 fallback, stop/`fg`/`Ctrl-C` job control, asynchronous Git prompt enrichment,
 isolation of a worker blocked on filesystem I/O, and exact terminal-mode
-restoration.
+restoration. It also exercises encrypted history across agent and shell
+restarts, arrow-key recall, incremental `Ctrl-R`, private commands, and timed
+passphrase reminders.
 
 Additional reliability gates are:
 
@@ -336,18 +351,18 @@ Start the interactive shell from a terminal:
 For example:
 
 ```text
-$gsh> long-running-command
+[main] [●] $gsh> long-running-command
 
-$gsh> printf 'hello\n' | tr a-z A-Z
+[main] [○] $gsh> printf 'hello\n' | tr a-z A-Z
 HELLO
-$gsh> cd /tmp
-$gsh> pwd
+[main] [○] $gsh> cd /tmp
+[main] [○] $gsh> pwd
 /tmp
-$gsh> sleep 1 &
+[main] [○] $gsh> sleep 1 &
 [1] 12345
-$gsh> wait "$!" && printf 'done\n'
+[main] [○] $gsh> wait "$!" && printf 'done\n'
 done
-$gsh> rt
+[main] [●] $gsh> rt
 reactor cycles=... async_jobs=... focus=editor ...
 ```
 
@@ -355,9 +370,16 @@ Enter freezes the submitted prompt and command into a cell with one initial
 output row. The cell grows when additional output rows arrive. The fresh editor
 at the bottom accepts input immediately while independent cells run and finish
 in any order. Shell-state mutations and `$?` dependencies remain ordered. A
-terminal program receives input only after
-`fg`; `Ctrl-]` detaches it without stopping it. The cell and PTY limits are
-fixed, and saturation rejects new work instead of allocating without bound.
+private-input program such as `sudo` receives focus automatically when its PTY
+disables echo; the preserved editor remains unchanged and normal editing
+resumes when the job settles. Non-canonical applications such as `htop`,
+editors, pagers, and terminal coding agents receive an automatic contained
+full-screen focus; their curses protocol is displayed live and the completed
+cell keeps only `[full-screen session]`, not a raw control-sequence dump.
+Line-oriented programs without a detectable transition receive input after
+`fg`; `Ctrl-]` can detach any focused job without stopping it. The cell and PTY
+limits are fixed, and saturation rejects new work instead of allocating
+without bound.
 Long loops and other compound commands do not fence unrelated external work:
 a literal command such as `git status` starts immediately when the running
 compound command has no pending mutation that can alter its launch state.
@@ -369,14 +391,55 @@ can use classic mode:
 GSH_REPL=classic ./build/gsh
 ```
 
+The managed REPL is enabled by default and can be selected persistently with:
+
+```text
+shell.async_repl.enabled = true
+```
+
+An absent key also means `true`. `GSH_REPL=classic` forces classic mode, while
+any explicit non-`classic` value forces managed mode. Enter `/async` as an
+exact standalone interactive line to toggle the current session without
+modifying `~/.gshrc`. If jobs, PTYs, input, state commits, or classic background
+processes are still live, the requested transition remains pending; entering
+`/async` again cancels it.
+
 The future `?` steering and `??` AI queue described by specification 0008 are
 not implemented yet; ordinary shell operation does not depend on an LLM.
+
+Interactive command history retains at most 1024 accepted commands. Use the up
+and down arrows to navigate it and `Ctrl-R` for incremental reverse search. A
+complete command whose first and last bytes are ASCII spaces executes normally
+but is not recorded. History is stored in `~/.gsh/history.vault`, encrypted
+with a passphrase-derived Argon2id key and XChaCha20-Poly1305; the passphrase
+and plaintext entries are never written to `~/.gshrc`.
+
+One per-user `gsh-history-agent` owns the decrypted ring and keeps its key in
+RAM without an automatic expiry. At a cryptographically random interval from
+four through six hours, the next idle prompt asks for the passphrase as a
+memory reminder. A failed or cancelled reminder does not lock history. The
+defaults are created in `~/.gshrc` and can be adjusted declaratively:
+
+```text
+shell.history.unlock_ttl = infinite
+shell.history.reminder_min = 4h
+shell.history.reminder_max = 6h
+```
+
+`history status` reports the effective state. `history lock` explicitly wipes
+the agent key and `history shutdown` stops the agent; the next shell then asks
+for the passphrase before decrypting the existing vault.
 
 `rt` exposes the bounded reactor's local service-time diagnostics. Its 5 ms
 deadline applies only to work performed by the interactive core after `poll()`
 wakes; it is not a guarantee about external commands or the host OS. In a Git
 working tree, the optional branch segment appears asynchronously, for example
-`[main] $gsh>`. Typing and the base prompt never wait for it.
+`[main] [●] $gsh>`. The branch and `[●]` or `[○]` indicator are muted
+gray, while an explicit style reset keeps `$gsh>`, typed text, and command
+output in the terminal's default color. `[●]` means every prior command is
+terminal and its output source is closed; `[○]` means at least one command
+is queued, running, stopped, has pending input/output, or still owns a PTY.
+Typing and the base prompt never wait for Git enrichment.
 
 One command can also be executed without an interactive terminal:
 
@@ -441,7 +504,7 @@ job selection/notification, and dynamic
 command-name or command-substitution forms of parent-owned `wait` are also
 incomplete. The 30 atomic alias requirements are verified on macOS; native
 Linux x86-64 release evidence is still required. Command
-history and completion, AI requests through `?`,
+completion, AI requests through `?`,
 journaling/rewind, and OS automation are also outside this MVP.
 
 The core deliberately has no threads. One reactor remains the sole owner of
