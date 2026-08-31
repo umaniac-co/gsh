@@ -99,6 +99,9 @@ typedef struct {
     gsh_native_redirect redirects[GSH_NATIVE_REDIRECT_CAP];
     size_t redirect_count;
     bool expansion_error;
+    bool command_suppresses_functions;
+    bool command_uses_default_path;
+    bool command_regular_context;
 } gsh_native_command;
 
 typedef struct {

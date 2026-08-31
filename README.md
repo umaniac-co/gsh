@@ -142,6 +142,15 @@ arena provide allocation-free steady-state lookup, parser-guided recursive
 substitution preserves token provenance, and `alias`/`unalias` changes become
 visible in complete-command order. Subshell and asynchronous changes remain
 isolated, while compound mutations commit through a bounded rollback journal.
+`command -v`, `command -V`, and `type` share one bounded, allocation-free
+resolver for reserved words, aliases, special builtins, functions, regular
+builtins, explicit pathnames, and `PATH`; command-local `PATH`, `command -p`,
+redirections, pipelines, and missing-name status are native. The execution form
+of `command` is also native for the implemented target set, including nested
+wrappers, function suppression, `-p`, declaration assignments, temporary
+special-builtin prefixes, redirections, pipelines, and 126/127 propagation.
+It remains incomplete for target builtins not implemented yet; the
+command-location cache required by `hash` is also still missing.
 Function definition, deferred expansion, positional invocation scope,
 environment mutation, `return`, redefinition, and `unset -f` have native
 bounded implementations. Definition/call redirections and function execution
@@ -155,10 +164,11 @@ incomplete. The interactive unsupported-syntax bridge and the external
 `ENOEXEC` script fallback must disappear from normal shell-language execution
 before `gsh` can claim POSIX.1-2024 shell-language conformance.
 
-The builtins implemented in `gsh` itself include `cd`, `exit`, `pwd`, `export`,
+The builtins implemented in `gsh` itself include `cd`, `command` within the
+target set described above, `exit`, `pwd`, `export`,
 `readonly`, `unset`, `ulimit`, `umask`, `:`, `true`, `false`, `fg`, `bg`,
-`set`, `shift`, `wait`, `break`, `continue`, `alias`, `unalias`, `help`, and
-`rt` within their currently documented contexts. The exact standalone
+`set`, `shift`, `type`, `wait`, `break`, `continue`, `alias`, `unalias`,
+`help`, and `rt` within their currently documented contexts. The exact standalone
 interactive control submission `/async` toggles the managed REPL for the
 current session.
 `ulimit` implements the POSIX.1-2024 `-H`,
@@ -294,7 +304,8 @@ It alternates `gsh`, Bash without startup files, and Zsh with `-f`, reporting
 the tool versions, every ordered raw nanosecond sample, p50, p95, p99, maximum,
 and samples over 5 ms. All three shells emit the same-length base prompt.
 Workloads currently cover startup, idle key echo,
-`/usr/bin/true`, variable lookup, assignment, `${parameter:=word}`, arithmetic
+`/usr/bin/true`, variable and command lookup, assignment,
+`${parameter:=word}`, arithmetic
 assignment, a mutating expansion in a two-stage pipeline, `ulimit -S -n`,
 `umask`, `export`, `unset`, `readonly`, finite explicit-list `for`,
 `set -- a b c`, `shift`,

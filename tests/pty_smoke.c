@@ -4535,6 +4535,7 @@ static int latency_benchmark(const char *gsh, const char *bash,
     uint64_t key[BENCH_SHELLS][BENCH_KEY_SAMPLES];
     uint64_t execution[BENCH_SHELLS][BENCH_EXEC_SAMPLES];
     uint64_t lookup[BENCH_SHELLS][BENCH_EXEC_SAMPLES];
+    uint64_t command_lookup[BENCH_SHELLS][BENCH_EXEC_SAMPLES];
     uint64_t assignment[BENCH_SHELLS][BENCH_EXEC_SAMPLES];
     uint64_t assign_default[BENCH_SHELLS][BENCH_EXEC_SAMPLES];
     uint64_t arithmetic_assignment[BENCH_SHELLS][BENCH_EXEC_SAMPLES];
@@ -4657,6 +4658,9 @@ static int latency_benchmark(const char *gsh, const char *bash,
         benchmark_prompt_command(
             sessions, specs, lookup, "GSH_BENCH_VALUE=value\r",
             ": \"${GSH_BENCH_VALUE}\"\r", "variable lookup") == -1 ||
+        benchmark_prompt_command(
+            sessions, specs, command_lookup, NULL,
+            "command -v true\r", "command lookup") == -1 ||
         benchmark_prompt_command(sessions, specs, assignment, NULL,
                                  "GSH_BENCH_ASSIGN=value\r",
                                  "variable assignment") == -1 ||
@@ -4810,6 +4814,8 @@ done:
                           execution[offset], BENCH_EXEC_SAMPLES);
         print_raw_samples(specs[offset].name, "variable-lookup",
                           lookup[offset], BENCH_EXEC_SAMPLES);
+        print_raw_samples(specs[offset].name, "command-lookup",
+                          command_lookup[offset], BENCH_EXEC_SAMPLES);
         print_raw_samples(specs[offset].name, "variable-assignment",
                           assignment[offset], BENCH_EXEC_SAMPLES);
         print_raw_samples(specs[offset].name, "parameter-assign-default",
@@ -4874,6 +4880,8 @@ done:
         print_metric("true-enter-to-prompt", execution[offset],
                      BENCH_EXEC_SAMPLES, 5000000ULL);
         print_metric("variable-lookup", lookup[offset],
+                     BENCH_EXEC_SAMPLES, 5000000ULL);
+        print_metric("command-lookup", command_lookup[offset],
                      BENCH_EXEC_SAMPLES, 5000000ULL);
         print_metric("variable-assignment", assignment[offset],
                      BENCH_EXEC_SAMPLES, 5000000ULL);

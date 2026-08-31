@@ -35,6 +35,7 @@
 
 #include "builtin_cd.h"
 #include "builtin_alias.h"
+#include "builtin_command.h"
 #include "builtin_unalias.h"
 #include "builtin_ulimit.h"
 #include "builtin_umask.h"
@@ -3211,8 +3212,7 @@ static bool native_cd_builtin(const gsh_native_command *command)
 
 static bool native_environment_builtin(const gsh_native_command *command)
 {
-    return command->argc > 0 && command->assignment_count == 0 &&
-           command->redirect_count == 0 &&
+    return command->argc > 0 &&
            (strcmp(command->argv[0], "ulimit") == 0 ||
             strcmp(command->argv[0], "umask") == 0);
 }
@@ -3244,6 +3244,62 @@ static bool native_alias_builtin(const gsh_native_command *command)
             strcmp(command->argv[0], "unalias") == 0);
 }
 
+static bool native_command_inspection_builtin(
+    const gsh_native_command *command)
+{
+    return command->argc > 0 && gsh_command_is_inspection_builtin(
+                                      command->argc, command->argv);
+}
+
+/* ── Command Wrappers Become Explicit Execution Policy ───────────────
+ * Leaving `command` as an argv prefix would require every dispatcher to
+ * reinterpret its options and would make nested wrappers disagree.  After
+ * expansion, a bounded normalization removes execution-form wrappers and
+ * records the three semantic differences on the planned command.  A function
+ * named command still wins ordinary lookup; once a wrapper is active, later
+ * function lookup is deliberately suppressed as POSIX requires.
+ * ─────────────────────────────────────────────────────────────── */
+static void normalize_command_invocations(
+    gsh_native_pipeline *pipeline, const gsh_function_store *functions)
+{
+    size_t command_index;
+
+    for (command_index = 0;
+         command_index < pipeline->command_count &&
+         command_index < GSH_NATIVE_PIPELINE_CAP; command_index++) {
+        gsh_native_command *command = &pipeline->commands[command_index];
+        size_t wrappers = 0;
+
+        while (command->argc != 0 &&
+               wrappers < GSH_NATIVE_ARGUMENT_CAP &&
+               strcmp(command->argv[0], "command") == 0) {
+            gsh_command_invocation invocation;
+            size_t remaining;
+
+            if (!command->command_suppresses_functions &&
+                functions != NULL &&
+                gsh_functions_lookup(functions, "command", 7U) != NULL) {
+                break;
+            }
+            invocation = gsh_command_parse(command->argc, command->argv);
+            if (invocation.form != GSH_COMMAND_FORM_EXECUTE) {
+                break;
+            }
+            remaining = command->argc - invocation.first_operand;
+            memmove(command->argv,
+                    command->argv + invocation.first_operand,
+                    remaining * sizeof(command->argv[0]));
+            command->argc = remaining;
+            command->argv[remaining] = NULL;
+            command->command_suppresses_functions = true;
+            command->command_uses_default_path =
+                invocation.use_default_path;
+            command->command_regular_context = true;
+            wrappers++;
+        }
+    }
+}
+
 static bool native_return_builtin(const gsh_native_command *command)
 {
     return command->argc > 0 && strcmp(command->argv[0], "return") == 0;
@@ -3259,20 +3315,7 @@ static bool native_loop_control_builtin(
 
 static bool special_builtin_name(const char *name, size_t length)
 {
-    static const char *const names[] = {
-        ".",      ":",      "break",  "continue", "eval", "exec",
-        "exit",   "export", "readonly", "return", "set",  "shift",
-        "times",  "trap",   "unset",
-    };
-    size_t index;
-
-    for (index = 0; index < sizeof(names) / sizeof(names[0]); index++) {
-        if (strlen(names[index]) == length &&
-            memcmp(names[index], name, length) == 0) {
-            return true;
-        }
-    }
-    return false;
+    return gsh_command_special_builtin_name(name, length);
 }
 
 static bool native_alias_mutates(const gsh_native_command *command)
@@ -3349,6 +3392,8 @@ static bool native_pipeline_requires_evaluator(
            (native_cd_builtin(command) &&
             command->redirect_count != 0) ||
            (native_alias_builtin(command) &&
+            command->redirect_count != 0) ||
+           (native_command_inspection_builtin(command) &&
             command->redirect_count != 0) ||
            (native_colon_builtin(command) &&
             command->assignment_count != 0 &&
@@ -3465,6 +3510,20 @@ static int run_native_alias_builtin(
                                    journal, io)
                : gsh_builtin_unalias(command->argc, command->argv, aliases,
                                      journal, io);
+}
+
+static int run_native_command_inspection(
+    const gsh_native_command *command, const char *path,
+    const char *default_path, const gsh_alias_store *aliases,
+    const gsh_function_store *functions, const gsh_builtin_io *io)
+{
+    if (strcmp(command->argv[0], "type") == 0) {
+        return gsh_builtin_type(command->argc, command->argv, path, aliases,
+                                functions, io);
+    }
+    return gsh_builtin_command_inspect(
+        command->argc, command->argv, path, default_path, aliases,
+        functions, io);
 }
 
 static const gsh_builtin_io descriptor_builtin_io = {
@@ -3661,7 +3720,7 @@ static bool native_planned_command_is_supported(
     if (native_stateless_builtin(native, &builtin_status)) {
         return true;
     }
-    if (native_pwd_builtin(native) && native->assignment_count == 0) {
+    if (native_pwd_builtin(native)) {
         return true;
     }
     if (native_cd_builtin(native)) {
@@ -3677,14 +3736,20 @@ static bool native_planned_command_is_supported(
         return true;
     }
     if (native_wait_builtin(native)) {
-        return native->assignment_count == 0 &&
+        return (native->assignment_count == 0 ||
+                native->command_regular_context) &&
                native->redirect_count == 0;
     }
     if (native_alias_builtin(native)) {
         return true;
     }
+    if (native_command_inspection_builtin(native)) {
+        return true;
+    }
     if (native_return_builtin(native)) {
-        return native->assignment_count == 0 && native->redirect_count == 0;
+        return (native->assignment_count == 0 ||
+                native->command_regular_context) &&
+               native->redirect_count == 0;
     }
     if (native_loop_control_builtin(native)) {
         return pipeline->command_count == 1U;
@@ -3769,6 +3834,17 @@ static int apply_native_assignments(gsh_variable_store *variables,
         }
     }
     return 0;
+}
+
+static int apply_special_builtin_assignments(
+    gsh_variable_store *variables, gsh_variable_journal *journal,
+    const gsh_native_command *command,
+    const gsh_shell_options *options)
+{
+    return command->command_regular_context
+               ? GSH_ASSIGNMENT_OK
+               : apply_native_assignments(variables, journal, command,
+                                          options);
 }
 
 static int child_duplicate_descriptor(int source, int destination)
@@ -4052,8 +4128,8 @@ static int run_evaluator_variable_builtin(
         return 1;
     }
     {
-        int assignment_status =
-            apply_native_assignments(variables, journal, command, options);
+        int assignment_status = apply_special_builtin_assignments(
+            variables, journal, command, options);
 
         if (assignment_status != GSH_ASSIGNMENT_OK) {
             perror("gsh: assignment");
@@ -4122,7 +4198,8 @@ static int run_evaluator_state_builtin(
         (void)restore_redirect_descriptors(saved, saved_count);
         return 1;
     }
-    status = apply_native_assignments(variables, journal, command, options);
+    status = apply_special_builtin_assignments(
+        variables, journal, command, options);
     if (status != GSH_ASSIGNMENT_OK) {
         perror("gsh: assignment");
         status = status == GSH_ASSIGNMENT_JOURNAL_ERROR ? 125 : 1;
@@ -4200,7 +4277,8 @@ static int run_evaluator_colon_builtin(
         (void)restore_redirect_descriptors(saved, saved_count);
         return 1;
     }
-    status = apply_native_assignments(variables, journal, command, options);
+    status = apply_special_builtin_assignments(
+        variables, journal, command, options);
     if (status != GSH_ASSIGNMENT_OK) {
         perror("gsh: assignment");
         status = status == GSH_ASSIGNMENT_JOURNAL_ERROR ? 125 : 1;
@@ -4535,7 +4613,7 @@ static void start_native_pipeline(shell_state *state,
                 }
                 if (native_variable_builtin(
                         &pipeline->commands[index])) {
-                    if (apply_native_assignments(
+                    if (apply_special_builtin_assignments(
                             state->variables, NULL,
                             &pipeline->commands[index], &state->options) !=
                         GSH_ASSIGNMENT_OK) {
@@ -4554,7 +4632,7 @@ static void start_native_pipeline(shell_state *state,
                         gsh_positionals_initialize(&empty);
                         positionals = &empty;
                     }
-                    if (apply_native_assignments(
+                    if (apply_special_builtin_assignments(
                             state->variables, NULL,
                             &pipeline->commands[index], &state->options) !=
                         GSH_ASSIGNMENT_OK) {
@@ -4571,6 +4649,18 @@ static void start_native_pipeline(shell_state *state,
                 if (native_alias_builtin(&pipeline->commands[index])) {
                     _exit(run_native_alias_builtin(
                         &pipeline->commands[index], state->aliases, NULL,
+                        &descriptor_builtin_io));
+                }
+                if (native_command_inspection_builtin(
+                        &pipeline->commands[index])) {
+                    const gsh_native_command *command =
+                        &pipeline->commands[index];
+                    const char *path = command_path_value(
+                        state->variables, command, state->default_path);
+
+                    _exit(run_native_command_inspection(
+                        command, path, state->default_path,
+                        state->aliases, state->functions,
                         &descriptor_builtin_io));
                 }
             }
@@ -5091,6 +5181,9 @@ static const char *command_path_value(
     const gsh_variable_store *variables, const gsh_native_command *command,
     const char *default_path)
 {
+    if (command != NULL && command->command_uses_default_path) {
+        return default_path;
+    }
     return command_path_override(
         command, store_path_value(variables, default_path));
 }
@@ -5103,6 +5196,9 @@ static const char *scoped_command_path_value(
     const char *path = gsh_variable_journal_lookup_scoped(
         scope->changes, command_scope, "PATH", 4, &state);
 
+    if (command != NULL && command->command_uses_default_path) {
+        return default_path;
+    }
     if (state == GSH_VARIABLE_JOURNAL_VALUE_ABSENT) {
         path = store_path_value(scope->base, default_path);
     } else if (state == GSH_VARIABLE_JOURNAL_VALUE_UNSET) {
@@ -5384,6 +5480,14 @@ static bool run_planned_main_builtin(shell_state *state,
         return false;
     }
     command = &pipeline->commands[0];
+    if (command->argc != 0 &&
+        !command->command_suppresses_functions &&
+        !special_builtin_name(command->argv[0],
+                              strlen(command->argv[0])) &&
+        gsh_functions_lookup(state->functions, command->argv[0],
+                             strlen(command->argv[0])) != NULL) {
+        return false;
+    }
     if (start_async_stateless_redirection(state, pipeline, command)) {
         return true;
     }
@@ -5427,6 +5531,24 @@ static bool run_planned_main_builtin(shell_state *state,
         queue_prompt(state);
         return true;
     }
+    if (native_command_inspection_builtin(command) &&
+        command->redirect_count == 0 &&
+        gsh_functions_lookup(state->functions, command->argv[0],
+                             strlen(command->argv[0])) == NULL) {
+        const gsh_builtin_io io = {reactor_builtin_output, state};
+        const char *path = command_path_value(
+            state->variables, command, state->default_path);
+        int status = run_native_command_inspection(
+            command, path, state->default_path, state->aliases,
+            state->functions, &io);
+
+        state->last_status = pipeline->negated
+                                 ? (status == 0 ? 1 : 0)
+                                 : status;
+        state->mode = MODE_EDITOR;
+        queue_prompt(state);
+        return true;
+    }
     if (native_state_builtin(command) &&
         command->redirect_count == 0) {
         const gsh_builtin_io io = {reactor_builtin_output, state};
@@ -5436,7 +5558,7 @@ static bool run_planned_main_builtin(shell_state *state,
             output_text(state,
                         "gsh: positional parameter allocation failed\r\n");
             status = 125;
-        } else if (apply_native_assignments(
+        } else if (apply_special_builtin_assignments(
                        state->variables, NULL, command, &state->options) !=
                    GSH_ASSIGNMENT_OK) {
             output_format(state, "gsh: assignment: %s\r\n",
@@ -5462,8 +5584,8 @@ static bool run_planned_main_builtin(shell_state *state,
         bool function_mutates = native_function_mutates(command);
         int status;
 
-        if (apply_native_assignments(state->variables, NULL, command,
-                                     &state->options) !=
+        if (apply_special_builtin_assignments(
+                state->variables, NULL, command, &state->options) !=
             GSH_ASSIGNMENT_OK) {
             output_format(state, "gsh: assignment: %s\r\n",
                           strerror(errno));
@@ -5487,7 +5609,7 @@ static bool run_planned_main_builtin(shell_state *state,
     if (native_colon_builtin(command) &&
         command->assignment_count != 0 &&
         command->redirect_count == 0) {
-        int assignment_status = apply_native_assignments(
+        int assignment_status = apply_special_builtin_assignments(
             state->variables, NULL, command, &state->options);
 
         if (assignment_status != GSH_ASSIGNMENT_OK) {
@@ -5551,9 +5673,6 @@ static bool run_planned_main_builtin(shell_state *state,
         queue_prompt(state);
         return true;
     }
-    if (command->assignment_count != 0 || command->argc == 0) {
-        return false;
-    }
     if (native_environment_builtin(command)) {
         const gsh_builtin_io io = {reactor_builtin_output, state};
 
@@ -5561,6 +5680,9 @@ static bool run_planned_main_builtin(shell_state *state,
         state->mode = MODE_EDITOR;
         queue_prompt(state);
         return true;
+    }
+    if (command->assignment_count != 0 || command->argc == 0) {
+        return false;
     }
     if (strcmp(command->argv[0], "exit") == 0) {
         if (command->argc > 2) {
@@ -5895,7 +6017,8 @@ static bool run_pure_function(shell_state *state,
         return false;
     }
     command = &pipeline->commands[0];
-    function = command->argc == 0
+    function = command->argc == 0 ||
+                       command->command_suppresses_functions
                    ? NULL
                    : gsh_functions_lookup(state->functions,
                                           command->argv[0],
@@ -6134,6 +6257,10 @@ static void dispatch_pending(shell_state *state)
             plan_status = gsh_native_plan_pipeline_with_context(
                 state->pending_input, state->parse_storage, parsed.root,
                 &expansion, state->native_pipeline);
+            if (plan_status == GSH_NATIVE_PLAN_OK) {
+                normalize_command_invocations(state->native_pipeline,
+                                              state->functions);
+            }
         } else {
             state->parse_failures++;
         }
@@ -6168,6 +6295,8 @@ static void dispatch_pending(shell_state *state)
             !native_pipeline_requires_evaluator(state->native_pipeline) &&
             !(state->native_pipeline->command_count == 1U &&
               state->native_pipeline->commands[0].argc != 0 &&
+              !state->native_pipeline->commands[0]
+                   .command_suppresses_functions &&
               gsh_functions_lookup(
                   state->functions,
                   state->native_pipeline->commands[0].argv[0],
@@ -7922,7 +8051,7 @@ static int run_native_noninteractive_pipeline(
     gsh_alias_store *aliases, gsh_alias_journal *alias_journal,
     const pipeline_expansion_scope *scope,
     gsh_positional_store *positionals, gsh_shell_options *options,
-    native_evaluator *evaluator)
+    gsh_function_store *functions, native_evaluator *evaluator)
 {
     int pipes[GSH_NATIVE_PIPELINE_CAP - 1][2];
     int heredoc_pipes[GSH_NATIVE_HEREDOC_CAP][2];
@@ -7975,7 +8104,7 @@ static int run_native_noninteractive_pipeline(
                                      &builtin_status)) {
             if (native_colon_builtin(&pipeline->commands[0]) &&
                 pipeline->commands[0].assignment_count != 0) {
-                int assignment_status = apply_native_assignments(
+                int assignment_status = apply_special_builtin_assignments(
                     variables, journal, &pipeline->commands[0], options);
 
                 if (assignment_status != GSH_ASSIGNMENT_OK) {
@@ -7995,7 +8124,7 @@ static int run_native_noninteractive_pipeline(
                                      : builtin_status;
         }
         if (native_variable_builtin(&pipeline->commands[0])) {
-            int assignment_status = apply_native_assignments(
+            int assignment_status = apply_special_builtin_assignments(
                 variables, journal, &pipeline->commands[0], options);
 
             if (assignment_status != GSH_ASSIGNMENT_OK) {
@@ -8016,6 +8145,20 @@ static int run_native_noninteractive_pipeline(
         if (native_alias_builtin(&pipeline->commands[0])) {
             builtin_status = run_native_alias_builtin(
                 &pipeline->commands[0], aliases, alias_journal,
+                &descriptor_builtin_io);
+            return builtin_status == 125
+                       ? 125
+                       : (pipeline->negated
+                              ? (builtin_status == 0 ? 1 : 0)
+                              : builtin_status);
+        }
+        if (native_command_inspection_builtin(&pipeline->commands[0])) {
+            const gsh_native_command *command = &pipeline->commands[0];
+            const char *path = command_path_value(
+                variables, command, default_path);
+
+            builtin_status = run_native_command_inspection(
+                command, path, default_path, aliases, functions,
                 &descriptor_builtin_io);
             return builtin_status == 125
                        ? 125
@@ -8123,7 +8266,7 @@ static int run_native_noninteractive_pipeline(
                         &pipeline->commands[index], &descriptor_builtin_io));
                 }
                 if (native_variable_builtin(&pipeline->commands[index])) {
-                    if (apply_native_assignments(
+                    if (apply_special_builtin_assignments(
                             variables, NULL,
                             &pipeline->commands[index], options) !=
                         GSH_ASSIGNMENT_OK) {
@@ -8135,7 +8278,7 @@ static int run_native_noninteractive_pipeline(
                 }
                 if (native_state_builtin(
                         &pipeline->commands[index])) {
-                    if (apply_native_assignments(
+                    if (apply_special_builtin_assignments(
                             variables, NULL,
                             &pipeline->commands[index], options) !=
                         GSH_ASSIGNMENT_OK) {
@@ -8151,6 +8294,17 @@ static int run_native_noninteractive_pipeline(
                 if (native_alias_builtin(&pipeline->commands[index])) {
                     _exit(run_native_alias_builtin(
                         &pipeline->commands[index], aliases, NULL,
+                        &descriptor_builtin_io));
+                }
+                if (native_command_inspection_builtin(
+                        &pipeline->commands[index])) {
+                    const gsh_native_command *command =
+                        &pipeline->commands[index];
+                    const char *path = command_path_value(
+                        variables, command, default_path);
+
+                    _exit(run_native_command_inspection(
+                        command, path, default_path, aliases, functions,
                         &descriptor_builtin_io));
                 }
             }
@@ -8188,8 +8342,8 @@ static int run_native_noninteractive_pipeline(
             return 125;
         }
         members[launched++] = pid;
+        status_pid = pid;
     }
-    status_pid = members[pipeline->command_count - 1U];
     for (index = 0; index < pipeline->heredoc_count; index++) {
         pid_t pid = fault_should_fail("heredoc-fork", EAGAIN) ? -1 : fork();
 
@@ -8550,6 +8704,10 @@ static gsh_native_plan_status plan_evaluator_pipeline(
     status = gsh_native_plan_pipeline_node_with_context(
         evaluator->input, evaluator->storage, node_index, &expansion,
         evaluator->pipeline);
+    if (status == GSH_NATIVE_PLAN_OK) {
+        normalize_command_invocations(evaluator->pipeline,
+                                      evaluator->functions);
+    }
     evaluator->pipeline_scope = NULL;
     if (*scoped) {
         memcpy(evaluator->variables, scope->base,
@@ -8716,7 +8874,8 @@ static const gsh_function_entry *evaluator_function(
     const native_evaluator *evaluator,
     const gsh_native_command *command)
 {
-    return evaluator->functions == NULL || command->argc == 0
+    return evaluator->functions == NULL || command->argc == 0 ||
+                   command->command_suppresses_functions
                ? NULL
                : gsh_functions_lookup(evaluator->functions,
                                       command->argv[0],
@@ -9222,7 +9381,9 @@ static int evaluate_return(native_evaluator *evaluator,
     unsigned int status = (unsigned int)(evaluator->last_status & 255);
     const char *cursor;
 
-    if (command->argc > 2U || command->assignment_count != 0 ||
+    if (command->argc > 2U ||
+        (command->assignment_count != 0 &&
+         !command->command_regular_context) ||
         command->redirect_count != 0 || evaluator->function_depth == 0) {
         fputs("gsh: return: invalid context or operands\n", stderr);
         return 1;
@@ -9299,7 +9460,7 @@ static int evaluate_loop_control(native_evaluator *evaluator,
         (void)restore_redirect_descriptors(saved, saved_count);
         return 1;
     }
-    status = apply_native_assignments(
+    status = apply_special_builtin_assignments(
         evaluator->variables, evaluator->journal, command,
         &evaluator->options);
     if (status != GSH_ASSIGNMENT_OK) {
@@ -9539,6 +9700,7 @@ static int native_evaluate_pipeline(native_evaluator *evaluator,
             !native_environment_builtin(tail) &&
             !native_variable_builtin(tail) && !native_state_builtin(tail) &&
             !native_wait_builtin(tail) && !native_alias_builtin(tail) &&
+            !native_command_inspection_builtin(tail) &&
             !native_return_builtin(tail) &&
             !native_loop_control_builtin(tail) && function == NULL) {
             int heredoc_descriptors[GSH_NATIVE_HEREDOC_CAP][2];
@@ -9712,7 +9874,7 @@ static int native_evaluate_pipeline(native_evaluator *evaluator,
             evaluator->variables, evaluator->journal,
             evaluator->aliases, evaluator->alias_journal,
             scoped ? &scope : NULL, evaluator->positionals,
-            &evaluator->options, evaluator);
+            &evaluator->options, evaluator->functions, evaluator);
     }
     if (status == 125 && evaluator->pipeline->command_count == 1 &&
         (native_variable_builtin(&evaluator->pipeline->commands[0]) ||
@@ -10525,7 +10687,7 @@ static void managed_pipeline_child(
     status = run_native_noninteractive_pipeline(
         (gsh_native_pipeline *)pipeline, state->default_path,
         state->variables, NULL, state->aliases, NULL, scope,
-        state->positionals, &options, &evaluator);
+        state->positionals, &options, state->functions, &evaluator);
     _exit(status & 255);
 }
 

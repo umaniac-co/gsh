@@ -4096,6 +4096,59 @@ gsh_native_plan_status gsh_native_expand_words(
     return GSH_NATIVE_PLAN_OK;
 }
 
+/* ── Command Preserves Declaration Expansion ──────────────────────
+ * Assignment-shaped operands normally undergo field and pathname expansion.
+ * Export and readonly instead require assignment context, even when reached
+ * through one or more command wrappers.  The planner recognizes only the
+ * already-expanded prefix and accepts only `command`'s execution option, so
+ * later operands receive the right expansion without speculative execution.
+ * ─────────────────────────────────────────────────────────────── */
+static bool planned_declaration_utility(
+    const gsh_native_command *command)
+{
+    size_t index = 0;
+    size_t wrappers = 0;
+
+    while (index < command->argc &&
+           index < GSH_NATIVE_ARGUMENT_CAP &&
+           wrappers < GSH_NATIVE_ARGUMENT_CAP) {
+        if (strcmp(command->argv[index], "export") == 0 ||
+            strcmp(command->argv[index], "readonly") == 0) {
+            return true;
+        }
+        if (strcmp(command->argv[index], "command") != 0) {
+            return false;
+        }
+        index++;
+        while (index < command->argc &&
+               index < GSH_NATIVE_ARGUMENT_CAP &&
+               command->argv[index][0] == '-' &&
+               command->argv[index][1] != '\0') {
+            const char *option = command->argv[index] + 1U;
+            size_t scanned = 0;
+
+            if (strcmp(command->argv[index], "--") == 0) {
+                index++;
+                break;
+            }
+            while (*option != '\0' &&
+                   scanned < GSH_NATIVE_TEXT_CAP) {
+                if (*option != 'p') {
+                    return false;
+                }
+                option++;
+                scanned++;
+            }
+            if (*option != '\0') {
+                return false;
+            }
+            index++;
+        }
+        wrappers++;
+    }
+    return false;
+}
+
 static gsh_native_plan_status
 plan_command(const char *input, const gsh_parse_storage *storage,
              const gsh_ast_node *node,
@@ -4117,9 +4170,7 @@ plan_command(const char *input, const gsh_parse_storage *storage,
     memset(command, 0, sizeof(*command));
     for (index = 0; index < node->word_count; index++) {
         gsh_word_ref word = storage->words[node->first_word + index];
-        bool declaration = command->argc > 0 &&
-                           (strcmp(command->argv[0], "export") == 0 ||
-                            strcmp(command->argv[0], "readonly") == 0);
+        bool declaration = planned_declaration_utility(command);
         size_t assignment_length =
             command->argc == 0 || declaration
                 ? assignment_name_length(input, word)
