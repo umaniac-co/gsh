@@ -73,6 +73,7 @@ enum {
     PROMPT_PROTOCOL_VERSION = 1,
     PROMPT_REQUEST_BRANCH = 1,
     PROMPT_REQUEST_REDIRECTION = 2,
+    NONINTERACTIVE_INPUT_CAP = 1024 * 1024,
     GSH_NATIVE_JOB_MEMBER_CAP =
         GSH_NATIVE_PIPELINE_CAP + GSH_NATIVE_HEREDOC_CAP,
     CHILD_ENVIRONMENT_CAP = GSH_VARIABLE_ENVIRONMENT_CAP,
@@ -176,6 +177,8 @@ typedef struct {
     char history_search_draft[LINE_CAP];
     size_t history_search_draft_length;
     uint64_t history_reminder_deadline_ns;
+    bool classic_redraw_pending;
+    bool classic_clear_pending;
     char pending_line[LINE_CAP];
     size_t pending_len;
     const char *pending_input;
@@ -313,6 +316,9 @@ static int open_redirect_path(const char *target,
                               gsh_token_kind operator_kind,
                               const gsh_shell_options *options,
                               mode_t creation_mode);
+static bool literal_command_word_is(const char *input, gsh_word_ref word,
+                                    const char *text);
+static bool reactor_literal_word(const char *input, gsh_word_ref word);
 
 #ifdef GSH_FAULT_INJECTION
 static char g_fault_name[64];
@@ -909,6 +915,8 @@ static void queue_prompt(shell_state *state)
         state->async_repl->render_pending = true;
         return;
     }
+    state->classic_redraw_pending = false;
+    state->classic_clear_pending = false;
     if (state->history_search) {
         size_t length = state->history_search_query_length;
 
@@ -952,6 +960,40 @@ static void queue_redraw(shell_state *state)
     if (state->async_repl != NULL && state->async_repl->enabled) {
         state->async_repl->render_pending = true;
         return;
+    }
+    state->classic_redraw_pending = true;
+}
+
+static void queue_clear_redraw(shell_state *state)
+{
+    if (state->async_repl != NULL && state->async_repl->enabled) {
+        state->async_repl->render_pending = true;
+        return;
+    }
+    state->classic_clear_pending = true;
+    state->classic_redraw_pending = true;
+}
+
+/* ── Classic Redraws Are Latest-State Frames ─────────────────────
+ * Editing controls can request hundreds of redraws in one ready input burst.
+ * Materializing every intermediate frame wastes work and can crowd the final
+ * Ctrl-C acknowledgement out of the bounded output queue. The reactor keeps
+ * only the newest editor state and emits one frame before its bounded flush.
+ * A pending clear is folded into that same frame.
+ * ─────────────────────────────────────────────────────────────── */
+static void prepare_classic_redraw(shell_state *state)
+{
+    bool clear;
+
+    if (!state->classic_redraw_pending ||
+        (state->async_repl != NULL && state->async_repl->enabled)) {
+        return;
+    }
+    clear = state->classic_clear_pending;
+    state->classic_redraw_pending = false;
+    state->classic_clear_pending = false;
+    if (clear) {
+        (void)output_text(state, "\033[2J\033[H");
     }
     (void)output_text(state, "\r\033[2K");
     queue_prompt(state);
@@ -6830,13 +6872,7 @@ static bool process_editor_control(shell_state *state, unsigned char byte)
         return true;
     }
     if (byte == 0x0cU) {
-        if (state->async_repl != NULL && state->async_repl->enabled) {
-            state->async_repl->render_pending = true;
-            return true;
-        }
-        (void)output_text(state, "\033[2J\033[H");
-        queue_prompt(state);
-        (void)output_push(state, state->line, state->line_len);
+        queue_clear_redraw(state);
         return true;
     }
     return false;
@@ -7443,6 +7479,7 @@ static int run_reactor(shell_state *state)
         maybe_verify_history(state);
         schedule_managed_submissions(state);
         apply_async_transition(state);
+        prepare_classic_redraw(state);
         prepare_managed_render(state);
 
         if ((state->async_repl == NULL || !state->async_repl->enabled) &&
@@ -7548,6 +7585,7 @@ static int run_reactor(shell_state *state)
         enforce_prompt_deadline(state);
         schedule_managed_submissions(state);
         apply_async_transition(state);
+        prepare_classic_redraw(state);
         prepare_managed_render(state);
         if (state->output_len > 0) {
             flush_output(state);
@@ -7749,12 +7787,14 @@ static void cleanup(shell_state *state)
 static void print_usage(FILE *stream)
 {
     fprintf(stream,
-            "usage: gsh\n"
-            "       gsh -c command\n"
-            "       gsh -n -c command\n"
-            "       gsh --native-only -c command\n\n"
-            "Run the minimal interactive gsh reactor, or execute one command "
-            "non-interactively.\n"
+            "usage: gsh [command_file [argument ...]]\n"
+            "       gsh -s [argument ...]\n"
+            "       gsh -c command_string [command_name [argument ...]]\n"
+            "       gsh -n -c command_string\n"
+            "       gsh --native-only -c command_string "
+            "[command_name [argument ...]]\n\n"
+            "Run the interactive reactor, a command file, standard input, "
+            "or one command string.\n"
             "The async REPL is enabled by default; set GSH_REPL=classic or "
             "shell.async_repl.enabled=false in ~/.gshrc to start in classic "
             "mode.\n"
@@ -7783,37 +7823,63 @@ static int check_native_syntax(const char *input)
     return 2;
 }
 
-static bool alias_command_probe(void *opaque, const char *word,
-                                size_t length)
-{
-    bool *found = opaque;
-
-    if ((length == 5U && memcmp(word, "alias", 5) == 0) ||
-        (length == 7U && memcmp(word, "unalias", 7) == 0)) {
-        *found = true;
-    }
-    return false;
-}
-
-static bool input_contains_alias_builtin(
-    const char *input, size_t length, gsh_parse_storage *storage)
-{
-    gsh_word_ref candidate;
-    bool found = false;
-    gsh_parse_result result = gsh_parse_command_probe(
-        input, length, storage, alias_command_probe, &found, &candidate);
-
-    (void)candidate;
-    return result.status == GSH_PARSE_OK && found;
-}
-
 static bool storage_has_function(const gsh_parse_storage *storage)
 {
     size_t index;
 
+    if (storage == NULL || storage->node_count > GSH_PARSE_NODE_CAP) {
+        return false;
+    }
     for (index = 0; index < storage->node_count; index++) {
         if (storage->nodes[index].kind == GSH_AST_FUNCTION) {
             return true;
+        }
+    }
+    return false;
+}
+
+static bool storage_requires_alias_state(
+    const char *input, size_t input_length,
+    const gsh_parse_storage *storage)
+{
+    size_t node_index;
+
+    if (input == NULL || storage == NULL ||
+        storage->node_count > GSH_PARSE_NODE_CAP ||
+        storage->word_count > GSH_PARSE_WORD_CAP) {
+        return false;
+    }
+    /* Alias lookup happens before expansion, but the alias builtin itself can
+     * be named by expansion. Inspect only command positions: proven literal
+     * non-aliases stay on the zero-allocation path; dynamic names enable state
+     * conservatively before planning and execution. */
+    for (node_index = 0; node_index < storage->node_count; node_index++) {
+        const gsh_ast_node *node = &storage->nodes[node_index];
+        size_t word_index;
+
+        if (node->kind != GSH_AST_SIMPLE) {
+            continue;
+        }
+        if (node->first_word > storage->word_count ||
+            node->word_count > storage->word_count - node->first_word) {
+            return false;
+        }
+        for (word_index = 0; word_index < node->word_count; word_index++) {
+            gsh_word_ref word =
+                storage->words[node->first_word + word_index];
+
+            if (word.begin > word.end || word.end > input_length) {
+                return false;
+            }
+            if (managed_assignment_name_length(input, word) != 0) {
+                continue;
+            }
+            if (literal_command_word_is(input, word, "alias") ||
+                literal_command_word_is(input, word, "unalias") ||
+                !reactor_literal_word(input, word)) {
+                return true;
+            }
+            break;
         }
     }
     return false;
@@ -11251,40 +11317,30 @@ static void start_native_compound(shell_state *state, size_t node_index)
     (void)sigprocmask(SIG_SETMASK, &previous, NULL);
 }
 
-static int execute_native_alias_script(
-    const char *input, bool *handled, const char *parameter_zero,
+static int execute_native_script(
+    const char *input, size_t input_length, const char *parameter_zero,
     gsh_parse_storage *storage, gsh_native_pipeline *pipeline,
     gsh_variable_store *variables, gsh_variable_store *scratch,
     gsh_variable_store *scope_base, gsh_variable_journal *scope_changes,
     gsh_positional_store *positionals, const char *default_path)
 {
-    gsh_alias_store *aliases;
+    gsh_alias_store *aliases = NULL;
     gsh_function_store *functions = NULL;
     gsh_function_store *function_scratch = NULL;
-    char *expanded;
+    char *expanded = NULL;
     native_evaluator evaluator;
     gsh_background_table backgrounds;
-    size_t input_length = strlen(input);
     size_t offset = 0;
+    size_t complete_commands;
     int status = 0;
 
-    *handled = true;
-    aliases = fault_should_fail("alias-allocation", ENOMEM)
-                  ? NULL
-                  : malloc(sizeof(*aliases));
-    expanded = fault_should_fail("alias-allocation", ENOMEM)
-                   ? NULL
-                   : malloc(GSH_ALIAS_EXPANSION_CAP);
-    if (aliases == NULL || expanded == NULL) {
-        int saved_errno = errno;
-
-        free(aliases);
-        free(expanded);
-        errno = saved_errno;
-        perror("gsh: alias allocation");
+    if (input == NULL || parameter_zero == NULL || storage == NULL ||
+        pipeline == NULL || variables == NULL || scratch == NULL ||
+        scope_base == NULL || scope_changes == NULL || positionals == NULL ||
+        default_path == NULL || input_length > NONINTERACTIVE_INPUT_CAP) {
+        errno = EINVAL;
         return 125;
     }
-    gsh_aliases_initialize(aliases);
     memset(&evaluator, 0, sizeof(evaluator));
     evaluator.storage = storage;
     evaluator.pipeline = pipeline;
@@ -11293,30 +11349,51 @@ static int execute_native_alias_script(
     evaluator.parameter_zero = parameter_zero;
     evaluator.positionals = positionals;
     gsh_options_initialize(&evaluator.options, false);
-    evaluator.aliases = aliases;
+    evaluator.aliases = NULL;
     evaluator.scope_base = scope_base;
     evaluator.scope_changes = scope_changes;
     gsh_background_initialize(&backgrounds);
     evaluator.backgrounds = &backgrounds;
 
-    while (offset < input_length) {
+    /* ── Complete Commands Commit in Source Order ────────────────
+     * Parsing a whole script hid the POSIX rule that earlier complete
+     * commands run before a later syntax error. Alias definitions also become
+     * visible only after their defining complete command has executed.
+     * This bounded loop grows a candidate by physical lines until the parser
+     * reports a complete command, then evaluates it against persistent state.
+     * The input ceiling supplies the static loop bound and deterministic stop.
+     * ─────────────────────────────────────────────────────────────── */
+    for (complete_commands = 0;
+         offset < input_length &&
+         complete_commands < NONINTERACTIVE_INPUT_CAP;
+         complete_commands++) {
         const char *parsed_input = input + offset;
         size_t parsed_length = 0;
         size_t end = offset;
+        size_t lines;
         gsh_parse_result parsed;
 
-        do {
+        memset(&parsed, 0, sizeof(parsed));
+        for (lines = 0; lines < NONINTERACTIVE_INPUT_CAP; lines++) {
             const char *newline = memchr(input + end, '\n',
                                          input_length - end);
 
             end = newline == NULL ? input_length
                                   : (size_t)(newline - input) + 1U;
-            parsed = gsh_alias_parse(
-                input + offset, end - offset, aliases, expanded,
-                GSH_ALIAS_EXPANSION_CAP, storage, &parsed_input,
-                &parsed_length);
-        } while (parsed.status == GSH_PARSE_INCOMPLETE &&
-                 end < input_length);
+            if (aliases == NULL) {
+                parsed_length = end - offset;
+                parsed = gsh_parse(input + offset, parsed_length, storage);
+            } else {
+                parsed = gsh_alias_parse(
+                    input + offset, end - offset, aliases, expanded,
+                    GSH_ALIAS_EXPANSION_CAP, storage, &parsed_input,
+                    &parsed_length);
+            }
+            if (parsed.status != GSH_PARSE_INCOMPLETE ||
+                end == input_length) {
+                break;
+            }
+        }
         if (parsed.status != GSH_PARSE_OK) {
             fprintf(stderr, "gsh: %s at byte %zu\n",
                     gsh_parse_status_name(parsed.status),
@@ -11324,15 +11401,42 @@ static int execute_native_alias_script(
             status = 2;
             break;
         }
+        if (aliases == NULL &&
+            storage_requires_alias_state(parsed_input, parsed_length,
+                                         storage)) {
+            aliases = fault_should_fail("alias-allocation", ENOMEM)
+                          ? NULL
+                          : malloc(sizeof(*aliases));
+            if (aliases == NULL) {
+                perror("gsh: alias allocation");
+                status = 125;
+                break;
+            }
+            expanded = fault_should_fail("alias-allocation", ENOMEM)
+                           ? NULL
+                           : malloc(GSH_ALIAS_EXPANSION_CAP);
+            if (expanded == NULL) {
+                perror("gsh: alias allocation");
+                status = 125;
+                break;
+            }
+            gsh_aliases_initialize(aliases);
+            evaluator.aliases = aliases;
+        }
         if (storage_has_function(storage) && functions == NULL) {
             functions = fault_should_fail("function-allocation", ENOMEM)
                             ? NULL
                             : malloc(sizeof(*functions));
+            if (functions == NULL) {
+                perror("gsh: function allocation");
+                status = 125;
+                break;
+            }
             function_scratch =
                 fault_should_fail("function-allocation", ENOMEM)
                     ? NULL
                     : malloc(sizeof(*function_scratch));
-            if (functions == NULL || function_scratch == NULL) {
+            if (function_scratch == NULL) {
                 perror("gsh: function allocation");
                 status = 125;
                 break;
@@ -11358,6 +11462,7 @@ static int execute_native_alias_script(
         evaluator.positional_mutation_possible = false;
         evaluator.directory_mutation_possible = false;
         evaluator.alias_mutation_possible = false;
+        evaluator.function_mutation_possible = false;
         evaluator.state_commit_invalid = false;
         if (!native_preflight_node(&evaluator, parsed.root, 0)) {
             fprintf(stderr, "gsh: native execution unsupported\n");
@@ -11381,7 +11486,7 @@ static int execute_native_alias_script(
 }
 
 static int execute_native_noninteractive(
-    const char *input, bool required, bool *handled,
+    const char *input, size_t input_length,
     const char *parameter_zero, char *const *positional_parameters,
     size_t positional_count)
 {
@@ -11393,15 +11498,8 @@ static int execute_native_noninteractive(
     gsh_variable_store *scope_base = malloc(sizeof(*scope_base));
     gsh_variable_journal *scope_changes = malloc(sizeof(*scope_changes));
     gsh_positional_store *positionals = malloc(sizeof(*positionals));
-    gsh_function_store *functions = NULL;
-    gsh_function_store *function_scratch = NULL;
-    gsh_parse_result parsed;
-    native_evaluator evaluator;
-    gsh_background_table backgrounds;
-    int status;
+    int status = 125;
 
-    memset(&evaluator, 0, sizeof(evaluator));
-    *handled = false;
     if (storage == NULL || pipeline == NULL || variables == NULL ||
         scratch == NULL || scope_base == NULL || scope_changes == NULL ||
         positionals == NULL ||
@@ -11416,25 +11514,7 @@ static int execute_native_noninteractive(
         free(scope_changes);
         free(positionals);
         perror("gsh: native allocation");
-        *handled = true;
         return 125;
-    }
-    parsed = gsh_parse(input, strlen(input), storage);
-    if (parsed.status != GSH_PARSE_OK) {
-        if (required) {
-            fprintf(stderr, "gsh: %s at byte %zu\n",
-                    gsh_parse_status_name(parsed.status),
-                    parsed.error_offset);
-            *handled = true;
-        }
-        free(storage);
-        free(pipeline);
-        free(variables);
-        free(scratch);
-        free(scope_base);
-        free(scope_changes);
-        free(positionals);
-        return 2;
     }
     {
         size_t size = confstr(_CS_PATH, default_path, sizeof(default_path));
@@ -11443,101 +11523,9 @@ static int execute_native_noninteractive(
             memcpy(default_path, "/bin:/usr/bin", 14);
         }
     }
-    if (input_contains_alias_builtin(input, strlen(input), storage)) {
-        status = execute_native_alias_script(
-            input, handled, parameter_zero, storage, pipeline, variables,
-            scratch, scope_base, scope_changes, positionals, default_path);
-        free(storage);
-        free(pipeline);
-        free(variables);
-        free(scratch);
-        free(scope_base);
-        free(scope_changes);
-        free(positionals);
-        return status;
-    }
-    if (storage_has_function(storage)) {
-        functions = fault_should_fail("function-allocation", ENOMEM)
-                        ? NULL
-                        : malloc(sizeof(*functions));
-        function_scratch =
-            fault_should_fail("function-allocation", ENOMEM)
-                ? NULL
-                : malloc(sizeof(*function_scratch));
-        if (functions == NULL || function_scratch == NULL) {
-            free(storage);
-            free(pipeline);
-            free(variables);
-            free(scratch);
-            free(scope_base);
-            free(scope_changes);
-            free(positionals);
-            free(functions);
-            free(function_scratch);
-            perror("gsh: function allocation");
-            *handled = true;
-            return 125;
-        }
-        gsh_functions_initialize(functions);
-        gsh_functions_initialize(function_scratch);
-    }
-    evaluator.input = input;
-    evaluator.input_length = strlen(input);
-    evaluator.storage = storage;
-    evaluator.pipeline = pipeline;
-    evaluator.default_path = default_path;
-    evaluator.last_status = 0;
-    evaluator.shell_pid = (long)getpid();
-    evaluator.last_background_pid = 0;
-    evaluator.parameter_zero = parameter_zero;
-    evaluator.positionals = positionals;
-    gsh_options_initialize(&evaluator.options, false);
-    memcpy(scratch, variables, sizeof(*scratch));
-    evaluator.variables = scratch;
-    evaluator.journal = NULL;
-    evaluator.aliases = NULL;
-    evaluator.alias_journal = NULL;
-    evaluator.functions = functions;
-    evaluator.function_scratch = function_scratch;
-    evaluator.scope_base = scope_base;
-    evaluator.scope_changes = scope_changes;
-    evaluator.pipeline_scope = NULL;
-    evaluator.substitution_depth = 0;
-    evaluator.preflight = true;
-    evaluator.fatal_error = false;
-    evaluator.static_for_items = false;
-    evaluator.tail_exec_single = false;
-    evaluator.positional_mutation_possible = false;
-    evaluator.directory_mutation_possible = false;
-    evaluator.alias_mutation_possible = false;
-    evaluator.state_commit_invalid = false;
-    gsh_background_initialize(&backgrounds);
-    evaluator.backgrounds = &backgrounds;
-    if (!native_preflight_node(&evaluator, parsed.root, 0)) {
-        if (required) {
-            fprintf(stderr, "gsh: native execution unsupported\n");
-            *handled = true;
-        }
-        free(storage);
-        free(pipeline);
-        free(variables);
-        free(scratch);
-        free(scope_base);
-        free(scope_changes);
-        free(positionals);
-        free(functions);
-        free(function_scratch);
-        return 2;
-    }
-    *handled = true;
-    if (functions != NULL) {
-        gsh_functions_initialize(functions);
-        gsh_functions_initialize(function_scratch);
-    }
-    evaluator.variables = variables;
-    evaluator.preflight = false;
-    evaluator.fatal_error = false;
-    status = native_evaluate_node(&evaluator, parsed.root, 0);
+    status = execute_native_script(
+        input, input_length, parameter_zero, storage, pipeline, variables,
+        scratch, scope_base, scope_changes, positionals, default_path);
     free(storage);
     free(pipeline);
     free(variables);
@@ -11545,37 +11533,130 @@ static int execute_native_noninteractive(
     free(scope_base);
     free(scope_changes);
     free(positionals);
-    free(functions);
-    free(function_scratch);
+    return status;
+}
+
+static int execute_native_descriptor(
+    int descriptor, const char *source, const char *parameter_zero,
+    char *const *positional_parameters, size_t positional_count)
+{
+    char *input;
+    size_t used = 0;
+    unsigned int attempts;
+    bool eof = false;
+    bool limit = false;
+    int status = 125;
+
+    if (descriptor < 0 || source == NULL || parameter_zero == NULL) {
+        errno = EINVAL;
+        return 125;
+    }
+    input = malloc(NONINTERACTIVE_INPUT_CAP + 1U);
+    if (input == NULL) {
+        perror("gsh: input allocation");
+        return 125;
+    }
+    for (attempts = 0; attempts <= NONINTERACTIVE_INPUT_CAP; attempts++) {
+        char overflow;
+        void *destination = used == NONINTERACTIVE_INPUT_CAP
+                                ? (void *)&overflow
+                                : (void *)(input + used);
+        size_t capacity = used == NONINTERACTIVE_INPUT_CAP
+                              ? 1U
+                              : NONINTERACTIVE_INPUT_CAP - used;
+        ssize_t count = read(descriptor, destination, capacity);
+
+        if (count > 0) {
+            if (used == NONINTERACTIVE_INPUT_CAP) {
+                limit = true;
+                break;
+            }
+            used += (size_t)count;
+        } else if (count == 0) {
+            eof = true;
+            break;
+        } else if (errno != EINTR) {
+            fprintf(stderr, "gsh: %s: %s\n", source, strerror(errno));
+            break;
+        }
+    }
+    if (limit) {
+        fprintf(stderr, "gsh: %s exceeds input limit\n", source);
+        status = 2;
+    } else if (!eof) {
+        if (errno == EINTR) {
+            fprintf(stderr, "gsh: %s: interrupted read limit\n", source);
+        }
+    } else if (memchr(input, '\0', used) != NULL) {
+        fprintf(stderr, "gsh: %s contains a null byte\n", source);
+        status = 2;
+    } else {
+        input[used] = '\0';
+        status = execute_native_noninteractive(
+            input, used, parameter_zero, positional_parameters,
+            positional_count);
+    }
+    free(input);
+    return status;
+}
+
+static int execute_native_file(
+    const char *path, char *const *positional_parameters,
+    size_t positional_count)
+{
+    int descriptor;
+    int status;
+
+    if (path == NULL || path[0] == '\0') {
+        fprintf(stderr, "gsh: empty command file\n");
+        return 2;
+    }
+    descriptor = open(path, O_RDONLY | O_CLOEXEC);
+    if (descriptor == -1) {
+        fprintf(stderr, "gsh: %s: %s\n", path, strerror(errno));
+        return 2;
+    }
+    status = execute_native_descriptor(
+        descriptor, path, path, positional_parameters, positional_count);
+    if (close(descriptor) == -1 && status == 0) {
+        fprintf(stderr, "gsh: %s: %s\n", path, strerror(errno));
+        status = 125;
+    }
     return status;
 }
 
 static int exec_noninteractive(int argc, char **argv)
 {
-    char *script_arguments[] = {(char *)"sh", NULL};
-
     if (argc >= 3 && strcmp(argv[1], "-c") == 0) {
-        bool handled;
         const char *parameter_zero = argc >= 4 ? argv[3] : argv[0];
         char **positionals = argc >= 5 ? argv + 4 : NULL;
         size_t positional_count = argc >= 5 ? (size_t)argc - 4U : 0;
-        int status = execute_native_noninteractive(
-            argv[2], false, &handled, parameter_zero, positionals,
-            positional_count);
 
-        if (handled) {
-            return status;
-        }
-        argv[0] = (char *)"sh";
-        execve("/bin/sh", argv, environ);
-    } else if (argc == 1 && !isatty(STDIN_FILENO)) {
-        execve("/bin/sh", script_arguments, environ);
-    } else {
+        return execute_native_noninteractive(
+            argv[2], strlen(argv[2]), parameter_zero, positionals,
+            positional_count);
+    }
+    if (argc >= 2 && argv[1][0] == '-' &&
+        strcmp(argv[1], "-s") != 0 && strcmp(argv[1], "-") != 0 &&
+        strcmp(argv[1], "--") != 0) {
         print_usage(stderr);
         return 2;
     }
-    perror("gsh: /bin/sh");
-    return 127;
+    if (argc >= 2 && strcmp(argv[1], "--") == 0 && argc >= 3) {
+        return execute_native_file(
+            argv[2], argc >= 4 ? argv + 3 : NULL,
+            argc >= 4 ? (size_t)argc - 3U : 0U);
+    }
+    if (argc >= 2 && strcmp(argv[1], "-s") != 0 &&
+        strcmp(argv[1], "-") != 0 && strcmp(argv[1], "--") != 0) {
+        return execute_native_file(
+            argv[1], argc >= 3 ? argv + 2 : NULL,
+            argc >= 3 ? (size_t)argc - 2U : 0U);
+    }
+    return execute_native_descriptor(
+        STDIN_FILENO, "standard input", argv[0],
+        argc >= 3 ? argv + 2 : NULL,
+        argc >= 3 ? (size_t)argc - 2U : 0U);
 }
 
 int main(int argc, char **argv)
@@ -11596,13 +11677,12 @@ int main(int argc, char **argv)
     }
     if (argc >= 4 && strcmp(argv[1], "--native-only") == 0 &&
         strcmp(argv[2], "-c") == 0) {
-        bool handled;
         const char *parameter_zero = argc >= 5 ? argv[4] : argv[0];
         char **positionals = argc >= 6 ? argv + 5 : NULL;
         size_t positional_count = argc >= 6 ? (size_t)argc - 5U : 0;
 
         return execute_native_noninteractive(
-            argv[3], true, &handled, parameter_zero, positionals,
+            argv[3], strlen(argv[3]), parameter_zero, positionals,
             positional_count);
     }
     if (argc != 1 || !isatty(STDIN_FILENO)) {

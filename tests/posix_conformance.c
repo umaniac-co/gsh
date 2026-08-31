@@ -247,6 +247,88 @@ static int no_execution_case(const char *executable)
     return failed;
 }
 
+static int native_invocation_cases(const char *executable)
+{
+    static const char script[] =
+        "GSH_INVOCATION=file\n"
+        "alias gsh_invocation=/usr/bin/printf\n"
+        "gsh_invocation \"<%s:%s:%s:%s>\" \"$GSH_INVOCATION\" \"$0\" "
+        "\"$1\" \"$2\"\n";
+    char directory[] = "/tmp/gsh-native-input-XXXXXX";
+    char path[1024];
+    char command[4096];
+    char expected[2048];
+    syntax_case test = {"sh", "standard input with -s", command, 0,
+                        expected};
+    int descriptor = -1;
+    int failed = 0;
+
+    if (executable == NULL || executable[0] != '/' ||
+        mkdtemp(directory) == NULL ||
+        snprintf(path, sizeof(path), "%s/script.sh", directory) >=
+            (int)sizeof(path)) {
+        return 1;
+    }
+    descriptor = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+    if (descriptor == -1 ||
+        write(descriptor, script, sizeof(script) - 1U) !=
+            (ssize_t)(sizeof(script) - 1U)) {
+        if (descriptor >= 0) {
+            (void)close(descriptor);
+        }
+        failed = 1;
+    } else if (close(descriptor) == -1) {
+        failed = 1;
+    } else if (snprintf(
+                   command, sizeof(command),
+                   "/usr/bin/printf %%b 'GSH_INVOCATION=stdin\\n"
+                   "/usr/bin/printf \"<%%s:%%s:%%s:%%s>\" "
+                   "\"$GSH_INVOCATION\" \"$0\" \"$1\" \"$2\"' | "
+                   "'%s' -s first 'second value'",
+                   executable) >= (int)sizeof(command) ||
+               snprintf(expected, sizeof(expected),
+                        "<stdin:%s:first:second value>", executable) >=
+                   (int)sizeof(expected) ||
+               run_case(executable, &test, false) != 0) {
+        failed = 1;
+    }
+    test.name = "implicit standard input";
+    if (!failed &&
+        (snprintf(command, sizeof(command),
+                  "/usr/bin/printf %%b 'GSH_INVOCATION=implicit\\n"
+                  "/usr/bin/printf \"<%%s:%%s:%%s:%%s>\" "
+                  "\"$GSH_INVOCATION\" \"$0\" \"$1\" \"$2\"' | "
+                  "'%s' - operand",
+                  executable) >= (int)sizeof(command) ||
+         snprintf(expected, sizeof(expected), "<implicit:%s:operand:>",
+                  executable) >= (int)sizeof(expected) ||
+         run_case(executable, &test, false) != 0)) {
+        failed = 1;
+    }
+    test.name = "command file and positional arguments";
+    if (!failed &&
+        (snprintf(command, sizeof(command), "'%s' '%s' first 'second value'",
+                  executable, path) >= (int)sizeof(command) ||
+         snprintf(expected, sizeof(expected), "<file:%s:first:second value>",
+                  path) >= (int)sizeof(expected) ||
+         run_case(executable, &test, false) != 0)) {
+        failed = 1;
+    }
+    test.name = "regular invocation rejects native gap";
+    test.status = 2;
+    test.diagnostic = "native execution unsupported";
+    if (!failed &&
+        (snprintf(command, sizeof(command),
+                  "'%s' -c '{ :; } >/dev/null'", executable) >=
+             (int)sizeof(command) ||
+         run_case(executable, &test, false) != 0)) {
+        failed = 1;
+    }
+    (void)unlink(path);
+    (void)rmdir(directory);
+    return failed;
+}
+
 static int native_umask_creation_case(const char *executable)
 {
     char directory[] = "/tmp/gsh-native-umask-XXXXXX";
@@ -275,6 +357,37 @@ static int native_umask_creation_case(const char *executable)
     return failed;
 }
 
+static pid_t start_builtin_with_broken_output(const char *executable,
+                                              const char *command)
+{
+    int descriptors[2];
+    pid_t pid;
+
+    if (pipe(descriptors) == -1) {
+        return -1;
+    }
+    pid = fork();
+    if (pid == 0) {
+        char *arguments[] = {(char *)executable, (char *)"--native-only",
+                             (char *)"-c", (char *)command, NULL};
+
+        (void)close(descriptors[0]);
+        if (signal(SIGPIPE, SIG_IGN) == SIG_ERR ||
+            (descriptors[1] != STDOUT_FILENO &&
+             dup2(descriptors[1], STDOUT_FILENO) == -1)) {
+            _exit(126);
+        }
+        if (descriptors[1] != STDOUT_FILENO) {
+            (void)close(descriptors[1]);
+        }
+        execv(executable, arguments);
+        _exit(127);
+    }
+    (void)close(descriptors[0]);
+    (void)close(descriptors[1]);
+    return pid;
+}
+
 static int native_builtin_output_failure_cases(const char *executable)
 {
     static const char *const commands[] = {
@@ -286,16 +399,9 @@ static int native_builtin_output_failure_cases(const char *executable)
     for (index = 0; index < sizeof(commands) / sizeof(commands[0]); index++) {
         uint64_t deadline;
         int status = 0;
-        pid_t pid = fork();
+        pid_t pid = start_builtin_with_broken_output(executable,
+                                                     commands[index]);
 
-        if (pid == 0) {
-            char *arguments[] = {(char *)executable, (char *)"--native-only",
-                                 (char *)"-c", (char *)commands[index], NULL};
-
-            (void)close(STDOUT_FILENO);
-            execv(executable, arguments);
-            _exit(127);
-        }
         if (pid == -1) {
             return 1;
         }
@@ -2332,6 +2438,12 @@ int main(int argc, char **argv)
         {"alias", "portable punctuation alias name",
          "alias 'gsh-a=/bin/echo'\ngsh-a portable", 0,
          "portable\n"},
+        {"2.3.1/alias", "quoted alias builtin initializes native state",
+         "'alias' gsh_a=/bin/echo\ngsh_a quoted", 0, "quoted\n"},
+        {"2.6.2/alias", "expanded alias builtin initializes native state",
+         "GSH_ALIAS_COMMAND=alias\n"
+         "\"$GSH_ALIAS_COMMAND\" gsh_a=/bin/echo\ngsh_a expanded",
+         0, "expanded\n"},
         {"alias/1.7", "alias is intrinsic and bypasses PATH search",
          "PATH=/definitely/missing alias gsh_a=/usr/bin/true\nalias gsh_a",
          0, "gsh_a='/usr/bin/true'\n"},
@@ -2436,6 +2548,10 @@ int main(int argc, char **argv)
     if (no_execution_case(argv[1]) != 0) {
         return 1;
     }
+    if (native_invocation_cases(argv[1]) != 0) {
+        return 1;
+    }
+    execution_passed += 4U;
     for (index = 0;
          index < sizeof(execution_cases) / sizeof(execution_cases[0]);
          index++) {

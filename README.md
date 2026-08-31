@@ -147,7 +147,8 @@ performance gate, and platform evidence remain incomplete. The remaining
 `set` options beyond
 `a`/`C`/`f`/`u`, full monitor-mode job control, and the remaining nested
 expansion forms are still
-incomplete. The compatibility bridge must disappear
+incomplete. The interactive unsupported-syntax bridge and the external
+`ENOEXEC` script fallback must disappear from normal shell-language execution
 before `gsh` can claim POSIX.1-2024 shell-language conformance.
 
 The builtins implemented in `gsh` itself include `cd`, `exit`, `pwd`, `export`,
@@ -455,24 +456,35 @@ and the remaining operands become `$1`, `$2`, and so on:
   'for value; do printf "<%s>\n" "$value"; done' command-name a 'b c'
 ```
 
-`-c` chooses the native path when the implemented subset is sufficient and
-otherwise uses the compatibility bridge. Tests can prohibit delegation with:
+`-c` always uses the first-party evaluator. The historical `--native-only`
+spelling remains available for focused tests, but regular non-interactive
+invocation has the same no-delegation behavior:
 
 ```sh
 ./build/gsh --native-only -c \
   "/usr/bin/printf '%s\\n' native | /usr/bin/tr a-z A-Z"
 ```
 
-An unsupported construct then exits with status 2 instead of invoking another
+An unsupported construct exits with status 2 instead of invoking another
 shell. Native syntax checking without execution is available as
 `./build/gsh -n -c 'command'`.
 
-Input redirected from a file is passed to `/bin/sh`, which makes this work as a
-minimal script mode:
+`-s`, implicit standard input, and command-file operands use that same native
+evaluator and preserve `$0` plus the positional operands:
 
 ```sh
 ./build/gsh < script.sh
+./build/gsh -s first 'second value' < script.sh
+./build/gsh script.sh first 'second value'
 ```
+
+This first native ingestion tranche reads at most 1 MiB and buffers the whole
+source before evaluation. It rejects null bytes and oversized input
+deterministically. Streaming complete-command ingestion, the standard-input
+no-read-ahead rule, and removal of the temporary size ceiling remain required
+before the invocation interface is POSIX-complete. Interactive unsupported
+syntax and `ENOEXEC` handling for external text files still have compatibility
+fallbacks; non-interactive top-level input does not.
 
 ## Current scope
 
