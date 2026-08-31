@@ -63,6 +63,7 @@ enum {
     LINE_CAP = 4096,
     OUTPUT_CAP = 65536,
     MAX_SIGNAL_REAPS = 16,
+    MAX_INPUT_BYTES_PER_TURN = 256,
     SIMPLE_ARG_CAP = 128,
     EXEC_PATH_CAP = 4096,
     PATH_SCAN_CAP = 32768,
@@ -6859,27 +6860,47 @@ static void insert_editor_byte(shell_state *state, unsigned char byte)
 
 static void process_input(shell_state *state)
 {
-    unsigned char byte;
-    ssize_t count = read(state->tty_fd, &byte, sizeof(byte));
+    unsigned int handled;
 
-    if (count == 0) {
-        state->running = false;
+    if (state == NULL || state->tty_fd < 0) {
         return;
     }
-    if (count == -1) {
-        if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
+    /* ── Input Batches Collapse Redundant Full-Screen Frames ─────
+     * The reactor originally consumed one byte and redrew the whole managed
+     * viewport before reading the next byte. Linux PTYs often expose a paste
+     * one byte at a time, multiplying one command into hundreds of frames.
+     * A fixed batch drains already-ready bytes, while a line boundary returns
+     * ownership so dispatch and focus changes occur before later input.
+     * The cap preserves a statically bounded reactor turn and editor latency.
+     * ─────────────────────────────────────────────────────────────── */
+    for (handled = 0; handled < MAX_INPUT_BYTES_PER_TURN; handled++) {
+        unsigned char byte;
+        ssize_t count = read(state->tty_fd, &byte, sizeof(byte));
+
+        if (count == 0) {
             state->running = false;
+            break;
         }
-        return;
+        if (count == -1) {
+            if (errno == EINTR) {
+                continue;
+            }
+            if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                state->running = false;
+            }
+            break;
+        }
+        if (!(route_focused_input(state, byte) ||
+              process_managed_editor_signal(state, byte) ||
+              process_escape_input(state, byte) ||
+              process_history_search_input(state, byte) ||
+              process_editor_control(state, byte))) {
+            insert_editor_byte(state, byte);
+        }
+        if (!state->running || byte == '\r' || byte == '\n') {
+            break;
+        }
     }
-    if (route_focused_input(state, byte) ||
-        process_managed_editor_signal(state, byte) ||
-        process_escape_input(state, byte) ||
-        process_history_search_input(state, byte) ||
-        process_editor_control(state, byte)) {
-        return;
-    }
-    insert_editor_byte(state, byte);
 }
 
 static int load_managed_submission(shell_state *state, int cell_index)
