@@ -10,6 +10,9 @@ permissions:
 
 jobs:
   native-matrix:
+    defaults:
+      run:
+        shell: bash
     strategy:
       fail-fast: false
       matrix:
@@ -36,25 +39,35 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install comparison shell on Linux
+      - name: Install dependencies on Linux
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y zsh
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsodium-dev pkg-config zsh
+
+      - name: Install dependencies on macOS
+        if: runner.os == 'macOS'
+        run: brew install libsodium
 
       - name: Strict build and black-box gates
         run: |
+          set -o pipefail
           make clean
           mkdir -p build/evidence
-          make CC=${{ matrix.cc }} policy conformance check check-variables check-positionals check-background check-fault check-resource 2>&1 | tee build/evidence/gates.txt
+          make CC=${{ matrix.cc }} policy conformance check check-variables check-positionals check-background check-config check-aliases check-functions check-fault check-resource 2>&1 | tee build/evidence/gates.txt
           make CC=${{ matrix.cc }} fuzz-smoke FUZZ_CASES=250000 2>&1 | tee -a build/evidence/gates.txt
           make CC=${{ matrix.cc }} fuzz-pty PTY_FUZZ_CASES=5000 2>&1 | tee -a build/evidence/gates.txt
 
       - name: Clang static analyzer
         if: matrix.cc == 'clang'
-        run: make analyze 2>&1 | tee -a build/evidence/gates.txt
+        run: |
+          set -o pipefail
+          make analyze 2>&1 | tee -a build/evidence/gates.txt
 
       - name: Sanitizer gates
         if: matrix.sanitizer
         run: |
+          set -o pipefail
           make check-sanitize 2>&1 | tee -a build/evidence/gates.txt
           ASAN_OPTIONS=abort_on_error=1 UBSAN_OPTIONS=halt_on_error=1 \
             ./build/posix-conformance "$PWD/build/gsh-sanitize" 2>&1 | tee -a build/evidence/gates.txt
@@ -67,17 +80,22 @@ jobs:
 
       - name: Coverage-guided lexer fuzzing
         if: matrix.libfuzzer
-        run: make fuzz-libfuzzer FUZZ_CC=clang FUZZ_SECONDS=30 2>&1 | tee -a build/evidence/gates.txt
+        run: |
+          set -o pipefail
+          make fuzz-libfuzzer FUZZ_CC=clang FUZZ_SECONDS=30 2>&1 | tee -a build/evidence/gates.txt
 
       - name: Record unavailable libFuzzer gate
         if: ${{ matrix.libfuzzer == false }}
         run: echo "libfuzzer=unsupported-by-matrix" | tee -a build/evidence/gates.txt
 
       - name: PTY soak
-        run: make CC=${{ matrix.cc }} soak SOAK_SECONDS=15 2>&1 | tee -a build/evidence/gates.txt
+        run: |
+          set -o pipefail
+          make CC=${{ matrix.cc }} soak SOAK_SECONDS=15 2>&1 | tee -a build/evidence/gates.txt
 
       - name: Record platform and latency evidence
         run: |
+          set -o pipefail
           mkdir -p build/evidence
           uname -a > build/evidence/platform.txt
           ${{ matrix.cc }} --version >> build/evidence/platform.txt
@@ -86,6 +104,7 @@ jobs:
           make CC=${{ matrix.cc }} bench | tee build/evidence/latency.txt
 
       - name: Upload verification evidence
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: gsh-${{ matrix.label }}
