@@ -11,6 +11,8 @@
 #error "gsh tests require the POSIX.1-2024 feature-test baseline"
 #endif
 
+#include "../src/source_workspace.h"
+
 #include <errno.h>
 #include <dirent.h>
 #include <fcntl.h>
@@ -3252,6 +3254,44 @@ static int noninteractive_fault_case(const char *executable,
     return 0;
 }
 
+static int prepare_noninteractive_fault_input(FILE *input)
+{
+    static const char prefix[] = "alias fault_line=':'\nfault_line #";
+    unsigned char bytes[4096];
+    size_t written = 0;
+    size_t attempts;
+    int descriptor;
+
+    if (input == NULL || (descriptor = fileno(input)) < 0 ||
+        write(descriptor, prefix, sizeof(prefix) - 1U) !=
+            (ssize_t)(sizeof(prefix) - 1U)) {
+        return -1;
+    }
+    memset(bytes, 'x', sizeof(bytes));
+    for (attempts = 0;
+         written < GSH_SOURCE_INPUT_CAP && attempts < SIZE_MAX;
+         attempts++) {
+        size_t remaining = GSH_SOURCE_INPUT_CAP - written;
+        size_t request = remaining < sizeof(bytes) ? remaining
+                                                   : sizeof(bytes);
+        ssize_t count = write(descriptor, bytes, request);
+
+        if (count > 0) {
+            written += (size_t)count;
+        } else if (count == -1 && errno == EINTR) {
+            continue;
+        } else {
+            return -1;
+        }
+    }
+    if (written != GSH_SOURCE_INPUT_CAP ||
+        write(descriptor, "\n", 1) != 1 ||
+        lseek(descriptor, 0, SEEK_SET) == (off_t)-1) {
+        return -1;
+    }
+    return 0;
+}
+
 static int noninteractive_input_fault_case(const char *executable,
                                            const char *fault,
                                            const char *diagnostic)
@@ -3263,8 +3303,8 @@ static int noninteractive_input_fault_case(const char *executable,
     int status = 0;
     pid_t pid;
 
-    if (input == NULL || capture == NULL || fputs(":\n", input) == EOF ||
-        fflush(input) == EOF || fseek(input, 0, SEEK_SET) == -1) {
+    if (input == NULL || capture == NULL ||
+        prepare_noninteractive_fault_input(input) == -1) {
         if (input != NULL) {
             (void)fclose(input);
         }
@@ -3546,13 +3586,29 @@ static int fault_injection_flow(const char *executable)
         executable, "input-mode", "standard input input mode");
     failed |= noninteractive_input_fault_case(
         executable, "input-read", "standard input: Input/output error");
+    failed |= noninteractive_input_fault_case(
+        executable, "input-spill-open", "standard input: Too many open files");
+    failed |= noninteractive_input_fault_case(
+        executable, "input-spill-cloexec", "standard input: Input/output error");
+    failed |= noninteractive_input_fault_case(
+        executable, "input-spill-unlink", "standard input: Input/output error");
+    failed |= noninteractive_input_fault_case(
+        executable, "input-spill-write", "standard input: Input/output error");
+    failed |= noninteractive_input_fault_case(
+        executable, "input-spill-resize",
+        "standard input: No space left on device");
+    failed |= noninteractive_input_fault_case(
+        executable, "input-map", "standard input: Cannot allocate memory");
+    failed |= noninteractive_input_fault_case(
+        executable, "input-alias-map",
+        "standard input: Cannot allocate memory");
     failed |= enoexec_fault_case(executable);
     for (index = 0; index < sizeof(fatal_cases) / sizeof(fatal_cases[0]);
          index++) {
         failed |= fatal_fault_case(executable, fatal_cases[index]);
     }
     if (!failed) {
-        puts("pty fault: 85 deterministic boundary failures passed");
+        puts("pty fault: 92 deterministic boundary failures passed");
     }
     return failed;
 }

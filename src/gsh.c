@@ -26,6 +26,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -81,7 +82,8 @@ enum {
     PROMPT_PROTOCOL_VERSION = 1,
     PROMPT_REQUEST_BRANCH = 1,
     PROMPT_REQUEST_REDIRECTION = 2,
-    NONINTERACTIVE_INPUT_CAP = GSH_SOURCE_INPUT_CAP,
+    NONINTERACTIVE_INPUT_FAST_CAP = GSH_SOURCE_INPUT_CAP,
+    NATIVE_INPUT_RETRY_CAP = 1024 * 1024,
     GSH_NATIVE_JOB_MEMBER_CAP =
         GSH_NATIVE_PIPELINE_CAP + GSH_NATIVE_HEREDOC_CAP,
     CHILD_ENVIRONMENT_CAP = GSH_VARIABLE_ENVIRONMENT_CAP,
@@ -93,6 +95,8 @@ _Static_assert((unsigned int)GSH_POSITIONAL_CAP ==
 _Static_assert((unsigned int)GSH_POSITIONAL_TEXT_CAP ==
                    (unsigned int)GSH_NATIVE_TEXT_CAP,
                "positional and native text limits must match");
+_Static_assert(sizeof(off_t) >= sizeof(int64_t),
+               "descriptor-backed source offsets require 64-bit off_t");
 
 static const char PROMPT[] = "$gsh> ";
 static const char PROMPT_MUTED[] = "\033[90m";
@@ -14728,6 +14732,7 @@ static void initialize_native_script_session(
 
 static gsh_parse_result parse_native_script_text(
     native_script_session *session, const char *input, size_t input_length,
+    char *alias_expansion, size_t alias_expansion_capacity,
     const char **parsed_input, size_t *parsed_length)
 {
     native_evaluator *evaluator = &session->evaluator;
@@ -14740,8 +14745,7 @@ static gsh_parse_result parse_native_script_text(
     }
     return gsh_alias_parse(
         input, input_length, evaluator->aliases,
-        evaluator->source_workspaces->root_alias_expansion,
-        GSH_ALIAS_EXPANSION_CAP,
+        alias_expansion, alias_expansion_capacity,
         (gsh_parse_storage *)evaluator->storage, parsed_input,
         parsed_length);
 }
@@ -14803,8 +14807,7 @@ static int execute_native_script(
     int status = evaluator->last_status;
 
     if (input == NULL || session == NULL || storage == NULL ||
-        variables == NULL || scratch == NULL ||
-        input_length > NONINTERACTIVE_INPUT_CAP) {
+        variables == NULL || scratch == NULL) {
         errno = EINVAL;
         return 125;
     }
@@ -14815,11 +14818,12 @@ static int execute_native_script(
      * visible only after their defining complete command has executed.
      * This bounded loop grows a candidate by physical lines until the parser
      * reports a complete command, then evaluates it against persistent state.
-     * The input ceiling supplies the static loop bound and deterministic stop.
+     * SIZE_MAX is the representable source bound; storage failures, not a
+     * shell-selected line length, provide the operational resource ceiling.
      * ─────────────────────────────────────────────────────────────── */
     for (complete_commands = 0;
          offset < input_length &&
-         complete_commands < NONINTERACTIVE_INPUT_CAP;
+         complete_commands < SIZE_MAX;
          complete_commands++) {
         const char *parsed_input = input + offset;
         size_t parsed_length = 0;
@@ -14828,15 +14832,16 @@ static int execute_native_script(
         gsh_parse_result parsed;
 
         memset(&parsed, 0, sizeof(parsed));
-        for (lines = 0; lines < NONINTERACTIVE_INPUT_CAP; lines++) {
+        for (lines = 0; lines < SIZE_MAX; lines++) {
             const char *newline = memchr(input + end, '\n',
                                          input_length - end);
 
             end = newline == NULL ? input_length
                                   : (size_t)(newline - input) + 1U;
             parsed = parse_native_script_text(
-                session, input + offset, end - offset, &parsed_input,
-                &parsed_length);
+                session, input + offset, end - offset,
+                evaluator->source_workspaces->root_alias_expansion,
+                GSH_ALIAS_EXPANSION_CAP, &parsed_input, &parsed_length);
             if (parsed.status != GSH_PARSE_INCOMPLETE ||
                 end == input_length) {
                 break;
@@ -14973,6 +14978,15 @@ typedef struct {
     bool buffered;
 } native_input_reader;
 
+/* ── System Resources Replace Shell Line Limits ──────────────────
+ * The original fixed command buffer rejected valid long input even when the
+ * host still had memory and storage. Ordinary commands retain that preallocated
+ * fast path. A command that outgrows it spills into one unlinked 0600 file with
+ * close-on-exec ownership and is mapped only while parsing and executing that
+ * complete command. Alias rewriting receives a private copy-on-write view of
+ * the same file. This is the narrow post-initialization VM exception required
+ * by POSIX unlimited lines; each resource and failure has one bounded owner.
+ * ─────────────────────────────────────────────────────────────── */
 typedef struct {
     char *text;
     size_t length;
@@ -14980,7 +14994,204 @@ typedef struct {
     const char *parsed_text;
     size_t parsed_length;
     gsh_parse_result parsed;
+    int spill_descriptor;
+    unsigned char spill[NATIVE_INPUT_READ_CAP];
+    size_t spill_used;
+    void *source_mapping;
+    size_t source_mapping_length;
+    void *alias_mapping;
+    size_t alias_mapping_length;
 } native_input_command;
+
+static void initialize_native_input_command(native_input_command *command,
+                                            char *text)
+{
+    assert(command != NULL);
+    assert(text != NULL);
+    command->text = text;
+    command->length = 0;
+    command->source_offset = 0;
+    command->parsed_text = NULL;
+    command->parsed_length = 0;
+    memset(&command->parsed, 0, sizeof(command->parsed));
+    command->spill_descriptor = -1;
+    command->spill_used = 0;
+    command->source_mapping = NULL;
+    command->source_mapping_length = 0;
+    command->alias_mapping = NULL;
+    command->alias_mapping_length = 0;
+}
+
+static int release_native_input_views(native_input_command *command)
+{
+    int status = 0;
+
+    assert(command != NULL);
+    assert(command->source_mapping != MAP_FAILED);
+    assert(command->alias_mapping != MAP_FAILED);
+    if (command->alias_mapping != NULL) {
+        if (munmap(command->alias_mapping,
+                   command->alias_mapping_length) == -1) {
+            status = -1;
+        }
+        command->alias_mapping = NULL;
+        command->alias_mapping_length = 0;
+    }
+    if (command->source_mapping != NULL) {
+        if (munmap(command->source_mapping,
+                   command->source_mapping_length) == -1) {
+            status = -1;
+        }
+        command->source_mapping = NULL;
+        command->source_mapping_length = 0;
+    }
+    return status;
+}
+
+static int release_native_input_command(native_input_command *command)
+{
+    char *text;
+    int status;
+
+    assert(command != NULL);
+    assert(command->spill_descriptor >= -1);
+    text = command->text;
+    status = release_native_input_views(command);
+    if (command->spill_descriptor >= 0) {
+        memset(command->spill, 0, sizeof(command->spill));
+        if (close(command->spill_descriptor) == -1) {
+            status = -1;
+        }
+    }
+    initialize_native_input_command(command, text);
+    return status;
+}
+
+static int write_native_input_spill(int descriptor,
+                                    const unsigned char *bytes,
+                                    size_t length)
+{
+    size_t attempts;
+    size_t written = 0;
+
+    if (descriptor < 0 || bytes == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+    for (attempts = 0; written < length && attempts < SIZE_MAX;
+         attempts++) {
+        ssize_t count = fault_should_fail("input-spill-write", EIO)
+                            ? -1
+                            : write(descriptor, bytes + written,
+                                    length - written);
+
+        assert(written <= length);
+        if (count > 0) {
+            written += (size_t)count;
+        } else if (count == -1 && errno == EINTR) {
+            continue;
+        } else {
+            errno = count == 0 ? EIO : errno;
+            return -1;
+        }
+    }
+    if (written != length) {
+        errno = EOVERFLOW;
+        return -1;
+    }
+    return 0;
+}
+
+static int open_native_input_spill(native_input_command *command)
+{
+    char path[] = "/tmp/gsh-input-XXXXXX";
+    int descriptor;
+
+    assert(command != NULL);
+    assert(command->spill_descriptor == -1);
+    assert(command->length == NONINTERACTIVE_INPUT_FAST_CAP);
+    descriptor = fault_should_fail("input-spill-open", EMFILE)
+                     ? -1
+                     : mkstemp(path);
+    if (descriptor == -1) {
+        return -1;
+    }
+    if (fault_should_fail("input-spill-cloexec", EIO) ||
+        set_fd_flags(descriptor, F_GETFD, FD_CLOEXEC) == -1) {
+        int saved_errno = errno;
+
+        (void)unlink(path);
+        (void)close(descriptor);
+        errno = saved_errno;
+        return -1;
+    }
+    if (fault_should_fail("input-spill-unlink", EIO)) {
+        int saved_errno = errno;
+
+        (void)unlink(path);
+        (void)close(descriptor);
+        errno = saved_errno;
+        return -1;
+    }
+    if (unlink(path) == -1) {
+        int saved_errno = errno;
+
+        (void)close(descriptor);
+        errno = saved_errno;
+        return -1;
+    }
+    command->spill_descriptor = descriptor;
+    if (write_native_input_spill(
+            descriptor, (const unsigned char *)command->text,
+            command->length) == -1) {
+        return -1;
+    }
+    return 0;
+}
+
+static int flush_native_input_spill(native_input_command *command)
+{
+    assert(command != NULL);
+    assert(command->spill_used <= sizeof(command->spill));
+    if (command->spill_used == 0) {
+        return 0;
+    }
+    if (command->spill_descriptor < 0 ||
+        write_native_input_spill(command->spill_descriptor,
+                                 command->spill,
+                                 command->spill_used) == -1) {
+        return -1;
+    }
+    command->spill_used = 0;
+    return 0;
+}
+
+static int append_native_input_byte(native_input_command *command,
+                                    unsigned char byte)
+{
+    assert(command != NULL);
+    assert(command->spill_used <= sizeof(command->spill));
+    if (command->length == SIZE_MAX) {
+        errno = EOVERFLOW;
+        return -1;
+    }
+    if (command->spill_descriptor == -1 &&
+        command->length < NONINTERACTIVE_INPUT_FAST_CAP) {
+        command->text[command->length] = (char)byte;
+    } else {
+        if (command->spill_descriptor == -1 &&
+            open_native_input_spill(command) == -1) {
+            return -1;
+        }
+        if (command->spill_used == sizeof(command->spill) &&
+            flush_native_input_spill(command) == -1) {
+            return -1;
+        }
+        command->spill[command->spill_used++] = byte;
+    }
+    command->length++;
+    return 0;
+}
 
 static int initialize_native_input_reader(native_input_reader *reader,
                                           int descriptor,
@@ -15018,7 +15229,7 @@ static int read_native_input_byte(native_input_reader *reader,
     }
     reader->next = 0;
     reader->used = 0;
-    for (attempts = 0; attempts < NONINTERACTIVE_INPUT_CAP; attempts++) {
+    for (attempts = 0; attempts < NATIVE_INPUT_RETRY_CAP; attempts++) {
         size_t capacity = reader->buffered ? sizeof(reader->bytes) : 1U;
         ssize_t count = fault_should_fail("input-read", EIO)
                             ? -1
@@ -15058,15 +15269,134 @@ static int synchronize_native_input(native_input_reader *reader)
     return 0;
 }
 
+static int resize_native_input_spill(native_input_command *command,
+                                     size_t length)
+{
+    if (command == NULL || command->spill_descriptor < 0 ||
+        length > (size_t)INT64_MAX) {
+        errno = length > (size_t)INT64_MAX ? EFBIG : EINVAL;
+        return -1;
+    }
+    if (fault_should_fail("input-spill-resize", ENOSPC) ||
+        ftruncate(command->spill_descriptor, (off_t)length) == -1) {
+        return -1;
+    }
+    return 0;
+}
+
+static int map_native_input_source(native_input_command *command)
+{
+    void *mapping;
+
+    assert(command != NULL);
+    assert(command->spill_descriptor >= 0);
+    assert(command->length > NONINTERACTIVE_INPUT_FAST_CAP);
+    if (flush_native_input_spill(command) == -1 ||
+        resize_native_input_spill(command, command->length) == -1) {
+        return -1;
+    }
+    mapping = fault_should_fail("input-map", ENOMEM)
+                  ? MAP_FAILED
+                  : mmap(NULL, command->length, PROT_READ, MAP_PRIVATE,
+                         command->spill_descriptor, 0);
+    if (mapping == MAP_FAILED) {
+        return -1;
+    }
+    command->source_mapping = mapping;
+    command->source_mapping_length = command->length;
+    return 0;
+}
+
+static int map_native_alias_expansion(native_input_command *command)
+{
+    const size_t maximum_growth =
+        (size_t)GSH_ALIAS_EXPANSION_LIMIT *
+        ((size_t)GSH_ALIAS_VALUE_CAP + 1U);
+    size_t capacity;
+    void *mapping;
+
+    assert(command != NULL);
+    assert(command->spill_descriptor >= 0);
+    assert(command->source_mapping != NULL);
+    if (command->length > SIZE_MAX - maximum_growth - 1U) {
+        errno = EOVERFLOW;
+        return -1;
+    }
+    capacity = command->length + maximum_growth + 1U;
+    if (resize_native_input_spill(command, capacity) == -1) {
+        return -1;
+    }
+    mapping = fault_should_fail("input-alias-map", ENOMEM)
+                  ? MAP_FAILED
+                  : mmap(NULL, capacity, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE, command->spill_descriptor, 0);
+    if (mapping == MAP_FAILED) {
+        return -1;
+    }
+    command->alias_mapping = mapping;
+    command->alias_mapping_length = capacity;
+    return 0;
+}
+
+static int parse_native_input_command(native_input_command *command,
+                                      native_script_session *session)
+{
+    const char *input;
+    char *alias_expansion;
+    size_t alias_capacity;
+
+    assert(command != NULL);
+    assert(session != NULL);
+    assert(command->source_mapping == NULL);
+    assert(command->alias_mapping == NULL);
+    input = command->text;
+    alias_expansion =
+        session->evaluator.source_workspaces->root_alias_expansion;
+    alias_capacity = GSH_ALIAS_EXPANSION_CAP;
+    if (command->spill_descriptor >= 0) {
+        if (map_native_input_source(command) == -1) {
+            return -1;
+        }
+        input = command->source_mapping;
+        if (gsh_aliases_count(session->evaluator.aliases) != 0) {
+            if (map_native_alias_expansion(command) == -1) {
+                return -1;
+            }
+            alias_expansion = command->alias_mapping;
+            alias_capacity = command->alias_mapping_length;
+        }
+    } else {
+        command->text[command->length] = '\0';
+    }
+    command->parsed_text = input;
+    command->parsed_length = command->length;
+    command->parsed = parse_native_script_text(
+        session, input, command->length, alias_expansion, alias_capacity,
+        &command->parsed_text, &command->parsed_length);
+    if (command->alias_mapping != NULL &&
+        command->parsed_text != command->alias_mapping) {
+        if (munmap(command->alias_mapping,
+                   command->alias_mapping_length) == -1) {
+            return -1;
+        }
+        command->alias_mapping = NULL;
+        command->alias_mapping_length = 0;
+    }
+    return 0;
+}
+
 static int read_native_input_command(
     native_input_reader *reader, native_script_session *session,
     native_input_command *command)
 {
     size_t scanned;
 
+    assert(command->spill_descriptor == -1);
+    assert(command->source_mapping == NULL);
+    assert(command->alias_mapping == NULL);
     command->length = 0;
     command->source_offset = reader->source_offset;
-    for (scanned = 0; scanned <= NONINTERACTIVE_INPUT_CAP; scanned++) {
+    for (scanned = 0; scanned < SIZE_MAX; scanned++) {
         unsigned char byte = 0;
         int read_status = read_native_input_byte(reader, &byte);
         bool parse_now = read_status == 0 || byte == '\n';
@@ -15083,11 +15413,9 @@ static int read_native_input_command(
                 errno = EILSEQ;
                 return -1;
             }
-            if (command->length == NONINTERACTIVE_INPUT_CAP) {
-                errno = EFBIG;
+            if (append_native_input_byte(command, byte) == -1) {
                 return -1;
             }
-            command->text[command->length++] = (char)byte;
             if (reader->source_offset == SIZE_MAX) {
                 errno = EOVERFLOW;
                 return -1;
@@ -15100,19 +15428,19 @@ static int read_native_input_command(
         if (command->length == 0 && read_status == 0) {
             return 0;
         }
-        command->text[command->length] = '\0';
-        command->parsed_text = command->text;
-        command->parsed_length = command->length;
-        command->parsed = parse_native_script_text(
-            session, command->text, command->length,
-            &command->parsed_text, &command->parsed_length);
+        if (parse_native_input_command(command, session) == -1) {
+            return -1;
+        }
         if (command->parsed.status == GSH_PARSE_INCOMPLETE &&
             read_status != 0) {
+            if (release_native_input_views(command) == -1) {
+                return -1;
+            }
             continue;
         }
         return 1;
     }
-    errno = EFBIG;
+    errno = EOVERFLOW;
     return -1;
 }
 
@@ -15137,7 +15465,8 @@ static int execute_native_descriptor(
         perror("gsh: native allocation");
         return 125;
     }
-    command.text = resources.source_workspaces->root_input;
+    initialize_native_input_command(
+        &command, resources.source_workspaces->root_input);
     if (initialize_native_input_reader(&reader, descriptor,
                                        shares_command_input) == -1) {
         fprintf(stderr, "gsh: %s input mode: %s\n", source,
@@ -15154,12 +15483,11 @@ static int execute_native_descriptor(
             break;
         }
         if (read_status == -1) {
-            if (errno == EFBIG) {
-                fprintf(stderr,
-                        "gsh: %s complete command exceeds input limit\n",
-                        source);
-                status = 2;
-            } else if (errno == EILSEQ) {
+            int input_errno = errno;
+
+            (void)release_native_input_command(&command);
+            errno = input_errno;
+            if (errno == EILSEQ) {
                 fprintf(stderr, "gsh: %s contains a null byte\n", source);
                 status = 2;
             } else {
@@ -15174,26 +15502,45 @@ static int execute_native_descriptor(
                     gsh_parse_status_name(command.parsed.status),
                     command.source_offset + command.parsed.error_offset);
             status = 2;
+            (void)release_native_input_command(&command);
             break;
         }
         if (native_parsed_script_is_empty(
                 &resources.session, command.parsed.root)) {
+            if (release_native_input_command(&command) == -1) {
+                fprintf(stderr, "gsh: %s input cleanup: %s\n", source,
+                        strerror(errno));
+                status = 125;
+                break;
+            }
             continue;
         }
         if (synchronize_native_input(&reader) == -1) {
             fprintf(stderr, "gsh: %s input synchronization: %s\n",
                     source, strerror(errno));
             status = 125;
+            (void)release_native_input_command(&command);
             break;
         }
         status = execute_native_parsed(
             &resources.session, command.parsed_text,
             command.parsed_length, command.parsed.root,
             resources.variables, resources.scratch);
+        if (release_native_input_command(&command) == -1) {
+            fprintf(stderr, "gsh: %s input cleanup: %s\n", source,
+                    strerror(errno));
+            status = 125;
+            break;
+        }
         if (resources.session.evaluator.fatal_error ||
             resources.session.evaluator.exiting) {
             break;
         }
+    }
+    if (release_native_input_command(&command) == -1 && status == 0) {
+        fprintf(stderr, "gsh: %s input cleanup: %s\n", source,
+                strerror(errno));
+        status = 125;
     }
     release_native_script_resources(&resources);
     return status;

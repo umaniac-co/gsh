@@ -102,7 +102,7 @@ owns parser, planner, transactional, function, alias, and 1 MiB source storage,
 so entering a command substitution, `eval`, or dot script performs no heap
 allocation and depth exhaustion is deterministic. The same allocation owns the
 persistent root alias and function stores plus the top-level 1 MiB
-complete-command window,
+complete-command fast window,
 removing their former first-use allocations without faulting in their unused
 text and parser arenas. `-c` maps its command name and
 arguments to `$0` and the positional parameters, with native
@@ -307,7 +307,7 @@ make fuzz-pty-sanitize
 make soak SOAK_SECONDS=60
 ```
 
-`check-fault` uses a separate test-only binary and exercises 81 deterministic
+`check-fault` uses a separate test-only binary and exercises 92 deterministic
 failure points. The production build contains neither the injection
 configuration nor its fault names. `check-resource` covers runtime descriptor
 and process exhaustion, data-limit capability, bounded single-line and
@@ -558,16 +558,19 @@ Descriptor input is streamed and committed one complete command at a time, so
 the total source length is no longer capped. Command-file input uses a 16 KiB
 read window. Standard input that shares its open file description with child
 commands is rewound to the exact command boundary when seekable; a pipe or
-other non-seekable input is read without prefetch past that boundary. A single
-complete command remains bounded to 1 MiB and null bytes are rejected
-deterministically; removing that remaining line/command-size bound is still
-required for complete POSIX input semantics. Non-blocking standard input is
+other non-seekable input is read without prefetch past that boundary. Complete
+commands up to 1 MiB stay in the preallocated fast window. Longer commands
+spill in 16 KiB batches to one mode-0600 file that is immediately unlinked;
+its descriptor is close-on-exec and private mappings exist only while parsing
+and executing that command. Alias rewrites use a copy-on-write view of the same
+backing file. There is therefore no shell-selected line or complete-command
+input limit: address space and filesystem exhaustion are reported as system
+resource failures. Null bytes remain invalid. Non-blocking standard input is
 switched to blocking mode on the shared open file description before reading,
 as required. Empty and comment-only complete commands preserve the prior
-status. Interactive unsupported
-syntax—including interactive `eval` and dot—still has a compatibility
-fallback; non-interactive top-level input and external `ENOEXEC` scripts do
-not.
+status. Interactive unsupported syntax—including interactive `eval` and
+dot—still has a compatibility fallback; non-interactive top-level input and
+external `ENOEXEC` scripts do not.
 
 ## Current scope
 
@@ -626,9 +629,9 @@ replaces the worker.
 
 This is soft real-time engineering, not hard real-time or mission-grade status.
 The repository has executable conformance tranches, bounded fuzz/property
-checks, sanitizer builds, 85 deterministic fault cases, resource-pressure
+checks, sanitizer builds, 92 deterministic fault cases, resource-pressure
 scenarios, and a configurable soak runner. The current native tranche contains
-524 execution cases, 30 syntax cases, and 18 deterministic limit cases with
+525 execution cases, 30 syntax cases, and 17 deterministic limit cases with
 one explicitly unsupported case and no delegated cases. The current same-source
 tranche passes the local macOS matrix, but does not gain same-revision remote
 evidence until the macOS arm64 and Ubuntu x86-64 GCC/Clang jobs run after

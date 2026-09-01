@@ -414,27 +414,32 @@ static int native_seekable_input_case(const char *executable,
     return failed;
 }
 
-static int native_oversized_input_case(const char *executable)
+static int native_unlimited_line_input_case(const char *executable)
 {
-    char directory[] = "/tmp/gsh-native-input-limit-XXXXXX";
+    static const char definition[] =
+        "alias long_line='/usr/bin/printf LONG_LINE_OK'\nlong_line #";
+    char directory[] = "/tmp/gsh-native-unlimited-line-XXXXXX";
     char path[1024];
     char command[4096];
     syntax_case test = {
-        "sh/2.1", "single complete-command input limit", command, 2,
-        "complete command exceeds input limit"};
+        "2.3", "single command line exceeds one MiB with alias rewrite",
+        command, 0, "LONG_LINE_OK"};
     int descriptor = -1;
     int failed = 0;
 
     if (mkdtemp(directory) == NULL ||
-        snprintf(path, sizeof(path), "%s/oversized.sh", directory) >=
+        snprintf(path, sizeof(path), "%s/unlimited-line.sh", directory) >=
             (int)sizeof(path) ||
         snprintf(command, sizeof(command), "'%s' '%s'", executable,
                  path) >= (int)sizeof(command)) {
         return 1;
     }
     descriptor = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
-    if (descriptor == -1 || write(descriptor, "#", 1) != 1 ||
-        write_repeated_byte(descriptor, 'x', GSH_SOURCE_INPUT_CAP) == -1) {
+    if (descriptor == -1 ||
+        write(descriptor, definition, sizeof(definition) - 1U) !=
+            (ssize_t)(sizeof(definition) - 1U) ||
+        write_repeated_byte(descriptor, 'x', GSH_SOURCE_INPUT_CAP) == -1 ||
+        write(descriptor, "\n", 1) != 1) {
         failed = 1;
     }
     if (descriptor >= 0 && close(descriptor) == -1) {
@@ -600,6 +605,9 @@ static int native_invocation_cases(const char *executable)
         failed = 1;
     }
     if (!failed && native_large_input_case(executable, directory) != 0) {
+        failed = 1;
+    }
+    if (!failed && native_unlimited_line_input_case(executable) != 0) {
         failed = 1;
     }
     if (!failed && native_seekable_input_case(executable, directory) != 0) {
@@ -1593,10 +1601,6 @@ static int native_limit_cases(const char *executable)
                         "native execution unsupported"};
     size_t used = 0;
     size_t index;
-
-    if (native_oversized_input_case(executable) != 0) {
-        return 1;
-    }
 
     for (index = 0; index < 33; index++) {
         int length = snprintf(command + used, sizeof(command) - used,
@@ -3896,7 +3900,7 @@ int main(int argc, char **argv)
     if (native_invocation_cases(argv[1]) != 0) {
         return 1;
     }
-    execution_passed += 8U;
+    execution_passed += 9U;
     for (index = 0;
          index < sizeof(execution_cases) / sizeof(execution_cases[0]);
          index++) {
@@ -3969,7 +3973,7 @@ int main(int argc, char **argv)
     if (native_limit_cases(argv[1]) != 0) {
         return 1;
     }
-    limit_passed = 18;
+    limit_passed = 17;
     printf("POSIX native tranche: syntax=%zu execution=%zu limits=%zu "
            "unsupported=%zu delegated=0\n",
            passed + 1U, execution_passed, limit_passed, unsupported);
