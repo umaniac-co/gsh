@@ -454,23 +454,22 @@ static bool fault_injection_active(void)
 {
     return g_fault_name[0] != '\0';
 }
+
+#define GSH_FAULT_PARAMETER(name) , const char *name
+#define GSH_FAULT_ARGUMENT(name) , name
 #else
 static void initialize_fault_injection(void)
 {
 }
 
-static bool fault_should_fail(const char *name, int error)
-{
-    (void)name;
-    (void)error;
-    return false;
-}
-
-
 static bool fault_injection_active(void)
 {
     return false;
 }
+
+#define fault_should_fail(name, error) false
+#define GSH_FAULT_PARAMETER(name)
+#define GSH_FAULT_ARGUMENT(name)
 #endif
 
 static int ensure_alias_state(shell_state *state, bool transaction)
@@ -561,8 +560,8 @@ static int set_fd_flags(int fd, int command, int flag)
     return 0;
 }
 
-static int make_pipe(int descriptors[2], bool nonblocking,
-                     const char *fault_name)
+static int make_pipe(int descriptors[2], bool nonblocking
+                     GSH_FAULT_PARAMETER(fault_name))
 {
     if (fault_should_fail(fault_name, EMFILE) || pipe(descriptors) == -1) {
         return -1;
@@ -1394,7 +1393,8 @@ static int initialize_interactive(shell_state *state,
     }
     make_editor_modes(state);
 
-    if (make_pipe(state->signal_pipe, true, "signal-pipe") == -1) {
+    if (make_pipe(state->signal_pipe, true
+                  GSH_FAULT_ARGUMENT("signal-pipe")) == -1) {
         return -1;
     }
     g_signal_write_fd = state->signal_pipe[1];
@@ -5751,8 +5751,8 @@ static void start_native_pipeline(shell_state *state,
     for (created_heredocs = 0;
          created_heredocs < pipeline->heredoc_count;
          created_heredocs++) {
-        if (make_pipe(heredoc_pipes[created_heredocs], false,
-                      "heredoc-pipe") == -1) {
+        if (make_pipe(heredoc_pipes[created_heredocs], false
+                      GSH_FAULT_ARGUMENT("heredoc-pipe")) == -1) {
             output_format(state, "gsh: here-document pipe: %s\r\n",
                           strerror(errno));
             close_heredoc_descriptors(heredoc_pipes,
@@ -5763,7 +5763,8 @@ static void start_native_pipeline(shell_state *state,
         }
     }
     for (created_pipes = 0; created_pipes < pipe_count; created_pipes++) {
-        if (make_pipe(pipes[created_pipes], false, "pipeline-pipe") == -1) {
+        if (make_pipe(pipes[created_pipes], false
+                      GSH_FAULT_ARGUMENT("pipeline-pipe")) == -1) {
             output_format(state, "gsh: pipeline pipe: %s\r\n",
                           strerror(errno));
             close_pipeline_descriptors(pipes, created_pipes);
@@ -5774,7 +5775,7 @@ static void start_native_pipeline(shell_state *state,
             return;
         }
     }
-    if (make_pipe(gate, false, "job-pipe") == -1) {
+    if (make_pipe(gate, false GSH_FAULT_ARGUMENT("job-pipe")) == -1) {
         output_format(state, "gsh: launch gate: %s\r\n", strerror(errno));
         close_pipeline_descriptors(pipes, created_pipes);
         close_heredoc_descriptors(heredoc_pipes, created_heredocs);
@@ -6272,7 +6273,7 @@ static void start_async_external(shell_state *state, simple_command *direct)
     pid_t pid;
 
     if (open_managed_pty(&pty) == -1 ||
-        make_pipe(gate, false, "job-pipe") == -1) {
+        make_pipe(gate, false GSH_FAULT_ARGUMENT("job-pipe")) == -1) {
         output_format(state, "gsh: managed launch: %s\r\n",
                       strerror(errno));
         if (pty.master >= 0) {
@@ -6362,7 +6363,7 @@ static void start_external(shell_state *state, simple_command *direct)
         queue_prompt(state);
         return;
     }
-    if (make_pipe(gate, false, "job-pipe") == -1) {
+    if (make_pipe(gate, false GSH_FAULT_ARGUMENT("job-pipe")) == -1) {
         output_format(state, "gsh: pipe: %s\r\n", strerror(errno));
         state->mode = MODE_EDITOR;
         queue_prompt(state);
@@ -9694,8 +9695,8 @@ static int run_native_noninteractive_pipeline(
     for (created_heredocs = 0;
          created_heredocs < pipeline->heredoc_count;
          created_heredocs++) {
-        if (make_pipe(heredoc_pipes[created_heredocs], false,
-                      "heredoc-pipe") == -1) {
+        if (make_pipe(heredoc_pipes[created_heredocs], false
+                      GSH_FAULT_ARGUMENT("heredoc-pipe")) == -1) {
             perror("gsh: here-document pipe");
             close_heredoc_descriptors(heredoc_pipes,
                                       created_heredocs);
@@ -9703,7 +9704,8 @@ static int run_native_noninteractive_pipeline(
         }
     }
     for (created_pipes = 0; created_pipes < pipe_count; created_pipes++) {
-        if (make_pipe(pipes[created_pipes], false, "pipeline-pipe") == -1) {
+        if (make_pipe(pipes[created_pipes], false
+                      GSH_FAULT_ARGUMENT("pipeline-pipe")) == -1) {
             perror("gsh: pipeline pipe");
             close_pipeline_descriptors(pipes, created_pipes);
             close_heredoc_descriptors(heredoc_pipes,
@@ -11465,7 +11467,8 @@ static pid_t start_substitution_child(native_evaluator *nested,
 {
     pid_t pid;
 
-    if (make_pipe(capture, false, "substitution-pipe") == -1) {
+    if (make_pipe(capture, false
+                  GSH_FAULT_ARGUMENT("substitution-pipe")) == -1) {
         perror("gsh: command substitution pipe");
         return -1;
     }
@@ -13835,7 +13838,7 @@ static void start_async_native_pipeline(
     pid_t pid;
 
     if (open_managed_pty(&pty) == -1 ||
-        make_pipe(gate, false, "job-pipe") == -1) {
+        make_pipe(gate, false GSH_FAULT_ARGUMENT("job-pipe")) == -1) {
         output_format(state, "gsh: managed pipeline: %s\r\n",
                       strerror(errno));
         if (pty.master >= 0) {
@@ -14310,13 +14313,16 @@ _Static_assert(sizeof(gsh_function_store) <= GSH_STATE_COMMIT_IO_BOUND,
                "function commit exceeds the bounded writer");
 
 static int write_commit_bytes(int descriptor, const void *source,
-                              size_t length, const char *fault)
+                              size_t length GSH_FAULT_PARAMETER(fault))
 {
     const unsigned char *cursor = source;
     size_t remaining = length;
     size_t attempts;
 
-    if (descriptor < 0 || source == NULL || fault == NULL ||
+    if (descriptor < 0 || source == NULL ||
+#ifdef GSH_FAULT_INJECTION
+        fault == NULL ||
+#endif
         length > GSH_STATE_COMMIT_IO_BOUND) {
         errno = EINVAL;
         return -1;
@@ -14358,8 +14364,8 @@ static int write_function_commit(int descriptor,
     if (fault_should_fail("function-commit-malformed", EPROTO)) {
         header.reserved = 1;
     }
-    if (write_commit_bytes(descriptor, &header, sizeof(header),
-                           "state-commit-write") == -1) {
+    if (write_commit_bytes(descriptor, &header, sizeof(header)
+                           GSH_FAULT_ARGUMENT("state-commit-write")) == -1) {
         return -1;
     }
     total = gsh_functions_snapshot_payload_size(&header);
@@ -14374,8 +14380,9 @@ static int write_function_commit(int descriptor,
             errno = EPROTO;
             return -1;
         }
-        if (write_commit_bytes(descriptor, source, available,
-                               "function-commit-write") == -1) {
+        if (write_commit_bytes(
+                descriptor, source, available
+                GSH_FAULT_ARGUMENT("function-commit-write")) == -1) {
             return -1;
         }
         offset += available;
@@ -14453,8 +14460,9 @@ static int write_variable_commit(
                                &control);
     for (part = 0; part < GSH_STATE_COMMIT_PART_CAP; part++) {
         if (parts[part] != NULL &&
-            write_commit_bytes(descriptor, parts[part], lengths[part],
-                               "state-commit-write") == -1) {
+            write_commit_bytes(
+                descriptor, parts[part], lengths[part]
+                GSH_FAULT_ARGUMENT("state-commit-write")) == -1) {
             return -1;
         }
     }
@@ -14666,7 +14674,7 @@ static void start_native_compound(shell_state *state, size_t node_index)
         queue_prompt(state);
         return;
     }
-    if (make_pipe(gate, false, "evaluator-gate") == -1) {
+    if (make_pipe(gate, false GSH_FAULT_ARGUMENT("evaluator-gate")) == -1) {
         output_format(state, "gsh: evaluator gate: %s\r\n",
                       strerror(errno));
         abandon_pending_list(state);
@@ -14674,7 +14682,8 @@ static void start_native_compound(shell_state *state, size_t node_index)
         queue_prompt(state);
         return;
     }
-    if (make_pipe(commit, false, "state-commit-pipe") == -1 ||
+    if (make_pipe(commit, false
+                  GSH_FAULT_ARGUMENT("state-commit-pipe")) == -1 ||
         set_fd_flags(commit[0], F_GETFL, O_NONBLOCK) == -1) {
         int saved_errno = errno;
 
@@ -14718,7 +14727,8 @@ static void start_native_compound(shell_state *state, size_t node_index)
         return;
     }
     if (state->pending_exec_possible &&
-        make_pipe(exec_outcome, false, "exec-outcome-pipe") == -1) {
+        make_pipe(exec_outcome, false
+                  GSH_FAULT_ARGUMENT("exec-outcome-pipe")) == -1) {
         int saved_errno = errno;
 
         close(gate[0]);
