@@ -3252,6 +3252,58 @@ static int noninteractive_fault_case(const char *executable,
     return 0;
 }
 
+static int noninteractive_input_fault_case(const char *executable,
+                                           const char *fault,
+                                           const char *diagnostic)
+{
+    FILE *input = tmpfile();
+    FILE *capture = tmpfile();
+    char output[4096];
+    size_t length = 0;
+    int status = 0;
+    pid_t pid;
+
+    if (input == NULL || capture == NULL || fputs(":\n", input) == EOF ||
+        fflush(input) == EOF || fseek(input, 0, SEEK_SET) == -1) {
+        if (input != NULL) {
+            (void)fclose(input);
+        }
+        if (capture != NULL) {
+            (void)fclose(capture);
+        }
+        return 1;
+    }
+    pid = fork();
+    if (pid == 0) {
+        if (setenv("GSH_FAULT", fault, 1) == -1 ||
+            dup2(fileno(input), STDIN_FILENO) == -1 ||
+            dup2(fileno(capture), STDOUT_FILENO) == -1 ||
+            dup2(fileno(capture), STDERR_FILENO) == -1) {
+            _exit(126);
+        }
+        execl(executable, executable, "-s", (char *)NULL);
+        _exit(127);
+    }
+    if (pid == -1 || wait_fault_child(pid, &status) == -1) {
+        (void)fclose(input);
+        (void)fclose(capture);
+        return 1;
+    }
+    if (fseek(capture, 0, SEEK_SET) == 0) {
+        length = fread(output, 1, sizeof(output), capture);
+    }
+    (void)fclose(input);
+    (void)fclose(capture);
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 125 ||
+        find_bytes((const unsigned char *)output, length, diagnostic) ==
+            NULL) {
+        fprintf(stderr, "pty fault: non-interactive input failed: %s\n",
+                fault);
+        return 1;
+    }
+    return 0;
+}
+
 static int enoexec_fault_case(const char *executable)
 {
     char fixture[] = "/tmp/gsh-fault-enoexec-XXXXXX";
@@ -3490,13 +3542,17 @@ static int fault_injection_flow(const char *executable)
     failed |= noninteractive_fault_case(
         executable, "shell-executable-resolution", ":", 125,
         "executable resolution");
+    failed |= noninteractive_input_fault_case(
+        executable, "input-mode", "standard input input mode");
+    failed |= noninteractive_input_fault_case(
+        executable, "input-read", "standard input: Input/output error");
     failed |= enoexec_fault_case(executable);
     for (index = 0; index < sizeof(fatal_cases) / sizeof(fatal_cases[0]);
          index++) {
         failed |= fatal_fault_case(executable, fatal_cases[index]);
     }
     if (!failed) {
-        puts("pty fault: 83 deterministic boundary failures passed");
+        puts("pty fault: 85 deterministic boundary failures passed");
     }
     return failed;
 }

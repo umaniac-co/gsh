@@ -100,9 +100,11 @@ evaluator processes; neither can block the interactive reactor. Nested source
 evaluation uses an eight-slot LIFO arena allocated once at startup. Each slot
 owns parser, planner, transactional, function, alias, and 1 MiB source storage,
 so entering a command substitution, `eval`, or dot script performs no heap
-allocation and depth exhaustion is deterministic. The same allocation owns the persistent root
-alias and function stores, removing their former first-use allocations without
-faulting in their unused text and parser arenas. `-c` maps its command name and
+allocation and depth exhaustion is deterministic. The same allocation owns the
+persistent root alias and function stores plus the top-level 1 MiB
+complete-command window,
+removing their former first-use allocations without faulting in their unused
+text and parser arenas. `-c` maps its command name and
 arguments to `$0` and the positional parameters, with native
 `$#`, numbered parameters, `$@`, `$*`, and `$-`; quoted `$@` retains its
 multi-field semantics. `set --` and operand forms replace or clear positional
@@ -552,11 +554,17 @@ evaluator and preserve `$0` plus the positional operands:
 ./build/gsh script.sh first 'second value'
 ```
 
-This first native ingestion tranche reads at most 1 MiB and buffers the whole
-source before evaluation. It rejects null bytes and oversized input
-deterministically. Streaming complete-command ingestion, the standard-input
-no-read-ahead rule, and removal of the temporary size ceiling remain required
-before the invocation interface is POSIX-complete. Interactive unsupported
+Descriptor input is streamed and committed one complete command at a time, so
+the total source length is no longer capped. Command-file input uses a 16 KiB
+read window. Standard input that shares its open file description with child
+commands is rewound to the exact command boundary when seekable; a pipe or
+other non-seekable input is read without prefetch past that boundary. A single
+complete command remains bounded to 1 MiB and null bytes are rejected
+deterministically; removing that remaining line/command-size bound is still
+required for complete POSIX input semantics. Non-blocking standard input is
+switched to blocking mode on the shared open file description before reading,
+as required. Empty and comment-only complete commands preserve the prior
+status. Interactive unsupported
 syntax—including interactive `eval` and dot—still has a compatibility
 fallback; non-interactive top-level input and external `ENOEXEC` scripts do
 not.
@@ -618,9 +626,9 @@ replaces the worker.
 
 This is soft real-time engineering, not hard real-time or mission-grade status.
 The repository has executable conformance tranches, bounded fuzz/property
-checks, sanitizer builds, 83 deterministic fault cases, resource-pressure
+checks, sanitizer builds, 85 deterministic fault cases, resource-pressure
 scenarios, and a configurable soak runner. The current native tranche contains
-519 execution cases, 30 syntax cases, and 17 deterministic limit cases with
+524 execution cases, 30 syntax cases, and 18 deterministic limit cases with
 one explicitly unsupported case and no delegated cases. The current same-source
 tranche passes the local macOS matrix, but does not gain same-revision remote
 evidence until the macOS arm64 and Ubuntu x86-64 GCC/Clang jobs run after

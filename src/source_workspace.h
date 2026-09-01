@@ -37,6 +37,7 @@ typedef struct {
     gsh_function_store root_functions;
     gsh_function_store root_function_scratch;
     char root_alias_expansion[GSH_ALIAS_EXPANSION_CAP];
+    char root_input[GSH_SOURCE_INPUT_CAP + 1U];
     gsh_source_workspace workspaces[GSH_SOURCE_DEPTH_CAP];
 } gsh_source_workspace_stack;
 

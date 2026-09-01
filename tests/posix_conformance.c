@@ -322,6 +322,206 @@ static int no_execution_case(const char *executable)
     return failed;
 }
 
+static int write_repeated_byte(int descriptor, unsigned char byte,
+                               size_t count)
+{
+    unsigned char bytes[4096];
+    size_t written = 0;
+
+    memset(bytes, byte, sizeof(bytes));
+    while (written < count) {
+        size_t available = count - written;
+        size_t request = available < sizeof(bytes) ? available
+                                                   : sizeof(bytes);
+        ssize_t result = write(descriptor, bytes, request);
+
+        if (result > 0) {
+            written += (size_t)result;
+        } else if (result == -1 && errno == EINTR) {
+            continue;
+        } else {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int native_large_input_case(const char *executable,
+                                   const char *directory)
+{
+    char path[1024];
+    char command[4096];
+    syntax_case test = {"sh/2.1", "streamed source exceeds one MiB",
+                        command, 0, "STREAM_OK"};
+    int descriptor;
+    int failed = 0;
+
+    if (snprintf(path, sizeof(path), "%s/large.sh", directory) >=
+            (int)sizeof(path) ||
+        snprintf(command, sizeof(command), "'%s' '%s'", executable,
+                 path) >= (int)sizeof(command)) {
+        return 1;
+    }
+    descriptor = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+    if (descriptor == -1 || write(descriptor, "#", 1) != 1 ||
+        write_repeated_byte(descriptor, 'x', 600000U) == -1 ||
+        write(descriptor, "\n#", 2) != 2 ||
+        write_repeated_byte(descriptor, 'y', 600000U) == -1 ||
+        write(descriptor, "\n/usr/bin/printf STREAM_OK\n", 27) != 27) {
+        failed = 1;
+    }
+    if (descriptor >= 0 && close(descriptor) == -1) {
+        failed = 1;
+    }
+    if (!failed && run_case(executable, &test, false) != 0) {
+        failed = 1;
+    }
+    (void)unlink(path);
+    return failed;
+}
+
+static int native_seekable_input_case(const char *executable,
+                                      const char *directory)
+{
+    static const char script[] = "/bin/cat\nseekable payload\n";
+    char path[1024];
+    char command[4096];
+    syntax_case test = {
+        "sh/2.1", "seekable standard input is rewound before execution",
+        command, 0, "seekable payload\n"};
+    int descriptor;
+    int failed = 0;
+
+    if (snprintf(path, sizeof(path), "%s/stdin.sh", directory) >=
+            (int)sizeof(path) ||
+        snprintf(command, sizeof(command), "'%s' -s < '%s'", executable,
+                 path) >= (int)sizeof(command)) {
+        return 1;
+    }
+    descriptor = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+    if (descriptor == -1 ||
+        write(descriptor, script, sizeof(script) - 1U) !=
+            (ssize_t)(sizeof(script) - 1U)) {
+        failed = 1;
+    }
+    if (descriptor >= 0 && close(descriptor) == -1) {
+        failed = 1;
+    }
+    if (!failed && run_case(executable, &test, false) != 0) {
+        failed = 1;
+    }
+    (void)unlink(path);
+    return failed;
+}
+
+static int native_oversized_input_case(const char *executable)
+{
+    char directory[] = "/tmp/gsh-native-input-limit-XXXXXX";
+    char path[1024];
+    char command[4096];
+    syntax_case test = {
+        "sh/2.1", "single complete-command input limit", command, 2,
+        "complete command exceeds input limit"};
+    int descriptor = -1;
+    int failed = 0;
+
+    if (mkdtemp(directory) == NULL ||
+        snprintf(path, sizeof(path), "%s/oversized.sh", directory) >=
+            (int)sizeof(path) ||
+        snprintf(command, sizeof(command), "'%s' '%s'", executable,
+                 path) >= (int)sizeof(command)) {
+        return 1;
+    }
+    descriptor = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+    if (descriptor == -1 || write(descriptor, "#", 1) != 1 ||
+        write_repeated_byte(descriptor, 'x', GSH_SOURCE_INPUT_CAP) == -1) {
+        failed = 1;
+    }
+    if (descriptor >= 0 && close(descriptor) == -1) {
+        failed = 1;
+    }
+    descriptor = -1;
+    if (!failed && run_case(executable, &test, false) != 0) {
+        failed = 1;
+    }
+    if (descriptor >= 0) {
+        (void)close(descriptor);
+    }
+    (void)unlink(path);
+    (void)rmdir(directory);
+    return failed;
+}
+
+static int native_nonblocking_input_case(const char *executable)
+{
+    static const char script[] = "exit 0\n";
+    int input[2];
+    int flags;
+    pid_t pid;
+    uint64_t deadline;
+    int status = 0;
+    bool blocking = false;
+    size_t attempts;
+
+    if (pipe(input) == -1 ||
+        (flags = fcntl(input[0], F_GETFL)) == -1 ||
+        fcntl(input[0], F_SETFL, flags | O_NONBLOCK) == -1) {
+        return 1;
+    }
+    pid = fork();
+    if (pid == 0) {
+        char *const arguments[] = {(char *)executable, "-s", NULL};
+
+        close(input[1]);
+        if (dup2(input[0], STDIN_FILENO) == -1) {
+            _exit(126);
+        }
+        if (input[0] != STDIN_FILENO) {
+            close(input[0]);
+        }
+        execv(executable, arguments);
+        _exit(127);
+    }
+    if (pid == -1) {
+        close(input[1]);
+        close(input[0]);
+        return 1;
+    }
+    deadline = monotonic_ns() + 2000000000ULL;
+    while (monotonic_ns() < deadline) {
+        flags = fcntl(input[0], F_GETFL);
+        if (flags != -1 && (flags & O_NONBLOCK) == 0) {
+            blocking = true;
+            break;
+        }
+        (void)poll(NULL, 0, 1);
+    }
+    if (blocking &&
+        write(input[1], script, sizeof(script) - 1U) !=
+            (ssize_t)(sizeof(script) - 1U)) {
+        blocking = false;
+    }
+    close(input[1]);
+    close(input[0]);
+    if (!blocking) {
+        (void)kill(pid, SIGKILL);
+    }
+    for (attempts = 0; attempts < 1024U; attempts++) {
+        pid_t waited = waitpid(pid, &status, 0);
+
+        if (waited == pid) {
+            break;
+        }
+        if (waited == -1 && errno != EINTR) {
+            break;
+        }
+    }
+    return blocking && attempts < 1024U && WIFEXITED(status) &&
+                   WEXITSTATUS(status) == 0
+               ? 0
+               : 1;
+}
+
 static int native_invocation_cases(const char *executable)
 {
     static const char script[] =
@@ -387,6 +587,25 @@ static int native_invocation_cases(const char *executable)
          snprintf(expected, sizeof(expected), "<file:%s:first:second value>",
                   path) >= (int)sizeof(expected) ||
          run_case(executable, &test, false) != 0)) {
+        failed = 1;
+    }
+    test.name = "non-seekable standard input is not read ahead";
+    test.diagnostic = "streamed payload\n";
+    if (!failed &&
+        (snprintf(command, sizeof(command),
+                  "/usr/bin/printf '%%s\\n' '/bin/cat' "
+                  "'streamed payload' | '%s' -s",
+                  executable) >= (int)sizeof(command) ||
+         run_case(executable, &test, false) != 0)) {
+        failed = 1;
+    }
+    if (!failed && native_large_input_case(executable, directory) != 0) {
+        failed = 1;
+    }
+    if (!failed && native_seekable_input_case(executable, directory) != 0) {
+        failed = 1;
+    }
+    if (!failed && native_nonblocking_input_case(executable) != 0) {
         failed = 1;
     }
     test.name = "regular invocation rejects native gap";
@@ -788,6 +1007,8 @@ static int native_exit_core_cases(const char *executable)
          NULL},
         {"exit", "omitted status uses the preceding pipeline",
          "false; exit; :", 1, NULL},
+        {"exit", "empty complete commands preserve the preceding status",
+         "false\n\n# comment\nexit\n", 1, NULL},
         {"exit", "pipeline negation cannot outlive exit", "! exit 9; :", 9,
          NULL},
         {"exit", "exit crosses a function frame",
@@ -1372,6 +1593,10 @@ static int native_limit_cases(const char *executable)
                         "native execution unsupported"};
     size_t used = 0;
     size_t index;
+
+    if (native_oversized_input_case(executable) != 0) {
+        return 1;
+    }
 
     for (index = 0; index < 33; index++) {
         int length = snprintf(command + used, sizeof(command) - used,
@@ -3671,7 +3896,7 @@ int main(int argc, char **argv)
     if (native_invocation_cases(argv[1]) != 0) {
         return 1;
     }
-    execution_passed += 4U;
+    execution_passed += 8U;
     for (index = 0;
          index < sizeof(execution_cases) / sizeof(execution_cases[0]);
          index++) {
@@ -3692,7 +3917,7 @@ int main(int argc, char **argv)
     if (native_exit_cases(argv[1]) != 0) {
         return 1;
     }
-    execution_passed += 18U;
+    execution_passed += 19U;
     if (native_enoexec_cases(argv[1]) != 0) {
         return 1;
     }
@@ -3744,7 +3969,7 @@ int main(int argc, char **argv)
     if (native_limit_cases(argv[1]) != 0) {
         return 1;
     }
-    limit_passed = 17;
+    limit_passed = 18;
     printf("POSIX native tranche: syntax=%zu execution=%zu limits=%zu "
            "unsupported=%zu delegated=0\n",
            passed + 1U, execution_passed, limit_passed, unsupported);
