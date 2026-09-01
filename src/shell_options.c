@@ -6,6 +6,7 @@
 #endif
 
 #include "shell_options.h"
+#include "positional_parameters.h"
 
 #include <errno.h>
 #include <string.h>
@@ -26,6 +27,9 @@ static const option_descriptor descriptors[] = {
 void gsh_options_initialize(gsh_shell_options *options, bool interactive)
 {
     options->enabled = interactive ? GSH_OPTION_INTERACTIVE : 0U;
+    options->getopts_index = 1U;
+    options->getopts_offset = 1U;
+    options->getopts_optind_generation = 0U;
 }
 
 bool gsh_options_enabled(const gsh_shell_options *options,
@@ -40,7 +44,11 @@ bool gsh_options_validate(const gsh_shell_options *options)
                                GSH_OPTION_ALLEXPORT | GSH_OPTION_NOUNSET |
                                GSH_OPTION_INTERACTIVE;
 
-    return options != NULL && (options->enabled & ~known) == 0U;
+    return options != NULL && (options->enabled & ~known) == 0U &&
+           options->getopts_index >= 1U &&
+           options->getopts_index <= GSH_POSITIONAL_CAP + 1U &&
+           options->getopts_offset >= 1U &&
+           options->getopts_offset <= GSH_POSITIONAL_TEXT_CAP;
 }
 
 static int update(gsh_shell_options *options,

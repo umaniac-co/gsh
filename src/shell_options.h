@@ -16,6 +16,9 @@ enum {
 
 typedef struct {
     uint32_t enabled;
+    uint16_t getopts_index;
+    uint16_t getopts_offset;
+    uint64_t getopts_optind_generation;
 } gsh_shell_options;
 
 void gsh_options_initialize(gsh_shell_options *options, bool interactive);

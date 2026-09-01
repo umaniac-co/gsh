@@ -6,6 +6,7 @@
 
 #include <errno.h>
 #include <limits.h>
+#include <stdlib.h>
 #include <string.h>
 
 enum {
@@ -54,6 +55,7 @@ static uint32_t variable_hash(const char *name, size_t length)
 void gsh_variables_initialize(gsh_variable_store *store)
 {
     memset(store, 0, sizeof(*store));
+    store->next_value_generation = 1U;
 }
 
 static bool entry_name_matches(const gsh_variable_store *store,
@@ -178,6 +180,31 @@ static int successful_update(gsh_variable_store *store, const char *name,
     return 0;
 }
 
+static void mark_value_update(gsh_variable_store *store, size_t index)
+{
+    size_t attempts;
+
+    for (attempts = 0; attempts <= store->count; attempts++) {
+        uint64_t candidate = store->next_value_generation++;
+        size_t entry;
+        bool used = candidate == 0U;
+
+        if (store->next_value_generation == 0U) {
+            store->next_value_generation = 1U;
+        }
+        for (entry = 0; !used && entry < store->count; entry++) {
+            used = store->entries[entry].value_generation == candidate;
+        }
+        if (!used) {
+            store->entries[index].value_generation = candidate;
+            return;
+        }
+    }
+    /* At most count generations are live, so the bounded search above must
+     * always find a free non-zero generation. */
+    abort();
+}
+
 static int set_variable(gsh_variable_store *store, const char *name,
                         size_t name_length, const char *value,
                         size_t value_length, unsigned int attribute_mask,
@@ -235,6 +262,7 @@ static int set_variable(gsh_variable_store *store, const char *name,
             entry->attributes = (uint16_t)(
                 (entry->attributes & ~attribute_mask) |
                 (attributes & attribute_mask));
+            mark_value_update(store, index);
             return successful_update(store, name, name_length, set_value);
         }
         if (new_length > old_length &&
@@ -268,6 +296,7 @@ static int set_variable(gsh_variable_store *store, const char *name,
             (entry->attributes & ~attribute_mask) |
             (attributes & attribute_mask));
         entry->attributes &= (uint16_t)~GSH_VARIABLE_INTERNAL_UNSET;
+        mark_value_update(store, index);
         return successful_update(store, name, name_length, set_value);
     }
     if (store->count == GSH_VARIABLE_CAP) {
@@ -295,6 +324,7 @@ static int set_variable(gsh_variable_store *store, const char *name,
         store->text_used -= (uint32_t)new_length;
         return -1;
     }
+    if (set_value) mark_value_update(store, index);
     return successful_update(store, name, name_length, set_value);
 }
 
@@ -408,6 +438,9 @@ int gsh_variables_import(gsh_variable_store *store,
     if (gsh_variables_set(store, "IFS", 3, " \t\n", 3, 0, 0) == -1) {
         return -1;
     }
+    if (gsh_variables_set(store, "OPTIND", 6, "1", 1, 0, 0) == -1) {
+        return -1;
+    }
     return 0;
 }
 
@@ -440,6 +473,21 @@ bool gsh_variables_is_set(const gsh_variable_store *store, size_t index)
 uint64_t gsh_variables_path_generation(const gsh_variable_store *store)
 {
     return store == NULL ? 0U : store->path_generation;
+}
+
+uint64_t gsh_variables_value_generation(const gsh_variable_store *store,
+                                        const char *name,
+                                        size_t name_length)
+{
+    size_t index;
+
+    if (store == NULL || !gsh_variable_name_is_valid(name, name_length)) {
+        return 0;
+    }
+    index = variable_index(store, name, name_length,
+                           variable_hash(name, name_length));
+    return index == GSH_VARIABLE_CAP ? 0
+                                     : store->entries[index].value_generation;
 }
 
 void gsh_variable_journal_initialize(gsh_variable_journal *journal,

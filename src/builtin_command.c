@@ -3,6 +3,7 @@
 #endif
 
 #include "builtin_command.h"
+#include "builtin_registry.h"
 
 #include <errno.h>
 #include <string.h>
@@ -74,26 +75,16 @@ static bool reserved_word_name(const char *name, size_t length)
 
 static bool implemented_special_name(const char *name, size_t length)
 {
-    static const char *const names[] = {
-        ".",      ":",      "break", "continue", "eval", "exec",
-        "exit",   "export", "readonly", "return", "set", "shift",
-        "times",  "trap",   "unset",
-    };
+    const gsh_builtin_descriptor *descriptor =
+        gsh_builtin_lookup(name, length);
 
-    return name_in_table(name, length, names,
-                         sizeof(names) / sizeof(names[0]));
+    return descriptor != NULL && descriptor->implemented &&
+           descriptor->special;
 }
 
 static bool regular_builtin_name(const char *name, size_t length)
 {
-    static const char *const names[] = {
-        "alias", "bg",      "cd",    "command", "false", "fg",
-        "hash",  "help",    "pwd",   "rt",      "true",  "type",
-        "ulimit", "umask",  "unalias", "wait",
-    };
-
-    return name_in_table(name, length, names,
-                         sizeof(names) / sizeof(names[0]));
+    return gsh_builtin_regular_name(name, length);
 }
 
 bool gsh_command_intrinsic_name(const char *name, size_t length)

@@ -35,6 +35,14 @@ typedef struct {
     const char *diagnostic;
 } syntax_case;
 
+enum { ECHO_DIFFERENTIAL_CASE_COUNT = 15 };
+
+typedef struct {
+    unsigned char bytes[65536];
+    size_t length;
+    int status;
+} command_capture;
+
 static int build_nested_substitution(char *command, size_t capacity,
                                      size_t depth)
 {
@@ -298,6 +306,150 @@ static int run_case(const char *executable, const syntax_case *test,
                     bool syntax_only)
 {
     return run_case_arguments(executable, test, syntax_only, NULL, NULL, 0);
+}
+
+static int capture_shell_command(const char *executable, bool bash,
+                                 const char *command,
+                                 command_capture *capture)
+{
+    char bash_command[4096];
+    int descriptors[2];
+    int flags;
+    int wait_status = 0;
+    uint64_t deadline;
+    pid_t pid;
+
+    memset(capture, 0, sizeof(*capture));
+    if (bash && snprintf(bash_command, sizeof(bash_command),
+                         "shopt -u xpg_echo; %s", command) >=
+                    (int)sizeof(bash_command)) {
+        return -1;
+    }
+    if (pipe(descriptors) == -1) return -1;
+    pid = fork();
+    if (pid == 0) {
+        char *gsh_arguments[] = {(char *)executable, (char *)"-c",
+                                 (char *)command, NULL};
+        char *bash_arguments[] = {
+            (char *)executable, (char *)"--noprofile", (char *)"--norc",
+            (char *)"-c", bash_command, NULL};
+
+        close(descriptors[0]);
+        if (dup2(descriptors[1], STDOUT_FILENO) == -1) _exit(126);
+        close(descriptors[1]);
+        execv(executable, bash ? bash_arguments : gsh_arguments);
+        _exit(127);
+    }
+    close(descriptors[1]);
+    if (pid == -1) {
+        close(descriptors[0]);
+        return -1;
+    }
+    flags = fcntl(descriptors[0], F_GETFL);
+    if (flags == -1 ||
+        fcntl(descriptors[0], F_SETFL, flags | O_NONBLOCK) == -1) {
+        (void)kill(pid, SIGKILL);
+        (void)waitpid(pid, NULL, 0);
+        close(descriptors[0]);
+        return -1;
+    }
+    deadline = monotonic_ns() + 2000000000ULL;
+    for (;;) {
+        pid_t waited = waitpid(pid, &wait_status, WNOHANG);
+        ssize_t count;
+
+        do {
+            count = read(descriptors[0], capture->bytes + capture->length,
+                         sizeof(capture->bytes) - capture->length);
+            if (count > 0) capture->length += (size_t)count;
+        } while (count > 0 && capture->length < sizeof(capture->bytes));
+        if (capture->length == sizeof(capture->bytes)) {
+            (void)kill(pid, SIGKILL);
+            (void)waitpid(pid, NULL, 0);
+            close(descriptors[0]);
+            errno = EOVERFLOW;
+            return -1;
+        }
+        if (waited == pid) break;
+        if (waited == -1 && errno != EINTR) {
+            close(descriptors[0]);
+            return -1;
+        }
+        if (monotonic_ns() >= deadline) {
+            (void)kill(pid, SIGKILL);
+            (void)waitpid(pid, NULL, 0);
+            close(descriptors[0]);
+            errno = ETIMEDOUT;
+            return -1;
+        }
+        {
+            struct pollfd descriptor = {descriptors[0], POLLIN, 0};
+
+            (void)poll(&descriptor, 1, 10);
+        }
+    }
+    for (;;) {
+        ssize_t count = read(descriptors[0],
+                             capture->bytes + capture->length,
+                             sizeof(capture->bytes) - capture->length);
+
+        if (count > 0) {
+            capture->length += (size_t)count;
+        } else if (count == -1 && errno == EINTR) {
+            continue;
+        } else {
+            break;
+        }
+    }
+    close(descriptors[0]);
+    capture->status = WIFEXITED(wait_status) ? WEXITSTATUS(wait_status)
+                                             : 128 + WTERMSIG(wait_status);
+    return 0;
+}
+
+static int echo_differential_cases(const char *gsh, const char *bash)
+{
+    static const char *const commands[ECHO_DIFFERENTIAL_CASE_COUNT] = {
+        "echo",
+        "echo plain words",
+        "echo -n no-newline",
+        "echo -nnne compact",
+        "echo -e 'a\\nb'",
+        "echo -E '\\n'",
+        "echo -ne 'a\\tb'",
+        "echo -e 'left\\cright'; echo after",
+        "echo -x",
+        "echo -- value",
+        "echo -e '\\x41\\u0042\\U00000043'",
+        "echo -e '\\012'",
+        "echo -e -E '\\n'",
+        "echo -E -e '\\n'",
+        "echo -nE -e x",
+    };
+    size_t index;
+
+    if (bash == NULL || access(bash, X_OK) == -1) {
+        fprintf(stderr,
+                "conformance: Bash is required for echo differential\n");
+        return 1;
+    }
+    for (index = 0; index < ECHO_DIFFERENTIAL_CASE_COUNT; index++) {
+        command_capture actual;
+        command_capture expected;
+
+        if (capture_shell_command(gsh, false, commands[index], &actual) ==
+                -1 ||
+            capture_shell_command(bash, true, commands[index], &expected) ==
+                -1 ||
+            actual.status != expected.status ||
+            actual.length != expected.length ||
+            memcmp(actual.bytes, expected.bytes, actual.length) != 0) {
+            fprintf(stderr, "conformance: echo differs from Bash: %s\n",
+                    commands[index]);
+            return 1;
+        }
+    }
+    return 0;
 }
 
 static int no_execution_case(const char *executable)
@@ -1922,6 +2074,48 @@ static int native_limit_cases(const char *executable)
     return 0;
 }
 
+static int native_read_overflow_case(const char *executable)
+{
+    char directory[] = "/tmp/gsh-read-overflow-XXXXXX";
+    char path[1024] = {0};
+    char command[4096];
+    syntax_case test = {
+        "read/limits", "oversize read drains and commits nothing", command,
+        0, "<before:unset:next:1>"};
+    int descriptor = -1;
+    int failed = 0;
+
+    if (mkdtemp(directory) == NULL ||
+        snprintf(path, sizeof(path), "%s/input", directory) >=
+            (int)sizeof(path) ||
+        snprintf(command, sizeof(command),
+                 "keep=before; exec 3<'%s'; read keep extra <&3; "
+                 "overflow=$?; read next <&3; "
+                 "printf '<%%s:%%s:%%s:%%s>\\n' \"$keep\" "
+                 "\"${extra-unset}\" \"$next\" \"$overflow\"",
+                 path) >= (int)sizeof(command)) {
+        failed = 1;
+        goto done;
+    }
+    descriptor = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+    if (descriptor == -1 ||
+        write_repeated_byte(descriptor, 'x', 5000U) == -1 ||
+        write(descriptor, "\nnext\n", 6U) != 6 ||
+        close(descriptor) == -1) {
+        failed = 1;
+        descriptor = -1;
+        goto done;
+    }
+    descriptor = -1;
+    failed = run_case(executable, &test, false) != 0;
+
+done:
+    if (descriptor >= 0) (void)close(descriptor);
+    if (path[0] != '\0') (void)unlink(path);
+    (void)rmdir(directory);
+    return failed;
+}
+
 static int native_heredoc_stress_cases(const char *executable)
 {
     char command[61000];
@@ -3342,6 +3536,128 @@ int main(int argc, char **argv)
         {"2.15", "native colon builtin", ":", 0, NULL},
         {"2.15", "native true builtin", "true", 0, NULL},
         {"2.15", "native false builtin", "false", 1, NULL},
+        {"2.9.1/echo", "standalone assignment reaches native builtins",
+         "foo=bar; echo \"$foo\"; printf '<%s>\\n' \"$foo\"; "
+         "test \"$foo\" = bar; [ \"$foo\" = bar ]",
+         0, "bar\n<bar>\n"},
+        {"echo", "default echo option combinations",
+         "echo -ne 'one\\ntwo'; echo -E '\\n'; echo -x",
+         0, "one\ntwo\\n\n-x\n"},
+        {"echo", "echo c escape suppresses remaining output",
+         "echo -e 'before\\cafter'; echo next", 0, "beforenext\n"},
+        {"echo", "echo is native in every pipeline position",
+         "echo left | /bin/cat; /usr/bin/printf ignored | echo right",
+         0, "left\nright\n"},
+        {"echo", "echo redirection restores descriptors",
+         "GSH_ECHO_FILE=/tmp/gsh-echo-$$; echo file >\"$GSH_ECHO_FILE\"; "
+         "echo terminal; /bin/cat \"$GSH_ECHO_FILE\"; "
+         "/bin/rm -f \"$GSH_ECHO_FILE\"",
+         0, "terminal\nfile\n"},
+        {"echo", "command wrappers select the native echo",
+         "echo() { printf 'function\\n'; }; echo; command echo native; "
+         "command -p echo portable",
+         0, "function\nnative\nportable\n"},
+        {"echo", "regular builtin prefix assignment is temporary",
+         "foo=outer; foo=inner echo value; echo \"$foo\"",
+         0, "value\nouter\n"},
+        {"printf", "printf reuses its format",
+         "printf '<%s>:%04d\\n' a 7 b 9", 0, "<a>:0007\n<b>:0009\n"},
+        {"printf", "printf missing operands use utility defaults",
+         "printf '<%d:%s>\\n'", 0, "<0:>\n"},
+        {"printf", "printf hexadecimal floating conversions",
+         "printf '%a:%A\\n' 1 2", 0, "0x1p+0:0X1P+1\n"},
+        {"printf", "printf quoted multibyte numeric operand",
+         "printf '%d:%x\\n' \"'é\" \"'é\"", 0, "233:e9\n"},
+        {"printf", "printf format and percent-b escapes",
+         "printf '\\101:%b:%s\\n' 'x\\0y' tail", 0, "A:x"},
+        {"printf", "printf invalid numeric operand is diagnosed natively",
+         "printf '%d\\n' invalid", 1, "invalid numeric operand"},
+        {"printf", "printf redirection and pipeline stay native",
+         "GSH_PRINTF_FILE=/tmp/gsh-printf-$$; "
+         "printf '%s\\n' redirected >\"$GSH_PRINTF_FILE\"; "
+         "printf '%s\\n' pipeline | /bin/cat; "
+         "/bin/cat \"$GSH_PRINTF_FILE\"; /bin/rm -f \"$GSH_PRINTF_FILE\"",
+         0, "pipeline\nredirected\n"},
+        {"test", "test and bracket share string and integer semantics",
+         "test alpha != beta && test 7 -ge 7 && "
+         "[ -n alpha ] && [ ! -z alpha ]",
+         0, NULL},
+        {"test", "test logical primaries honor truth values",
+         "test x -a y && test '' -o x && ! test '' -a x",
+         0, NULL},
+        {"test", "test file predicates and identity",
+         "GSH_TEST_FILE=/tmp/gsh-test-$$; : >\"$GSH_TEST_FILE\"; "
+         "test -e \"$GSH_TEST_FILE\" && test -f \"$GSH_TEST_FILE\" && "
+         "test \"$GSH_TEST_FILE\" -ef \"$GSH_TEST_FILE\"; "
+         "status=$?; /bin/rm -f \"$GSH_TEST_FILE\"; test \"$status\" -eq 0",
+         0, NULL},
+        {"test", "bracket requires a closing operand",
+         "[ value = value", 2, "missing ]"},
+        {"test", "test composes through command pipeline and redirection",
+         "command test x = x | /bin/cat; test x = x 2>/dev/null",
+         0, NULL},
+        {"read", "redirected read commits all parent variables",
+         "read first rest <<EOF\none two three\nEOF\n"
+         "printf '<%s><%s>\\n' \"$first\" \"$rest\"",
+         0, "<one><two three>\n"},
+        {"read", "pipeline read variable updates are isolated",
+         "value=parent; printf 'child\\n' | read value; "
+         "printf '<%s>\\n' \"$value\"",
+         0, "<parent>\n"},
+        {"read", "read raw mode preserves backslashes",
+         "read -r value <<EOF\na\\tb\nEOF\nprintf '<%s>\\n' \"$value\"",
+         0, "<a\\tb>\n"},
+        {"read", "read continuation removes escaped newline",
+         "read value <<EOF\none\\\ntwo\nEOF\nprintf '<%s>\\n' \"$value\"",
+         0, "<onetwo>\n"},
+        {"read", "read uses prefix IFS without retaining it",
+         "IFS=old; IFS=, read first rest <<EOF\na,b,c\nEOF\n"
+         "printf '<%s><%s><%s>\\n' \"$first\" \"$rest\" \"$IFS\"",
+         0, "<a><b,c><old>\n"},
+        {"getopts", "getopts grouped sequence end and reset",
+         "set -- -ab value; getopts ab option; "
+         "printf '%s:%s\\n' \"$option\" \"$OPTIND\"; "
+         "getopts ab option; printf '%s:%s\\n' \"$option\" \"$OPTIND\"; "
+         "getopts ab option; printf '%s:%s:%s\\n' \"$?\" \"$option\" "
+         "\"$OPTIND\"; OPTIND=1; getopts ab option; "
+         "printf '%s:%s\\n' \"$option\" \"$OPTIND\"",
+         0, "a:1\nb:2\n1:?:2\na:1\n"},
+        {"getopts", "getopts attached required argument",
+         "set -- -ovalue; getopts o: option; "
+         "printf '%s:%s:%s\\n' \"$option\" \"$OPTARG\" \"$OPTIND\"",
+         0, "o:value:2\n"},
+        {"getopts", "getopts silent missing argument",
+         "set -- -o; getopts :o: option; "
+         "printf '%s:%s:%s\\n' \"$option\" \"$OPTARG\" \"$OPTIND\"",
+         0, ":o:2\n"},
+        {"getopts", "getopts explicit operands",
+         "OPTIND=1; getopts ab option -b tail; "
+         "printf '%s:%s\\n' \"$option\" \"$OPTIND\"",
+         0, "b:2\n"},
+        {"getopts", "pipeline getopts state is isolated",
+         "set -- -a; getopts a option | /bin/cat; "
+         "printf '<%s:%s>\\n' \"${option-unset}\" \"$OPTIND\"",
+         0, "<unset:1>\n"},
+        {"jobs", "jobs lists and kill targets a native jobspec",
+         "sleep 1 & jobs; kill -0 %1; kill %1; wait %1; test $? -gt 128",
+         0, "Running  sleep 1"},
+        {"jobs", "ambiguous jobspec is deterministic",
+         "sleep 1 & sleep 1 & jobs %?sleep; result=$?; "
+         "kill %1 %2; wait; test \"$result\" -eq 1",
+         0, "ambiguous job specification"},
+        {"jobs", "jobs output follows redirection and pipeline descriptors",
+         "GSH_JOBS_FILE=/tmp/gsh-jobs-$$; sleep 1 & "
+         "jobs -p >\"$GSH_JOBS_FILE\"; jobs | /bin/cat; kill %1; wait; "
+         "test -s \"$GSH_JOBS_FILE\"; status=$?; "
+         "/bin/rm -f \"$GSH_JOBS_FILE\"; test \"$status\" -eq 0",
+         0, "Running  sleep 1"},
+        {"kill", "kill signal names and numbers round trip",
+         "kill -l TERM; kill -l 15; kill -l 143", 0, "15\nTERM\nTERM\n"},
+        {"kill", "kill validates every operand before signaling",
+         "sleep 1 & kill %1 invalid; parse_status=$?; kill -0 %1; "
+         "live_status=$?; kill -- %1; wait %1; "
+         "test \"$parse_status\" -ne 0 && test \"$live_status\" -eq 0",
+         0, "invalid process ID"},
         {"command", "command -v identifies regular builtin",
          "command -v true", 0, "true\n"},
         {"command", "command -V describes regular builtin",
@@ -4172,8 +4488,9 @@ int main(int argc, char **argv)
     size_t limit_passed = 0;
     size_t unsupported = 0;
 
-    if (argc != 2) {
-        fprintf(stderr, "usage: posix-conformance /absolute/path/to/gsh\n");
+    if (argc != 3) {
+        fprintf(stderr,
+                "usage: posix-conformance /absolute/path/to/gsh bash\n");
         return 2;
     }
     if (configure_utf8_locale() == -1 ||
@@ -4216,6 +4533,10 @@ int main(int argc, char **argv)
         return 1;
     }
     execution_passed += 9U;
+    if (echo_differential_cases(argv[1], argv[2]) != 0) {
+        return 1;
+    }
+    execution_passed += ECHO_DIFFERENTIAL_CASE_COUNT;
     for (index = 0;
          index < sizeof(execution_cases) / sizeof(execution_cases[0]);
          index++) {
@@ -4290,10 +4611,11 @@ int main(int argc, char **argv)
         return 1;
     }
     execution_passed += 2U;
-    if (native_limit_cases(argv[1]) != 0) {
+    if (native_read_overflow_case(argv[1]) != 0 ||
+        native_limit_cases(argv[1]) != 0) {
         return 1;
     }
-    limit_passed = 17;
+    limit_passed = 18;
     printf("POSIX native tranche: syntax=%zu execution=%zu limits=%zu "
            "unsupported=%zu delegated=0\n",
            passed + 1U, execution_passed, limit_passed, unsupported);

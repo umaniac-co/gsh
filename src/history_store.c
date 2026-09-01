@@ -10,8 +10,10 @@
 #include <errno.h>
 #include <string.h>
 
-static const unsigned char history_magic[8] = {
+static const unsigned char history_magic_v1[8] = {
     'G', 'S', 'H', 'H', 'I', 'S', 'T', '1'};
+static const unsigned char history_magic_v2[8] = {
+    'G', 'S', 'H', 'H', 'I', 'S', 'T', '2'};
 
 /* ── Fixed Slots Make History Cost Provable ─────────────────────
  * A linked list made command retention depend on allocator health and age.
@@ -35,10 +37,33 @@ static uint32_t decode_u32(const unsigned char input[4])
            ((uint32_t)input[2] << 8) | (uint32_t)input[3];
 }
 
+static void encode_u64(unsigned char output[8], uint64_t value)
+{
+    size_t index;
+
+    for (index = 0; index < 8U; index++) {
+        output[7U - index] = (unsigned char)(value >> (index * 8U));
+    }
+}
+
+static uint64_t decode_u64(const unsigned char input[8])
+{
+    uint64_t value = 0;
+    size_t index;
+
+    for (index = 0; index < 8U; index++) {
+        value = (value << 8U) | input[index];
+    }
+    return value;
+}
+
 void gsh_history_initialize(gsh_history_store *store)
 {
     if (store != NULL) {
-        memset(store, 0, sizeof(*store));
+        memset(store->lengths, 0, sizeof(store->lengths));
+        store->start = 0;
+        store->count = 0;
+        store->next_event = 1U;
     }
 }
 
@@ -46,6 +71,7 @@ void gsh_history_clear(gsh_history_store *store)
 {
     if (store != NULL) {
         memset(store, 0, sizeof(*store));
+        store->next_event = 1U;
     }
 }
 
@@ -61,7 +87,8 @@ int gsh_history_add(gsh_history_store *store, const char *command,
     size_t slot;
 
     if (store == NULL || command == NULL || length == 0 ||
-        length >= GSH_HISTORY_ENTRY_CAP || store->count > GSH_HISTORY_CAP) {
+        length >= GSH_HISTORY_ENTRY_CAP || store->count > GSH_HISTORY_CAP ||
+        store->next_event == 0 || store->next_event <= store->count) {
         errno = EINVAL;
         return -1;
     }
@@ -73,6 +100,10 @@ int gsh_history_add(gsh_history_store *store, const char *command,
             return 0;
         }
     }
+    if (store->next_event == UINT64_MAX) {
+        errno = EOVERFLOW;
+        return -1;
+    }
     if (store->count < GSH_HISTORY_CAP) {
         slot = physical_index(store, store->count++);
     } else {
@@ -82,6 +113,7 @@ int gsh_history_add(gsh_history_store *store, const char *command,
     memcpy(store->entries[slot], command, length);
     store->entries[slot][length] = '\0';
     store->lengths[slot] = (uint16_t)length;
+    store->next_event++;
     return 1;
 }
 
@@ -147,19 +179,86 @@ int gsh_history_search_reverse(const gsh_history_store *store,
     return -1;
 }
 
+uint64_t gsh_history_oldest_event(const gsh_history_store *store)
+{
+    return store == NULL || store->count == 0 ||
+                   store->next_event <= store->count
+               ? 0
+               : store->next_event - store->count;
+}
+
+uint64_t gsh_history_newest_event(const gsh_history_store *store)
+{
+    return store == NULL || store->count == 0 || store->next_event == 0
+               ? 0
+               : store->next_event - 1U;
+}
+
+const char *gsh_history_event(const gsh_history_store *store,
+                              uint64_t event, size_t *length)
+{
+    uint64_t oldest = gsh_history_oldest_event(store);
+    size_t chronological;
+    size_t slot;
+
+    if (length != NULL) {
+        *length = 0;
+    }
+    if (store == NULL || length == NULL || oldest == 0 || event < oldest ||
+        event >= store->next_event) {
+        return NULL;
+    }
+    chronological = (size_t)(event - oldest);
+    slot = physical_index(store, chronological);
+    *length = store->lengths[slot];
+    return store->entries[slot];
+}
+
+int gsh_history_find_prefix(const gsh_history_store *store,
+                            const char *prefix, size_t prefix_length,
+                            uint64_t before_event, uint64_t *event)
+{
+    uint64_t oldest = gsh_history_oldest_event(store);
+    uint64_t candidate;
+    size_t checked;
+
+    if (store == NULL || prefix == NULL || event == NULL ||
+        prefix_length >= GSH_HISTORY_ENTRY_CAP || oldest == 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    candidate = before_event >= store->next_event
+                    ? store->next_event - 1U : before_event;
+    for (checked = 0; checked < store->count && candidate >= oldest;
+         checked++, candidate--) {
+        size_t length;
+        const char *entry = gsh_history_event(store, candidate, &length);
+
+        if (entry != NULL && prefix_length <= length &&
+            memcmp(entry, prefix, prefix_length) == 0) {
+            *event = candidate;
+            return 0;
+        }
+    }
+    errno = ENOENT;
+    return -1;
+}
+
 size_t gsh_history_serialize(const gsh_history_store *store,
                              unsigned char *output, size_t capacity)
 {
-    size_t used = 12;
+    size_t used = 20;
     size_t index;
 
     if (store == NULL || output == NULL || store->count > GSH_HISTORY_CAP ||
+        store->next_event == 0 || store->next_event <= store->count ||
         capacity < used) {
         errno = EINVAL;
         return 0;
     }
-    memcpy(output, history_magic, sizeof(history_magic));
+    memcpy(output, history_magic_v2, sizeof(history_magic_v2));
     encode_u32(output + 8, (uint32_t)store->count);
+    encode_u64(output + 12, store->next_event);
     for (index = 0; index < store->count; index++) {
         size_t slot = physical_index(store, index);
         size_t length = store->lengths[slot];
@@ -181,11 +280,13 @@ int gsh_history_deserialize(gsh_history_store *store,
                             const unsigned char *input, size_t length)
 {
     uint32_t count;
-    size_t offset = 12;
+    uint64_t restored_next = 0;
+    size_t offset;
     size_t index;
 
-    if (store == NULL || input == NULL || length < offset ||
-        memcmp(input, history_magic, sizeof(history_magic)) != 0) {
+    if (store == NULL || input == NULL || length < 12U ||
+        (memcmp(input, history_magic_v1, sizeof(history_magic_v1)) != 0 &&
+         memcmp(input, history_magic_v2, sizeof(history_magic_v2)) != 0)) {
         errno = EPROTO;
         return -1;
     }
@@ -194,7 +295,20 @@ int gsh_history_deserialize(gsh_history_store *store,
         errno = EOVERFLOW;
         return -1;
     }
+    offset = memcmp(input, history_magic_v2, sizeof(history_magic_v2)) == 0
+                 ? 20U : 12U;
+    if (length < offset) {
+        errno = EPROTO;
+        return -1;
+    }
     gsh_history_initialize(store);
+    if (offset == 20U) {
+        restored_next = decode_u64(input + 12);
+        if (restored_next == 0 || restored_next <= count) {
+            errno = EPROTO;
+            return -1;
+        }
+    }
     for (index = 0; index < count; index++) {
         uint32_t entry_length;
 
@@ -217,5 +331,8 @@ int gsh_history_deserialize(gsh_history_store *store,
         errno = EPROTO;
         return -1;
     }
+    store->next_event = restored_next != 0
+                            ? restored_next
+                            : (uint64_t)store->count + 1U;
     return 0;
 }

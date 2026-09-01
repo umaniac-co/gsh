@@ -10,7 +10,9 @@ SOURCES := src/gsh.c src/async_repl.c src/posix_lexer.c \
 	src/posix_parser.c src/native_plan.c \
 	src/source_workspace.c \
 	src/history_client.c src/history_store.c src/shell_config.c \
-	src/shell_variables.c src/builtin_common.c src/command_cache.c \
+	src/shell_variables.c src/builtin_common.c src/builtin_registry.c \
+	src/builtin_pure.c src/builtin_stateful.c src/builtin_fc.c \
+	src/builtin_job_control.c src/command_cache.c \
 	src/builtin_command.c \
 	src/builtin_cd.c src/builtin_times.c src/builtin_ulimit.c \
 	src/builtin_umask.c src/builtin_variables.c src/shell_aliases.c \
@@ -240,7 +242,7 @@ analyze:
 		src/history_agent.c -o /dev/null
 
 conformance: $(TARGET) $(CONFORMANCE_TARGET)
-	./$(CONFORMANCE_TARGET) $(abspath $(TARGET))
+	./$(CONFORMANCE_TARGET) $(abspath $(TARGET)) $(BASH_BIN)
 
 check-variables: $(VARIABLE_TEST_TARGET)
 	./$(VARIABLE_TEST_TARGET)

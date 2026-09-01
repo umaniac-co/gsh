@@ -1330,7 +1330,7 @@ static int ordinary_flow(const char *executable)
         consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, command) == -1 ||
         consume_through(&session, "GSH_PROBE_READY", TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "[stopped ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "]+ Stopped ", TEST_TIMEOUT_MS) == -1 ||
         consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "fg\r") == -1 ||
         consume_through(&session, "GSH_PROBE_CONTINUED", TEST_TIMEOUT_MS) ==
@@ -1351,6 +1351,171 @@ static int ordinary_flow(const char *executable)
         failed = 1;
     }
     remove_fixture(fixture);
+    return failed;
+}
+
+static int job_service_control_flow(const char *executable)
+{
+    char fixture[] = "/tmp/gsh-job-service-XXXXXX";
+    pty_session session;
+    int failed = 0;
+
+    if (mkdtemp(fixture) == NULL ||
+        start_session(&session, executable, fixture, SHELL_GSH) == -1) {
+        perror("pty jobs: setup");
+        (void)rmdir(fixture);
+        return 1;
+    }
+    if (consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        send_text(&session,
+                  "/bin/sh -c 'kill -STOP $$; echo GSH_JOB_ONE; "
+                  "sleep 30' &\r") == -1 ||
+        consume_through(&session, "[1] ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "]+ Stopped ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        send_text(&session, "jobs %1 | /bin/cat\r") == -1 ||
+        consume_through(&session, "Stopped ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        send_text(&session, "bg %1\r") == -1 ||
+        consume_through(&session, "[continued ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "GSH_JOB_ONE",
+                        TEST_TIMEOUT_MS) == -1 ||
+        send_text(&session,
+                  "/bin/sh -c 'kill -STOP $$; echo GSH_JOB_TWO; "
+                  "sleep 30' &\r") == -1 ||
+        consume_through(&session, "[2] ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "]+ Stopped ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        send_text(&session, "fg %2\r") == -1 ||
+        consume_through(&session, "GSH_JOB_TWO",
+                        TEST_TIMEOUT_MS) == -1 ||
+        send_bytes(&session, "\003", 1U) == -1 ||
+        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        send_text(&session,
+                  "kill %1; wait %1; printf 'GSH_WAIT=%s\\n' \"$?\"\r") ==
+            -1 ||
+        consume_through(&session, "GSH_WAIT=143", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1) {
+        perror("pty jobs: explicit fg/bg jobspec flow");
+        dump_capture(&session);
+        failed = 1;
+    }
+    if (!failed && process_child_count(session.pid) != 1) {
+        fprintf(stderr, "pty jobs: child process leaked\n");
+        failed = 1;
+    }
+    if (stop_session(&session) == -1) failed = 1;
+    (void)rmdir(fixture);
+    return failed;
+}
+
+static int fc_builtin_flow(const char *executable)
+{
+    static const char editor_body[] =
+        "#!/bin/sh\n"
+        "/usr/bin/printf 'echo GSH_FC_EDITED\\n' > \"$1\"\n";
+    char fixture[] = "/tmp/gsh-fc-flow-XXXXXX";
+    char editor[1024];
+    char command[1200];
+    pty_session session;
+    int failed = 0;
+
+    if (mkdtemp(fixture) == NULL ||
+        snprintf(editor, sizeof(editor), "%s/editor", fixture) >=
+            (int)sizeof(editor) ||
+        write_text_file(editor, editor_body, 0700) == -1 ||
+        start_session(&session, executable, fixture, SHELL_GSH) == -1 ||
+        snprintf(command, sizeof(command), "FCEDIT='%s' fc echo\r",
+                 editor) >= (int)sizeof(command)) {
+        perror("pty fc: setup");
+        (void)unlink(editor);
+        (void)rmdir(fixture);
+        return 1;
+    }
+    if (consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        send_text(&session, "echo GSH_FC_ORIGINAL\r") == -1 ||
+        consume_through(&session, "GSH_FC_ORIGINAL\r\n",
+                        TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        send_text(&session, "fc -s ORIGINAL=REPLAY echo\r") == -1 ||
+        consume_through(&session, "GSH_FC_REPLAY\r\n",
+                        TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        send_text(&session, "fc -ln echo\r") == -1 ||
+        consume_through(&session, "echo GSH_FC_ORIGINAL\r\n",
+                        TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        send_text(&session, command) == -1 ||
+        consume_through(&session, "GSH_FC_EDITED\r\n",
+                        TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        send_text(&session, "FCEDIT=/no/such/editor fc echo\r") == -1 ||
+        consume_through(&session, "gsh: fc: editor failed",
+                        TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        process_child_count(session.pid) != 1) {
+        perror("pty fc: flow");
+        dump_capture(&session);
+        failed = 1;
+    }
+    if (stop_session(&session) == -1) failed = 1;
+    (void)unlink(editor);
+    (void)rmdir(fixture);
+    return failed;
+}
+
+static int protected_bridge_flow(const char *executable)
+{
+    static const char *const commands[] = {
+        "{ echo bridge; } >/dev/null\r",
+        "{ printf bridge; } >/dev/null\r",
+        "{ test x = x; } >/dev/null\r",
+        "{ [ x = x ]; } >/dev/null\r",
+        "{ read value; } </dev/null\r",
+        "{ getopts a option; } >/dev/null\r",
+        "{ fc -l; } >/dev/null\r",
+        "{ jobs; } >/dev/null\r",
+        "{ kill -l; } >/dev/null\r",
+        "name=echo; { \"$name\" bridge; } >/dev/null\r",
+    };
+    char fixture[] = "/tmp/gsh-bridge-flow-XXXXXX";
+    pty_session session;
+    size_t index;
+    int failed = 0;
+
+    if (mkdtemp(fixture) == NULL ||
+        start_session(&session, executable, fixture, SHELL_GSH) == -1) {
+        perror("pty bridge guard: setup");
+        (void)rmdir(fixture);
+        return 1;
+    }
+    if (consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1) {
+        failed = 1;
+    }
+    for (index = 0; !failed &&
+                    index < sizeof(commands) / sizeof(commands[0]); index++) {
+        if (send_text(&session, commands[index]) == -1 ||
+            consume_through(
+                &session,
+                "native builtin ownership prevents compatibility fallback",
+                TEST_TIMEOUT_MS) == -1 ||
+            consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1) {
+            failed = 1;
+        }
+    }
+    if (!failed &&
+        (send_text(&session, "rt\r") == -1 ||
+         consume_through(&session, "protected_bridge=0",
+                         TEST_TIMEOUT_MS) == -1 ||
+         process_child_count(session.pid) != 1)) {
+        failed = 1;
+    }
+    if (failed) {
+        perror("pty bridge guard: flow");
+        dump_capture(&session);
+    }
+    if (stop_session(&session) == -1) failed = 1;
+    (void)rmdir(fixture);
     return failed;
 }
 
@@ -1746,7 +1911,7 @@ static int managed_repl_toggle(pty_session *session)
         wait_for_output(session, "\033[?1049lasync repl: off",
                         TEST_TIMEOUT_MS) == -1 ||
         send_text(session, "/bin/sleep 1 &\r") == -1 ||
-        wait_for_output(session, "[1] ", TEST_TIMEOUT_MS) == -1 ||
+        wait_for_output(session, "] ", TEST_TIMEOUT_MS) == -1 ||
         send_text(session, "/async\r") == -1 ||
         wait_for_output(session, "async repl: on pending",
                         TEST_TIMEOUT_MS) == -1 ||
@@ -3684,6 +3849,10 @@ static int fault_injection_flow(const char *executable)
          "gsh: evaluator gate:"},
         {"evaluator-fork", "/usr/bin/true && /usr/bin/true\r",
          "gsh: evaluator fork:"},
+        {"job-service-socket", "jobs; /usr/bin/true\r",
+         "gsh: job service socket:"},
+        {"job-table-allocation", "/usr/bin/true && /usr/bin/true\r",
+         "evaluator job state"},
         {"exec-outcome-pipe",
          "if true; then exec /usr/bin/true; fi\r",
          "gsh: exec outcome pipe:"},
@@ -5230,6 +5399,50 @@ static void print_raw_samples(const char *shell, const char *metric,
     putchar('\n');
 }
 
+static size_t paired_win_count(const uint64_t *candidate,
+                               const uint64_t *peer, size_t count)
+{
+    size_t wins = 0;
+    size_t index;
+
+    for (index = 0; index < count; index++) {
+        if (candidate[index] < peer[index]) wins++;
+    }
+    return wins;
+}
+
+static int direct_builtin_performance_gate(
+    uint64_t echo_samples[BENCH_SHELLS][BENCH_EXEC_SAMPLES],
+    uint64_t printf_samples[BENCH_SHELLS][BENCH_EXEC_SAMPLES],
+    uint64_t test_samples[BENCH_SHELLS][BENCH_EXEC_SAMPLES])
+{
+    size_t bash_wins =
+        paired_win_count(echo_samples[0], echo_samples[1],
+                         BENCH_EXEC_SAMPLES) +
+        paired_win_count(printf_samples[0], printf_samples[1],
+                         BENCH_EXEC_SAMPLES) +
+        paired_win_count(test_samples[0], test_samples[1],
+                         BENCH_EXEC_SAMPLES);
+    size_t zsh_wins =
+        paired_win_count(echo_samples[0], echo_samples[2],
+                         BENCH_EXEC_SAMPLES) +
+        paired_win_count(printf_samples[0], printf_samples[2],
+                         BENCH_EXEC_SAMPLES) +
+        paired_win_count(test_samples[0], test_samples[2],
+                         BENCH_EXEC_SAMPLES);
+    size_t total = 3U * BENCH_EXEC_SAMPLES;
+
+    printf("direct-builtin paired wins: bash=%zu/%zu zsh=%zu/%zu\n",
+           bash_wins, total, zsh_wins, total);
+    if (bash_wins * 2U <= total || zsh_wins * 2U <= total) {
+        fprintf(stderr,
+                "pty benchmark: direct builtins did not clear the >50%% "
+                "paired-win gate\n");
+        return -1;
+    }
+    return 0;
+}
+
 static void print_raw_memory(const char *shell, const char *metric,
                              const uint64_t *samples, size_t count)
 {
@@ -5526,6 +5739,9 @@ static int latency_benchmark(const char *gsh, const char *bash,
     uint64_t startup[BENCH_SHELLS][BENCH_STARTUP_SAMPLES];
     uint64_t key[BENCH_SHELLS][BENCH_KEY_SAMPLES];
     uint64_t execution[BENCH_SHELLS][BENCH_EXEC_SAMPLES];
+    uint64_t direct_echo[BENCH_SHELLS][BENCH_EXEC_SAMPLES];
+    uint64_t direct_printf[BENCH_SHELLS][BENCH_EXEC_SAMPLES];
+    uint64_t direct_test[BENCH_SHELLS][BENCH_EXEC_SAMPLES];
     uint64_t lookup[BENCH_SHELLS][BENCH_EXEC_SAMPLES];
     uint64_t command_lookup[BENCH_SHELLS][BENCH_EXEC_SAMPLES];
     uint64_t command_path_cache[BENCH_SHELLS][BENCH_EXEC_SAMPLES];
@@ -5624,6 +5840,27 @@ static int latency_benchmark(const char *gsh, const char *bash,
         started[offset] = true;
     }
 
+    for (sample = 0; sample < 8U; sample++) {
+        for (offset = 0; offset < BENCH_SHELLS; offset++) {
+            if (send_text(&sessions[offset],
+                          "echo GSH_BUILTIN\rprintf '%s\\n' "
+                          "GSH_BUILTIN\rtest x = x\r") == -1 ||
+                consume_through(&sessions[offset], specs[offset].prompt,
+                                TEST_TIMEOUT_MS) == -1 ||
+                consume_through(&sessions[offset], specs[offset].prompt,
+                                TEST_TIMEOUT_MS) == -1 ||
+                consume_through(&sessions[offset], specs[offset].prompt,
+                                TEST_TIMEOUT_MS) == -1) {
+                fprintf(stderr,
+                        "pty benchmark: %s direct builtin warmup failed\n",
+                        specs[offset].name);
+                failed = 1;
+                goto done;
+            }
+            discard_ready_output(&sessions[offset]);
+        }
+    }
+
     for (sample = 0; sample < BENCH_KEY_SAMPLES; sample++) {
         for (offset = 0; offset < BENCH_SHELLS; offset++) {
             size_t shell = (sample + offset) % BENCH_SHELLS;
@@ -5650,6 +5887,16 @@ static int latency_benchmark(const char *gsh, const char *bash,
     if (benchmark_prompt_command(sessions, specs, execution, NULL,
                                  "/usr/bin/true\r", "external true") ==
             -1 ||
+        benchmark_prompt_command(
+            sessions, specs, direct_echo, NULL, "echo GSH_BUILTIN\r",
+            "direct echo builtin") == -1 ||
+        benchmark_prompt_command(
+            sessions, specs, direct_printf, NULL,
+            "printf '%s\\n' GSH_BUILTIN\r",
+            "direct printf builtin") == -1 ||
+        benchmark_prompt_command(
+            sessions, specs, direct_test, NULL, "test x = x\r",
+            "direct test builtin") == -1 ||
         benchmark_prompt_command(
             sessions, specs, lookup, "GSH_BENCH_VALUE=value\r",
             ": \"${GSH_BENCH_VALUE}\"\r", "variable lookup") == -1 ||
@@ -5799,6 +6046,8 @@ done:
     if (failed) {
         return 1;
     }
+    if (direct_builtin_performance_gate(
+            direct_echo, direct_printf, direct_test) == -1) return 1;
 
     if (uname(&platform) == 0) {
         printf("platform: %s %s %s, cpus=%ld, terminal=80x24, "
@@ -5815,6 +6064,12 @@ done:
                           key[offset], BENCH_KEY_SAMPLES);
         print_raw_samples(specs[offset].name, "true-enter-to-prompt",
                           execution[offset], BENCH_EXEC_SAMPLES);
+        print_raw_samples(specs[offset].name, "direct-echo",
+                          direct_echo[offset], BENCH_EXEC_SAMPLES);
+        print_raw_samples(specs[offset].name, "direct-printf",
+                          direct_printf[offset], BENCH_EXEC_SAMPLES);
+        print_raw_samples(specs[offset].name, "direct-test",
+                          direct_test[offset], BENCH_EXEC_SAMPLES);
         print_raw_samples(specs[offset].name, "variable-lookup",
                           lookup[offset], BENCH_EXEC_SAMPLES);
         print_raw_samples(specs[offset].name, "command-lookup",
@@ -5887,6 +6142,12 @@ done:
         print_metric("idle-key-to-output", key[offset], BENCH_KEY_SAMPLES,
                      5000000ULL);
         print_metric("true-enter-to-prompt", execution[offset],
+                     BENCH_EXEC_SAMPLES, 5000000ULL);
+        print_metric("direct-echo", direct_echo[offset],
+                     BENCH_EXEC_SAMPLES, 5000000ULL);
+        print_metric("direct-printf", direct_printf[offset],
+                     BENCH_EXEC_SAMPLES, 5000000ULL);
+        print_metric("direct-test", direct_test[offset],
                      BENCH_EXEC_SAMPLES, 5000000ULL);
         print_metric("variable-lookup", lookup[offset],
                      BENCH_EXEC_SAMPLES, 5000000ULL);
@@ -6289,6 +6550,9 @@ int main(int argc, char **argv)
     }
 
     if (ordinary_flow(executable) != 0 ||
+        job_service_control_flow(executable) != 0 ||
+        fc_builtin_flow(executable) != 0 ||
+        protected_bridge_flow(executable) != 0 ||
         history_flow(executable) != 0 ||
         managed_async_repl_flow(executable) != 0 ||
         variable_builtin_flow(executable) != 0 ||
@@ -6305,8 +6569,9 @@ int main(int argc, char **argv)
         stalled_worker_flow(executable) != 0) {
         return 1;
     }
-    puts("pty smoke: exec paths, encrypted history, editor recall/search, "
-         "managed async REPL, job control, async prompt/redirection, "
+    puts("pty smoke: exec paths, native fc, protected bridge, encrypted history, "
+         "editor recall/search, managed async REPL, job control, "
+         "async prompt/redirection, "
          "cancellation, and worker deadline passed");
     return 0;
 }
