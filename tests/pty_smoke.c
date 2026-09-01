@@ -2394,7 +2394,7 @@ static int write_enoexec_fixture(const char *directory, char path[PATH_MAX])
 {
     static const char source[] =
         "/usr/bin/printf 'GSH_ENOEXEC_INTERACTIVE:<%s>\\n' \"$1\"\n"
-        "/bin/sh -c 'exit 6'\n";
+        "exit 6\n";
     size_t written = 0;
     size_t attempts;
     int descriptor;

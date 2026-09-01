@@ -779,6 +779,103 @@ static int native_source_cases(const char *executable)
     return failed;
 }
 
+static int native_exit_core_cases(const char *executable)
+{
+    static const syntax_case cases[] = {
+        {"exit", "explicit status terminates the shell", "exit 7; :", 7,
+         NULL},
+        {"exit", "maximum portable status is preserved", "exit 255; :", 255,
+         NULL},
+        {"exit", "omitted status uses the preceding pipeline",
+         "false; exit; :", 1, NULL},
+        {"exit", "pipeline negation cannot outlive exit", "! exit 9; :", 9,
+         NULL},
+        {"exit", "exit crosses a function frame",
+         "f(){ exit 11; }; f; :", 11, NULL},
+        {"exit", "exit crosses an eval frame", "eval 'exit 12'; :", 12,
+         NULL},
+        {"exit", "subshell exit remains isolated",
+         "(exit 13); /bin/test \"$?\" -eq 13", 0, NULL},
+        {"exit", "pipeline-stage exit remains isolated",
+         "exit 14 | /usr/bin/true; /bin/test \"$?\" -eq 0", 0, NULL},
+        {"exit", "asynchronous exit status reaches wait",
+         "exit 15 & wait \"$!\"; /bin/test \"$?\" -eq 15", 0, NULL},
+        {"exit", "command wrapper still invokes exit", "command exit 16; :",
+         16, NULL},
+        {"exit", "command substitution exit remains isolated",
+         "value=$(exit 17; /usr/bin/printf BAD); /bin/test -z \"$value\"",
+         0, NULL},
+        {"exit", "exit crosses a loop frame",
+         "while :; do exit 18; done; :", 18, NULL},
+        {"exit", "exit crosses a case frame",
+         "case x in x) exit 19;; esac; :", 19, NULL},
+        {"exit", "special-builtin operand error aborts",
+         "exit 1 2; /usr/bin/printf BAD", 1, "too many operands"},
+        {"exit", "out-of-range status is deterministic", "exit 256; :", 2,
+         "invalid status"},
+        {"exit", "command suppresses special error termination",
+         "command exit 1 2; /usr/bin/printf EXIT_RECOVERED", 0,
+         "EXIT_RECOVERED"},
+    };
+    size_t index;
+
+    for (index = 0; index < sizeof(cases) / sizeof(cases[0]); index++) {
+        if (run_case(executable, &cases[index], false) != 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int native_exit_file_cases(const char *executable)
+{
+    char directory[] = "/tmp/gsh-native-exit-XXXXXX";
+    char source[1024] = {0};
+    char output[1024] = {0};
+    char command[2300];
+    struct stat information;
+    syntax_case test = {"exit", "exit crosses a dot frame", command, 20,
+                        NULL};
+    int failed = 1;
+
+    if (mkdtemp(directory) == NULL ||
+        snprintf(source, sizeof(source), "%s/source", directory) >=
+            (int)sizeof(source) ||
+        snprintf(output, sizeof(output), "%s/output", directory) >=
+            (int)sizeof(output) ||
+        create_source_fixture(source, "exit 20\n:\n", 0600) == -1 ||
+        snprintf(command, sizeof(command), ". '%s'; :", source) >=
+            (int)sizeof(command) ||
+        run_case(executable, &test, false) != 0) {
+        goto done;
+    }
+    test.name = "exit applies redirections before termination";
+    test.status = 21;
+    if (snprintf(command, sizeof(command), "exit 21 > '%s'; :", output) >=
+            (int)sizeof(command) ||
+        run_case(executable, &test, false) != 0 ||
+        stat(output, &information) == -1 ||
+        !S_ISREG(information.st_mode) || information.st_size != 0) {
+        goto done;
+    }
+    failed = 0;
+done:
+    if (output[0] != '\0') {
+        (void)unlink(output);
+    }
+    if (source[0] != '\0') {
+        (void)unlink(source);
+    }
+    (void)rmdir(directory);
+    return failed;
+}
+
+static int native_exit_cases(const char *executable)
+{
+    return native_exit_core_cases(executable) != 0 ||
+           native_exit_file_cases(executable) != 0;
+}
+
 static int enoexec_argument_cases(const char *executable,
                                   const char *directory,
                                   const char *script)
@@ -863,7 +960,7 @@ static int native_enoexec_cases(const char *executable)
     static const char source[] =
         "/usr/bin/printf '<script:%s:%s:%s:%s>\\n' \"$0\" "
         "\"${1-unset}\" \"${2-unset}\" \"${GSH_ENOEXEC_ENV-unset}\"\n"
-        "/bin/sh -c \"exit ${GSH_ENOEXEC_STATUS:-0}\"\n";
+        "exit \"${GSH_ENOEXEC_STATUS:-0}\"\n";
     char directory[] = "/tmp/gsh-native-enoexec-XXXXXX";
     char script[1024] = {0};
     int length;
@@ -3581,6 +3678,10 @@ int main(int argc, char **argv)
         return 1;
     }
     execution_passed += 19U;
+    if (native_exit_cases(argv[1]) != 0) {
+        return 1;
+    }
+    execution_passed += 18U;
     if (native_enoexec_cases(argv[1]) != 0) {
         return 1;
     }

@@ -3973,6 +3973,11 @@ static bool native_exec_builtin(const gsh_native_command *command)
     return command->argc > 0 && strcmp(command->argv[0], "exec") == 0;
 }
 
+static bool native_exit_builtin(const gsh_native_command *command)
+{
+    return command->argc > 0 && strcmp(command->argv[0], "exit") == 0;
+}
+
 static bool native_eval_builtin(const gsh_native_command *command)
 {
     return command->argc > 0 && strcmp(command->argv[0], "eval") == 0;
@@ -4055,6 +4060,45 @@ static bool native_loop_control_builtin(
     return command->argc > 0 &&
            (strcmp(command->argv[0], "break") == 0 ||
             strcmp(command->argv[0], "continue") == 0);
+}
+
+static bool parse_exit_status(const gsh_native_command *command,
+                              int last_status, int *status)
+{
+    unsigned int value = (unsigned int)(last_status & 255);
+    const char *cursor;
+
+    if (command->argc > 2U) {
+        fputs("gsh: exit: too many operands\n", stderr);
+        *status = 1;
+        return false;
+    }
+    if (command->argc == 1U) {
+        *status = (int)value;
+        return true;
+    }
+    value = 0;
+    cursor = command->argv[1];
+    if (*cursor == '\0') {
+        fputs("gsh: exit: invalid status\n", stderr);
+        *status = 2;
+        return false;
+    }
+    while (*cursor != '\0') {
+        if (*cursor < '0' || *cursor > '9' || value > 25U) {
+            fputs("gsh: exit: invalid status\n", stderr);
+            *status = 2;
+            return false;
+        }
+        value = value * 10U + (unsigned int)(*cursor++ - '0');
+    }
+    if (value > 255U) {
+        fputs("gsh: exit: invalid status\n", stderr);
+        *status = 2;
+        return false;
+    }
+    *status = (int)value;
+    return true;
 }
 
 static bool special_builtin_name(const char *name, size_t length)
@@ -4522,6 +4566,9 @@ static bool native_planned_command_is_supported(
         return true;
     }
     if (native_exec_builtin(native)) {
+        return true;
+    }
+    if (native_exit_builtin(native)) {
         return true;
     }
     if (native_source_builtin(native)) {
@@ -5688,6 +5735,18 @@ static void start_native_pipeline(shell_state *state,
                 if (native_stateless_builtin(&pipeline->commands[index],
                                              &builtin_status)) {
                     _exit(builtin_status);
+                }
+                if (native_exit_builtin(&pipeline->commands[index])) {
+                    if (apply_special_builtin_assignments(
+                            state->variables, NULL,
+                            &pipeline->commands[index], &state->options) !=
+                        GSH_ASSIGNMENT_OK) {
+                        child_exec_error("exit assignment", errno);
+                    }
+                    (void)parse_exit_status(
+                        &pipeline->commands[index], state->last_status,
+                        &builtin_status);
+                    _exit(builtin_status & 255);
                 }
                 if (native_pwd_builtin(&pipeline->commands[index])) {
                     _exit(child_run_pwd(&pipeline->commands[index],
@@ -9297,6 +9356,7 @@ static gsh_command_cache *evaluator_command_cache(
     native_evaluator *evaluator);
 static const gsh_times_context *evaluator_times_context(
     native_evaluator *evaluator);
+static int evaluator_last_status(const native_evaluator *evaluator);
 
 static int run_pipeline_function(native_evaluator *parent,
                                  gsh_native_pipeline *pipeline,
@@ -9568,6 +9628,19 @@ static int run_native_noninteractive_pipeline(
                                              &builtin_status)) {
                     _exit(builtin_status);
                 }
+                if (native_exit_builtin(&pipeline->commands[index])) {
+                    if (apply_special_builtin_assignments(
+                            variables, NULL,
+                            &pipeline->commands[index], options) !=
+                        GSH_ASSIGNMENT_OK) {
+                        child_exec_error("exit assignment", errno);
+                    }
+                    (void)parse_exit_status(
+                        &pipeline->commands[index],
+                        evaluator_last_status(evaluator),
+                        &builtin_status);
+                    _exit(builtin_status & 255);
+                }
                 if (native_pwd_builtin(&pipeline->commands[index])) {
                     _exit(child_run_pwd(&pipeline->commands[index],
                                         variables));
@@ -9825,6 +9898,8 @@ struct native_evaluator {
     bool function_active[GSH_FUNCTION_CAP];
     bool returning;
     int return_status;
+    bool exiting;
+    int exit_status;
     size_t active_loops;
     native_loop_control loop_control;
     size_t loop_levels;
@@ -10349,6 +10424,11 @@ static const gsh_times_context *evaluator_times_context(
     native_evaluator *evaluator)
 {
     return evaluator == NULL ? NULL : evaluator->times_context;
+}
+
+static int evaluator_last_status(const native_evaluator *evaluator)
+{
+    return evaluator == NULL ? 0 : evaluator->last_status;
 }
 
 static bool native_preflight_node(native_evaluator *evaluator,
@@ -11399,6 +11479,55 @@ static gsh_native_plan_status execute_command_substitution(
     return status;
 }
 
+/* ── Exit Propagates to the Current Execution-Environment Boundary ──
+ * A return belongs to one function or dot frame; exit belongs to the shell
+ * environment containing all of those frames.  Recording it separately lets
+ * ordinary bounded unwinding restore redirects and source slots before the
+ * top-level process terminates.  Forked evaluators inherit their own record,
+ * naturally confining exit to subshells, substitutions, pipelines, and jobs.
+ * ─────────────────────────────────────────────────────────────── */
+static int evaluate_exit(native_evaluator *evaluator,
+                         const gsh_native_command *command)
+{
+    gsh_saved_descriptor saved[GSH_NATIVE_REDIRECT_CAP];
+    size_t saved_count = 0;
+    int status = 125;
+    bool valid = false;
+
+    if (save_redirect_descriptors(command, saved, &saved_count) == -1) {
+        perror("gsh: exit redirection save");
+    } else if (apply_evaluator_redirects(
+                   evaluator->pipeline, command,
+                   &evaluator->options) == -1) {
+        perror("gsh: exit redirection");
+        status = 1;
+    } else {
+        int assignment = apply_special_builtin_assignments(
+            evaluator->variables, evaluator->journal, command,
+            &evaluator->options);
+
+        if (assignment != GSH_ASSIGNMENT_OK) {
+            perror("gsh: exit assignment");
+            status = assignment == GSH_ASSIGNMENT_JOURNAL_ERROR ? 125 : 1;
+        } else {
+            valid = parse_exit_status(command, evaluator->last_status,
+                                      &status);
+        }
+    }
+    if (restore_redirect_descriptors(saved, saved_count) == -1) {
+        perror("gsh: exit redirection restore");
+        status = 125;
+        valid = false;
+    }
+    if (valid) {
+        evaluator->exiting = true;
+        evaluator->exit_status = status;
+    } else if (!command->command_regular_context) {
+        evaluator->fatal_error = true;
+    }
+    return status;
+}
+
 static int evaluate_return(native_evaluator *evaluator,
                            const gsh_native_command *command)
 {
@@ -11653,6 +11782,7 @@ static int run_pipeline_function(native_evaluator *parent,
     child.tail_exec_single = false;
     child.exec_outcome_fd = -1;
     child.returning = false;
+    child.exiting = false;
     child.fatal_error = false;
     gsh_background_initialize(&backgrounds);
     child.backgrounds = &backgrounds;
@@ -11730,6 +11860,7 @@ static int native_evaluate_pipeline(native_evaluator *evaluator,
             !native_times_builtin(tail) &&
             !native_source_builtin(tail) &&
             !native_exec_builtin(tail) &&
+            !native_exit_builtin(tail) &&
             !native_command_inspection_builtin(tail) &&
             !native_return_builtin(tail) &&
             !native_loop_control_builtin(tail) && function == NULL) {
@@ -11763,6 +11894,11 @@ static int native_evaluate_pipeline(native_evaluator *evaluator,
         if (evaluator->pipeline->negated && status != 125) {
             status = status == 0 ? 1 : 0;
         }
+    } else if (evaluator->pipeline->command_count == 1 &&
+               native_exit_builtin(
+                   &evaluator->pipeline->commands[0])) {
+        status = evaluate_exit(
+            evaluator, &evaluator->pipeline->commands[0]);
     } else if (evaluator->pipeline->command_count == 1 &&
                native_return_builtin(
                    &evaluator->pipeline->commands[0])) {
@@ -11959,7 +12095,8 @@ static int native_evaluate_pipeline(native_evaluator *evaluator,
             scoped ? &scope : NULL, evaluator->positionals,
             &evaluator->options, evaluator->functions, evaluator);
     }
-    if (status == 125 && evaluator->pipeline->command_count == 1 &&
+    if (status == 125 && !evaluator->exiting &&
+        evaluator->pipeline->command_count == 1 &&
         (native_variable_builtin(&evaluator->pipeline->commands[0]) ||
          native_state_builtin(&evaluator->pipeline->commands[0]) ||
          native_cd_builtin(&evaluator->pipeline->commands[0]) ||
@@ -11968,6 +12105,7 @@ static int native_evaluate_pipeline(native_evaluator *evaluator,
          native_times_builtin(&evaluator->pipeline->commands[0]) ||
          native_source_builtin(&evaluator->pipeline->commands[0]) ||
          native_exec_builtin(&evaluator->pipeline->commands[0]) ||
+         native_exit_builtin(&evaluator->pipeline->commands[0]) ||
          native_loop_control_builtin(
              &evaluator->pipeline->commands[0]) ||
          (evaluator->pipeline->commands[0].argc == 0 &&
@@ -11995,9 +12133,13 @@ static int native_evaluate_if(native_evaluator *evaluator,
             int condition = native_evaluate_node(evaluator, first,
                                                  depth + 1U);
 
-            if (evaluator->returning || evaluator->loop_levels != 0) {
-                return evaluator->returning ? evaluator->return_status
-                                            : condition;
+            if (evaluator->exiting || evaluator->returning ||
+                evaluator->loop_levels != 0) {
+                return evaluator->exiting
+                           ? evaluator->exit_status
+                           : evaluator->returning
+                                 ? evaluator->return_status
+                                 : condition;
             }
             if (condition == 0) {
                 return native_evaluate_node(evaluator, second,
@@ -12054,9 +12196,13 @@ static int native_evaluate_case(native_evaluator *evaluator,
                          : native_evaluate_node(evaluator,
                                                 item->first_child,
                                                 depth + 1U);
-            if (evaluator->returning || evaluator->loop_levels != 0) {
-                return evaluator->returning ? evaluator->return_status
-                                            : status;
+            if (evaluator->exiting || evaluator->returning ||
+                evaluator->loop_levels != 0) {
+                return evaluator->exiting
+                           ? evaluator->exit_status
+                           : evaluator->returning
+                                 ? evaluator->return_status
+                                 : status;
             }
             if ((item->flags & GSH_AST_FLAG_CASE_FALLTHROUGH) == 0) {
                 return status;
@@ -12116,7 +12262,8 @@ static int native_evaluate_for(native_evaluator *evaluator,
             }
             status = native_evaluate_node(evaluator, node->first_child,
                                           depth + 1U);
-            if (evaluator->fatal_error || evaluator->returning) {
+            if (evaluator->fatal_error || evaluator->exiting ||
+                evaluator->returning) {
                 break;
             }
             if (consume_loop_control(evaluator) == LOOP_CONTROL_LEAVE) {
@@ -12171,7 +12318,8 @@ static int native_evaluate_for(native_evaluator *evaluator,
         }
         status = native_evaluate_node(evaluator, node->first_child,
                                       depth + 1U);
-        if (evaluator->fatal_error || evaluator->returning) {
+        if (evaluator->fatal_error || evaluator->exiting ||
+            evaluator->returning) {
             break;
         }
         if (consume_loop_control(evaluator) == LOOP_CONTROL_LEAVE) {
@@ -12192,6 +12340,9 @@ static int native_evaluate_node_inner(native_evaluator *evaluator,
 
     if (depth > 128) {
         return 125;
+    }
+    if (evaluator->exiting) {
+        return evaluator->exit_status;
     }
     if (evaluator->returning) {
         return evaluator->return_status;
@@ -12287,7 +12438,8 @@ static int native_evaluate_node_inner(native_evaluator *evaluator,
                 evaluator, condition, depth + 1U);
             int control;
 
-            if (evaluator->fatal_error || evaluator->returning) {
+            if (evaluator->fatal_error || evaluator->exiting ||
+                evaluator->returning) {
                 break;
             }
             control = consume_loop_control(evaluator);
@@ -12307,7 +12459,8 @@ static int native_evaluate_node_inner(native_evaluator *evaluator,
                 break;
             }
             body_status = native_evaluate_node(evaluator, body, depth + 1U);
-            if (evaluator->fatal_error || evaluator->returning) {
+            if (evaluator->fatal_error || evaluator->exiting ||
+                evaluator->returning) {
                 break;
             }
             control = consume_loop_control(evaluator);
@@ -12319,8 +12472,10 @@ static int native_evaluate_node_inner(native_evaluator *evaluator,
             }
         }
         evaluator->active_loops--;
-        return evaluator->returning ? evaluator->return_status
-                                    : body_status;
+        return evaluator->exiting
+                   ? evaluator->exit_status
+                   : evaluator->returning ? evaluator->return_status
+                                          : body_status;
     }
     child = node->first_child;
     while (child != GSH_AST_NONE) {
@@ -12338,10 +12493,13 @@ static int native_evaluate_node_inner(native_evaluator *evaluator,
             }
         }
         status = native_evaluate_node(evaluator, child, depth + 1U);
-        if (evaluator->fatal_error || evaluator->returning ||
+        if (evaluator->fatal_error || evaluator->exiting ||
+            evaluator->returning ||
             evaluator->loop_levels != 0) {
-            return evaluator->returning ? evaluator->return_status
-                                        : status;
+            return evaluator->exiting
+                       ? evaluator->exit_status
+                       : evaluator->returning ? evaluator->return_status
+                                              : status;
         }
         child = child_node->next_sibling;
     }
@@ -12572,11 +12730,14 @@ static int leave_source_frame(native_evaluator *evaluator,
     bool released = gsh_source_workspace_release(
         evaluator->source_workspaces, frame->workspace);
 
-    if (frame->consume_return && evaluator->returning) {
+    if (evaluator->exiting) {
+        status = evaluator->exit_status;
+    } else if (frame->consume_return && evaluator->returning) {
         status = evaluator->return_status;
         evaluator->returning = false;
     }
-    if (!evaluator->fatal_error && frame->negated && status != 125) {
+    if (!evaluator->fatal_error && !evaluator->exiting &&
+        frame->negated && status != 125) {
         status = status == 0 ? 1 : 0;
     }
     evaluator->dot_depth = frame->dot_depth;
@@ -12634,6 +12795,7 @@ static int run_pipeline_source(native_evaluator *parent,
     child.exec_descriptor_socket = -1;
     child.fatal_error = false;
     child.returning = false;
+    child.exiting = false;
     clear_source_request(&child);
     gsh_background_initialize(&backgrounds);
     child.backgrounds = &backgrounds;
@@ -12695,6 +12857,9 @@ static int native_evaluate_node_sync(native_evaluator *evaluator,
     while (frame_count > 0) {
         status = leave_source_frame(evaluator, &frames[--frame_count],
                                     status);
+    }
+    if (evaluator->exiting) {
+        status = evaluator->exit_status;
     }
     assert(!evaluator->source_request_active);
     assert(frame_count == 0U);
@@ -12771,6 +12936,9 @@ static int native_evaluate_node(native_evaluator *evaluator,
 
     if (evaluator->fatal_error) {
         return 1;
+    }
+    if (evaluator->exiting) {
+        return evaluator->exit_status;
     }
     status = (evaluator->storage->nodes[node_index].flags &
               GSH_AST_FLAG_ASYNC) != 0
@@ -14632,7 +14800,7 @@ static int execute_native_script(
         evaluator.preflight = false;
         evaluator.fatal_error = false;
         status = native_evaluate_node(&evaluator, parsed.root, 0);
-        if (evaluator.fatal_error) {
+        if (evaluator.fatal_error || evaluator.exiting) {
             break;
         }
         offset = end;

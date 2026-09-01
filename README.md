@@ -171,6 +171,13 @@ format is re-executed through gsh's initialization-time canonical pathname,
 never through `/bin/sh`. The new native shell image preserves the child PID,
 process group, descriptors, exported environment, resolved script `$0`,
 operands, pipeline/background behavior, and `exec` overlay status.
+The non-interactive `exit` special builtin uses an explicit evaluator control
+record rather than terminating from an inner helper. It applies assignments
+and redirections first, crosses function, `eval`, and dot frames, ignores
+pipeline negation once termination is requested, and is naturally confined by
+the process boundaries of subshells, substitutions, pipelines, and asynchronous
+lists. Direct interactive `exit` remains native; parent-owned termination from
+an interactive compound evaluator is still continuation-engine work.
 The `eval` and `.` special builtins are native in the non-interactive evaluator.
 `eval` concatenates operands with one space, supports an optional `--`, parses
 the result in a preallocated source slot, and executes it in the caller's
@@ -610,7 +617,7 @@ This is soft real-time engineering, not hard real-time or mission-grade status.
 The repository has executable conformance tranches, bounded fuzz/property
 checks, sanitizer builds, 83 deterministic fault cases, resource-pressure
 scenarios, and a configurable soak runner. The current native tranche contains
-497 execution cases, 30 syntax cases, and 17 deterministic limit cases with
+515 execution cases, 30 syntax cases, and 17 deterministic limit cases with
 one explicitly unsupported case and no delegated cases. The current same-source
 tranche passes the local macOS matrix, but does not gain same-revision remote
 evidence until the macOS arm64 and Ubuntu x86-64 GCC/Clang jobs run after
