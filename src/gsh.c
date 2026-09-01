@@ -34,6 +34,10 @@
 #include <time.h>
 #include <unistd.h>
 
+#if defined(__APPLE__)
+#include <mach-o/dyld.h>
+#endif
+
 #include "builtin_cd.h"
 #include "builtin_alias.h"
 #include "builtin_command.h"
@@ -97,6 +101,9 @@ static const char ASYNC_SETTLED_INDICATOR[] = "[●]";
 static const char ASYNC_PENDING_INDICATOR[] = "[○]";
 static const uint64_t REACTOR_DEADLINE_NS = 5U * 1000U * 1000U;
 static const uint64_t PROMPT_WORKER_DEADLINE_NS = 100U * 1000U * 1000U;
+static char g_shell_executable[EXEC_PATH_CAP];
+static dev_t g_shell_executable_device;
+static ino_t g_shell_executable_inode;
 
 typedef enum {
     MODE_EDITOR,
@@ -3584,20 +3591,175 @@ static void child_exec_error(const char *name, int error)
     _exit(write_exec_error(name, error));
 }
 
+static int resolve_launch_candidate(const char *path)
+{
+    if (access(path, X_OK) == -1 ||
+        realpath(path, g_shell_executable) == NULL) {
+        return -1;
+    }
+    return 0;
+}
+
+static int resolve_launch_argument(const char *argument_zero)
+{
+    const char *path;
+    const char *cursor;
+    size_t name_length;
+    size_t scanned = 0;
+
+    if (argument_zero == NULL || argument_zero[0] == '\0') {
+        errno = EINVAL;
+        return -1;
+    }
+    if (strchr(argument_zero, '/') != NULL) {
+        return resolve_launch_candidate(argument_zero);
+    }
+    path = getenv("PATH");
+    cursor = path == NULL ? "/bin:/usr/bin" : path;
+    name_length = strnlen(argument_zero, EXEC_PATH_CAP);
+    if (name_length == EXEC_PATH_CAP) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    while (scanned <= PATH_SCAN_CAP) {
+        char candidate[EXEC_PATH_CAP];
+        size_t available = PATH_SCAN_CAP - scanned;
+        size_t remaining = strnlen(cursor, available + 1U);
+        const char *separator;
+        size_t directory_length;
+        size_t offset;
+
+        if (remaining > available) {
+            errno = E2BIG;
+            return -1;
+        }
+        separator = memchr(cursor, ':', remaining);
+        directory_length = separator == NULL
+                               ? remaining
+                               : (size_t)(separator - cursor);
+        offset = directory_length == 0 ? 1U : directory_length;
+        scanned += directory_length + (separator == NULL ? 0U : 1U);
+        if (offset + 1U + name_length + 1U <= sizeof(candidate)) {
+            if (directory_length == 0) {
+                candidate[0] = '.';
+            } else {
+                memcpy(candidate, cursor, directory_length);
+            }
+            candidate[offset++] = '/';
+            memcpy(candidate + offset, argument_zero, name_length + 1U);
+            if (resolve_launch_candidate(candidate) == 0) {
+                return 0;
+            }
+        }
+        if (separator == NULL) {
+            break;
+        }
+        cursor = separator + 1U;
+    }
+    errno = ENOENT;
+    return -1;
+}
+
+static int initialize_shell_executable(const char *argument_zero)
+{
+    int resolved = -1;
+    struct stat information;
+
+#if defined(__APPLE__)
+    char candidate[EXEC_PATH_CAP];
+    uint32_t capacity = (uint32_t)sizeof(candidate);
+
+    if (_NSGetExecutablePath(candidate, &capacity) == 0 &&
+        resolve_launch_candidate(candidate) == 0) {
+        resolved = 0;
+    }
+#elif defined(__linux__)
+    ssize_t length = readlink("/proc/self/exe", g_shell_executable,
+                              sizeof(g_shell_executable) - 1U);
+
+    if (length > 0 && (size_t)length < sizeof(g_shell_executable) - 1U) {
+        g_shell_executable[length] = '\0';
+        resolved = 0;
+    }
+#endif
+    if (resolved == -1) {
+        resolved = resolve_launch_argument(argument_zero);
+    }
+    if (resolved == -1 || stat(g_shell_executable, &information) == -1 ||
+        !S_ISREG(information.st_mode)) {
+        return -1;
+    }
+    g_shell_executable_device = information.st_dev;
+    g_shell_executable_inode = information.st_ino;
+    return 0;
+}
+
+/* ── ENOEXEC Re-enters the Native Shell ────────────────────────
+ * POSIX requires an executable text file without a recognized image format
+ * to be interpreted as a shell script. Re-execing this process through its
+ * initialization-time canonical path preserves the child PID, process group,
+ * descriptors, environment, script `$0`, and operands while ensuring every
+ * command still passes through gsh's bounded first-party evaluator.
+ * ─────────────────────────────────────────────────────────────── */
 static void child_exec_script(const char *path, char *const arguments[],
                               char *const environment[])
 {
     char *shell_arguments[SIMPLE_ARG_CAP + 2];
+    struct stat information;
+#if !defined(__linux__)
+    struct stat current;
+#endif
     size_t index = 1;
+    int descriptor;
+    int error;
 
-    shell_arguments[0] = (char *)"sh";
+    shell_arguments[0] = g_shell_executable;
     shell_arguments[1] = (char *)path;
     while (arguments[index] != NULL && index < SIMPLE_ARG_CAP) {
         shell_arguments[index + 1] = arguments[index];
         index++;
     }
     shell_arguments[index + 1] = NULL;
-    execve("/bin/sh", shell_arguments, environment);
+    descriptor = fault_should_fail("enoexec-interpreter-open", EIO)
+                     ? -1
+                     : open(g_shell_executable, O_RDONLY | O_CLOEXEC);
+    if (descriptor == -1) {
+        return;
+    }
+    if (fstat(descriptor, &information) == -1) {
+        error = errno;
+        close(descriptor);
+        errno = error;
+        return;
+    }
+    if (information.st_dev != g_shell_executable_device ||
+        information.st_ino != g_shell_executable_inode) {
+        error = EIO;
+        close(descriptor);
+        errno = error;
+        return;
+    }
+#if defined(__linux__)
+    fexecve(descriptor, shell_arguments, environment);
+#else
+    if (stat(g_shell_executable, &current) == -1) {
+        error = errno;
+        close(descriptor);
+        errno = error;
+        return;
+    }
+    if (current.st_dev != information.st_dev ||
+        current.st_ino != information.st_ino) {
+        error = EIO;
+        close(descriptor);
+        errno = error;
+        return;
+    }
+    execve(g_shell_executable, shell_arguments, environment);
+#endif
+    error = errno;
+    close(descriptor);
+    errno = error;
 }
 
 static void child_try_exec(const char *path, char *const arguments[],
@@ -14679,6 +14841,11 @@ int main(int argc, char **argv)
     if (argc == 4 && strcmp(argv[1], "-n") == 0 &&
         strcmp(argv[2], "-c") == 0) {
         return check_native_syntax(argv[3]);
+    }
+    if (fault_should_fail("shell-executable-resolution", EIO) ||
+        initialize_shell_executable(argv[0]) == -1) {
+        perror("gsh: executable resolution");
+        return 125;
     }
     if (argc >= 4 && strcmp(argv[1], "--native-only") == 0 &&
         strcmp(argv[2], "-c") == 0) {

@@ -384,13 +384,6 @@ static int start_session(pty_session *session, const char *executable,
                 }
             }
         }
-        /* ── Internal-Descriptor Tests Need a Stable First Slot ──
-         * CI launchers may leak an unrelated descriptor 3 without CLOEXEC.
-         * The exec-protection test deliberately targets the shell's first
-         * internal descriptor, so make that slot deterministic immediately
-         * before overlaying the child. Standard descriptors remain intact.
-         * ─────────────────────────────────────────────────────── */
-        (void)close(STDERR_FILENO + 1);
         if (kind == SHELL_BASH) {
             execl(executable, executable, "--noprofile", "--norc", "-i",
                   (char *)NULL);
@@ -2289,7 +2282,13 @@ static int exec_internal_descriptor_case(const char *executable,
 
     if (start_session(&session, executable, fixture, SHELL_GSH) == -1 ||
         consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
-        send_text(&session, "command exec 9>&3\r") == -1 ||
+        send_text(&session,
+                  "command exec 100>&3 101>&4 102>&5 103>&6 104>&7 "
+                  "105>&8 106>&9 107>&10 108>&11 109>&12 110>&13 "
+                  "111>&14 112>&15 113>&16 114>&17 115>&18 116>&19 "
+                  "117>&20 118>&21 119>&22 120>&23 121>&24 122>&25 "
+                  "123>&26 124>&27 125>&28 126>&29 127>&30 128>&31 "
+                  "129>&32 130>&33 131>&34\r") == -1 ||
         consume_through(&session, "gsh: exec redirection:",
                         TEST_TIMEOUT_MS) == -1 ||
         consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
@@ -2388,6 +2387,88 @@ static int exec_builtin_flow(const char *executable)
         failed = 1;
     }
     remove_exec_fixture(fixture);
+    return failed;
+}
+
+static int write_enoexec_fixture(const char *directory, char path[PATH_MAX])
+{
+    static const char source[] =
+        "/usr/bin/printf 'GSH_ENOEXEC_INTERACTIVE:<%s>\\n' \"$1\"\n"
+        "/bin/sh -c 'exit 6'\n";
+    size_t written = 0;
+    size_t attempts;
+    int descriptor;
+    int status;
+
+    if (snprintf(path, PATH_MAX, "%s/probe", directory) >= PATH_MAX) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    descriptor = open(path, O_WRONLY | O_CREAT | O_EXCL, 0700);
+    if (descriptor == -1) {
+        return -1;
+    }
+    for (attempts = 0;
+         written < sizeof(source) - 1U && attempts < sizeof(source);
+         attempts++) {
+        ssize_t count = write(descriptor, source + written,
+                              sizeof(source) - 1U - written);
+
+        if (count > 0) {
+            written += (size_t)count;
+        } else if (count == -1 && errno == EINTR) {
+            continue;
+        } else {
+            break;
+        }
+    }
+    status = written == sizeof(source) - 1U &&
+                     fchmod(descriptor, 0700) == 0
+                 ? 0
+                 : -1;
+    if (close(descriptor) == -1) {
+        status = -1;
+    }
+    return status;
+}
+
+static int interactive_enoexec_flow(const char *executable)
+{
+    char fixture[] = "/tmp/gsh-pty-enoexec-XXXXXX";
+    char script[PATH_MAX] = {0};
+    pty_session session;
+    int failed = 0;
+
+    if (mkdtemp(fixture) == NULL ||
+        write_enoexec_fixture(fixture, script) == -1 ||
+        start_session(&session, executable, fixture, SHELL_GSH) == -1) {
+        perror("pty ENOEXEC: setup");
+        failed = 1;
+        goto done;
+    }
+    if (consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        send_text(&session, "./probe interactive\r") == -1 ||
+        consume_through(&session, "GSH_ENOEXEC_INTERACTIVE:<interactive>",
+                        TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        send_text(&session,
+                  "/bin/test \"$?\" -eq 6 && "
+                  "/usr/bin/printf GSH_ENOEXEC_STATUS\r") == -1 ||
+        consume_through(&session, "GSH_ENOEXEC_STATUS", TEST_TIMEOUT_MS) ==
+            -1 ||
+        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1) {
+        perror("pty ENOEXEC: flow");
+        dump_capture(&session);
+        failed = 1;
+    }
+    if (stop_session(&session) == -1) {
+        failed = 1;
+    }
+done:
+    if (script[0] != '\0') {
+        (void)unlink(script);
+    }
+    (void)rmdir(fixture);
     return failed;
 }
 
@@ -3171,6 +3252,30 @@ static int noninteractive_fault_case(const char *executable,
     return 0;
 }
 
+static int enoexec_fault_case(const char *executable)
+{
+    char fixture[] = "/tmp/gsh-fault-enoexec-XXXXXX";
+    char script[PATH_MAX] = {0};
+    char command[PATH_MAX + 4U];
+    int length;
+    int failed = 1;
+
+    if (mkdtemp(fixture) != NULL &&
+        write_enoexec_fixture(fixture, script) == 0) {
+        length = snprintf(command, sizeof(command), "'%s'", script);
+        if (length >= 0 && length < (int)sizeof(command)) {
+            failed = noninteractive_fault_case(
+                executable, "enoexec-interpreter-open", command, 126,
+                "execution failed");
+        }
+    }
+    if (script[0] != '\0') {
+        (void)unlink(script);
+    }
+    (void)rmdir(fixture);
+    return failed;
+}
+
 static int fault_injection_flow(const char *executable)
 {
     static const struct {
@@ -3382,12 +3487,16 @@ static int fault_injection_flow(const char *executable)
     failed |= noninteractive_fault_case(
         executable, "descriptor-dup", "eval : 1>&2", 1,
         "source redirection");
+    failed |= noninteractive_fault_case(
+        executable, "shell-executable-resolution", ":", 125,
+        "executable resolution");
+    failed |= enoexec_fault_case(executable);
     for (index = 0; index < sizeof(fatal_cases) / sizeof(fatal_cases[0]);
          index++) {
         failed |= fatal_fault_case(executable, fatal_cases[index]);
     }
     if (!failed) {
-        puts("pty fault: 81 deterministic boundary failures passed");
+        puts("pty fault: 83 deterministic boundary failures passed");
     }
     return failed;
 }
@@ -5800,6 +5909,7 @@ int main(int argc, char **argv)
         command_hash_flow(executable) != 0 ||
         times_builtin_flow(executable) != 0 ||
         exec_builtin_flow(executable) != 0 ||
+        interactive_enoexec_flow(executable) != 0 ||
         function_builtin_flow(executable) != 0 ||
         deferred_pattern_flow(executable) != 0 ||
         asynchronous_list_flow(executable) != 0 ||

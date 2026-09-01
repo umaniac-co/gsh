@@ -166,6 +166,11 @@ the owning shell session with the utility's status. A direct interactive
 `exec` preserves the shell PID; a compound interactive `exec` still overlays
 the isolated evaluator child before its owner exits, so exact original-PID
 identity remains continuation-engine work.
+When `execve()` reports `ENOEXEC`, executable text without a recognized image
+format is re-executed through gsh's initialization-time canonical pathname,
+never through `/bin/sh`. The new native shell image preserves the child PID,
+process group, descriptors, exported environment, resolved script `$0`,
+operands, pipeline/background behavior, and `exec` overlay status.
 The `eval` and `.` special builtins are native in the non-interactive evaluator.
 `eval` concatenates operands with one space, supports an optional `--`, parses
 the result in a preallocated source slot, and executes it in the caller's
@@ -195,9 +200,9 @@ performance gate, and platform evidence remain incomplete. The remaining
 `set` options beyond
 `a`/`C`/`f`/`u`, full monitor-mode job control, and the remaining nested
 expansion forms are still
-incomplete. The interactive unsupported-syntax bridge and the external
-`ENOEXEC` script fallback must disappear from normal shell-language execution
-before `gsh` can claim POSIX.1-2024 shell-language conformance.
+incomplete. The interactive unsupported-syntax bridge must disappear from
+normal shell-language execution before `gsh` can claim POSIX.1-2024
+shell-language conformance.
 
 The builtins implemented in `gsh` itself include `.`, `cd`, `command` within the
 target set described above, `eval`, `exec`, `exit`, `hash`, `pwd`, `export`,
@@ -542,8 +547,9 @@ source before evaluation. It rejects null bytes and oversized input
 deterministically. Streaming complete-command ingestion, the standard-input
 no-read-ahead rule, and removal of the temporary size ceiling remain required
 before the invocation interface is POSIX-complete. Interactive unsupported
-syntax—including interactive `eval` and dot—and `ENOEXEC` handling for external text files still have compatibility
-fallbacks; non-interactive top-level input does not.
+syntax—including interactive `eval` and dot—still has a compatibility
+fallback; non-interactive top-level input and external `ENOEXEC` scripts do
+not.
 
 ## Current scope
 
@@ -602,14 +608,13 @@ replaces the worker.
 
 This is soft real-time engineering, not hard real-time or mission-grade status.
 The repository has executable conformance tranches, bounded fuzz/property
-checks, sanitizer builds, 81 deterministic fault cases, resource-pressure
+checks, sanitizer builds, 83 deterministic fault cases, resource-pressure
 scenarios, and a configurable soak runner. The current native tranche contains
-491 execution cases, 30 syntax cases, and 17 deterministic limit cases with
-one explicitly unsupported case and no delegated cases. The current same-source tranche
-passes the local macOS matrix. The preceding pushed revision also passes the
-macOS arm64 and Ubuntu x86-64 GCC/Clang CI rows; the current worktree does not
-gain that same-revision remote evidence until those jobs run after publication.
-Present coverage is also not yet complete.
+497 execution cases, 30 syntax cases, and 17 deterministic limit cases with
+one explicitly unsupported case and no delegated cases. The current same-source
+tranche passes the local macOS matrix, but does not gain same-revision remote
+evidence until the macOS arm64 and Ubuntu x86-64 GCC/Clang jobs run after
+publication. Present coverage is also not yet complete.
 
 The normative checklist and evidence-state rules live in
 [`specs/0007.verification.md`](specs/0007.verification.md). CI defines macOS Clang

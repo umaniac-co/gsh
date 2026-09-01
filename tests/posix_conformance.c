@@ -779,6 +779,112 @@ static int native_source_cases(const char *executable)
     return failed;
 }
 
+static int enoexec_argument_cases(const char *executable,
+                                  const char *directory,
+                                  const char *script)
+{
+    char command[8192];
+    char expected[2048];
+    syntax_case test = {"2.9.1.6", "ENOEXEC script preserves operands",
+                        command, 7, expected};
+
+    if (snprintf(command, sizeof(command),
+                 "GSH_ENOEXEC_STATUS=7 '%s' alpha 'beta gamma'", script) >=
+            (int)sizeof(command) ||
+        snprintf(expected, sizeof(expected),
+                 "<script:%s:alpha:beta gamma:unset>\n", script) >=
+            (int)sizeof(expected) ||
+        run_case(executable, &test, false) != 0) {
+        return 1;
+    }
+    test.name = "PATH-found ENOEXEC script uses the resolved pathname";
+    test.status = 3;
+    if (snprintf(command, sizeof(command),
+                 "PATH='%s:/bin:/usr/bin' GSH_ENOEXEC_STATUS=3 "
+                 "probe one two",
+                 directory) >= (int)sizeof(command) ||
+        snprintf(expected, sizeof(expected),
+                 "<script:%s/probe:one:two:unset>\n", directory) >=
+            (int)sizeof(expected) ||
+        run_case(executable, &test, false) != 0) {
+        return 1;
+    }
+    return 0;
+}
+
+static int enoexec_environment_cases(const char *executable,
+                                     const char *script)
+{
+    char command[8192];
+    char expected[2048];
+    syntax_case test = {"2.9.1.6", "ENOEXEC receives a temporary environment",
+                        command, 0, expected};
+
+    if (snprintf(command, sizeof(command),
+                 "GSH_ENOEXEC_ENV=visible '%s'; "
+                 "/bin/test -z \"${GSH_ENOEXEC_ENV+set}\"",
+                 script) >= (int)sizeof(command) ||
+        snprintf(expected, sizeof(expected),
+                 "<script:%s:unset:unset:visible>\n", script) >=
+            (int)sizeof(expected) ||
+        run_case(executable, &test, false) != 0) {
+        return 1;
+    }
+    test.name = "ENOEXEC script executes as a pipeline stage";
+    test.diagnostic = "SCRIPT";
+    if (snprintf(command, sizeof(command),
+                 "'%s' left right | /usr/bin/tr a-z A-Z", script) >=
+            (int)sizeof(command) ||
+        run_case(executable, &test, false) != 0) {
+        return 1;
+    }
+    test.name = "asynchronous ENOEXEC status reaches wait";
+    test.diagnostic = "<script:";
+    if (snprintf(command, sizeof(command),
+                 "GSH_ENOEXEC_STATUS=9 '%s' & wait \"$!\"; "
+                 "/bin/test \"$?\" -eq 9",
+                 script) >= (int)sizeof(command) ||
+        run_case(executable, &test, false) != 0) {
+        return 1;
+    }
+    test.name = "exec overlays with the native ENOEXEC interpreter";
+    test.status = 11;
+    if (snprintf(command, sizeof(command),
+                 "GSH_ENOEXEC_STATUS=11 exec '%s' overlay operand", script) >=
+            (int)sizeof(command) ||
+        run_case(executable, &test, false) != 0) {
+        return 1;
+    }
+    return 0;
+}
+
+static int native_enoexec_cases(const char *executable)
+{
+    static const char source[] =
+        "/usr/bin/printf '<script:%s:%s:%s:%s>\\n' \"$0\" "
+        "\"${1-unset}\" \"${2-unset}\" \"${GSH_ENOEXEC_ENV-unset}\"\n"
+        "/bin/sh -c \"exit ${GSH_ENOEXEC_STATUS:-0}\"\n";
+    char directory[] = "/tmp/gsh-native-enoexec-XXXXXX";
+    char script[1024] = {0};
+    int length;
+    int failed = 1;
+
+    if (mkdtemp(directory) != NULL) {
+        length = snprintf(script, sizeof(script), "%s/probe", directory);
+        if (length >= 0 && length < (int)sizeof(script) &&
+            create_source_fixture(script, source, 0700) == 0) {
+            failed =
+                enoexec_argument_cases(executable, directory, script) != 0 ||
+                enoexec_environment_cases(executable, script) != 0;
+        }
+    }
+    if (script[0] != '\0') {
+        (void)unlink(script);
+    }
+    (void)rmdir(directory);
+    return failed;
+}
+
 static int native_umask_creation_case(const char *executable)
 {
     char directory[] = "/tmp/gsh-native-umask-XXXXXX";
@@ -3475,6 +3581,10 @@ int main(int argc, char **argv)
         return 1;
     }
     execution_passed += 19U;
+    if (native_enoexec_cases(argv[1]) != 0) {
+        return 1;
+    }
+    execution_passed += 6U;
     if (native_redirection_cases(argv[1]) != 0) {
         return 1;
     }
