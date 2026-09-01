@@ -2489,6 +2489,63 @@ int main(int argc, char **argv)
          "/bin/rm -rf \"$GSH_HASH_ROOT\"; "
          "/bin/test \"$GSH_HASH_STATUS\" -eq 0",
          0, NULL},
+        {"exec", "exec is identified as a special builtin",
+         "command -V exec", 0, "exec is a special builtin\n"},
+        {"exec", "exec overlays the shell with an external utility",
+         "exec /usr/bin/printf '<%s>\\n' replaced; "
+         "/usr/bin/false",
+         0, "<replaced>\n"},
+        {"exec", "exec leading assignment reaches the utility",
+         "GSH_EXEC_VALUE='alpha beta' exec /usr/bin/printenv GSH_EXEC_VALUE",
+         0, "alpha beta\n"},
+        {"exec", "exec uses its leading PATH assignment",
+         "PATH=/bin exec sh -c 'exit 7'", 7, NULL},
+        {"exec", "exec accepts the option terminator",
+         "exec -- /usr/bin/printf EXEC_END", 0, "EXEC_END"},
+        {"exec", "exec without a utility commits descriptors",
+         "GSH_EXEC_FILE=/tmp/gsh-exec-descriptor-$$; "
+         "exec 9>\"$GSH_EXEC_FILE\"; /usr/bin/printf persisted >&9; "
+         "exec 9>&-; /bin/cat \"$GSH_EXEC_FILE\"; "
+         "/bin/rm -f \"$GSH_EXEC_FILE\"",
+         0, "persisted"},
+        {"exec", "failed regular exec keeps successful redirections",
+         "GSH_EXEC_FILE=/tmp/gsh-exec-failure-$$; "
+         "command exec 2>\"$GSH_EXEC_FILE\" /definitely/missing; "
+         "/usr/bin/printf after >&2; /bin/cat \"$GSH_EXEC_FILE\"; "
+         "/bin/rm -f \"$GSH_EXEC_FILE\"",
+         0, "after"},
+        {"exec", "exec failure aborts a non-interactive shell",
+         "exec /definitely/missing; /usr/bin/printf BAD_EXEC", 127,
+         "command not found"},
+        {"exec", "exec reports a non-executable utility as 126",
+         "exec /; /usr/bin/printf BAD_EXEC", 126,
+         "permission denied"},
+        {"exec", "negation does not suppress special exec failure",
+         "! exec /definitely/missing; /usr/bin/printf BAD_EXEC", 127,
+         "command not found"},
+        {"exec", "command suppresses exec special error semantics",
+         "command exec /definitely/missing; /usr/bin/printf RECOVERED",
+         0, "RECOVERED"},
+        {"exec", "exec rejects unsupported options",
+         "exec -x; /usr/bin/printf BAD_EXEC", 2,
+         "unsupported option"},
+        {"exec", "exec overlays a pipeline stage",
+         "/usr/bin/printf x | exec /usr/bin/tr x y", 0, "y"},
+        {"exec", "subshell exec does not replace its parent shell",
+         "(exec /usr/bin/printf sub); /usr/bin/printf parent", 0,
+         "subparent"},
+        {"exec", "asynchronous exec replaces only its child environment",
+         "exec /bin/sh -c 'exit 9' & wait \"$!\"; "
+         "/bin/test \"$?\" -eq 9",
+         0, NULL},
+        {"exec", "command substitution exec replaces only its child",
+         "/usr/bin/printf '<%s>\n' "
+         "\"$(exec /usr/bin/printf substituted)\"",
+         0, "<substituted>\n"},
+        {"exec", "exec inside a function overlays the shell",
+         "gsh_exec_function() { exec /usr/bin/printf function; }; "
+         "gsh_exec_function; /usr/bin/false",
+         0, "function"},
         {"times", "times is identified as a special builtin",
          "command -V times", 0, "times is a special builtin\n"},
         {"times", "times writes two POSIX timing rows",

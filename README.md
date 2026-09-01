@@ -155,6 +155,17 @@ redirections, pipelines, and missing-name status are native. The execution form
 of `command` is also native for the implemented target set, including nested
 wrappers, function suppression, `-p`, declaration assignments, temporary
 special-builtin prefixes, redirections, pipelines, and 126/127 propagation.
+The `exec` special builtin performs a zero-allocation `execve` overlay for
+external utilities, honors leading `PATH` and environment assignments, and
+commits successful redirections even when option parsing or utility lookup
+fails. Interactive compound evaluation reports overlay success through a
+close-on-exec protocol; descriptor state crosses the evaluator boundary in a
+validated, collision-safe `SCM_RIGHTS` snapshot. Classic and managed REPLs
+therefore preserve descriptor changes, while a successful overlay terminates
+the owning shell session with the utility's status. A direct interactive
+`exec` preserves the shell PID; a compound interactive `exec` still overlays
+the isolated evaluator child before its owner exits, so exact original-PID
+identity remains continuation-engine work.
 `hash` and ordinary external execution share a 128-entry, open-addressed
 command-location cache with allocation-free steady-state lookup. Every
 successful `PATH` assignment invalidates it, stale executable locations fall
@@ -266,7 +277,7 @@ make fuzz-pty-sanitize
 make soak SOAK_SECONDS=60
 ```
 
-`check-fault` uses a separate test-only binary and exercises 69 deterministic
+`check-fault` uses a separate test-only binary and exercises 77 deterministic
 failure points. The production build contains neither the injection
 configuration nor its fault names. `check-resource` covers runtime descriptor
 and process exhaustion, data-limit capability, bounded single-line and
@@ -323,7 +334,8 @@ Workloads currently cover startup, idle key echo,
 `/usr/bin/true`, variable, builtin-command, and cached `PATH` lookup, assignment,
 `${parameter:=word}`, arithmetic
 assignment, a mutating expansion in a two-stage pipeline, `ulimit -S -n`,
-`umask`, `times`, `export`, `unset`, `readonly`, finite explicit-list `for`,
+`umask`, `times`, descriptor-only `exec`, `export`, `unset`, `readonly`,
+finite explicit-list `for`,
 `set -- a b c`, `shift`,
 `set -Cf; set +Cf`, controlled `allexport` assignment and `nounset` lookup,
 simple and fixed multi-star parameter pattern removal, disabled pathname
@@ -348,30 +360,31 @@ systems. Final same-revision matrices and their raw output belong in
 the ignored local `dev/performance/` directory, separately from `build/`.
 
 The current local worktree snapshot below is evidence for this machine, not a
-release or cross-platform performance claim. It was measured on 2026-08-27 with
+release or cross-platform performance claim. It was measured on 2026-09-01 with
 Darwin 25.5.0 arm64 (18 CPUs), Apple Clang 21.0.0, Bash 5.3.3, and Zsh 5.9.
-The complete record contains 29 latency and 26 command-memory workloads; this
-compact view shows startup, idle input, and the new alias paths. Cells are
+The complete record contains 33 latency and 26 command-memory workloads; this
+compact view shows startup, idle input, `exec`, and the alias paths. Cells are
 p50 / p99 milliseconds over 120 startup, 500 key, or 300 command samples:
 
 | Workload | `gsh` | Bash | Zsh |
 | --- | ---: | ---: | ---: |
-| startup | 2.646 / 3.210 | 4.403 / 5.281 | 4.917 / 6.060 |
-| idle key | 0.011 / 0.015 | 0.011 / 0.015 | 0.011 / 0.014 |
-| alias define/update | 0.063 / 0.079 | 0.072 / 0.083 | 0.086 / 0.105 |
-| alias lookup/expand | 0.039 / 0.048 | 0.059 / 0.070 | 0.064 / 0.076 |
-| `unalias` | 0.056 / 0.067 | 0.069 / 0.080 | 0.080 / 0.091 |
+| startup | 3.199 / 3.658 | 5.411 / 6.207 | 5.919 / 6.815 |
+| idle key | 0.011 / 0.014 | 0.011 / 0.014 | 0.011 / 0.013 |
+| `exec` descriptor commit | 0.053 / 0.102 | 0.093 / 0.140 | 0.104 / 0.160 |
+| alias define/update | 0.024 / 0.029 | 0.063 / 0.077 | 0.082 / 0.097 |
+| alias lookup/expand | 0.018 / 0.026 | 0.052 / 0.060 | 0.064 / 0.074 |
+| `unalias` | 0.023 / 0.027 | 0.060 / 0.068 | 0.075 / 0.089 |
 
-The independent alias-only repeat confirms that gsh is lower than both
-comparison shells at p50, p95, p99, and maximum for all three alias workloads.
-Its main process uses 1.672 MiB at idle, versus 2.297 MiB for Bash and 1.828 MiB
-for Zsh in that repeat. Its complete 2.579 MiB process tree is still 0.282 MiB
-and 0.751 MiB larger respectively because of the persistent worker; that fixed
-cost remains an explicit optimization target. Re-run `make bench` after every
-affected implementation change; never carry a result across revisions as if it
-were fresh evidence. The full comparison, direct differences, methodology,
-ordered raw values, and first-use memory growth are in the ignored local file
-`dev/performance/2026-08-27-macos-arm64-alias.md` when that evidence is present.
+The current full repeat puts gsh below both comparison shells at p50 and p99
+for the displayed command workloads. Its main process uses 2.500 MiB at idle,
+versus 2.360 MiB for Bash and 1.875 MiB for Zsh. Its complete 3.391 MiB process
+tree is still 1.031 MiB and 1.516 MiB larger respectively because of the
+persistent worker and preallocated language workspaces; that fixed cost remains
+an explicit optimization target. Re-run `make bench` after every affected
+implementation change; never carry a result across revisions as if it were
+fresh evidence. The full methodology, ordered raw values, percentiles, and
+first-use memory growth are in the ignored local file
+`dev/performance/current.raw.txt` when that evidence is present.
 
 ## Run
 
@@ -569,12 +582,12 @@ replaces the worker.
 
 This is soft real-time engineering, not hard real-time or mission-grade status.
 The repository has executable conformance tranches, bounded fuzz/property
-checks, sanitizer builds, 69 deterministic fault cases, resource-pressure
+checks, sanitizer builds, 77 deterministic fault cases, resource-pressure
 scenarios, and a configurable soak runner. The current same-source tranche
-passes the local macOS matrix and a native-ISA Ubuntu ARM64 GCC/Clang matrix.
-That Linux execution is not amd64 translation, but it still does not satisfy
-the Linux x86-64 release matrix required by principle 007; present coverage is
-also not yet complete.
+passes the local macOS matrix. The preceding pushed revision also passes the
+macOS arm64 and Ubuntu x86-64 GCC/Clang CI rows; the current worktree does not
+gain that same-revision remote evidence until those jobs run after publication.
+Present coverage is also not yet complete.
 
 The normative checklist and evidence-state rules live in
 [`specs/0007.verification.md`](specs/0007.verification.md). CI defines macOS Clang

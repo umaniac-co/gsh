@@ -2204,6 +2204,186 @@ static int times_builtin_flow(const char *executable)
     return failed;
 }
 
+static void remove_exec_fixture(const char *fixture)
+{
+    static const char *const names[] = {
+        "descriptor.out", "compound.out", "compound.err", "failure.err",
+        "managed.out"};
+    char path[PATH_MAX];
+    size_t index;
+
+    for (index = 0; index < sizeof(names) / sizeof(names[0]); index++) {
+        if (snprintf(path, sizeof(path), "%s/%s", fixture,
+                     names[index]) < (int)sizeof(path)) {
+            (void)unlink(path);
+        }
+    }
+    (void)rmdir(fixture);
+}
+
+static int interactive_exec_overlay_case(
+    const char *executable, const char *fixture, bool managed,
+    const char *setup, const char *command, int expected_status)
+{
+    pty_session session;
+
+    if ((managed ? start_managed_session(&session, executable, fixture)
+                 : start_session(&session, executable, fixture, SHELL_GSH)) ==
+            -1 ||
+        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        (setup != NULL &&
+         (send_text(&session, setup) == -1 ||
+          consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1)) ||
+        send_text(&session, command) == -1 ||
+        wait_session_exit(&session, expected_status, TEST_TIMEOUT_MS) == -1) {
+        if (session.master >= 0) {
+            dump_capture(&session);
+            (void)stop_session(&session);
+        }
+        return 1;
+    }
+    return 0;
+}
+
+static int managed_exec_descriptor_case(const char *executable,
+                                        const char *fixture)
+{
+    pty_session session;
+    int failed = 0;
+
+    if (start_managed_session(&session, executable, fixture) == -1 ||
+        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        send_text(&session,
+                  "if true; then exec >managed.out; fi\r") == -1 ||
+        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        send_text(&session,
+                  "/usr/bin/printf GSH_MANAGED_EXEC_DESCRIPTOR\r") == -1 ||
+        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        send_text(&session, "exec 1>/dev/tty\r") == -1 ||
+        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        send_text(&session, "/bin/cat managed.out\r") == -1 ||
+        consume_through(&session, "GSH_MANAGED_EXEC_DESCRIPTOR",
+                        TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1) {
+        dump_capture(&session);
+        failed = 1;
+    }
+    if (stop_session(&session) == -1) {
+        failed = 1;
+    }
+    return failed;
+}
+
+static int exec_internal_descriptor_case(const char *executable,
+                                         const char *fixture)
+{
+    pty_session session;
+    int failed = 0;
+
+    if (start_session(&session, executable, fixture, SHELL_GSH) == -1 ||
+        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        send_text(&session, "command exec 9>&3\r") == -1 ||
+        consume_through(&session, "gsh: exec redirection:",
+                        TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        send_text(&session, "/usr/bin/true\r") == -1 ||
+        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1) {
+        dump_capture(&session);
+        failed = 1;
+    }
+    if (stop_session(&session) == -1) {
+        failed = 1;
+    }
+    return failed;
+}
+
+static int exec_builtin_flow(const char *executable)
+{
+    char fixture[] = "/tmp/gsh-pty-exec-XXXXXX";
+    pty_session session;
+    int failed = 0;
+
+    if (mkdtemp(fixture) == NULL ||
+        start_session(&session, executable, fixture, SHELL_GSH) == -1) {
+        perror("pty exec: setup");
+        remove_exec_fixture(fixture);
+        return 1;
+    }
+    if (consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        send_text(&session,
+                  "GSH_EXEC_KEEP=value exec 3>descriptor.out\r") == -1 ||
+        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        send_text(&session,
+                  "/usr/bin/printf persisted >&3; exec 3>&-; "
+                  "/bin/test \"$GSH_EXEC_KEEP\" = value && "
+                  "/bin/cat descriptor.out\r") == -1 ||
+        consume_through(&session, "persisted", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        send_text(&session,
+                  "if true; then GSH_EXEC_COMPOUND=value "
+                  "exec 4>compound.out; fi\r") == -1 ||
+        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        send_text(&session,
+                  "/usr/bin/printf compound >&4; exec 4>&-; "
+                  "/bin/test \"$GSH_EXEC_COMPOUND\" = value && "
+                  "/bin/cat compound.out\r") == -1 ||
+        consume_through(&session, "compound", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        send_text(&session,
+                  "if true; then command exec 2>compound.err "
+                  "/definitely/missing; fi\r") == -1 ||
+        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        send_text(&session,
+                  "/usr/bin/printf GSH_EXEC_COMPOUND_REDIRECT >&2; "
+                  "/bin/cat compound.err\r") == -1 ||
+        consume_through(&session, "GSH_EXEC_COMPOUND_REDIRECT",
+                        TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        send_text(&session,
+                  "command exec 2>failure.err /definitely/missing\r") ==
+            -1 ||
+        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        send_text(&session,
+                  "/usr/bin/printf GSH_EXEC_REDIRECT_PERSISTED >&2; "
+                  "/bin/cat failure.err\r") == -1 ||
+        consume_through(&session, "GSH_EXEC_REDIRECT_PERSISTED",
+                        TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        send_text(&session,
+                  "GSH_EXEC_INTERACTIVE=value exec /bin/sh -c "
+                  "'/bin/test \"$GSH_EXEC_INTERACTIVE\" = value || exit 9; "
+                  "exit 7'\r") == -1 ||
+        wait_session_exit(&session, 7, TEST_TIMEOUT_MS) == -1) {
+        perror("pty exec: flow");
+        dump_capture(&session);
+        failed = 1;
+    }
+    if (session.master >= 0 && stop_session(&session) == -1) {
+        failed = 1;
+    }
+    if (!failed &&
+        (exec_internal_descriptor_case(executable, fixture) != 0 ||
+         managed_exec_descriptor_case(executable, fixture) != 0 ||
+         interactive_exec_overlay_case(
+             executable, fixture, true, NULL,
+             "exec /bin/sh -c 'exit 11'\r", 11) != 0 ||
+         interactive_exec_overlay_case(
+             executable, fixture, false, NULL,
+             "if true; then exec /bin/sh -c 'exit 13'; fi\r", 13) != 0 ||
+         interactive_exec_overlay_case(
+             executable, fixture, true, NULL,
+             "if true; then exec /bin/sh -c 'exit 14'; fi\r", 14) != 0 ||
+         interactive_exec_overlay_case(
+             executable, fixture, false,
+             "gsh_exec_function() { exec /bin/sh -c 'exit 15'; }\r",
+             "gsh_exec_function\r", 15) != 0)) {
+        perror("pty exec: overlay cases");
+        failed = 1;
+    }
+    remove_exec_fixture(fixture);
+    return failed;
+}
+
 static int function_builtin_flow(const char *executable)
 {
     char fixture[] = "/tmp/gsh-pty-function-XXXXXX";
@@ -2963,6 +3143,44 @@ static int fault_injection_flow(const char *executable)
          "gsh: evaluator gate:"},
         {"evaluator-fork", "/usr/bin/true && /usr/bin/true\r",
          "gsh: evaluator fork:"},
+        {"exec-outcome-pipe",
+         "if true; then exec /usr/bin/true; fi\r",
+         "gsh: exec outcome pipe:"},
+        {"exec-descriptor-socket",
+         "if true; then exec /usr/bin/true; fi\r",
+         "gsh: exec descriptor socket:"},
+        {"exec-owner-descriptor-relocation",
+         "exec 3>/dev/null\r",
+         "gsh: exec descriptor protection:"},
+        {"transaction-descriptor-relocation",
+         "if true; then exec 3>/dev/null 4>/dev/null 5>/dev/null "
+         "6>/dev/null 7>/dev/null 8>/dev/null 9>/dev/null 10>/dev/null "
+         "11>/dev/null 12>/dev/null 13>/dev/null 14>/dev/null "
+         "15>/dev/null 16>/dev/null 17>/dev/null 18>/dev/null "
+         "19>/dev/null 20>/dev/null 21>/dev/null 22>/dev/null "
+         "23>/dev/null 24>/dev/null 25>/dev/null 26>/dev/null "
+         "27>/dev/null 28>/dev/null 29>/dev/null 30>/dev/null "
+         "31>/dev/null 32>/dev/null 33>/dev/null 34>/dev/null; fi\r",
+         "gsh: exec descriptor protection:"},
+        {"exec-descriptor-send",
+         "if true; then exec 8>/dev/null; fi\r",
+         "gsh: exec descriptor commit:"},
+        {"exec-descriptor-receive",
+         "if true; then exec 8>/dev/null; fi\r",
+         "gsh: exec descriptor transaction rejected"},
+        {"exec-descriptor-apply",
+         "if true; then exec 8>/dev/null; fi\r",
+         "gsh: exec descriptor transaction rejected"},
+        {"exec-descriptor-stabilize",
+         "if true; then exec 3>/dev/null 4>/dev/null 5>/dev/null "
+         "6>/dev/null 7>/dev/null 8>/dev/null 9>/dev/null 10>/dev/null "
+         "11>/dev/null 12>/dev/null 13>/dev/null 14>/dev/null "
+         "15>/dev/null 16>/dev/null 17>/dev/null 18>/dev/null "
+         "19>/dev/null 20>/dev/null 21>/dev/null 22>/dev/null "
+         "23>/dev/null 24>/dev/null 25>/dev/null 26>/dev/null "
+         "27>/dev/null 28>/dev/null 29>/dev/null 30>/dev/null "
+         "31>/dev/null 32>/dev/null 33>/dev/null 34>/dev/null; fi\r",
+         "gsh: exec descriptor transaction rejected"},
         {"async-fork", "/usr/bin/true &\r",
          "gsh: asynchronous fork:"},
         {"expansion-assignment",
@@ -3082,7 +3300,7 @@ static int fault_injection_flow(const char *executable)
         failed |= fatal_fault_case(executable, fatal_cases[index]);
     }
     if (!failed) {
-        puts("pty fault: 69 deterministic boundary failures passed");
+        puts("pty fault: 77 deterministic boundary failures passed");
     }
     return failed;
 }
@@ -4735,6 +4953,7 @@ static int latency_benchmark(const char *gsh, const char *bash,
     uint64_t resource_limit[BENCH_SHELLS][BENCH_EXEC_SAMPLES];
     uint64_t creation_mask[BENCH_SHELLS][BENCH_EXEC_SAMPLES];
     uint64_t process_times[BENCH_SHELLS][BENCH_EXEC_SAMPLES];
+    uint64_t exec_descriptor[BENCH_SHELLS][BENCH_EXEC_SAMPLES];
     uint64_t export_assignment[BENCH_SHELLS][BENCH_EXEC_SAMPLES];
     uint64_t unset_variable[BENCH_SHELLS][BENCH_EXEC_SAMPLES];
     uint64_t readonly_existing[BENCH_SHELLS][BENCH_EXEC_SAMPLES];
@@ -4881,6 +5100,9 @@ static int latency_benchmark(const char *gsh, const char *bash,
             -1 ||
         benchmark_prompt_command(sessions, specs, process_times, NULL,
                                  "times\r", "process times") == -1 ||
+        benchmark_prompt_command(
+            sessions, specs, exec_descriptor, "exec 9>&-\r",
+            "exec 9>/dev/null\r", "exec descriptor commit") == -1 ||
         benchmark_prompt_command(
             sessions, specs, export_assignment, NULL,
             "export GSH_BENCH_EXPORT=value\r", "export assignment") == -1 ||
@@ -5033,6 +5255,8 @@ done:
                           creation_mask[offset], BENCH_EXEC_SAMPLES);
         print_raw_samples(specs[offset].name, "process-times",
                           process_times[offset], BENCH_EXEC_SAMPLES);
+        print_raw_samples(specs[offset].name, "exec-descriptor-commit",
+                          exec_descriptor[offset], BENCH_EXEC_SAMPLES);
         print_raw_samples(specs[offset].name, "export-assignment",
                           export_assignment[offset], BENCH_EXEC_SAMPLES);
         print_raw_samples(specs[offset].name, "unset-variable",
@@ -5101,6 +5325,8 @@ done:
         print_metric("umask-report", creation_mask[offset],
                      BENCH_EXEC_SAMPLES, 5000000ULL);
         print_metric("process-times", process_times[offset],
+                     BENCH_EXEC_SAMPLES, 5000000ULL);
+        print_metric("exec-descriptor-commit", exec_descriptor[offset],
                      BENCH_EXEC_SAMPLES, 5000000ULL);
         print_metric("export-assignment", export_assignment[offset],
                      BENCH_EXEC_SAMPLES, 5000000ULL);
@@ -5486,6 +5712,7 @@ int main(int argc, char **argv)
         alias_builtin_flow(executable) != 0 ||
         command_hash_flow(executable) != 0 ||
         times_builtin_flow(executable) != 0 ||
+        exec_builtin_flow(executable) != 0 ||
         function_builtin_flow(executable) != 0 ||
         deferred_pattern_flow(executable) != 0 ||
         asynchronous_list_flow(executable) != 0 ||

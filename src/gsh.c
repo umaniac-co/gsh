@@ -154,6 +154,20 @@ typedef struct {
 
 enum { GSH_COMMAND_CACHE_COMMIT_VERSION = 1 };
 
+enum {
+    GSH_EXEC_DESCRIPTOR_COMMIT_VERSION = 1,
+    GSH_EXEC_DESCRIPTOR_COMMIT_CAP = 128,
+};
+
+typedef struct {
+    uint32_t version;
+    uint32_t count;
+    uint32_t open_count;
+    uint32_t reserved;
+    int32_t targets[GSH_EXEC_DESCRIPTOR_COMMIT_CAP];
+    unsigned char open[GSH_EXEC_DESCRIPTOR_COMMIT_CAP];
+} exec_descriptor_commit;
+
 typedef struct {
     uint32_t version;
     uint32_t reserved;
@@ -284,6 +298,15 @@ typedef struct {
     bool variable_commit_active;
     bool variable_commit_eof;
     bool variable_commit_invalid;
+    int exec_outcome_fd;
+    bool pending_exec_possible;
+    int exec_descriptor_socket;
+    int pending_exec_descriptors[GSH_EXEC_DESCRIPTOR_COMMIT_CAP];
+    size_t pending_exec_descriptor_count;
+    int pending_exec_protected_descriptors[
+        GSH_EXEC_DESCRIPTOR_COMMIT_CAP];
+    size_t pending_exec_protected_descriptor_count;
+    bool exec_standard_descriptor_changed[3];
 
     uint64_t reactor_cycles;
     uint64_t reactor_misses;
@@ -1179,6 +1202,8 @@ static int initialize_interactive(shell_state *state,
     state->prompt_worker_fd = -1;
     state->prompt_worker_pid = -1;
     state->variable_commit_fd = -1;
+    state->exec_outcome_fd = -1;
+    state->exec_descriptor_socket = -1;
     state->directory_commit_socket = -1;
     state->directory_commit_fd = -1;
     state->async_capture_cell = -1;
@@ -2020,6 +2045,17 @@ static void close_variable_commit(shell_state *state)
     state->variable_commit_active = false;
     state->variable_commit_eof = false;
     state->variable_commit_invalid = false;
+    if (state->exec_outcome_fd >= 0) {
+        close(state->exec_outcome_fd);
+    }
+    state->exec_outcome_fd = -1;
+    state->pending_exec_possible = false;
+    if (state->exec_descriptor_socket >= 0) {
+        close(state->exec_descriptor_socket);
+    }
+    state->exec_descriptor_socket = -1;
+    state->pending_exec_descriptor_count = 0;
+    state->pending_exec_protected_descriptor_count = 0;
     free(state->positional_commit);
     state->positional_commit = NULL;
     state->positional_commit_expected = false;
@@ -2435,6 +2471,377 @@ static bool finish_background_wait(shell_state *state)
     return true;
 }
 
+enum {
+    GSH_EXEC_OUTCOME_INVALID = -1,
+    GSH_EXEC_OUTCOME_NONE = 0,
+    GSH_EXEC_OUTCOME_OVERLAID = 1,
+    GSH_EXEC_OUTCOME_FAILED = 2,
+};
+
+static int finish_exec_outcome(shell_state *state)
+{
+    unsigned char outcomes[3];
+    size_t received = 0;
+
+    if (state->exec_outcome_fd < 0) {
+        return GSH_EXEC_OUTCOME_NONE;
+    }
+    while (received < sizeof(outcomes)) {
+        ssize_t count = read(state->exec_outcome_fd, outcomes + received,
+                             sizeof(outcomes) - received);
+
+        if (count > 0) {
+            received += (size_t)count;
+        } else if (count == -1 && errno == EINTR) {
+            continue;
+        } else if (count == 0) {
+            break;
+        } else {
+            received = sizeof(outcomes);
+            break;
+        }
+    }
+    close(state->exec_outcome_fd);
+    state->exec_outcome_fd = -1;
+    if (received == 0) {
+        return GSH_EXEC_OUTCOME_NONE;
+    }
+    if (received == 1U && outcomes[0] == 'A') {
+        return GSH_EXEC_OUTCOME_OVERLAID;
+    }
+    if (received == 2U && outcomes[0] == 'A' && outcomes[1] == 'F') {
+        return GSH_EXEC_OUTCOME_FAILED;
+    }
+    return GSH_EXEC_OUTCOME_INVALID;
+}
+
+static bool exec_commit_targets_valid(
+    const shell_state *state, const exec_descriptor_commit *commit)
+{
+    size_t index;
+    size_t open_count = 0;
+
+    assert(state->pending_exec_descriptor_count <=
+           GSH_EXEC_DESCRIPTOR_COMMIT_CAP);
+    if (commit->version != GSH_EXEC_DESCRIPTOR_COMMIT_VERSION ||
+        commit->reserved != 0 ||
+        commit->count != state->pending_exec_descriptor_count ||
+        commit->count > GSH_EXEC_DESCRIPTOR_COMMIT_CAP) {
+        return false;
+    }
+    for (index = 0; index < commit->count; index++) {
+        if (commit->targets[index] !=
+                state->pending_exec_descriptors[index] ||
+            commit->open[index] > 1U) {
+            return false;
+        }
+        open_count += commit->open[index];
+    }
+    return open_count == commit->open_count;
+}
+
+static bool exec_commit_contains_target(
+    const exec_descriptor_commit *commit, int descriptor)
+{
+    size_t index;
+
+    for (index = 0; index < commit->count; index++) {
+        if (commit->targets[index] == descriptor) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool exec_targets_contain(const int32_t targets[], size_t count,
+                                 int descriptor)
+{
+    size_t index;
+
+    for (index = 0; index < count; index++) {
+        if (targets[index] == descriptor) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static int relocate_exec_owner_fd(const int32_t targets[], size_t count,
+                                  int minimum, int *descriptor)
+{
+    int duplicate;
+
+    if (*descriptor < 0 ||
+        !exec_targets_contain(targets, count, *descriptor)) {
+        return 0;
+    }
+    duplicate = fault_should_fail("exec-owner-descriptor-relocation",
+                                  EMFILE)
+                    ? -1
+                    : fcntl(*descriptor, F_DUPFD_CLOEXEC, minimum);
+    if (duplicate == -1) {
+        return -1;
+    }
+    close(*descriptor);
+    *descriptor = duplicate;
+    return 0;
+}
+
+static int relocate_exec_signal_fd(const int32_t targets[], size_t count,
+                                   int minimum, int *descriptor)
+{
+    int previous = *descriptor;
+    int duplicate;
+
+    if (previous < 0 ||
+        !exec_targets_contain(targets, count, previous)) {
+        return 0;
+    }
+    duplicate = fault_should_fail("exec-owner-descriptor-relocation",
+                                  EMFILE)
+                    ? -1
+                    : fcntl(previous, F_DUPFD_CLOEXEC, minimum);
+    if (duplicate == -1) {
+        return -1;
+    }
+    g_signal_write_fd = duplicate;
+    *descriptor = duplicate;
+    close(previous);
+    return 0;
+}
+
+/* ── User Descriptors Never Own Reactor Resources ─────────────────
+ * Interactive shells keep terminal, signal, worker, and PTY descriptors in
+ * the same process that owns persistent `exec` redirections. A user target
+ * can numerically collide with any of them, especially descriptors 3 and 4.
+ * Before committing, matching resources move above every target with CLOEXEC;
+ * the user receives the requested number while the reactor retains ownership.
+ * The fixed owner and cell sets bound both work and partial-failure recovery.
+ * ─────────────────────────────────────────────────────────────── */
+static int protect_exec_owner_descriptors(
+    shell_state *state, const int32_t targets[], size_t count)
+{
+    int *owned[] = {
+        &state->tty_fd, &state->signal_pipe[0],
+        &state->prompt_worker_fd, &state->history_client.descriptor,
+        &state->variable_commit_fd, &state->exec_outcome_fd,
+        &state->exec_descriptor_socket, &state->directory_commit_socket,
+        &state->directory_commit_fd,
+    };
+    int minimum = STDERR_FILENO + 1;
+    size_t index;
+
+    for (index = 0; index < count; index++) {
+        if (targets[index] < 0 || targets[index] == INT_MAX) {
+            errno = EINVAL;
+            return -1;
+        }
+        if (targets[index] >= minimum) {
+            minimum = targets[index] + 1;
+        }
+    }
+    for (index = 0; index < sizeof(owned) / sizeof(owned[0]); index++) {
+        if (relocate_exec_owner_fd(targets, count, minimum,
+                                   owned[index]) == -1) {
+            return -1;
+        }
+    }
+    if (relocate_exec_signal_fd(targets, count, minimum,
+                                &state->signal_pipe[1]) == -1) {
+        return -1;
+    }
+    for (index = 0; state->async_repl != NULL &&
+                    index < GSH_ASYNC_CELL_CAP; index++) {
+        if (relocate_exec_owner_fd(
+                targets, count, minimum,
+                &state->async_repl->cells[index].pty_fd) == -1) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static void close_exec_commit_fds(int descriptors[], size_t count)
+{
+    size_t index;
+
+    for (index = 0; index < count; index++) {
+        if (descriptors[index] >= 0) {
+            close(descriptors[index]);
+            descriptors[index] = -1;
+        }
+    }
+}
+
+static int stabilize_exec_commit_fds(
+    const exec_descriptor_commit *commit, int descriptors[], size_t count)
+{
+    int reservations[GSH_EXEC_DESCRIPTOR_COMMIT_CAP];
+    size_t reservation_count = 0;
+    size_t index;
+
+    for (index = 0; index < count; index++) {
+        if (!exec_commit_contains_target(commit, descriptors[index])) {
+            continue;
+        }
+        for (;;) {
+            int duplicate =
+                fault_should_fail("exec-descriptor-stabilize", EMFILE)
+                    ? -1
+                    : fcntl(descriptors[index], F_DUPFD_CLOEXEC,
+                            STDERR_FILENO + 1);
+
+            if (duplicate == -1) {
+                close_exec_commit_fds(reservations, reservation_count);
+                return -1;
+            }
+            if (!exec_commit_contains_target(commit, duplicate)) {
+                close(descriptors[index]);
+                descriptors[index] = duplicate;
+                break;
+            }
+            if (reservation_count == GSH_EXEC_DESCRIPTOR_COMMIT_CAP) {
+                close(duplicate);
+                close_exec_commit_fds(reservations, reservation_count);
+                errno = EMFILE;
+                return -1;
+            }
+            reservations[reservation_count++] = duplicate;
+        }
+    }
+    close_exec_commit_fds(reservations, reservation_count);
+    return 0;
+}
+
+static int apply_exec_descriptor_commit(
+    shell_state *state, const exec_descriptor_commit *commit,
+    int descriptors[])
+{
+    size_t index;
+    size_t open_index = 0;
+    int status = 0;
+
+    if (stabilize_exec_commit_fds(
+            commit, descriptors, commit->open_count) == -1) {
+        close_exec_commit_fds(descriptors, commit->open_count);
+        return -1;
+    }
+    for (index = 0; index < commit->count; index++) {
+        int target = commit->targets[index];
+
+        if (fault_should_fail("exec-descriptor-apply", EIO)) {
+            status = -1;
+            if (commit->open[index] != 0) {
+                open_index++;
+            }
+            continue;
+        }
+        if (commit->open[index] != 0) {
+            if (dup2(descriptors[open_index++], target) == -1) {
+                status = -1;
+            } else if (target <= STDERR_FILENO) {
+                state->exec_standard_descriptor_changed[target] = true;
+            }
+        } else if (close(target) == -1 && errno != EBADF) {
+            status = -1;
+        } else if (target <= STDERR_FILENO) {
+            state->exec_standard_descriptor_changed[target] = true;
+        }
+    }
+    close_exec_commit_fds(descriptors, commit->open_count);
+    return status;
+}
+
+static size_t receive_exec_commit_fds(
+    struct msghdr *message, int descriptors[], bool *control_valid)
+{
+    struct cmsghdr *header = CMSG_FIRSTHDR(message);
+    size_t rights_count = 0;
+
+    *control_valid = header == NULL;
+    if (header == NULL || header->cmsg_level != SOL_SOCKET ||
+        header->cmsg_type != SCM_RIGHTS ||
+        header->cmsg_len < CMSG_LEN(0)) {
+        return 0;
+    }
+    {
+        size_t rights_bytes = header->cmsg_len - CMSG_LEN(0);
+
+        if (rights_bytes % sizeof(int) != 0 ||
+            rights_bytes / sizeof(int) >
+                GSH_EXEC_DESCRIPTOR_COMMIT_CAP) {
+            return 0;
+        }
+        rights_count = rights_bytes / sizeof(int);
+        if (rights_count == 0) {
+            return 0;
+        }
+        memcpy(descriptors, CMSG_DATA(header), rights_bytes);
+    }
+    *control_valid = CMSG_NXTHDR(message, header) == NULL;
+    return rights_count;
+}
+
+static int receive_exec_descriptor_commit(shell_state *state)
+{
+    exec_descriptor_commit commit;
+    int descriptors[GSH_EXEC_DESCRIPTOR_COMMIT_CAP];
+    unsigned char control[
+        CMSG_SPACE(sizeof(int) * GSH_EXEC_DESCRIPTOR_COMMIT_CAP)];
+    struct iovec payload = {&commit, sizeof(commit)};
+    struct msghdr message;
+    ssize_t received;
+    size_t rights_count = 0;
+    int receive_error = EIO;
+    bool control_valid;
+
+    if (state->exec_descriptor_socket < 0) {
+        return 0;
+    }
+    memset(&commit, 0, sizeof(commit));
+    memset(descriptors, -1, sizeof(descriptors));
+    memset(control, 0, sizeof(control));
+    memset(&message, 0, sizeof(message));
+    message.msg_iov = &payload;
+    message.msg_iovlen = 1;
+    message.msg_control = control;
+    message.msg_controllen = sizeof(control);
+    if (fault_should_fail("exec-descriptor-receive", EIO)) {
+        received = -1;
+    } else {
+        received = recvmsg(state->exec_descriptor_socket, &message,
+                           MSG_DONTWAIT);
+        if (received == -1) {
+            receive_error = errno;
+        }
+    }
+    close(state->exec_descriptor_socket);
+    state->exec_descriptor_socket = -1;
+    if (received == -1 &&
+        (receive_error == EAGAIN || receive_error == EWOULDBLOCK)) {
+        return 0;
+    }
+    control_valid = false;
+    if (received >= 0) {
+        rights_count = receive_exec_commit_fds(
+            &message, descriptors, &control_valid);
+    }
+    if (received != (ssize_t)sizeof(commit) ||
+        (message.msg_flags & (MSG_TRUNC | MSG_CTRUNC)) != 0 ||
+        !exec_commit_targets_valid(state, &commit) ||
+        rights_count != commit.open_count ||
+        !control_valid) {
+        close_exec_commit_fds(descriptors, rights_count);
+        return -1;
+    }
+    if (protect_exec_owner_descriptors(
+            state, commit.targets, commit.count) == -1) {
+        close_exec_commit_fds(descriptors, rights_count);
+        return -1;
+    }
+    return apply_exec_descriptor_commit(state, &commit, descriptors);
+}
+
 static void finish_job(shell_state *state)
 {
     bool was_foreground = state->current_job.foreground;
@@ -2444,9 +2851,22 @@ static void finish_job(shell_state *state)
                      ? wait_status_value(wait_status)
                      : 1;
     bool silent = state->current_job.silent;
+    int exec_outcome = finish_exec_outcome(state);
+    bool overlaid = exec_outcome == GSH_EXEC_OUTCOME_OVERLAID;
+    int descriptor_commit_status =
+        overlaid ? 0 : receive_exec_descriptor_commit(state);
 
-    if (state->current_job.pipeline_status_known &&
+    if (overlaid) {
+        close_variable_commit(state);
+    } else if (state->current_job.pipeline_status_known &&
         !finish_variable_commit(state, wait_status)) {
+        status = 125;
+    }
+    if (exec_outcome == GSH_EXEC_OUTCOME_INVALID) {
+        status = 125;
+    }
+    if (descriptor_commit_status == -1) {
+        output_text(state, "gsh: exec descriptor transaction rejected\r\n");
         status = 125;
     }
 
@@ -2462,6 +2882,15 @@ static void finish_job(shell_state *state)
         state->async_state_cell >= 0) {
         leave_managed_fullscreen(state, state->async_state_cell);
         (void)gsh_async_repl_reap(state->async_repl, pid, wait_status);
+    }
+
+    if (overlaid) {
+        if (was_foreground) {
+            reclaim_terminal(state, false);
+        }
+        abandon_pending_list(state);
+        state->running = false;
+        return;
     }
 
     if (was_foreground) {
@@ -3134,20 +3563,25 @@ static void child_write_text(const char *text)
     }
 }
 
-static void child_exec_error(const char *name, int error)
+static int write_exec_error(const char *name, int error)
 {
     child_write_text("gsh: ");
     child_write_text(name);
     if (error == ENOENT || error == ENOTDIR) {
         child_write_text(": command not found\n");
-        _exit(127);
+        return 127;
     }
     if (error == EACCES) {
         child_write_text(": permission denied\n");
     } else {
         child_write_text(": execution failed\n");
     }
-    _exit(126);
+    return 126;
+}
+
+static void child_exec_error(const char *name, int error)
+{
+    _exit(write_exec_error(name, error));
 }
 
 static void child_exec_script(const char *path, char *const arguments[],
@@ -3175,10 +3609,10 @@ static void child_try_exec(const char *path, char *const arguments[],
     }
 }
 
-static void child_exec_direct(char *const arguments[], const char *path_value,
-                              char *const environment[],
-                              const gsh_command_cache *cache,
-                              uint64_t path_generation, bool cacheable)
+static int exec_direct_error(char *const arguments[], const char *path_value,
+                             char *const environment[],
+                             const gsh_command_cache *cache,
+                             uint64_t path_generation, bool cacheable)
 {
     const char *name = arguments[0];
     size_t name_length = child_string_length(name, EXEC_PATH_CAP);
@@ -3186,11 +3620,11 @@ static void child_exec_direct(char *const arguments[], const char *path_value,
     bool access_denied = false;
 
     if (name_length == 0 || name_length == EXEC_PATH_CAP) {
-        child_exec_error(name, ENAMETOOLONG);
+        return ENAMETOOLONG;
     }
     if (child_string_contains(name, '/')) {
         child_try_exec(name, arguments, environment);
-        child_exec_error(name, errno);
+        return errno;
     }
     if (cacheable) {
         const char *cached = gsh_command_cache_lookup(
@@ -3198,6 +3632,11 @@ static void child_exec_direct(char *const arguments[], const char *path_value,
 
         if (cached != NULL) {
             child_try_exec(cached, arguments, environment);
+            if (errno == EACCES) {
+                access_denied = true;
+            } else if (errno != ENOENT && errno != ENOTDIR) {
+                return errno;
+            }
         }
     }
 
@@ -3219,10 +3658,10 @@ static void child_exec_direct(char *const arguments[], const char *path_value,
             child_copy_bytes(candidate, cursor, directory_length);
             offset = directory_length;
         } else {
-            child_exec_error(name, ENAMETOOLONG);
+            return ENAMETOOLONG;
         }
         if (offset + 1 + name_length + 1 > sizeof(candidate)) {
-            child_exec_error(name, ENAMETOOLONG);
+            return ENAMETOOLONG;
         }
         candidate[offset++] = '/';
         child_copy_bytes(candidate + offset, name, name_length + 1U);
@@ -3232,14 +3671,25 @@ static void child_exec_direct(char *const arguments[], const char *path_value,
         if (error == EACCES) {
             access_denied = true;
         } else if (error != ENOENT && error != ENOTDIR) {
-            child_exec_error(name, error);
+            return error;
         }
         if (*separator == '\0') {
             break;
         }
         cursor = separator + 1;
     }
-    child_exec_error(name, access_denied ? EACCES : ENOENT);
+    return access_denied ? EACCES : ENOENT;
+}
+
+static void child_exec_direct(char *const arguments[], const char *path_value,
+                              char *const environment[],
+                              const gsh_command_cache *cache,
+                              uint64_t path_generation, bool cacheable)
+{
+    int error = exec_direct_error(arguments, path_value, environment, cache,
+                                  path_generation, cacheable);
+
+    child_exec_error(arguments[0], error);
 }
 
 static bool direct_path_is_bounded(const simple_command *command,
@@ -3354,6 +3804,11 @@ static bool native_hash_builtin(const gsh_native_command *command)
 static bool native_times_builtin(const gsh_native_command *command)
 {
     return command->argc > 0 && strcmp(command->argv[0], "times") == 0;
+}
+
+static bool native_exec_builtin(const gsh_native_command *command)
+{
+    return command->argc > 0 && strcmp(command->argv[0], "exec") == 0;
 }
 
 static bool native_command_inspection_builtin(
@@ -3494,7 +3949,8 @@ static bool native_pipeline_requires_evaluator(
         return false;
     }
     command = &pipeline->commands[0];
-    return (native_variable_builtin(command) &&
+    return native_exec_builtin(command) ||
+           (native_variable_builtin(command) &&
             (command->redirect_count != 0 ||
              (command->assignment_count != 0 &&
               native_variable_listing(command)))) ||
@@ -3888,6 +4344,9 @@ static bool native_planned_command_is_supported(
     if (native_times_builtin(native)) {
         return true;
     }
+    if (native_exec_builtin(native)) {
+        return true;
+    }
     if (native_command_inspection_builtin(native)) {
         return true;
     }
@@ -4201,9 +4660,9 @@ static int open_redirect_target(const gsh_native_redirect *redirect,
                               options, 0666);
 }
 
-static int apply_evaluator_redirects(
+static int apply_evaluator_redirects_record(
     const gsh_native_pipeline *pipeline, const gsh_native_command *command,
-    const gsh_shell_options *options)
+    const gsh_shell_options *options, bool standard_changes[3])
 {
     size_t index;
 
@@ -4215,6 +4674,10 @@ static int apply_evaluator_redirects(
             if (close(redirect->descriptor) == -1 && errno != EBADF) {
                 return -1;
             }
+            if (standard_changes != NULL && redirect->descriptor >= 0 &&
+                redirect->descriptor <= 2) {
+                standard_changes[redirect->descriptor] = true;
+            }
             continue;
         }
         if (redirect->operator_kind == GSH_TOKEN_LESSAND ||
@@ -4222,6 +4685,10 @@ static int apply_evaluator_redirects(
             if (child_duplicate_descriptor(redirect->duplicate_descriptor,
                                            redirect->descriptor) == -1) {
                 return -1;
+            }
+            if (standard_changes != NULL && redirect->descriptor >= 0 &&
+                redirect->descriptor <= 2) {
+                standard_changes[redirect->descriptor] = true;
             }
             continue;
         }
@@ -4246,8 +4713,217 @@ static int apply_evaluator_redirects(
         if (descriptor != redirect->descriptor) {
             close(descriptor);
         }
+        if (standard_changes != NULL && redirect->descriptor >= 0 &&
+            redirect->descriptor <= 2) {
+            standard_changes[redirect->descriptor] = true;
+        }
     }
     return 0;
+}
+
+static int apply_evaluator_redirects(
+    const gsh_native_pipeline *pipeline, const gsh_native_command *command,
+    const gsh_shell_options *options)
+{
+    return apply_evaluator_redirects_record(
+        pipeline, command, options, NULL);
+}
+
+/* ── `exec` Is a Descriptor Commit, Then an Overlay ──────────────────
+ * Ordinary builtins borrow redirected descriptors and restore them.  POSIX
+ * gives `exec` the opposite transaction boundary: every successful redirect
+ * is committed before option handling or utility lookup, including failures.
+ * The search helper returns only on failure, so the successful path adds no
+ * cleanup, allocation, or post-exec branch.
+ * ─────────────────────────────────────────────────────────────── */
+static int exec_utility_index(const gsh_native_command *command,
+                              size_t *utility_index)
+{
+    size_t index = 1U;
+
+    if (index < command->argc && strcmp(command->argv[index], "--") == 0) {
+        index++;
+    } else if (index < command->argc && command->argv[index][0] == '-' &&
+               command->argv[index][1] != '\0') {
+        child_write_text("gsh: exec: unsupported option: ");
+        child_write_text(command->argv[index]);
+        child_write_text("\n");
+        return -1;
+    }
+    *utility_index = index;
+    return 0;
+}
+
+static int notify_exec_outcome(int descriptor, unsigned char outcome)
+{
+    unsigned int attempts;
+
+    if (descriptor <= STDERR_FILENO) {
+        return 0;
+    }
+    for (attempts = 0; attempts < 16U; attempts++) {
+        ssize_t written = write(descriptor, &outcome, sizeof(outcome));
+
+        if (written == (ssize_t)sizeof(outcome)) {
+            return 0;
+        }
+        if (written == -1 && errno == EINTR) {
+            continue;
+        }
+        errno = written == 0 ? EIO : errno;
+        return -1;
+    }
+    errno = EINTR;
+    return -1;
+}
+
+static int prepare_interactive_exec(shell_state *owner)
+{
+    static const char leave_managed_screen[] =
+        "\033[0m\033[?25h\033[?1049l";
+
+    if (owner == NULL) {
+        return 0;
+    }
+    flush_output(owner);
+    if (owner->output_len != 0 ||
+        tcsetattr(owner->tty_fd, TCSANOW, &owner->original_modes) == -1) {
+        child_write_text("gsh: exec: terminal handoff failed\n");
+        return -1;
+    }
+    if (owner->async_repl != NULL && owner->async_repl->enabled) {
+        child_write_descriptor(owner->tty_fd, leave_managed_screen,
+                               sizeof(leave_managed_screen) - 1U);
+    }
+    owner->terminal_changed = false;
+    reset_child_signals();
+    return 0;
+}
+
+static int restore_interactive_exec(shell_state *owner)
+{
+    if (owner == NULL) {
+        return 0;
+    }
+    if (install_signal_handlers() == -1 ||
+        tcsetattr(owner->tty_fd, TCSANOW, &owner->editor_modes) == -1) {
+        owner->running = false;
+        return -1;
+    }
+    owner->terminal_changed = true;
+    if (owner->async_repl != NULL && owner->async_repl->enabled) {
+        owner->async_repl->render_pending = true;
+    }
+    return 0;
+}
+
+static int protect_interactive_exec(
+    shell_state *owner, const gsh_native_command *command)
+{
+    int32_t targets[GSH_NATIVE_REDIRECT_CAP * 2U];
+    size_t count = 0;
+    size_t index;
+
+    if (owner == NULL || command->redirect_count == 0) {
+        return 0;
+    }
+    assert(command->redirect_count <= GSH_NATIVE_REDIRECT_CAP);
+    for (index = 0; index < command->redirect_count; index++) {
+        const gsh_native_redirect *redirect = &command->redirects[index];
+
+        targets[count++] = redirect->descriptor;
+        if (redirect->duplicate_descriptor >= 0) {
+            targets[count++] = redirect->duplicate_descriptor;
+        }
+    }
+    assert(count <= GSH_NATIVE_REDIRECT_CAP * 2U);
+    return protect_exec_owner_descriptors(owner, targets, count);
+}
+
+static int exec_external_utility(
+    const gsh_native_command *command, size_t utility_index,
+    const gsh_variable_store *variables, const char *default_path,
+    gsh_command_cache *cache, int outcome_fd)
+{
+    char *environment_storage[CHILD_ENVIRONMENT_CAP];
+    char *const *environment;
+    int exec_error;
+
+    if (fault_should_fail("exec", EIO)) {
+        exec_error = errno;
+    } else {
+        environment = child_command_environment(
+            variables, command, environment_storage);
+        exec_error = exec_direct_error(
+            command->argv + utility_index,
+            command_path_value(variables, command, default_path),
+            environment, cache,
+            command_cache_path_generation(variables, command),
+            command_uses_persistent_path(command));
+    }
+    if (notify_exec_outcome(outcome_fd, 'F') == -1) {
+        return 125;
+    }
+    return write_exec_error(command->argv[utility_index], exec_error);
+}
+
+static int run_evaluator_exec_builtin(
+    const gsh_native_pipeline *pipeline, gsh_variable_store *variables,
+    gsh_variable_journal *journal, const gsh_shell_options *options,
+    const char *default_path, gsh_command_cache *cache,
+    shell_state *interactive_owner, int outcome_fd,
+    bool *descriptors_dirty, bool *builtin_failed)
+{
+    const gsh_native_command *command = &pipeline->commands[0];
+    size_t utility_index;
+    int assignment_status;
+    int status;
+
+    *builtin_failed = true;
+    if (descriptors_dirty != NULL && command->redirect_count != 0) {
+        *descriptors_dirty = true;
+    }
+    if (protect_interactive_exec(interactive_owner, command) == -1) {
+        perror("gsh: exec descriptor protection");
+        return 125;
+    }
+    if (apply_evaluator_redirects_record(
+            pipeline, command, options,
+            interactive_owner == NULL
+                ? NULL
+                : interactive_owner->exec_standard_descriptor_changed) ==
+        -1) {
+        perror("gsh: exec redirection");
+        return 1;
+    }
+    assignment_status = apply_special_builtin_assignments(
+        variables, journal, command, options);
+    if (assignment_status != GSH_ASSIGNMENT_OK) {
+        perror("gsh: exec assignment");
+        return assignment_status == GSH_ASSIGNMENT_JOURNAL_ERROR ? 125 : 1;
+    }
+    if (exec_utility_index(command, &utility_index) == -1) {
+        return 2;
+    }
+    if (utility_index == command->argc) {
+        *builtin_failed = false;
+        return pipeline->negated ? 1 : 0;
+    }
+    if (notify_exec_outcome(outcome_fd, 'A') == -1) {
+        perror("gsh: exec outcome");
+        return 125;
+    }
+    if (prepare_interactive_exec(interactive_owner) == -1) {
+        return 125;
+    }
+    status = exec_external_utility(
+        command, utility_index, variables, default_path, cache, outcome_fd);
+    if (restore_interactive_exec(interactive_owner) == -1) {
+        return 125;
+    }
+    return command->command_regular_context && pipeline->negated
+               ? (status == 0 ? 1 : 0)
+               : status;
 }
 
 static int run_evaluator_variable_builtin(
@@ -5160,9 +5836,12 @@ static int attach_child_pty(shell_state *state, const managed_pty *pty)
     }
     if (tcsetattr(slave, TCSANOW, &state->original_modes) == -1 ||
         tcsetpgrp(slave, getpgrp()) == -1 ||
-        dup2(slave, STDIN_FILENO) == -1 ||
-        dup2(slave, STDOUT_FILENO) == -1 ||
-        dup2(slave, STDERR_FILENO) == -1) {
+        (!state->exec_standard_descriptor_changed[STDIN_FILENO] &&
+         dup2(slave, STDIN_FILENO) == -1) ||
+        (!state->exec_standard_descriptor_changed[STDOUT_FILENO] &&
+         dup2(slave, STDOUT_FILENO) == -1) ||
+        (!state->exec_standard_descriptor_changed[STDERR_FILENO] &&
+         dup2(slave, STDERR_FILENO) == -1)) {
         (void)close(slave);
         return -1;
     }
@@ -5867,6 +6546,22 @@ static bool run_planned_main_builtin(shell_state *state,
         return false;
     }
     if (start_async_stateless_redirection(state, pipeline, command)) {
+        return true;
+    }
+    if (native_exec_builtin(command)) {
+        bool builtin_failed;
+        int status = run_evaluator_exec_builtin(
+            pipeline, state->variables, NULL, &state->options,
+            state->default_path, state->command_cache, state,
+            -1, NULL, &builtin_failed);
+
+        (void)builtin_failed;
+        if (command->assignment_count != 0) {
+            state->variable_generation++;
+        }
+        state->last_status = status;
+        state->mode = MODE_EDITOR;
+        queue_prompt(state);
         return true;
     }
     if (native_wait_builtin(command) && command->redirect_count == 0) {
@@ -7890,13 +8585,15 @@ static bool async_transition_has_live_shell_state(const shell_state *state)
            gsh_background_active_count(&state->background_jobs) != 0 ||
            state->async_state_cell >= 0 || state->variable_commit_active ||
            state->variable_commit_fd >= 0 ||
+           state->exec_outcome_fd >= 0 ||
+           state->exec_descriptor_socket >= 0 ||
            state->directory_commit_socket >= 0 ||
            state->directory_commit_fd >= 0 || state->pending_list_active ||
            state->pending_and_or_active || state->wait_target_count != 0 ||
            state->wait_all || state->pending_positional_commit ||
            state->pending_alias_commit || state->pending_function_commit ||
            state->pending_command_cache_commit ||
-           state->pending_directory_commit ||
+           state->pending_directory_commit || state->pending_exec_possible ||
            state->positional_commit_expected || state->alias_commit_expected ||
            state->function_commit_expected ||
            state->command_cache_commit_expected ||
@@ -8408,6 +9105,7 @@ static int native_wait_status_value(int status, bool negated)
 }
 
 typedef struct native_evaluator native_evaluator;
+static void close_evaluator_exec_transaction(native_evaluator *evaluator);
 static gsh_command_cache *evaluator_command_cache(
     native_evaluator *evaluator);
 static const gsh_times_context *evaluator_times_context(
@@ -8466,6 +9164,17 @@ static int run_native_noninteractive_pipeline(
     if (pipeline->command_count == 1U && evaluator != NULL &&
         native_loop_control_builtin(&pipeline->commands[0])) {
         return evaluate_loop_control(evaluator, pipeline);
+    }
+    if (pipeline->command_count == 1U &&
+        native_exec_builtin(&pipeline->commands[0])) {
+        bool builtin_failed;
+        int status = run_evaluator_exec_builtin(
+            pipeline, variables, journal, options, default_path,
+            evaluator_command_cache(evaluator), NULL, -1,
+            NULL, &builtin_failed);
+
+        (void)builtin_failed;
+        return status;
     }
     if (pipeline->command_count == 1 &&
         native_variable_builtin(&pipeline->commands[0]) &&
@@ -8619,6 +9328,7 @@ static int run_native_noninteractive_pipeline(
             size_t close_index;
 
             reset_child_signals();
+            close_evaluator_exec_transaction(evaluator);
             if (pipeline->commands[index].expansion_error) {
                 _exit(1);
             }
@@ -8712,6 +9422,36 @@ static int run_native_noninteractive_pipeline(
                 }
                 if (native_wait_builtin(&pipeline->commands[index])) {
                     _exit(pipeline->commands[index].argc == 1 ? 0 : 127);
+                }
+                if (native_exec_builtin(&pipeline->commands[index])) {
+                    size_t utility_index;
+
+                    if (exec_utility_index(&pipeline->commands[index],
+                                           &utility_index) == -1) {
+                        _exit(2);
+                    }
+                    if (utility_index ==
+                        pipeline->commands[index].argc) {
+                        _exit(0);
+                    }
+                    {
+                        char *environment_storage[CHILD_ENVIRONMENT_CAP];
+                        char *const *environment =
+                            child_command_environment(
+                                variables, &pipeline->commands[index],
+                                environment_storage);
+
+                        child_exec_direct(
+                            pipeline->commands[index].argv + utility_index,
+                            command_path_value(
+                                variables, &pipeline->commands[index],
+                                default_path),
+                            environment, evaluator_command_cache(evaluator),
+                            command_cache_path_generation(
+                                variables, &pipeline->commands[index]),
+                            command_uses_persistent_path(
+                                &pipeline->commands[index]));
+                    }
                 }
                 if (native_alias_builtin(&pipeline->commands[index])) {
                     _exit(run_native_alias_builtin(
@@ -8900,9 +9640,32 @@ struct native_evaluator {
     bool alias_mutation_possible;
     bool function_mutation_possible;
     bool command_cache_mutation_possible;
+    bool exec_possible;
+    int exec_descriptors[GSH_EXEC_DESCRIPTOR_COMMIT_CAP];
+    size_t exec_descriptor_count;
+    int exec_protected_descriptors[GSH_EXEC_DESCRIPTOR_COMMIT_CAP];
+    size_t exec_protected_descriptor_count;
+    bool exec_descriptors_dirty;
     bool state_commit_invalid;
+    int exec_outcome_fd;
+    int exec_descriptor_socket;
     gsh_background_table *backgrounds;
 };
+
+static void close_evaluator_exec_transaction(native_evaluator *evaluator)
+{
+    if (evaluator == NULL) {
+        return;
+    }
+    if (evaluator->exec_outcome_fd > STDERR_FILENO) {
+        close(evaluator->exec_outcome_fd);
+    }
+    if (evaluator->exec_descriptor_socket > STDERR_FILENO) {
+        close(evaluator->exec_descriptor_socket);
+    }
+    evaluator->exec_outcome_fd = -1;
+    evaluator->exec_descriptor_socket = -1;
+}
 
 static gsh_command_cache *evaluator_command_cache(
     native_evaluator *evaluator)
@@ -9440,6 +10203,51 @@ static bool preflight_evaluator_function(
     return supported;
 }
 
+static bool preflight_record_exec_descriptor(
+    int descriptors[GSH_EXEC_DESCRIPTOR_COMMIT_CAP], size_t *count,
+    int descriptor)
+{
+    size_t prior;
+
+    assert(*count <= GSH_EXEC_DESCRIPTOR_COMMIT_CAP);
+    for (prior = 0; prior < *count; prior++) {
+        if (descriptors[prior] == descriptor) {
+            return true;
+        }
+    }
+    if (descriptor < 0 || *count == GSH_EXEC_DESCRIPTOR_COMMIT_CAP) {
+        return false;
+    }
+    descriptors[(*count)++] = descriptor;
+    return true;
+}
+
+static bool preflight_record_exec_descriptors(
+    native_evaluator *evaluator, const gsh_native_command *command)
+{
+    size_t redirect;
+
+    for (redirect = 0; redirect < command->redirect_count; redirect++) {
+        const gsh_native_redirect *entry = &command->redirects[redirect];
+
+        if (!preflight_record_exec_descriptor(
+                evaluator->exec_descriptors,
+                &evaluator->exec_descriptor_count, entry->descriptor) ||
+            !preflight_record_exec_descriptor(
+                evaluator->exec_protected_descriptors,
+                &evaluator->exec_protected_descriptor_count,
+                entry->descriptor) ||
+            (entry->duplicate_descriptor >= 0 &&
+             !preflight_record_exec_descriptor(
+                 evaluator->exec_protected_descriptors,
+                 &evaluator->exec_protected_descriptor_count,
+                 entry->duplicate_descriptor))) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static bool native_preflight_node(native_evaluator *evaluator,
                                   size_t node_index, size_t depth)
 {
@@ -9534,6 +10342,12 @@ static bool native_preflight_node(native_evaluator *evaluator,
                     evaluator->function_mutation_possible = true;
                 }
                 if (evaluator->pipeline->command_count == 1U &&
+                    native_exec_builtin(command)) {
+                    evaluator->exec_possible = true;
+                    supported = preflight_record_exec_descriptors(
+                        evaluator, command);
+                }
+                if (evaluator->pipeline->command_count == 1U &&
                     (native_hash_builtin(command) ||
                      native_command_inspection_builtin(command) ||
                      command_can_populate_cache(command,
@@ -9576,13 +10390,30 @@ static bool native_preflight_node(native_evaluator *evaluator,
     if (node->kind != GSH_AST_PROGRAM && child == GSH_AST_NONE) {
         return false;
     }
-    while (child != GSH_AST_NONE) {
-        if (!native_preflight_node(evaluator, child, depth + 1U)) {
-            return false;
+    {
+        bool saved_exec_possible = evaluator->exec_possible;
+        size_t saved_exec_descriptor_count =
+            evaluator->exec_descriptor_count;
+        size_t saved_exec_protected_descriptor_count =
+            evaluator->exec_protected_descriptor_count;
+        bool isolated_exec = node->kind == GSH_AST_SUBSHELL ||
+                             (node->flags & GSH_AST_FLAG_ASYNC) != 0;
+
+        while (child != GSH_AST_NONE) {
+            if (!native_preflight_node(evaluator, child, depth + 1U)) {
+                return false;
+            }
+            child = evaluator->storage->nodes[child].next_sibling;
+            if (++visited > evaluator->storage->node_count) {
+                return false;
+            }
         }
-        child = evaluator->storage->nodes[child].next_sibling;
-        if (++visited > evaluator->storage->node_count) {
-            return false;
+        if (isolated_exec) {
+            evaluator->exec_possible = saved_exec_possible;
+            evaluator->exec_descriptor_count =
+                saved_exec_descriptor_count;
+            evaluator->exec_protected_descriptor_count =
+                saved_exec_protected_descriptor_count;
         }
     }
     return true;
@@ -9624,6 +10455,8 @@ static void initialize_substitution_evaluator(
     gsh_background_table *backgrounds)
 {
     memset(nested, 0, sizeof(*nested));
+    nested->exec_outcome_fd = parent->exec_outcome_fd;
+    nested->exec_descriptor_socket = parent->exec_descriptor_socket;
     nested->input = input;
     nested->input_length = input_length;
     nested->storage = &workspace->storage;
@@ -9698,6 +10531,7 @@ static pid_t start_substitution_child(native_evaluator *nested,
 
         (void)close(capture[0]);
         reset_child_signals();
+        close_evaluator_exec_transaction(nested);
         if (child_duplicate_descriptor(capture[1], STDOUT_FILENO) == -1) {
             child_exec_error("command substitution output", errno);
         }
@@ -10131,6 +10965,7 @@ static int run_pipeline_function(native_evaluator *parent,
     child.alias_journal = NULL;
     child.pipeline_scope = NULL;
     child.tail_exec_single = false;
+    child.exec_outcome_fd = -1;
     child.returning = false;
     child.fatal_error = false;
     gsh_background_initialize(&backgrounds);
@@ -10207,6 +11042,7 @@ static int native_evaluate_pipeline(native_evaluator *evaluator,
             !native_wait_builtin(tail) && !native_alias_builtin(tail) &&
             !native_hash_builtin(tail) &&
             !native_times_builtin(tail) &&
+            !native_exec_builtin(tail) &&
             !native_command_inspection_builtin(tail) &&
             !native_return_builtin(tail) &&
             !native_loop_control_builtin(tail) && function == NULL) {
@@ -10397,6 +11233,23 @@ static int native_evaluate_pipeline(native_evaluator *evaluator,
                                  GSH_OPTION_INTERACTIVE)) {
             evaluator->fatal_error = true;
         }
+    } else if (evaluator->pipeline->command_count == 1 &&
+               native_exec_builtin(&evaluator->pipeline->commands[0])) {
+        const gsh_native_command *exec_command =
+            &evaluator->pipeline->commands[0];
+        bool builtin_failed;
+
+        status = run_evaluator_exec_builtin(
+            evaluator->pipeline, evaluator->variables,
+            evaluator->journal, &evaluator->options,
+            evaluator->default_path, evaluator->command_cache,
+            NULL, evaluator->exec_outcome_fd,
+            &evaluator->exec_descriptors_dirty, &builtin_failed);
+        if (builtin_failed && !exec_command->command_regular_context &&
+            !gsh_options_enabled(&evaluator->options,
+                                 GSH_OPTION_INTERACTIVE)) {
+            evaluator->fatal_error = true;
+        }
     } else {
         status = run_native_noninteractive_pipeline(
             evaluator->pipeline, evaluator->default_path,
@@ -10412,6 +11265,7 @@ static int native_evaluate_pipeline(native_evaluator *evaluator,
          native_alias_builtin(&evaluator->pipeline->commands[0]) ||
          native_hash_builtin(&evaluator->pipeline->commands[0]) ||
          native_times_builtin(&evaluator->pipeline->commands[0]) ||
+         native_exec_builtin(&evaluator->pipeline->commands[0]) ||
          native_loop_control_builtin(
              &evaluator->pipeline->commands[0]) ||
          (evaluator->pipeline->commands[0].argc == 0 &&
@@ -10688,6 +11542,7 @@ static int native_evaluate_node_inner(native_evaluator *evaluator,
             child.loop_control = NATIVE_LOOP_CONTROL_NONE;
             child.loop_levels = 0;
             child.times_context = NULL;
+            close_evaluator_exec_transaction(&child);
             child_status = native_evaluate_node(
                 &child, node->first_child, depth + 1U);
             _exit(child_status & 255);
@@ -10781,7 +11636,8 @@ static int native_evaluate_node_inner(native_evaluator *evaluator,
             }
         }
         status = native_evaluate_node(evaluator, child, depth + 1U);
-        if (evaluator->returning || evaluator->loop_levels != 0) {
+        if (evaluator->fatal_error || evaluator->returning ||
+            evaluator->loop_levels != 0) {
             return evaluator->returning ? evaluator->return_status
                                         : status;
         }
@@ -10829,6 +11685,7 @@ static int native_evaluate_async(native_evaluator *evaluator,
         child.loop_levels = 0;
         child.tail_exec_single =
             async_node_has_single_pipeline(evaluator, node_index);
+        close_evaluator_exec_transaction(&child);
         status = native_evaluate_node_inner(&child, node_index, depth);
         _exit(status & 255);
     }
@@ -10920,7 +11777,13 @@ static bool native_node_is_supported(shell_state *state, size_t node_index)
     evaluator.alias_mutation_possible = false;
     evaluator.function_mutation_possible = false;
     evaluator.command_cache_mutation_possible = false;
+    evaluator.exec_possible = false;
+    evaluator.exec_descriptor_count = 0;
+    evaluator.exec_protected_descriptor_count = 0;
+    evaluator.exec_descriptors_dirty = false;
     evaluator.state_commit_invalid = false;
+    evaluator.exec_outcome_fd = -1;
+    evaluator.exec_descriptor_socket = -1;
     evaluator.backgrounds = &state->background_jobs;
     state->pending_positional_commit =
         state->parse_storage->node_count > node_index &&
@@ -10930,6 +11793,9 @@ static bool native_node_is_supported(shell_state *state, size_t node_index)
         state->pending_alias_commit = false;
         state->pending_function_commit = false;
         state->pending_command_cache_commit = false;
+        state->pending_exec_possible = false;
+        state->pending_exec_descriptor_count = 0;
+        state->pending_exec_protected_descriptor_count = 0;
         return false;
     }
     state->pending_directory_commit =
@@ -10940,6 +11806,22 @@ static bool native_node_is_supported(shell_state *state, size_t node_index)
     state->pending_function_commit = evaluator.function_mutation_possible;
     state->pending_command_cache_commit =
         evaluator.command_cache_mutation_possible;
+    state->pending_exec_possible = evaluator.exec_possible;
+    state->pending_exec_descriptor_count =
+        evaluator.exec_descriptor_count;
+    assert(state->pending_exec_descriptor_count <=
+           GSH_EXEC_DESCRIPTOR_COMMIT_CAP);
+    memcpy(state->pending_exec_descriptors, evaluator.exec_descriptors,
+           evaluator.exec_descriptor_count *
+               sizeof(evaluator.exec_descriptors[0]));
+    state->pending_exec_protected_descriptor_count =
+        evaluator.exec_protected_descriptor_count;
+    assert(state->pending_exec_protected_descriptor_count <=
+           GSH_EXEC_DESCRIPTOR_COMMIT_CAP);
+    memcpy(state->pending_exec_protected_descriptors,
+           evaluator.exec_protected_descriptors,
+           evaluator.exec_protected_descriptor_count *
+               sizeof(evaluator.exec_protected_descriptors[0]));
     return true;
 }
 
@@ -11167,6 +12049,8 @@ static void initialize_interactive_evaluator(native_evaluator *evaluator,
                                              gsh_variable_store *variables)
 {
     memset(evaluator, 0, sizeof(*evaluator));
+    evaluator->exec_outcome_fd = -1;
+    evaluator->exec_descriptor_socket = -1;
     evaluator->input = state->pending_input;
     evaluator->input_length = state->pending_input_length;
     evaluator->storage = state->parse_storage;
@@ -11464,6 +12348,8 @@ static bool start_background_node(shell_state *state, size_t node_index)
         int status;
 
         memset(&evaluator, 0, sizeof(evaluator));
+        evaluator.exec_outcome_fd = -1;
+        evaluator.exec_descriptor_socket = -1;
         (void)setpgid(0, 0);
         reset_child_signals();
         (void)sigprocmask(SIG_SETMASK, &previous, NULL);
@@ -11867,12 +12753,164 @@ static int write_variable_commit(
     return 0;
 }
 
+static int build_exec_descriptor_commit(
+    const native_evaluator *evaluator, exec_descriptor_commit *commit,
+    int rights[GSH_EXEC_DESCRIPTOR_COMMIT_CAP])
+{
+    size_t index;
+
+    if (evaluator->exec_descriptor_count >
+        GSH_EXEC_DESCRIPTOR_COMMIT_CAP) {
+        errno = EOVERFLOW;
+        return -1;
+    }
+    assert(evaluator->exec_descriptor_count <=
+           GSH_EXEC_DESCRIPTOR_COMMIT_CAP);
+    memset(commit, 0, sizeof(*commit));
+    commit->version = GSH_EXEC_DESCRIPTOR_COMMIT_VERSION;
+    commit->count = (uint32_t)evaluator->exec_descriptor_count;
+    for (index = 0; index < evaluator->exec_descriptor_count; index++) {
+        int target = evaluator->exec_descriptors[index];
+
+        commit->targets[index] = target;
+        if (fcntl(target, F_GETFD) >= 0) {
+            commit->open[index] = 1U;
+            rights[commit->open_count++] = target;
+        } else if (errno != EBADF) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int send_exec_descriptor_commit(
+    int socket, const native_evaluator *evaluator)
+{
+    exec_descriptor_commit commit;
+    int rights[GSH_EXEC_DESCRIPTOR_COMMIT_CAP];
+    unsigned char control[
+        CMSG_SPACE(sizeof(int) * GSH_EXEC_DESCRIPTOR_COMMIT_CAP)];
+    struct iovec payload = {&commit, sizeof(commit)};
+    struct msghdr message;
+    unsigned int attempts;
+
+    if (!evaluator->exec_descriptors_dirty || socket < 0) {
+        return 0;
+    }
+    if (build_exec_descriptor_commit(evaluator, &commit, rights) == -1) {
+        return -1;
+    }
+    memset(&message, 0, sizeof(message));
+    message.msg_iov = &payload;
+    message.msg_iovlen = 1;
+    if (commit.open_count != 0) {
+        struct cmsghdr *header;
+        size_t control_size =
+            CMSG_SPACE(sizeof(int) * commit.open_count);
+
+        memset(control, 0, control_size);
+        message.msg_control = control;
+        message.msg_controllen = control_size;
+        header = CMSG_FIRSTHDR(&message);
+        header->cmsg_level = SOL_SOCKET;
+        header->cmsg_type = SCM_RIGHTS;
+        header->cmsg_len = CMSG_LEN(sizeof(int) * commit.open_count);
+        memcpy(CMSG_DATA(header), rights,
+               sizeof(int) * commit.open_count);
+    }
+    for (attempts = 0; attempts < 16U; attempts++) {
+        ssize_t sent = fault_should_fail("exec-descriptor-send", EIO)
+                           ? -1
+                           : sendmsg(socket, &message, 0);
+
+        if (sent == (ssize_t)sizeof(commit)) {
+            return 0;
+        }
+        if (sent == -1 && errno == EINTR) {
+            continue;
+        }
+        errno = sent >= 0 ? EIO : errno;
+        return -1;
+    }
+    errno = EINTR;
+    return -1;
+}
+
 static void abandon_pending_list(shell_state *state)
 {
     state->pending_list_active = false;
     state->pending_list_next = GSH_AST_NONE;
     state->pending_and_or_active = false;
     state->pending_and_or_next = GSH_AST_NONE;
+    state->pending_exec_possible = false;
+    state->pending_exec_descriptor_count = 0;
+    state->pending_exec_protected_descriptor_count = 0;
+}
+
+static bool pending_exec_protects_descriptor(const shell_state *state,
+                                             int descriptor)
+{
+    size_t index;
+
+    for (index = 0;
+         index < state->pending_exec_protected_descriptor_count; index++) {
+        if (state->pending_exec_protected_descriptors[index] ==
+            descriptor) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static int protect_exec_transaction_descriptors(
+    const shell_state *state, int gate[2], int commit[2], int directory[2],
+    int outcome[2], int descriptors[2])
+{
+    int *child_descriptors[] = {
+        &gate[0], &commit[1], &directory[1], &outcome[1], &descriptors[1]};
+    int reservations[GSH_EXEC_DESCRIPTOR_COMMIT_CAP];
+    size_t reservation_count = 0;
+    size_t index;
+
+    assert(state->pending_exec_protected_descriptor_count <=
+           GSH_EXEC_DESCRIPTOR_COMMIT_CAP);
+    for (index = 0;
+         index < sizeof(child_descriptors) / sizeof(child_descriptors[0]);
+         index++) {
+        int *descriptor = child_descriptors[index];
+
+        if (*descriptor < 0 ||
+            !pending_exec_protects_descriptor(state, *descriptor)) {
+            continue;
+        }
+        for (;;) {
+            int duplicate =
+                fault_should_fail("transaction-descriptor-relocation",
+                                  EMFILE)
+                    ? -1
+                    : fcntl(*descriptor, F_DUPFD_CLOEXEC,
+                            STDERR_FILENO + 1);
+
+            if (duplicate == -1) {
+                close_exec_commit_fds(reservations, reservation_count);
+                return -1;
+            }
+            if (!pending_exec_protects_descriptor(state, duplicate)) {
+                close(*descriptor);
+                *descriptor = duplicate;
+                break;
+            }
+            if (reservation_count == GSH_EXEC_DESCRIPTOR_COMMIT_CAP) {
+                close(duplicate);
+                close_exec_commit_fds(reservations, reservation_count);
+                errno = EMFILE;
+                return -1;
+            }
+            reservations[reservation_count++] = duplicate;
+        }
+    }
+    close_exec_commit_fds(reservations, reservation_count);
+    return 0;
 }
 
 static void start_native_compound(shell_state *state, size_t node_index)
@@ -11880,6 +12918,8 @@ static void start_native_compound(shell_state *state, size_t node_index)
     int gate[2];
     int commit[2] = {-1, -1};
     int directory[2] = {-1, -1};
+    int exec_outcome[2] = {-1, -1};
+    int exec_descriptors[2] = {-1, -1};
     managed_pty pty = {.master = -1, .slave_hold = -1};
     bool managed = state->async_repl != NULL && state->async_repl->enabled;
     sigset_t blocked;
@@ -11968,6 +13008,82 @@ static void start_native_compound(shell_state *state, size_t node_index)
         queue_prompt(state);
         return;
     }
+    if (state->pending_exec_possible &&
+        make_pipe(exec_outcome, false, "exec-outcome-pipe") == -1) {
+        int saved_errno = errno;
+
+        close(gate[0]);
+        close(gate[1]);
+        close(commit[0]);
+        close(commit[1]);
+        if (directory[0] >= 0) {
+            close(directory[0]);
+            close(directory[1]);
+        }
+        state->pending_exec_possible = false;
+        output_format(state, "gsh: exec outcome pipe: %s\r\n",
+                      strerror(saved_errno));
+        abandon_pending_list(state);
+        state->mode = MODE_EDITOR;
+        queue_prompt(state);
+        return;
+    }
+    if (state->pending_exec_possible &&
+        (fault_should_fail("exec-descriptor-socket", EMFILE) ||
+         socketpair(AF_UNIX, SOCK_DGRAM, 0, exec_descriptors) == -1 ||
+         set_fd_flags(exec_descriptors[0], F_GETFL, O_NONBLOCK) == -1 ||
+         set_fd_flags(exec_descriptors[0], F_GETFD, FD_CLOEXEC) == -1 ||
+         set_fd_flags(exec_descriptors[1], F_GETFD, FD_CLOEXEC) == -1)) {
+        int saved_errno = errno;
+
+        close(gate[0]);
+        close(gate[1]);
+        close(commit[0]);
+        close(commit[1]);
+        if (directory[0] >= 0) {
+            close(directory[0]);
+            close(directory[1]);
+        }
+        close(exec_outcome[0]);
+        close(exec_outcome[1]);
+        if (exec_descriptors[0] >= 0) {
+            close(exec_descriptors[0]);
+            close(exec_descriptors[1]);
+        }
+        state->pending_exec_possible = false;
+        output_format(state, "gsh: exec descriptor socket: %s\r\n",
+                      strerror(saved_errno));
+        abandon_pending_list(state);
+        state->mode = MODE_EDITOR;
+        queue_prompt(state);
+        return;
+    }
+    if (state->pending_exec_possible &&
+        protect_exec_transaction_descriptors(
+            state, gate, commit, directory, exec_outcome,
+            exec_descriptors) == -1) {
+        int saved_errno = errno;
+
+        close(gate[0]);
+        close(gate[1]);
+        close(commit[0]);
+        close(commit[1]);
+        if (directory[0] >= 0) {
+            close(directory[0]);
+            close(directory[1]);
+        }
+        close(exec_outcome[0]);
+        close(exec_outcome[1]);
+        close(exec_descriptors[0]);
+        close(exec_descriptors[1]);
+        state->pending_exec_possible = false;
+        output_format(state, "gsh: exec descriptor protection: %s\r\n",
+                      strerror(saved_errno));
+        abandon_pending_list(state);
+        state->mode = MODE_EDITOR;
+        queue_prompt(state);
+        return;
+    }
     sigemptyset(&blocked);
     sigaddset(&blocked, SIGCHLD);
     if (sigprocmask(SIG_BLOCK, &blocked, &previous) == -1) {
@@ -11978,6 +13094,14 @@ static void start_native_compound(shell_state *state, size_t node_index)
         if (directory[0] >= 0) {
             close(directory[0]);
             close(directory[1]);
+        }
+        if (exec_outcome[0] >= 0) {
+            close(exec_outcome[0]);
+            close(exec_outcome[1]);
+        }
+        if (exec_descriptors[0] >= 0) {
+            close(exec_descriptors[0]);
+            close(exec_descriptors[1]);
         }
         state->directory_commit_expected = false;
         state->pending_directory_commit = false;
@@ -12020,6 +13144,14 @@ static void start_native_compound(shell_state *state, size_t node_index)
                 close(directory[0]);
                 close(directory[1]);
             }
+            if (exec_outcome[0] >= 0) {
+                close(exec_outcome[0]);
+                close(exec_outcome[1]);
+            }
+            if (exec_descriptors[0] >= 0) {
+                close(exec_descriptors[0]);
+                close(exec_descriptors[1]);
+            }
             (void)sigprocmask(SIG_SETMASK, &previous, NULL);
             state->positional_commit_expected = false;
             state->pending_positional_commit = false;
@@ -12060,6 +13192,12 @@ static void start_native_compound(shell_state *state, size_t node_index)
         memset(&evaluator, 0, sizeof(evaluator));
         close(gate[1]);
         close(commit[0]);
+        if (exec_outcome[0] >= 0) {
+            close(exec_outcome[0]);
+        }
+        if (exec_descriptors[0] >= 0) {
+            close(exec_descriptors[0]);
+        }
         if (directory[0] >= 0) {
             close(directory[0]);
         }
@@ -12122,9 +13260,22 @@ static void start_native_compound(shell_state *state, size_t node_index)
         evaluator.function_mutation_possible = false;
         evaluator.command_cache_mutation_possible = false;
         evaluator.state_commit_invalid = false;
+        evaluator.exec_outcome_fd = exec_outcome[1];
+        evaluator.exec_descriptor_socket = exec_descriptors[1];
+        evaluator.exec_descriptor_count =
+            state->pending_exec_descriptor_count;
+        memcpy(evaluator.exec_descriptors,
+               state->pending_exec_descriptors,
+               evaluator.exec_descriptor_count *
+                   sizeof(evaluator.exec_descriptors[0]));
         gsh_background_initialize(&evaluator_backgrounds);
         evaluator.backgrounds = &evaluator_backgrounds;
         status = native_evaluate_node(&evaluator, node_index, 0);
+        if (send_exec_descriptor_commit(
+                exec_descriptors[1], &evaluator) == -1) {
+            perror("gsh: exec descriptor commit");
+            status = 125;
+        }
         if (state->directory_commit_expected &&
             send_directory_descriptor(directory[1]) == -1) {
             status = 125;
@@ -12150,10 +13301,22 @@ static void start_native_compound(shell_state *state, size_t node_index)
             status = 125;
         }
         close(commit[1]);
+        if (exec_outcome[1] >= 0) {
+            close(exec_outcome[1]);
+        }
+        if (exec_descriptors[1] >= 0) {
+            close(exec_descriptors[1]);
+        }
         _exit(status & 255);
     }
     close(gate[0]);
     close(commit[1]);
+    if (exec_outcome[1] >= 0) {
+        close(exec_outcome[1]);
+    }
+    if (exec_descriptors[1] >= 0) {
+        close(exec_descriptors[1]);
+    }
     if (directory[1] >= 0) {
         close(directory[1]);
     }
@@ -12170,6 +13333,12 @@ static void start_native_compound(shell_state *state, size_t node_index)
         }
         if (directory[0] >= 0) {
             close(directory[0]);
+        }
+        if (exec_outcome[0] >= 0) {
+            close(exec_outcome[0]);
+        }
+        if (exec_descriptors[0] >= 0) {
+            close(exec_descriptors[0]);
         }
         free(state->positional_commit);
         state->positional_commit = NULL;
@@ -12198,6 +13367,8 @@ static void start_native_compound(shell_state *state, size_t node_index)
     }
 
     state->variable_commit_fd = commit[0];
+    state->exec_outcome_fd = exec_outcome[0];
+    state->exec_descriptor_socket = exec_descriptors[0];
     state->directory_commit_socket = directory[0];
     state->variable_commit_received = 0;
     state->variable_commit_active = true;
@@ -12309,6 +13480,8 @@ static int execute_native_script(
     function_scratch = &source_workspaces->root_function_scratch;
     expanded = source_workspaces->root_alias_expansion;
     memset(&evaluator, 0, sizeof(evaluator));
+    evaluator.exec_outcome_fd = -1;
+    evaluator.exec_descriptor_socket = -1;
     evaluator.storage = storage;
     evaluator.pipeline = pipeline;
     evaluator.default_path = default_path;
