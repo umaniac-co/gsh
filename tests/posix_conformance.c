@@ -391,7 +391,7 @@ static pid_t start_builtin_with_broken_output(const char *executable,
 static int native_builtin_output_failure_cases(const char *executable)
 {
     static const char *const commands[] = {
-        "umask", "ulimit -S -n", "export -p",
+        "umask", "ulimit -S -n", "times", "export -p",
         "readonly GSH_CLOSED_OUTPUT=value; readonly -p",
         "alias gsh_closed_output=value\nalias gsh_closed_output"};
     size_t index;
@@ -2419,6 +2419,33 @@ int main(int argc, char **argv)
          "/bin/rm -rf \"$GSH_HASH_ROOT\"; "
          "/bin/test \"$GSH_HASH_STATUS\" -eq 0",
          0, NULL},
+        {"times", "times is identified as a special builtin",
+         "command -V times", 0, "times is a special builtin\n"},
+        {"times", "times writes two POSIX timing rows",
+         "GSH_TIMES_FILE=/tmp/gsh-times-output-$$; times >\"$GSH_TIMES_FILE\"; "
+         "/bin/test \"$(/usr/bin/wc -l <\"$GSH_TIMES_FILE\")\" -eq 2; "
+         "GSH_TIMES_STATUS=$?; /bin/rm -f \"$GSH_TIMES_FILE\"; "
+         "/bin/test \"$GSH_TIMES_STATUS\" -eq 0",
+         0, NULL},
+        {"times", "times assignment persists in the current environment",
+         "GSH_TIMES_VALUE=before; GSH_TIMES_VALUE=after times >/dev/null; "
+         "/bin/test \"$GSH_TIMES_VALUE\" = after",
+         0, NULL},
+        {"times", "times redirection works inside a compound command",
+         "GSH_TIMES_FILE=/tmp/gsh-times-compound-$$; "
+         "if true; then times >\"$GSH_TIMES_FILE\"; fi; "
+         "/bin/test \"$(/usr/bin/wc -l <\"$GSH_TIMES_FILE\")\" -eq 2; "
+         "GSH_TIMES_STATUS=$?; /bin/rm -f \"$GSH_TIMES_FILE\"; "
+         "/bin/test \"$GSH_TIMES_STATUS\" -eq 0",
+         0, NULL},
+        {"times", "times runs in a pipeline subshell",
+         "times | /usr/bin/awk 'END { print NR }'", 0, "2\n"},
+        {"times", "times operand error aborts a non-interactive shell",
+         "times unexpected; /usr/bin/printf BAD_TIMES", 1,
+         "does not accept operands"},
+        {"times", "command suppresses times special error semantics",
+         "command times unexpected; /usr/bin/printf TIMES_RECOVERED",
+         0, "TIMES_RECOVERED"},
         {"export", "native export assignment",
          "export GSH_EXPORT_VALUE='alpha beta'; "
          "/usr/bin/printenv GSH_EXPORT_VALUE",

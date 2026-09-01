@@ -11,7 +11,7 @@ SOURCES := src/gsh.c src/async_repl.c src/posix_lexer.c \
 	src/history_client.c src/history_store.c src/shell_config.c \
 	src/shell_variables.c src/builtin_common.c src/command_cache.c \
 	src/builtin_command.c \
-	src/builtin_cd.c src/builtin_ulimit.c \
+	src/builtin_cd.c src/builtin_times.c src/builtin_ulimit.c \
 	src/builtin_umask.c src/builtin_variables.c src/shell_aliases.c \
 	src/alias_expansion.c src/builtin_alias.c src/builtin_unalias.c \
 	src/shell_functions.c \

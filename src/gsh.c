@@ -36,6 +36,7 @@
 #include "builtin_cd.h"
 #include "builtin_alias.h"
 #include "builtin_command.h"
+#include "builtin_times.h"
 #include "builtin_unalias.h"
 #include "builtin_ulimit.h"
 #include "builtin_umask.h"
@@ -3367,6 +3368,11 @@ static bool native_hash_builtin(const gsh_native_command *command)
     return command->argc > 0 && strcmp(command->argv[0], "hash") == 0;
 }
 
+static bool native_times_builtin(const gsh_native_command *command)
+{
+    return command->argc > 0 && strcmp(command->argv[0], "times") == 0;
+}
+
 static bool native_command_inspection_builtin(
     const gsh_native_command *command)
 {
@@ -3518,6 +3524,9 @@ static bool native_pipeline_requires_evaluator(
             command->redirect_count != 0) ||
            (native_hash_builtin(command) &&
             command->redirect_count != 0) ||
+           (native_times_builtin(command) &&
+            (command->assignment_count != 0 ||
+             command->redirect_count != 0)) ||
            (native_command_inspection_builtin(command) &&
             command->redirect_count != 0) ||
            (native_colon_builtin(command) &&
@@ -3662,6 +3671,15 @@ static int run_native_hash_builtin(
 {
     return gsh_builtin_hash(command->argc, command->argv, path, functions,
                             cache, path_generation, cache_changed, io);
+}
+
+static int run_native_times_builtin(
+    const gsh_native_command *command,
+    const gsh_times_context *times_context,
+    const gsh_builtin_io *io)
+{
+    return gsh_builtin_times(command->argc, command->argv, times_context,
+                             io);
 }
 
 static const gsh_builtin_io descriptor_builtin_io = {
@@ -3882,6 +3900,9 @@ static bool native_planned_command_is_supported(
         return true;
     }
     if (native_hash_builtin(native)) {
+        return true;
+    }
+    if (native_times_builtin(native)) {
         return true;
     }
     if (native_command_inspection_builtin(native)) {
@@ -4347,6 +4368,48 @@ static int run_evaluator_hash_builtin(
         &descriptor_builtin_io);
     if (restore_redirect_descriptors(saved, saved_count) == -1) {
         perror("gsh: hash redirection restore");
+        return 125;
+    }
+    return status == 125 ? 125
+                         : (pipeline->negated ? (status == 0 ? 1 : 0)
+                                              : status);
+}
+
+static int run_evaluator_times_builtin(
+    const gsh_native_pipeline *pipeline, gsh_variable_store *variables,
+    gsh_variable_journal *journal, const gsh_shell_options *options,
+    const gsh_times_context *times_context, bool *builtin_failed)
+{
+    const gsh_native_command *command = &pipeline->commands[0];
+    gsh_saved_descriptor saved[GSH_NATIVE_REDIRECT_CAP];
+    size_t saved_count;
+    int status;
+
+    *builtin_failed = false;
+    if (save_redirect_descriptors(command, saved, &saved_count) == -1) {
+        perror("gsh: times redirection save");
+        *builtin_failed = true;
+        return 125;
+    }
+    if (apply_evaluator_redirects(pipeline, command, options) == -1) {
+        perror("gsh: times redirection");
+        (void)restore_redirect_descriptors(saved, saved_count);
+        *builtin_failed = true;
+        return 1;
+    }
+    status = apply_special_builtin_assignments(
+        variables, journal, command, options);
+    if (status != GSH_ASSIGNMENT_OK) {
+        perror("gsh: times assignment");
+        status = status == GSH_ASSIGNMENT_JOURNAL_ERROR ? 125 : 1;
+    } else {
+        status = run_native_times_builtin(
+            command, times_context, &descriptor_builtin_io);
+    }
+    *builtin_failed = status != 0;
+    if (restore_redirect_descriptors(saved, saved_count) == -1) {
+        perror("gsh: times redirection restore");
+        *builtin_failed = true;
         return 125;
     }
     return status == 125 ? 125
@@ -4853,6 +4916,17 @@ static void start_native_pipeline(shell_state *state,
                         hash_command_path_generation(state->variables,
                                                      command),
                         NULL, &descriptor_builtin_io));
+                }
+                if (native_times_builtin(&pipeline->commands[index])) {
+                    if (apply_special_builtin_assignments(
+                            state->variables, NULL,
+                            &pipeline->commands[index], &state->options) !=
+                        GSH_ASSIGNMENT_OK) {
+                        child_exec_error("assignment", errno);
+                    }
+                    _exit(run_native_times_builtin(
+                        &pipeline->commands[index], NULL,
+                        &descriptor_builtin_io));
                 }
                 if (native_command_inspection_builtin(
                         &pipeline->commands[index])) {
@@ -5865,6 +5939,18 @@ static bool run_planned_main_builtin(shell_state *state,
         if (cache_changed) {
             state->command_cache_generation++;
         }
+        state->last_status = pipeline->negated
+                                 ? (status == 0 ? 1 : 0)
+                                 : status;
+        state->mode = MODE_EDITOR;
+        queue_prompt(state);
+        return true;
+    }
+    if (native_times_builtin(command) && command->redirect_count == 0 &&
+        command->assignment_count == 0) {
+        const gsh_builtin_io io = {reactor_builtin_output, state};
+        int status = run_native_times_builtin(command, NULL, &io);
+
         state->last_status = pipeline->negated
                                  ? (status == 0 ? 1 : 0)
                                  : status;
@@ -8392,6 +8478,8 @@ static int native_wait_status_value(int status, bool negated)
 typedef struct native_evaluator native_evaluator;
 static gsh_command_cache *evaluator_command_cache(
     native_evaluator *evaluator);
+static const gsh_times_context *evaluator_times_context(
+    native_evaluator *evaluator);
 
 static int run_pipeline_function(native_evaluator *parent,
                                  gsh_native_pipeline *pipeline,
@@ -8525,6 +8613,25 @@ static int run_native_noninteractive_pipeline(
                 command, path, functions,
                 evaluator_command_cache(evaluator),
                 hash_command_path_generation(variables, command), NULL,
+                &descriptor_builtin_io);
+            return builtin_status == 125
+                       ? 125
+                       : (pipeline->negated
+                              ? (builtin_status == 0 ? 1 : 0)
+                              : builtin_status);
+        }
+        if (native_times_builtin(&pipeline->commands[0])) {
+            int assignment_status = apply_special_builtin_assignments(
+                variables, journal, &pipeline->commands[0], options);
+
+            if (assignment_status != GSH_ASSIGNMENT_OK) {
+                perror("gsh: times assignment");
+                return assignment_status == GSH_ASSIGNMENT_JOURNAL_ERROR
+                           ? 125
+                           : 1;
+            }
+            builtin_status = run_native_times_builtin(
+                &pipeline->commands[0], evaluator_times_context(evaluator),
                 &descriptor_builtin_io);
             return builtin_status == 125
                        ? 125
@@ -8691,6 +8798,17 @@ static int run_native_noninteractive_pipeline(
                         hash_command_path_generation(variables, command),
                         NULL, &descriptor_builtin_io));
                 }
+                if (native_times_builtin(&pipeline->commands[index])) {
+                    if (apply_special_builtin_assignments(
+                            variables, NULL,
+                            &pipeline->commands[index], options) !=
+                        GSH_ASSIGNMENT_OK) {
+                        child_exec_error("assignment", errno);
+                    }
+                    _exit(run_native_times_builtin(
+                        &pipeline->commands[index], NULL,
+                        &descriptor_builtin_io));
+                }
                 if (native_command_inspection_builtin(
                         &pipeline->commands[index])) {
                     const gsh_native_command *command =
@@ -8828,6 +8946,7 @@ struct native_evaluator {
     gsh_function_store *function_scratch;
     gsh_command_cache *command_cache;
     uint64_t command_cache_base_generation;
+    const gsh_times_context *times_context;
     gsh_variable_store *scope_base;
     gsh_variable_journal *scope_changes;
     pipeline_expansion_scope *pipeline_scope;
@@ -8856,6 +8975,12 @@ static gsh_command_cache *evaluator_command_cache(
     native_evaluator *evaluator)
 {
     return evaluator == NULL ? NULL : evaluator->command_cache;
+}
+
+static const gsh_times_context *evaluator_times_context(
+    native_evaluator *evaluator)
+{
+    return evaluator == NULL ? NULL : evaluator->times_context;
 }
 
 static bool native_preflight_node(native_evaluator *evaluator,
@@ -10125,6 +10250,7 @@ static int native_evaluate_pipeline(native_evaluator *evaluator,
             !native_variable_builtin(tail) && !native_state_builtin(tail) &&
             !native_wait_builtin(tail) && !native_alias_builtin(tail) &&
             !native_hash_builtin(tail) &&
+            !native_times_builtin(tail) &&
             !native_command_inspection_builtin(tail) &&
             !native_return_builtin(tail) &&
             !native_loop_control_builtin(tail) && function == NULL) {
@@ -10301,6 +10427,20 @@ static int native_evaluate_pipeline(native_evaluator *evaluator,
             evaluator->pipeline, evaluator->variables,
             evaluator->default_path, evaluator->functions,
             evaluator->command_cache, &evaluator->options);
+    } else if (evaluator->pipeline->command_count == 1 &&
+               native_times_builtin(&evaluator->pipeline->commands[0])) {
+        bool builtin_failed;
+
+        status = run_evaluator_times_builtin(
+            evaluator->pipeline, evaluator->variables,
+            evaluator->journal, &evaluator->options,
+            evaluator->times_context, &builtin_failed);
+        if (builtin_failed &&
+            !evaluator->pipeline->commands[0].command_regular_context &&
+            !gsh_options_enabled(&evaluator->options,
+                                 GSH_OPTION_INTERACTIVE)) {
+            evaluator->fatal_error = true;
+        }
     } else {
         status = run_native_noninteractive_pipeline(
             evaluator->pipeline, evaluator->default_path,
@@ -10315,6 +10455,7 @@ static int native_evaluate_pipeline(native_evaluator *evaluator,
          native_cd_builtin(&evaluator->pipeline->commands[0]) ||
          native_alias_builtin(&evaluator->pipeline->commands[0]) ||
          native_hash_builtin(&evaluator->pipeline->commands[0]) ||
+         native_times_builtin(&evaluator->pipeline->commands[0]) ||
          native_loop_control_builtin(
              &evaluator->pipeline->commands[0]) ||
          (evaluator->pipeline->commands[0].argc == 0 &&
@@ -10590,6 +10731,7 @@ static int native_evaluate_node_inner(native_evaluator *evaluator,
             child.active_loops = 0;
             child.loop_control = NATIVE_LOOP_CONTROL_NONE;
             child.loop_levels = 0;
+            child.times_context = NULL;
             child_status = native_evaluate_node(
                 &child, node->first_child, depth + 1U);
             _exit(child_status & 255);
@@ -11784,6 +11926,8 @@ static void start_native_compound(shell_state *state, size_t node_index)
     bool managed = state->async_repl != NULL && state->async_repl->enabled;
     sigset_t blocked;
     sigset_t previous;
+    struct tms owner_times;
+    bool owner_times_valid = false;
     pid_t pid;
 
     if (state->current_job.active) {
@@ -11943,6 +12087,7 @@ static void start_native_compound(shell_state *state, size_t node_index)
                    sizeof(*state->positional_commit));
         }
     }
+    owner_times_valid = gsh_times_snapshot(&owner_times) == 0;
     pid = managed && open_managed_pty(&pty) == -1
               ? -1
               : (fault_should_fail("evaluator-fork", EAGAIN) ? -1
@@ -11951,6 +12096,7 @@ static void start_native_compound(shell_state *state, size_t node_index)
         char release;
         native_evaluator evaluator;
         gsh_background_table evaluator_backgrounds;
+        gsh_times_context times_context;
         int status;
 
         memset(&evaluator, 0, sizeof(evaluator));
@@ -11998,6 +12144,11 @@ static void start_native_compound(shell_state *state, size_t node_index)
         evaluator.command_cache = state->command_cache;
         evaluator.command_cache_base_generation =
             state->command_cache_generation;
+        memset(&times_context, 0, sizeof(times_context));
+        if (owner_times_valid) {
+            (void)gsh_times_rebase(&times_context, &owner_times);
+        }
+        evaluator.times_context = &times_context;
         evaluator.scope_base = state->pipeline_variables;
         evaluator.scope_changes = state->pipeline_changes;
         evaluator.pipeline_scope = NULL;

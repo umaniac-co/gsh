@@ -171,7 +171,7 @@ before `gsh` can claim POSIX.1-2024 shell-language conformance.
 
 The builtins implemented in `gsh` itself include `cd`, `command` within the
 target set described above, `exit`, `hash`, `pwd`, `export`,
-`readonly`, `unset`, `ulimit`, `umask`, `:`, `true`, `false`, `fg`, `bg`,
+`readonly`, `unset`, `ulimit`, `umask`, `times`, `:`, `true`, `false`, `fg`, `bg`,
 `set`, `shift`, `type`, `wait`, `break`, `continue`, `alias`, `unalias`,
 `help`, and `rt` within their currently documented contexts. The exact standalone
 interactive control submission `/async` toggles the managed REPL for the
@@ -181,7 +181,10 @@ current session.
 `umask` implements octal masks, `-S`, and POSIX symbolic masks including
 permission copying and the initial-mode semantics of `X`. An unredirected
 standalone invocation of either environment builtin changes the current shell,
-while a pipeline stage remains isolated. The editor is intentionally limited
+while a pipeline stage remains isolated. `times` reports the four `times()`
+counters using `_SC_CLK_TCK` precision and locale-neutral formatting; compound
+evaluators rebase their counters on the owning shell, while true subshells
+remain isolated. The editor is intentionally limited
 to insertion at the end of the line, bounded multiline input with `PS2`,
 UTF-8-aware backspace, history arrows, incremental `Ctrl-R`, `Ctrl-U`,
 `Ctrl-L`, `Ctrl-C`, and `Ctrl-D`. The managed
@@ -312,7 +315,7 @@ Workloads currently cover startup, idle key echo,
 `/usr/bin/true`, variable, builtin-command, and cached `PATH` lookup, assignment,
 `${parameter:=word}`, arithmetic
 assignment, a mutating expansion in a two-stage pipeline, `ulimit -S -n`,
-`umask`, `export`, `unset`, `readonly`, finite explicit-list `for`,
+`umask`, `times`, `export`, `unset`, `readonly`, finite explicit-list `for`,
 `set -- a b c`, `shift`,
 `set -Cf; set +Cf`, controlled `allexport` assignment and `nounset` lookup,
 simple and fixed multi-star parameter pattern removal, disabled pathname

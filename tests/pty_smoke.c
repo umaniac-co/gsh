@@ -2133,6 +2133,77 @@ static int command_hash_flow(const char *executable)
     return failed;
 }
 
+static void remove_times_fixture(const char *fixture)
+{
+    static const char *const names[] = {"direct.out", "compound.out"};
+    char path[PATH_MAX];
+    size_t index;
+
+    for (index = 0; index < sizeof(names) / sizeof(names[0]); index++) {
+        if (snprintf(path, sizeof(path), "%s/%s", fixture,
+                     names[index]) < (int)sizeof(path)) {
+            (void)unlink(path);
+        }
+    }
+    (void)rmdir(fixture);
+}
+
+static int times_builtin_flow(const char *executable)
+{
+    char fixture[] = "/tmp/gsh-pty-times-XXXXXX";
+    pty_session session;
+    int failed = 0;
+
+    if (mkdtemp(fixture) == NULL ||
+        start_session(&session, executable, fixture, SHELL_GSH) == -1) {
+        perror("pty times: setup");
+        remove_times_fixture(fixture);
+        return 1;
+    }
+    if (consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        send_text(&session,
+                  "times >direct.out; "
+                  "/bin/test \"$(/usr/bin/wc -l <direct.out)\" -eq 2 && "
+                  "/usr/bin/printf GSH_TIMES_DIRECT\r") == -1 ||
+        consume_through(&session, "GSH_TIMES_DIRECT", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        send_text(&session,
+                  "if true; then times >compound.out; fi; "
+                  "/bin/test \"$(/usr/bin/wc -l <compound.out)\" -eq 2 && "
+                  "/usr/bin/printf GSH_TIMES_COMPOUND\r") == -1 ||
+        consume_through(&session, "GSH_TIMES_COMPOUND", TEST_TIMEOUT_MS) ==
+            -1 ||
+        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        send_text(&session,
+                  "GSH_TIMES_VALUE=before; "
+                  "GSH_TIMES_VALUE=after times >/dev/null; "
+                  "/bin/test \"$GSH_TIMES_VALUE\" = after && "
+                  "/usr/bin/printf GSH_TIMES_ASSIGN\r") == -1 ||
+        consume_through(&session, "GSH_TIMES_ASSIGN", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        send_text(&session, "times unexpected\r") == -1 ||
+        consume_through(&session, "does not accept operands",
+                        TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        send_text(&session, "/usr/bin/printf GSH_TIMES_RECOVERED\r") == -1 ||
+        consume_through(&session, "GSH_TIMES_RECOVERED", TEST_TIMEOUT_MS) ==
+            -1 ||
+        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1) {
+        perror("pty times: flow");
+        dump_capture(&session);
+        failed = 1;
+    }
+    if (!failed && process_child_count(session.pid) != 1) {
+        fprintf(stderr, "pty times: command left child processes\n");
+        failed = 1;
+    }
+    if (stop_session(&session) == -1) {
+        failed = 1;
+    }
+    remove_times_fixture(fixture);
+    return failed;
+}
+
 static int function_builtin_flow(const char *executable)
 {
     char fixture[] = "/tmp/gsh-pty-function-XXXXXX";
@@ -4665,6 +4736,7 @@ static int latency_benchmark(const char *gsh, const char *bash,
     uint64_t pipeline_assignment[BENCH_SHELLS][BENCH_EXEC_SAMPLES];
     uint64_t resource_limit[BENCH_SHELLS][BENCH_EXEC_SAMPLES];
     uint64_t creation_mask[BENCH_SHELLS][BENCH_EXEC_SAMPLES];
+    uint64_t process_times[BENCH_SHELLS][BENCH_EXEC_SAMPLES];
     uint64_t export_assignment[BENCH_SHELLS][BENCH_EXEC_SAMPLES];
     uint64_t unset_variable[BENCH_SHELLS][BENCH_EXEC_SAMPLES];
     uint64_t readonly_existing[BENCH_SHELLS][BENCH_EXEC_SAMPLES];
@@ -4809,6 +4881,8 @@ static int latency_benchmark(const char *gsh, const char *bash,
         benchmark_prompt_command(sessions, specs, creation_mask, NULL,
                                  "umask\r", "umask report") ==
             -1 ||
+        benchmark_prompt_command(sessions, specs, process_times, NULL,
+                                 "times\r", "process times") == -1 ||
         benchmark_prompt_command(
             sessions, specs, export_assignment, NULL,
             "export GSH_BENCH_EXPORT=value\r", "export assignment") == -1 ||
@@ -4959,6 +5033,8 @@ done:
                           resource_limit[offset], BENCH_EXEC_SAMPLES);
         print_raw_samples(specs[offset].name, "umask-report",
                           creation_mask[offset], BENCH_EXEC_SAMPLES);
+        print_raw_samples(specs[offset].name, "process-times",
+                          process_times[offset], BENCH_EXEC_SAMPLES);
         print_raw_samples(specs[offset].name, "export-assignment",
                           export_assignment[offset], BENCH_EXEC_SAMPLES);
         print_raw_samples(specs[offset].name, "unset-variable",
@@ -5025,6 +5101,8 @@ done:
         print_metric("ulimit-soft-nofile", resource_limit[offset],
                      BENCH_EXEC_SAMPLES, 5000000ULL);
         print_metric("umask-report", creation_mask[offset],
+                     BENCH_EXEC_SAMPLES, 5000000ULL);
+        print_metric("process-times", process_times[offset],
                      BENCH_EXEC_SAMPLES, 5000000ULL);
         print_metric("export-assignment", export_assignment[offset],
                      BENCH_EXEC_SAMPLES, 5000000ULL);
@@ -5409,6 +5487,7 @@ int main(int argc, char **argv)
         variable_builtin_flow(executable) != 0 ||
         alias_builtin_flow(executable) != 0 ||
         command_hash_flow(executable) != 0 ||
+        times_builtin_flow(executable) != 0 ||
         function_builtin_flow(executable) != 0 ||
         deferred_pattern_flow(executable) != 0 ||
         asynchronous_list_flow(executable) != 0 ||
