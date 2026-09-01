@@ -47,7 +47,7 @@ jobs:
 
       - name: Install dependencies on macOS
         if: runner.os == 'macOS'
-        run: brew install libsodium
+        run: brew install bash libsodium zsh
 
       - name: Strict build and black-box gates
         run: |
@@ -70,7 +70,7 @@ jobs:
           set -o pipefail
           make check-sanitize 2>&1 | tee -a build/evidence/gates.txt
           ASAN_OPTIONS=abort_on_error=1 UBSAN_OPTIONS=halt_on_error=1 \
-            ./build/posix-conformance "$PWD/build/gsh-sanitize" 2>&1 | tee -a build/evidence/gates.txt
+            ./build/posix-conformance "$PWD/build/gsh-sanitize" "$(command -v bash)" 2>&1 | tee -a build/evidence/gates.txt
           make fuzz-sanitize FUZZ_CASES=250000 2>&1 | tee -a build/evidence/gates.txt
           make fuzz-pty-sanitize PTY_FUZZ_CASES=2000 2>&1 | tee -a build/evidence/gates.txt
 

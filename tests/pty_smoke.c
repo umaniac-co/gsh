@@ -1357,8 +1357,29 @@ static int ordinary_flow(const char *executable)
 static int job_service_control_flow(const char *executable)
 {
     char fixture[] = "/tmp/gsh-job-service-XXXXXX";
+    char probe[4096];
+    char command[4100];
+    char *separator;
     pty_session session;
     int failed = 0;
+
+    if (strlen(executable) + 1U > sizeof(probe)) {
+        fprintf(stderr, "pty jobs: probe path is too long\n");
+        return 1;
+    }
+    memcpy(probe, executable, strlen(executable) + 1U);
+    separator = strrchr(probe, '/');
+    if (separator == NULL ||
+        (size_t)(separator - probe) + sizeof("/job-probe") > sizeof(probe)) {
+        fprintf(stderr, "pty jobs: cannot derive job probe path\n");
+        return 1;
+    }
+    memcpy(separator, "/job-probe", sizeof("/job-probe"));
+    if (snprintf(command, sizeof(command), "%s &\r", probe) >=
+        (int)sizeof(command)) {
+        fprintf(stderr, "pty jobs: probe command is too long\n");
+        return 1;
+    }
 
     if (mkdtemp(fixture) == NULL ||
         start_session(&session, executable, fixture, SHELL_GSH) == -1) {
@@ -1367,10 +1388,9 @@ static int job_service_control_flow(const char *executable)
         return 1;
     }
     if (consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
-        send_text(&session,
-                  "/bin/sh -c 'kill -STOP $$; echo GSH_JOB_ONE; "
-                  "sleep 30' &\r") == -1 ||
+        send_text(&session, command) == -1 ||
         consume_through(&session, "[1] ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "GSH_PROBE_READY", TEST_TIMEOUT_MS) == -1 ||
         consume_through(&session, "]+ Stopped ", TEST_TIMEOUT_MS) == -1 ||
         consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "jobs %1 | /bin/cat\r") == -1 ||
@@ -1378,16 +1398,15 @@ static int job_service_control_flow(const char *executable)
         consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "bg %1\r") == -1 ||
         consume_through(&session, "[continued ", TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "GSH_JOB_ONE",
+        consume_through(&session, "GSH_PROBE_CONTINUED",
                         TEST_TIMEOUT_MS) == -1 ||
-        send_text(&session,
-                  "/bin/sh -c 'kill -STOP $$; echo GSH_JOB_TWO; "
-                  "sleep 30' &\r") == -1 ||
+        send_text(&session, command) == -1 ||
         consume_through(&session, "[2] ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "GSH_PROBE_READY", TEST_TIMEOUT_MS) == -1 ||
         consume_through(&session, "]+ Stopped ", TEST_TIMEOUT_MS) == -1 ||
         consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "fg %2\r") == -1 ||
-        consume_through(&session, "GSH_JOB_TWO",
+        consume_through(&session, "GSH_PROBE_CONTINUED",
                         TEST_TIMEOUT_MS) == -1 ||
         send_bytes(&session, "\003", 1U) == -1 ||
         consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
@@ -5121,6 +5140,12 @@ static int soak_flow(const char *executable, unsigned long seconds)
         failed = 1;
         goto done;
     }
+    if (soak_iteration(&session) == -1) {
+        perror("pty soak: warm-up iteration");
+        dump_capture(&session);
+        failed = 1;
+        goto done;
+    }
 
     initial_rss = process_rss_bytes(session.pid);
     initial_fds = process_fd_count(session.pid);
@@ -5187,7 +5212,14 @@ static int soak_flow(const char *executable, unsigned long seconds)
     if (final_rss < 0 || final_fds < 0 || final_fds > initial_fds + 1 ||
         final_rss > initial_rss + 4 * 1024 * 1024 ||
         final_children < 0 || final_children > initial_children) {
-        fprintf(stderr, "pty soak: resource growth exceeded bounds\n");
+        fprintf(stderr,
+                "pty soak: resource growth exceeded bounds "
+                "rss_initial=%lld rss_max=%lld rss_final=%lld "
+                "fds_initial=%d fds_max=%d fds_final=%d "
+                "children_initial=%d children_max=%d children_final=%d\n",
+                (long long)initial_rss, (long long)maximum_rss,
+                (long long)final_rss, initial_fds, maximum_fds, final_fds,
+                initial_children, maximum_children, final_children);
         failed = 1;
         goto done;
     }
