@@ -3811,6 +3811,21 @@ static bool native_exec_builtin(const gsh_native_command *command)
     return command->argc > 0 && strcmp(command->argv[0], "exec") == 0;
 }
 
+static bool native_eval_builtin(const gsh_native_command *command)
+{
+    return command->argc > 0 && strcmp(command->argv[0], "eval") == 0;
+}
+
+static bool native_dot_builtin(const gsh_native_command *command)
+{
+    return command->argc > 0 && strcmp(command->argv[0], ".") == 0;
+}
+
+static bool native_source_builtin(const gsh_native_command *command)
+{
+    return native_eval_builtin(command) || native_dot_builtin(command);
+}
+
 static bool native_command_inspection_builtin(
     const gsh_native_command *command)
 {
@@ -4347,6 +4362,9 @@ static bool native_planned_command_is_supported(
     if (native_exec_builtin(native)) {
         return true;
     }
+    if (native_source_builtin(native)) {
+        return true;
+    }
     if (native_command_inspection_builtin(native)) {
         return true;
     }
@@ -4401,12 +4419,10 @@ enum {
     GSH_ASSIGNMENT_JOURNAL_ERROR = -2,
 };
 
-static int apply_native_assignments(gsh_variable_store *variables,
-                                    gsh_variable_journal *journal,
-                                    const gsh_native_command *command,
-                                    const gsh_shell_options *options)
+static int apply_native_assignments_with_attributes(
+    gsh_variable_store *variables, gsh_variable_journal *journal,
+    const gsh_native_command *command, unsigned int attributes)
 {
-    unsigned int attributes = assignment_attributes(options);
     size_t index;
 
     for (index = 0; index < command->assignment_count; index++) {
@@ -4438,6 +4454,15 @@ static int apply_native_assignments(gsh_variable_store *variables,
         }
     }
     return 0;
+}
+
+static int apply_native_assignments(gsh_variable_store *variables,
+                                    gsh_variable_journal *journal,
+                                    const gsh_native_command *command,
+                                    const gsh_shell_options *options)
+{
+    return apply_native_assignments_with_attributes(
+        variables, journal, command, assignment_attributes(options));
 }
 
 static int apply_special_builtin_assignments(
@@ -9116,6 +9141,10 @@ static int run_pipeline_function(native_evaluator *parent,
                                  size_t command_index,
                                  gsh_variable_store *variables,
                                  bool *found);
+static int run_pipeline_source(native_evaluator *parent,
+                               gsh_native_pipeline *pipeline,
+                               size_t command_index,
+                               gsh_variable_store *variables);
 static int evaluate_loop_control(native_evaluator *evaluator,
                                  const gsh_native_pipeline *pipeline);
 
@@ -9420,6 +9449,11 @@ static int run_native_noninteractive_pipeline(
                         &pipeline->commands[index], variables,
                         positionals, options, &descriptor_builtin_io));
                 }
+                if (native_source_builtin(&pipeline->commands[index])) {
+                    _exit(run_pipeline_source(evaluator, pipeline, index,
+                                              variables) &
+                          255);
+                }
                 if (native_wait_builtin(&pipeline->commands[index])) {
                     _exit(pipeline->commands[index].argc == 1 ? 0 : 127);
                 }
@@ -9624,6 +9658,7 @@ struct native_evaluator {
     gsh_source_workspace_stack *source_workspaces;
     pipeline_expansion_scope *pipeline_scope;
     size_t source_depth;
+    size_t dot_depth;
     size_t function_depth;
     bool function_active[GSH_FUNCTION_CAP];
     bool returning;
@@ -9649,8 +9684,483 @@ struct native_evaluator {
     bool state_commit_invalid;
     int exec_outcome_fd;
     int exec_descriptor_socket;
+    bool source_request_active;
+    bool source_request_dot;
+    bool source_request_negated;
+    bool source_request_temporary_variables;
+    gsh_source_workspace *source_request_workspace;
+    const gsh_native_command *source_request_command;
+    const char *source_request_input;
+    size_t source_request_input_length;
+    size_t source_request_root;
+    gsh_saved_descriptor source_request_saved[
+        GSH_NATIVE_REDIRECT_CAP];
+    size_t source_request_saved_count;
     gsh_background_table *backgrounds;
 };
+
+typedef struct {
+    const char *input;
+    size_t input_length;
+    const gsh_parse_storage *storage;
+    gsh_native_pipeline *pipeline;
+    gsh_variable_store *variables;
+    gsh_variable_store *scope_base;
+    gsh_variable_journal *journal;
+    size_t source_depth;
+    size_t dot_depth;
+    gsh_source_workspace *workspace;
+    gsh_saved_descriptor saved[GSH_NATIVE_REDIRECT_CAP];
+    size_t saved_count;
+    const gsh_native_command *temporary_command;
+    bool consume_return;
+    bool negated;
+    bool temporary_variables;
+} native_source_frame;
+
+enum { GSH_EVALUATOR_SOURCE_REQUEST = 256 };
+
+static bool native_preflight_node(native_evaluator *evaluator,
+                                  size_t node_index, size_t depth);
+
+static int read_source_descriptor(int descriptor, char *input,
+                                  size_t *input_length)
+{
+    size_t used = 0;
+    size_t attempts;
+
+    if (descriptor < 0 || input == NULL || input_length == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+    for (attempts = 0; attempts <= GSH_SOURCE_INPUT_CAP; attempts++) {
+        size_t available = GSH_SOURCE_INPUT_CAP - used;
+        ssize_t count = read(descriptor, input + used,
+                             available == 0 ? 1U : available);
+
+        if (count > 0) {
+            if (available == 0 || memchr(input + used, '\0',
+                                         (size_t)count) != NULL) {
+                errno = available == 0 ? EFBIG : EILSEQ;
+                return -1;
+            }
+            used += (size_t)count;
+            assert(used <= GSH_SOURCE_INPUT_CAP);
+        } else if (count == 0) {
+            input[used] = '\0';
+            *input_length = used;
+            return 0;
+        } else if (errno != EINTR) {
+            return -1;
+        }
+    }
+    errno = EINTR;
+    return -1;
+}
+
+static int dot_open_candidate(const char *directory, size_t directory_length,
+                              const char *name, size_t name_length)
+{
+    char candidate[EXEC_PATH_CAP];
+    size_t offset = 0;
+
+    if (directory == NULL || name == NULL || name_length == 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (directory_length == 0) {
+        candidate[offset++] = '.';
+    } else if (directory_length >= sizeof(candidate)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    } else {
+        memcpy(candidate, directory, directory_length);
+        offset = directory_length;
+    }
+    if (offset + 1U + name_length + 1U > sizeof(candidate)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    candidate[offset++] = '/';
+    memcpy(candidate + offset, name, name_length + 1U);
+    return open(candidate, O_RDONLY | O_CLOEXEC);
+}
+
+static int open_dot_source(const char *name, const char *path)
+{
+    size_t name_length;
+    const char *cursor = path;
+    size_t components;
+    int remembered_error = ENOENT;
+
+    if (name == NULL || path == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+    name_length = strnlen(name, EXEC_PATH_CAP);
+    if (name_length == 0 || name_length == EXEC_PATH_CAP) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    if (strchr(name, '/') != NULL) {
+        return open(name, O_RDONLY | O_CLOEXEC);
+    }
+    for (components = 0; components <= GSH_VARIABLE_VALUE_CAP;
+         components++) {
+        size_t remaining = strnlen(cursor, GSH_VARIABLE_VALUE_CAP + 1U);
+        const char *separator;
+        size_t directory_length;
+        int descriptor;
+
+        if (remaining > GSH_VARIABLE_VALUE_CAP) {
+            errno = E2BIG;
+            return -1;
+        }
+        separator = memchr(cursor, ':', remaining);
+        directory_length =
+            separator == NULL ? remaining
+                              : (size_t)(separator - cursor);
+        descriptor = dot_open_candidate(
+            cursor, directory_length, name, name_length);
+
+        if (descriptor >= 0) {
+            return descriptor;
+        }
+        if (errno == EACCES) {
+            remembered_error = EACCES;
+        } else if (errno != ENOENT && errno != ENOTDIR) {
+            return -1;
+        }
+        if (separator == NULL) {
+            errno = remembered_error;
+            return -1;
+        }
+        cursor = separator + 1U;
+    }
+    errno = E2BIG;
+    return -1;
+}
+
+static int concatenate_eval_source(const gsh_native_command *command,
+                                   char *input, size_t *input_length)
+{
+    size_t used = 0;
+    size_t argument;
+    size_t first_argument;
+
+    if (command == NULL || input == NULL || input_length == NULL ||
+        command->argc > GSH_NATIVE_ARGUMENT_CAP) {
+        errno = EINVAL;
+        return -1;
+    }
+    first_argument = command->argc > 1U &&
+                             strcmp(command->argv[1], "--") == 0
+                         ? 2U
+                         : 1U;
+    argument = first_argument;
+    for (; argument < command->argc; argument++) {
+        size_t length = strnlen(command->argv[argument],
+                                GSH_SOURCE_INPUT_CAP + 1U);
+        size_t separator = argument == first_argument ? 0U : 1U;
+
+        if (length > GSH_SOURCE_INPUT_CAP ||
+            separator + length > GSH_SOURCE_INPUT_CAP - used) {
+            errno = E2BIG;
+            return -1;
+        }
+        if (separator != 0) {
+            input[used++] = ' ';
+        }
+        memcpy(input + used, command->argv[argument], length);
+        used += length;
+    }
+    input[used] = '\0';
+    *input_length = used;
+    return 0;
+}
+
+static int load_dot_source(native_evaluator *evaluator,
+                           const gsh_native_command *command,
+                           const gsh_variable_store *variables,
+                           gsh_source_workspace *workspace,
+                           size_t *input_length)
+{
+    size_t operand = 1U;
+    int descriptor;
+    int source_error = 0;
+    int status;
+
+    if (operand < command->argc &&
+        strcmp(command->argv[operand], "--") == 0) {
+        operand++;
+    }
+    if (command->argc - operand != 1U) {
+        fputs("gsh: .: exactly one file operand required\n", stderr);
+        return 2;
+    }
+    descriptor = open_dot_source(
+        command->argv[operand],
+        store_path_value(variables, evaluator->default_path));
+    if (descriptor == -1) {
+        fprintf(stderr, "gsh: .: %s: %s\n", command->argv[operand],
+                strerror(errno));
+        return 1;
+    }
+    if (read_source_descriptor(descriptor, workspace->input,
+                               input_length) == -1) {
+        source_error = errno;
+    }
+    status = source_error == 0 ? 0 : 1;
+    if (close(descriptor) == -1 && status == 0) {
+        source_error = errno;
+        status = 1;
+    }
+    if (status != 0) {
+        fprintf(stderr, "gsh: .: %s: %s\n", command->argv[operand],
+                strerror(source_error));
+    }
+    return status;
+}
+
+static bool source_program_is_supported(
+    native_evaluator *evaluator, gsh_source_workspace *workspace,
+    const gsh_variable_store *source_variables, const char *input,
+    size_t input_length, size_t root)
+{
+    native_evaluator preflight = *evaluator;
+    gsh_variable_store *preflight_scope = &workspace->scope_base;
+
+    if (source_variables == &workspace->scope_base) {
+        preflight_scope = evaluator->scope_base;
+    }
+    if (source_variables == NULL || preflight_scope == NULL ||
+        preflight_scope == &workspace->variables) {
+        return false;
+    }
+    memcpy(&workspace->variables, source_variables,
+           sizeof(workspace->variables));
+    preflight.input = input;
+    preflight.input_length = input_length;
+    preflight.storage = &workspace->storage;
+    preflight.pipeline = &workspace->pipeline;
+    preflight.variables = &workspace->variables;
+    preflight.journal = NULL;
+    preflight.alias_journal = NULL;
+    preflight.scope_base = preflight_scope;
+    preflight.scope_changes = &workspace->scope_changes;
+    preflight.source_depth = evaluator->source_depth + 1U;
+    preflight.preflight = true;
+    preflight.fatal_error = false;
+    preflight.source_request_active = false;
+    memset(preflight.function_active, 0,
+           sizeof(preflight.function_active));
+    if (evaluator->functions != NULL &&
+        storage_has_function(&workspace->storage)) {
+        gsh_functions_initialize(&workspace->function_scratch);
+        if (!gsh_functions_clone(&workspace->functions,
+                                 evaluator->functions)) {
+            return false;
+        }
+        preflight.functions = &workspace->functions;
+        preflight.function_scratch = &workspace->function_scratch;
+    } else {
+        preflight.functions = evaluator->functions;
+        preflight.function_scratch = evaluator->function_scratch;
+    }
+    return native_preflight_node(&preflight, root, 0);
+}
+
+static int prepare_source_request(
+    native_evaluator *evaluator, gsh_source_workspace *workspace,
+    const gsh_variable_store *source_variables, size_t input_length,
+    const char *name, const gsh_native_command *temporary_command,
+    const gsh_saved_descriptor saved[GSH_NATIVE_REDIRECT_CAP],
+    size_t saved_count, bool dot)
+{
+    const char *parsed_input;
+    size_t parsed_length = input_length;
+    gsh_parse_result parsed;
+
+    if (evaluator == NULL || workspace == NULL ||
+        source_variables == NULL || name == NULL || saved == NULL ||
+        input_length > GSH_SOURCE_INPUT_CAP ||
+        saved_count > GSH_NATIVE_REDIRECT_CAP) {
+        errno = EINVAL;
+        return 125;
+    }
+    parsed_input = workspace->input;
+    parsed = gsh_alias_parse(
+        workspace->input, input_length, evaluator->aliases,
+        workspace->alias_expansion, GSH_ALIAS_EXPANSION_CAP,
+        &workspace->storage, &parsed_input, &parsed_length);
+
+    if (parsed.status != GSH_PARSE_OK) {
+        fprintf(stderr, "gsh: %s: %s at byte %zu\n", name,
+                gsh_parse_status_name(parsed.status), parsed.error_offset);
+        return 2;
+    }
+    if (!source_program_is_supported(
+            evaluator, workspace, source_variables, parsed_input,
+            parsed_length, parsed.root)) {
+        fprintf(stderr, "gsh: %s: native source unsupported\n", name);
+        return 125;
+    }
+    evaluator->source_request_active = true;
+    evaluator->source_request_dot = dot;
+    evaluator->source_request_temporary_variables =
+        temporary_command != NULL;
+    evaluator->source_request_workspace = workspace;
+    evaluator->source_request_command = temporary_command;
+    evaluator->source_request_input = parsed_input;
+    evaluator->source_request_input_length = parsed_length;
+    evaluator->source_request_root = parsed.root;
+    evaluator->source_request_saved_count = saved_count;
+    memcpy(evaluator->source_request_saved, saved,
+           saved_count * sizeof(saved[0]));
+    return GSH_EVALUATOR_SOURCE_REQUEST;
+}
+
+static int prepare_source_variable_view(
+    native_evaluator *evaluator, const gsh_native_command *command,
+    gsh_source_workspace *workspace,
+    const gsh_variable_store **source_variables,
+    const gsh_native_command **temporary_command)
+{
+    int status;
+
+    *source_variables = evaluator->variables;
+    *temporary_command = NULL;
+    if (!command->command_regular_context ||
+        command->assignment_count == 0U) {
+        return 0;
+    }
+    memcpy(&workspace->scope_base, evaluator->variables,
+           sizeof(workspace->scope_base));
+    status = apply_native_assignments_with_attributes(
+        &workspace->scope_base, NULL, command,
+        assignment_attributes(&evaluator->options) | GSH_VARIABLE_EXPORTED);
+    if (status != GSH_ASSIGNMENT_OK) {
+        perror("gsh: source assignment");
+        return 1;
+    }
+    *source_variables = &workspace->scope_base;
+    *temporary_command = command;
+    return 0;
+}
+
+static int load_builtin_source_text(
+    native_evaluator *evaluator, const gsh_native_command *command,
+    const gsh_variable_store *source_variables,
+    gsh_source_workspace *workspace, size_t *input_length)
+{
+    if (native_dot_builtin(command)) {
+        return load_dot_source(evaluator, command, source_variables,
+                               workspace, input_length);
+    }
+    if (concatenate_eval_source(command, workspace->input,
+                                input_length) == -1) {
+        fprintf(stderr, "gsh: eval: %s\n", strerror(errno));
+        return 125;
+    }
+    return 0;
+}
+
+static int request_builtin_source(
+    native_evaluator *evaluator, const gsh_native_command *command,
+    const gsh_saved_descriptor saved[GSH_NATIVE_REDIRECT_CAP],
+    size_t saved_count)
+{
+    gsh_source_workspace *workspace;
+    const gsh_variable_store *source_variables;
+    const gsh_native_command *temporary_command;
+    size_t input_length = 0;
+    bool dot = native_dot_builtin(command);
+    int status;
+
+    if (!dot && command->argc == 1U) {
+        return 0;
+    }
+    if (evaluator->source_workspaces == NULL ||
+        evaluator->source_depth != gsh_source_workspaces_depth(
+                                       evaluator->source_workspaces) ||
+        fault_should_fail("source-workspace-exhaustion", EAGAIN)) {
+        fputs("gsh: nested source workspace limit exceeded\n", stderr);
+        return 125;
+    }
+    workspace = gsh_source_workspace_acquire(evaluator->source_workspaces);
+    if (workspace == NULL) {
+        fputs("gsh: nested source workspace limit exceeded\n", stderr);
+        return 125;
+    }
+    status = prepare_source_variable_view(
+        evaluator, command, workspace, &source_variables,
+        &temporary_command);
+    if (status == 0) {
+        status = load_builtin_source_text(
+            evaluator, command, source_variables, workspace,
+            &input_length);
+    }
+    if (status == 0) {
+        status = prepare_source_request(
+            evaluator, workspace, source_variables, input_length,
+            command->argv[0], temporary_command, saved, saved_count, dot);
+    }
+    if (status != GSH_EVALUATOR_SOURCE_REQUEST &&
+        !gsh_source_workspace_release(evaluator->source_workspaces,
+                                      workspace)) {
+        return 125;
+    }
+    return status;
+}
+
+static int run_evaluator_source_builtin(native_evaluator *evaluator,
+                                        bool *builtin_failed)
+{
+    const gsh_native_command *command = &evaluator->pipeline->commands[0];
+    gsh_saved_descriptor saved[GSH_NATIVE_REDIRECT_CAP];
+    size_t saved_count = 0;
+    int assignment_status;
+    int status;
+
+    *builtin_failed = true;
+    assert(!evaluator->source_request_active);
+    if (save_redirect_descriptors(command, saved, &saved_count) == -1) {
+        perror("gsh: source redirection save");
+        return 125;
+    }
+    if (apply_evaluator_redirects(evaluator->pipeline, command,
+                                  &evaluator->options) == -1) {
+        perror("gsh: source redirection");
+        (void)restore_redirect_descriptors(saved, saved_count);
+        return 1;
+    }
+    assignment_status = apply_special_builtin_assignments(
+        evaluator->variables, evaluator->journal, command,
+        &evaluator->options);
+    if (assignment_status != GSH_ASSIGNMENT_OK) {
+        perror("gsh: source assignment");
+        status = assignment_status == GSH_ASSIGNMENT_JOURNAL_ERROR
+                     ? 125
+                     : 1;
+    } else {
+        status = request_builtin_source(evaluator, command, saved,
+                                        saved_count);
+    }
+    if (status == GSH_EVALUATOR_SOURCE_REQUEST) {
+        evaluator->source_request_negated = evaluator->pipeline->negated;
+        *builtin_failed = false;
+        return status;
+    }
+    if (restore_redirect_descriptors(saved, saved_count) == -1) {
+        perror("gsh: source redirection restore");
+        return 125;
+    }
+    *builtin_failed = status != 0;
+    return status == 125 ? 125
+                         : (evaluator->pipeline->negated
+                                ? (status == 0 ? 1 : 0)
+                                : status);
+}
 
 static void close_evaluator_exec_transaction(native_evaluator *evaluator)
 {
@@ -10312,6 +10822,11 @@ static bool native_preflight_node(native_evaluator *evaluator,
 
                     supported = native_planned_command_is_supported(
                         evaluator->pipeline, index, path);
+                    if (supported && native_source_builtin(planned) &&
+                        gsh_options_enabled(&evaluator->options,
+                                            GSH_OPTION_INTERACTIVE)) {
+                        supported = false;
+                    }
                 }
             }
         }
@@ -10346,6 +10861,14 @@ static bool native_preflight_node(native_evaluator *evaluator,
                     evaluator->exec_possible = true;
                     supported = preflight_record_exec_descriptors(
                         evaluator, command);
+                }
+                if (evaluator->pipeline->command_count == 1U &&
+                    native_source_builtin(command)) {
+                    evaluator->positional_mutation_possible = true;
+                    evaluator->directory_mutation_possible = true;
+                    evaluator->alias_mutation_possible = true;
+                    evaluator->function_mutation_possible = true;
+                    evaluator->command_cache_mutation_possible = true;
                 }
                 if (evaluator->pipeline->command_count == 1U &&
                     (native_hash_builtin(command) ||
@@ -10723,7 +11246,8 @@ static int evaluate_return(native_evaluator *evaluator,
     if (command->argc > 2U ||
         (command->assignment_count != 0 &&
          !command->command_regular_context) ||
-        command->redirect_count != 0 || evaluator->function_depth == 0) {
+        command->redirect_count != 0 ||
+        (evaluator->function_depth == 0 && evaluator->dot_depth == 0)) {
         fputs("gsh: return: invalid context or operands\n", stderr);
         return 1;
     }
@@ -11042,6 +11566,7 @@ static int native_evaluate_pipeline(native_evaluator *evaluator,
             !native_wait_builtin(tail) && !native_alias_builtin(tail) &&
             !native_hash_builtin(tail) &&
             !native_times_builtin(tail) &&
+            !native_source_builtin(tail) &&
             !native_exec_builtin(tail) &&
             !native_command_inspection_builtin(tail) &&
             !native_return_builtin(tail) &&
@@ -11234,6 +11759,20 @@ static int native_evaluate_pipeline(native_evaluator *evaluator,
             evaluator->fatal_error = true;
         }
     } else if (evaluator->pipeline->command_count == 1 &&
+               native_source_builtin(
+                   &evaluator->pipeline->commands[0])) {
+        const gsh_native_command *source_command =
+            &evaluator->pipeline->commands[0];
+        bool builtin_failed;
+
+        status = run_evaluator_source_builtin(evaluator,
+                                              &builtin_failed);
+        if (builtin_failed && !source_command->command_regular_context &&
+            !gsh_options_enabled(&evaluator->options,
+                                 GSH_OPTION_INTERACTIVE)) {
+            evaluator->fatal_error = true;
+        }
+    } else if (evaluator->pipeline->command_count == 1 &&
                native_exec_builtin(&evaluator->pipeline->commands[0])) {
         const gsh_native_command *exec_command =
             &evaluator->pipeline->commands[0];
@@ -11265,6 +11804,7 @@ static int native_evaluate_pipeline(native_evaluator *evaluator,
          native_alias_builtin(&evaluator->pipeline->commands[0]) ||
          native_hash_builtin(&evaluator->pipeline->commands[0]) ||
          native_times_builtin(&evaluator->pipeline->commands[0]) ||
+         native_source_builtin(&evaluator->pipeline->commands[0]) ||
          native_exec_builtin(&evaluator->pipeline->commands[0]) ||
          native_loop_control_builtin(
              &evaluator->pipeline->commands[0]) ||
@@ -11646,6 +12186,360 @@ static int native_evaluate_node_inner(native_evaluator *evaluator,
     return status;
 }
 
+static bool command_assigns_variable(
+    const gsh_native_command *command, const char *name,
+    size_t name_length)
+{
+    size_t index;
+
+    for (index = 0; index < command->assignment_count; index++) {
+        const char *assignment = command->assignments[index];
+        const char *separator = strchr(assignment, '=');
+
+        if (separator != NULL &&
+            (size_t)(separator - assignment) == name_length &&
+            memcmp(assignment, name, name_length) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static int copy_variable_entry(gsh_variable_store *destination,
+                               const gsh_variable_store *source,
+                               size_t index)
+{
+    const char *assignment;
+    const char *separator;
+    unsigned int attributes;
+    size_t name_length;
+    size_t value_length;
+
+    assignment = gsh_variables_assignment(source, index, &attributes);
+    separator = assignment == NULL ? NULL : strchr(assignment, '=');
+    if (separator == NULL) {
+        errno = EPROTO;
+        return -1;
+    }
+    name_length = (size_t)(separator - assignment);
+    if (!gsh_variables_is_set(source, index)) {
+        return gsh_variables_set_attributes(
+            destination, assignment, name_length,
+            GSH_VARIABLE_ATTRIBUTE_MASK, attributes);
+    }
+    value_length = strnlen(separator + 1U, GSH_VARIABLE_VALUE_CAP + 1U);
+    if (value_length > GSH_VARIABLE_VALUE_CAP) {
+        errno = EPROTO;
+        return -1;
+    }
+    return gsh_variables_set(
+        destination, assignment, name_length, separator + 1U,
+        value_length, GSH_VARIABLE_ATTRIBUTE_MASK, attributes);
+}
+
+static int copy_selected_variables(
+    gsh_variable_store *destination, const gsh_variable_store *source,
+    const gsh_native_command *command, bool assigned)
+{
+    size_t index;
+
+    for (index = 0; index < gsh_variables_count(source); index++) {
+        const char *assignment =
+            gsh_variables_assignment(source, index, NULL);
+        const char *separator =
+            assignment == NULL ? NULL : strchr(assignment, '=');
+        bool selected;
+
+        if (separator == NULL) {
+            errno = EPROTO;
+            return -1;
+        }
+        selected = command_assigns_variable(
+            command, assignment, (size_t)(separator - assignment));
+        if (selected == assigned &&
+            copy_variable_entry(destination, source, index) == -1) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/* ── Regular-Builtin Prefixes Are an Atomic Variable Overlay ───
+ * `command eval` and `command .` suppress special-builtin assignment
+ * persistence. The sourced program still runs in the current shell and may
+ * mutate every other variable. Rebuilding into a spare fixed store commits
+ * those mutations while restoring prefix names even if the temporary value
+ * became readonly; failure leaves the caller's store byte-for-byte intact.
+ * ─────────────────────────────────────────────────────────────── */
+static int merge_temporary_source_variables(
+    gsh_variable_store *original, const gsh_variable_store *evaluated,
+    gsh_variable_store *scratch, const gsh_native_command *command)
+{
+    bool temporary_path = command_assigns_variable(command, "PATH", 4U);
+    uint64_t path_generation =
+        temporary_path ? original->path_generation
+                       : evaluated->path_generation;
+
+    if (original == evaluated || original == scratch ||
+        evaluated == scratch) {
+        errno = EINVAL;
+        return -1;
+    }
+    gsh_variables_initialize(scratch);
+    if (copy_selected_variables(scratch, evaluated, command, false) == -1 ||
+        copy_selected_variables(scratch, original, command, true) == -1) {
+        return -1;
+    }
+    scratch->path_generation = path_generation;
+    memcpy(original, scratch, sizeof(*original));
+    return 0;
+}
+
+static void clear_source_request(native_evaluator *evaluator)
+{
+    evaluator->source_request_active = false;
+    evaluator->source_request_dot = false;
+    evaluator->source_request_negated = false;
+    evaluator->source_request_temporary_variables = false;
+    evaluator->source_request_workspace = NULL;
+    evaluator->source_request_command = NULL;
+    evaluator->source_request_input = NULL;
+    evaluator->source_request_input_length = 0;
+    evaluator->source_request_root = GSH_AST_NONE;
+    evaluator->source_request_saved_count = 0;
+}
+
+static bool source_request_is_valid(const native_evaluator *evaluator)
+{
+    const gsh_source_workspace *workspace =
+        evaluator->source_request_workspace;
+    bool input_owned = workspace != NULL &&
+                       (evaluator->source_request_input == workspace->input ||
+                        evaluator->source_request_input ==
+                            workspace->alias_expansion);
+
+    return evaluator->source_request_active && input_owned &&
+           evaluator->source_workspaces != NULL &&
+           evaluator->source_depth < GSH_SOURCE_DEPTH_CAP &&
+           evaluator->source_depth + 1U == gsh_source_workspaces_depth(
+                                                evaluator->source_workspaces) &&
+           evaluator->source_request_root < workspace->storage.node_count &&
+           evaluator->source_request_input_length <= GSH_SOURCE_INPUT_CAP &&
+           evaluator->source_request_saved_count <=
+               GSH_NATIVE_REDIRECT_CAP &&
+           (!evaluator->source_request_temporary_variables ||
+            (evaluator->source_request_command != NULL &&
+             evaluator->source_request_command->command_regular_context &&
+             evaluator->source_request_command->assignment_count != 0U));
+}
+
+static int abandon_source_request(native_evaluator *evaluator)
+{
+    gsh_source_workspace *workspace =
+        evaluator->source_request_workspace;
+    size_t saved_count = evaluator->source_request_saved_count <=
+                                 GSH_NATIVE_REDIRECT_CAP
+                             ? evaluator->source_request_saved_count
+                             : GSH_NATIVE_REDIRECT_CAP;
+    int status = 125;
+
+    if (restore_redirect_descriptors(evaluator->source_request_saved,
+                                     saved_count) ==
+        -1) {
+        perror("gsh: source redirection abandon");
+    }
+    if (!gsh_source_workspace_release(evaluator->source_workspaces,
+                                      workspace)) {
+        fputs("gsh: source workspace ownership failure\n", stderr);
+    }
+    clear_source_request(evaluator);
+    evaluator->fatal_error = true;
+    return status;
+}
+
+static void enter_source_frame(native_evaluator *evaluator,
+                               native_source_frame *frame,
+                               size_t *node_index)
+{
+    frame->input = evaluator->input;
+    frame->input_length = evaluator->input_length;
+    frame->storage = evaluator->storage;
+    frame->pipeline = evaluator->pipeline;
+    frame->variables = evaluator->variables;
+    frame->scope_base = evaluator->scope_base;
+    frame->journal = evaluator->journal;
+    frame->source_depth = evaluator->source_depth;
+    frame->dot_depth = evaluator->dot_depth;
+    frame->workspace = evaluator->source_request_workspace;
+    frame->saved_count = evaluator->source_request_saved_count;
+    frame->temporary_command = evaluator->source_request_command;
+    frame->consume_return = evaluator->source_request_dot;
+    frame->negated = evaluator->source_request_negated;
+    frame->temporary_variables =
+        evaluator->source_request_temporary_variables;
+    memcpy(frame->saved, evaluator->source_request_saved,
+           frame->saved_count * sizeof(frame->saved[0]));
+    evaluator->input = evaluator->source_request_input;
+    evaluator->input_length = evaluator->source_request_input_length;
+    evaluator->storage = &frame->workspace->storage;
+    evaluator->pipeline = &frame->workspace->pipeline;
+    if (frame->temporary_variables) {
+        evaluator->variables = &frame->workspace->scope_base;
+        evaluator->scope_base = &frame->workspace->variables;
+        evaluator->journal = NULL;
+    }
+    evaluator->source_depth++;
+    evaluator->dot_depth += frame->consume_return ? 1U : 0U;
+    *node_index = evaluator->source_request_root;
+    clear_source_request(evaluator);
+    assert(evaluator->source_depth ==
+           gsh_source_workspaces_depth(evaluator->source_workspaces));
+    assert(*node_index < evaluator->storage->node_count);
+}
+
+static int leave_source_frame(native_evaluator *evaluator,
+                              native_source_frame *frame, int status)
+{
+    bool merged =
+        !frame->temporary_variables ||
+        merge_temporary_source_variables(
+            frame->variables, evaluator->variables,
+            &frame->workspace->variables, frame->temporary_command) == 0;
+    bool restored = restore_redirect_descriptors(
+                        frame->saved, frame->saved_count) == 0;
+    bool released = gsh_source_workspace_release(
+        evaluator->source_workspaces, frame->workspace);
+
+    if (frame->consume_return && evaluator->returning) {
+        status = evaluator->return_status;
+        evaluator->returning = false;
+    }
+    if (!evaluator->fatal_error && frame->negated && status != 125) {
+        status = status == 0 ? 1 : 0;
+    }
+    evaluator->dot_depth = frame->dot_depth;
+    evaluator->source_depth = frame->source_depth;
+    evaluator->pipeline = frame->pipeline;
+    evaluator->storage = frame->storage;
+    evaluator->journal = frame->journal;
+    evaluator->scope_base = frame->scope_base;
+    evaluator->variables = frame->variables;
+    evaluator->input_length = frame->input_length;
+    evaluator->input = frame->input;
+    if (!merged || !restored || !released) {
+        fputs(!merged
+                  ? "gsh: source variable commit failed\n"
+                  : !restored
+                        ? "gsh: source redirection restore failed\n"
+                        : "gsh: source workspace ownership failure\n",
+              stderr);
+        evaluator->fatal_error = true;
+        status = 125;
+    }
+    if (released) {
+        assert(evaluator->source_depth == gsh_source_workspaces_depth(
+                                               evaluator->source_workspaces));
+    }
+    return status;
+}
+
+static int run_pipeline_source(native_evaluator *parent,
+                               gsh_native_pipeline *pipeline,
+                               size_t command_index,
+                               gsh_variable_store *variables)
+{
+    gsh_saved_descriptor no_saved_descriptors[GSH_NATIVE_REDIRECT_CAP];
+    gsh_background_table backgrounds;
+    native_source_frame frame;
+    native_evaluator child;
+    const gsh_native_command *command;
+    size_t root = GSH_AST_NONE;
+    int status;
+
+    if (parent == NULL || pipeline == NULL || variables == NULL ||
+        command_index >= pipeline->command_count) {
+        return 125;
+    }
+    child = *parent;
+    command = &pipeline->commands[command_index];
+    child.pipeline = pipeline;
+    child.variables = variables;
+    child.journal = NULL;
+    child.alias_journal = NULL;
+    child.pipeline_scope = NULL;
+    child.tail_exec_single = false;
+    child.exec_outcome_fd = -1;
+    child.exec_descriptor_socket = -1;
+    child.fatal_error = false;
+    child.returning = false;
+    clear_source_request(&child);
+    gsh_background_initialize(&backgrounds);
+    child.backgrounds = &backgrounds;
+    status = apply_special_builtin_assignments(
+        variables, NULL, command, &child.options);
+    if (status != GSH_ASSIGNMENT_OK) {
+        return status == GSH_ASSIGNMENT_JOURNAL_ERROR ? 125 : 1;
+    }
+    status = request_builtin_source(&child, command, no_saved_descriptors, 0);
+    if (status != GSH_EVALUATOR_SOURCE_REQUEST) {
+        return status;
+    }
+    child.source_request_negated = false;
+    if (!source_request_is_valid(&child)) {
+        return abandon_source_request(&child);
+    }
+    enter_source_frame(&child, &frame, &root);
+    status = native_evaluate_node(&child, root, 0);
+    return leave_source_frame(&child, &frame, status);
+}
+
+/* ── Nested Sources Use a Fixed Continuation Stack ──────────────
+ * Eval and dot must execute in the caller's environment while their
+ * invocation redirections remain active. A source request therefore hands
+ * ownership of its preallocated parser slot and saved descriptors to this
+ * bounded driver. Frames unwind in strict LIFO order on success, return, or
+ * failure; source nesting never allocates and cannot exceed the arena depth.
+ * ─────────────────────────────────────────────────────────────── */
+static int native_evaluate_node_sync(native_evaluator *evaluator,
+                                     size_t node_index, size_t depth)
+{
+    native_source_frame frames[GSH_SOURCE_DEPTH_CAP];
+    size_t frame_count = 0;
+    size_t iterations;
+    int status = 125;
+
+    for (iterations = 0; iterations <= GSH_SOURCE_DEPTH_CAP;
+         iterations++) {
+        status = native_evaluate_node_inner(evaluator, node_index, depth);
+        if (status != GSH_EVALUATOR_SOURCE_REQUEST &&
+            evaluator->source_request_active) {
+            status = abandon_source_request(evaluator);
+            break;
+        }
+        if (status != GSH_EVALUATOR_SOURCE_REQUEST) {
+            break;
+        }
+        if (frame_count == GSH_SOURCE_DEPTH_CAP ||
+            !source_request_is_valid(evaluator)) {
+            status = abandon_source_request(evaluator);
+            break;
+        }
+        enter_source_frame(evaluator, &frames[frame_count++], &node_index);
+        depth = 0;
+    }
+    if (status == GSH_EVALUATOR_SOURCE_REQUEST) {
+        status = abandon_source_request(evaluator);
+    }
+    while (frame_count > 0) {
+        status = leave_source_frame(evaluator, &frames[--frame_count],
+                                    status);
+    }
+    assert(!evaluator->source_request_active);
+    assert(frame_count == 0U);
+    evaluator->last_status = status;
+    return status;
+}
+
 static int native_evaluate_async(native_evaluator *evaluator,
                                  size_t node_index, size_t depth)
 {
@@ -11686,7 +12580,7 @@ static int native_evaluate_async(native_evaluator *evaluator,
         child.tail_exec_single =
             async_node_has_single_pipeline(evaluator, node_index);
         close_evaluator_exec_transaction(&child);
-        status = native_evaluate_node_inner(&child, node_index, depth);
+        status = native_evaluate_node_sync(&child, node_index, depth);
         _exit(status & 255);
     }
     if (pid == -1) {
@@ -11719,7 +12613,7 @@ static int native_evaluate_node(native_evaluator *evaluator,
     status = (evaluator->storage->nodes[node_index].flags &
               GSH_AST_FLAG_ASYNC) != 0
                  ? native_evaluate_async(evaluator, node_index, depth)
-                 : native_evaluate_node_inner(evaluator, node_index, depth);
+                 : native_evaluate_node_sync(evaluator, node_index, depth);
 
     evaluator->last_status = status;
     return status;

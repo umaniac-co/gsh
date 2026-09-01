@@ -3096,6 +3096,74 @@ static int fatal_fault_case(const char *executable, const char *fault)
     return failed;
 }
 
+static int wait_fault_child(pid_t pid, int *status)
+{
+    uint64_t deadline = monotonic_ns() + 2000000000ULL;
+    size_t attempts;
+
+    for (attempts = 0; attempts < 201U; attempts++) {
+        pid_t waited = waitpid(pid, status, WNOHANG);
+
+        if (waited == pid) {
+            return 0;
+        }
+        if (waited == -1 && errno != EINTR) {
+            return -1;
+        }
+        if (monotonic_ns() >= deadline) {
+            break;
+        }
+        (void)poll(NULL, 0, 10);
+    }
+    (void)kill(pid, SIGKILL);
+    (void)waitpid(pid, status, 0);
+    return -1;
+}
+
+static int noninteractive_fault_case(const char *executable,
+                                     const char *fault,
+                                     const char *command, int expected,
+                                     const char *diagnostic)
+{
+    FILE *capture = tmpfile();
+    char output[4096];
+    size_t length = 0;
+    int status = 0;
+    pid_t pid;
+
+    if (capture == NULL) {
+        return 1;
+    }
+    pid = fork();
+    if (pid == 0) {
+        int descriptor = fileno(capture);
+
+        if (setenv("GSH_FAULT", fault, 1) == -1 ||
+            dup2(descriptor, STDOUT_FILENO) == -1 ||
+            dup2(descriptor, STDERR_FILENO) == -1) {
+            _exit(126);
+        }
+        execl(executable, executable, "--native-only", "-c", command,
+              (char *)NULL);
+        _exit(127);
+    }
+    if (pid == -1 || wait_fault_child(pid, &status) == -1) {
+        (void)fclose(capture);
+        return 1;
+    }
+    if (fseek(capture, 0, SEEK_SET) == 0) {
+        length = fread(output, 1, sizeof(output), capture);
+    }
+    (void)fclose(capture);
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != expected ||
+        find_bytes((const unsigned char *)output, length, diagnostic) == NULL) {
+        fprintf(stderr, "pty fault: non-interactive case failed: %s\n",
+                fault);
+        return 1;
+    }
+    return 0;
+}
+
 static int fault_injection_flow(const char *executable)
 {
     static const struct {
@@ -3295,12 +3363,24 @@ static int fault_injection_flow(const char *executable)
                                          "function-commit-malformed");
     failed |= function_commit_fault_case(executable,
                                          "function-commit-write");
+    failed |= noninteractive_fault_case(
+        executable, "source-workspace-exhaustion", "eval :", 125,
+        "nested source workspace limit exceeded");
+    failed |= noninteractive_fault_case(
+        executable, "descriptor-save", "eval : >/dev/null", 125,
+        "source redirection save");
+    failed |= noninteractive_fault_case(
+        executable, "redirect-open", "eval : >/dev/null", 1,
+        "source redirection");
+    failed |= noninteractive_fault_case(
+        executable, "descriptor-dup", "eval : 1>&2", 1,
+        "source redirection");
     for (index = 0; index < sizeof(fatal_cases) / sizeof(fatal_cases[0]);
          index++) {
         failed |= fatal_fault_case(executable, fatal_cases[index]);
     }
     if (!failed) {
-        puts("pty fault: 77 deterministic boundary failures passed");
+        puts("pty fault: 81 deterministic boundary failures passed");
     }
     return failed;
 }

@@ -80,6 +80,33 @@ static int build_nested_substitution(char *command, size_t capacity,
     return 0;
 }
 
+static int build_nested_eval(char *command, size_t capacity,
+                             size_t final_index)
+{
+    size_t used = 0;
+    size_t index;
+    int length;
+
+    length = snprintf(command, capacity, "GSH_EVAL_DEPTH_0=:");
+    if (length < 0 || (size_t)length >= capacity) {
+        return -1;
+    }
+    used = (size_t)length;
+    for (index = 1U; index <= final_index; index++) {
+        length = snprintf(
+            command + used, capacity - used,
+            "; GSH_EVAL_DEPTH_%zu='eval \"$GSH_EVAL_DEPTH_%zu\"'",
+            index, index - 1U);
+        if (length < 0 || (size_t)length >= capacity - used) {
+            return -1;
+        }
+        used += (size_t)length;
+    }
+    length = snprintf(command + used, capacity - used,
+                      "; eval \"$GSH_EVAL_DEPTH_%zu\"", final_index);
+    return length < 0 || (size_t)length >= capacity - used ? -1 : 0;
+}
+
 static int configure_utf8_locale(void)
 {
     const char *name;
@@ -374,6 +401,381 @@ static int native_invocation_cases(const char *executable)
     }
     (void)unlink(path);
     (void)rmdir(directory);
+    return failed;
+}
+
+static int create_source_fixture(const char *path, const char *text,
+                                 mode_t mode)
+{
+    size_t length = strlen(text);
+    size_t written = 0;
+    size_t attempts;
+    int descriptor = open(path, O_WRONLY | O_CREAT | O_EXCL, mode);
+
+    if (descriptor == -1) {
+        return -1;
+    }
+    for (attempts = 0; written < length && attempts <= length; attempts++) {
+        ssize_t count = write(descriptor, text + written,
+                              length - written);
+
+        if (count > 0) {
+            written += (size_t)count;
+        } else if (count == -1 && errno == EINTR) {
+            continue;
+        } else {
+            (void)close(descriptor);
+            return -1;
+        }
+    }
+    {
+        int status = written == length && fchmod(descriptor, mode) == 0
+                         ? 0
+                         : -1;
+
+        if (close(descriptor) == -1) {
+            status = -1;
+        }
+        return status;
+    }
+}
+
+typedef struct {
+    char directory[64];
+    char state[1024];
+    char return_script[1024];
+    char eval_return[1024];
+    char inner[1024];
+    char outer[1024];
+    char empty[1024];
+    char false_script[1024];
+    char cd[1024];
+    char parse[1024];
+    char print[1024];
+    char output[1024];
+} source_fixtures;
+
+static int source_fixture_path(char output[1024], const char *directory,
+                               const char *name)
+{
+    int length = snprintf(output, 1024, "%s/%s", directory, name);
+
+    return length < 0 || length >= 1024 ? -1 : 0;
+}
+
+static int initialize_source_paths(source_fixtures *fixtures)
+{
+    static const char template[] = "/tmp/gsh-native-source-XXXXXX";
+
+    memset(fixtures, 0, sizeof(*fixtures));
+    memcpy(fixtures->directory, template, sizeof(template));
+    if (mkdtemp(fixtures->directory) == NULL) {
+        return -1;
+    }
+    return source_fixture_path(fixtures->state, fixtures->directory,
+                               "state.sh") == -1 ||
+                   source_fixture_path(fixtures->return_script,
+                                       fixtures->directory,
+                                       "return.sh") == -1 ||
+                   source_fixture_path(fixtures->eval_return,
+                                       fixtures->directory,
+                                       "eval-return.sh") == -1 ||
+                   source_fixture_path(fixtures->inner, fixtures->directory,
+                                       "inner.sh") == -1 ||
+                   source_fixture_path(fixtures->outer, fixtures->directory,
+                                       "outer.sh") == -1 ||
+                   source_fixture_path(fixtures->empty, fixtures->directory,
+                                       "empty.sh") == -1 ||
+                   source_fixture_path(fixtures->false_script,
+                                       fixtures->directory,
+                                       "false.sh") == -1 ||
+                   source_fixture_path(fixtures->cd, fixtures->directory,
+                                       "cd.sh") == -1 ||
+                   source_fixture_path(fixtures->parse, fixtures->directory,
+                                       "parse.sh") == -1 ||
+                   source_fixture_path(fixtures->print, fixtures->directory,
+                                       "print.sh") == -1 ||
+                   source_fixture_path(fixtures->output, fixtures->directory,
+                                       "output") == -1
+               ? -1
+               : 0;
+}
+
+static int initialize_source_files(const source_fixtures *fixtures)
+{
+    static const char state[] =
+        "GSH_DOT_VALUE=loaded\n"
+        "gsh_dot_function() { /usr/bin/printf function; }\n"
+        "alias gsh_dot_alias=/usr/bin/printf\n";
+    char outer[2300];
+    int length = snprintf(
+        outer, sizeof(outer),
+        ". '%s'\n/usr/bin/printf 'outer:%%s' \"$?\"\n",
+        fixtures->inner);
+
+    if (length < 0 || length >= (int)sizeof(outer)) {
+        return -1;
+    }
+    return create_source_fixture(fixtures->state, state, 0400) == -1 ||
+                   create_source_fixture(
+                       fixtures->return_script,
+                       "/usr/bin/printf before\nreturn 7\n"
+                       "/usr/bin/printf BAD\n",
+                       0600) == -1 ||
+                   create_source_fixture(
+                       fixtures->eval_return,
+                       "eval 'return 9'\n/usr/bin/printf BAD\n",
+                       0600) == -1 ||
+                   create_source_fixture(
+                       fixtures->inner,
+                       "/usr/bin/printf inner\nreturn 4\n"
+                       "/usr/bin/printf BAD\n",
+                       0600) == -1 ||
+                   create_source_fixture(fixtures->outer, outer, 0600) ==
+                       -1 ||
+                   create_source_fixture(fixtures->empty, "", 0600) == -1 ||
+                   create_source_fixture(fixtures->false_script, "false\n",
+                                         0600) == -1 ||
+                   create_source_fixture(fixtures->cd, "cd /\n", 0600) ==
+                       -1 ||
+                   create_source_fixture(fixtures->parse, "if\n", 0600) ==
+                       -1 ||
+                   create_source_fixture(fixtures->print,
+                                         "/usr/bin/printf source\n",
+                                         0600) == -1
+               ? -1
+               : 0;
+}
+
+static void destroy_source_fixtures(const source_fixtures *fixtures)
+{
+    const char *paths[] = {
+        fixtures->output, fixtures->print, fixtures->parse, fixtures->cd,
+        fixtures->false_script, fixtures->empty, fixtures->outer,
+        fixtures->inner, fixtures->eval_return, fixtures->return_script,
+        fixtures->state};
+    size_t index;
+
+    for (index = 0; index < sizeof(paths) / sizeof(paths[0]); index++) {
+        if (paths[index][0] != '\0') {
+            (void)unlink(paths[index]);
+        }
+    }
+    if (fixtures->directory[0] != '\0') {
+        (void)rmdir(fixtures->directory);
+    }
+}
+
+static int source_state_cases(const char *executable,
+                              const source_fixtures *fixtures)
+{
+    char command[8192];
+    syntax_case test = {"dot", "slash pathname sources current state",
+                        command, 0, "functionalias"};
+
+    if (snprintf(command, sizeof(command),
+                 ". '%s'\n/bin/test \"$GSH_DOT_VALUE\" = loaded; "
+                 "gsh_dot_function; gsh_dot_alias alias",
+                 fixtures->state) >= (int)sizeof(command) ||
+        run_case(executable, &test, false) != 0) {
+        return 1;
+    }
+    test.name = "PATH search accepts a non-executable readable file";
+    test.diagnostic = NULL;
+    if (snprintf(command, sizeof(command),
+                 "PATH='%s:/bin:/usr/bin' . -- state.sh; "
+                 "/bin/test \"$GSH_DOT_VALUE:$PATH\" = "
+                 "loaded:'%s:/bin:/usr/bin'",
+                 fixtures->directory, fixtures->directory) >=
+            (int)sizeof(command) ||
+        run_case(executable, &test, false) != 0) {
+        return 1;
+    }
+    test.name = "command dot uses and restores its temporary PATH";
+    if (snprintf(command, sizeof(command),
+                 "GSH_DOT_PATH=$PATH; "
+                 "PATH='%s:/bin:/usr/bin' command . state.sh; "
+                 "/bin/test \"$GSH_DOT_VALUE\" = loaded; "
+                 "/bin/test \"$PATH\" = \"$GSH_DOT_PATH\"",
+                 fixtures->directory) >= (int)sizeof(command) ||
+        run_case(executable, &test, false) != 0) {
+        return 1;
+    }
+    test.name = "subshell dot mutation is isolated";
+    if (snprintf(command, sizeof(command),
+                 "GSH_DOT_VALUE=parent; (. '%s'; "
+                 "/bin/test \"$GSH_DOT_VALUE\" = loaded); "
+                 "/bin/test \"$GSH_DOT_VALUE\" = parent",
+                 fixtures->state) >= (int)sizeof(command) ||
+        run_case(executable, &test, false) != 0) {
+        return 1;
+    }
+    test.name = "pipeline dot mutation is isolated";
+    if (snprintf(command, sizeof(command),
+                 "GSH_DOT_VALUE=parent; . '%s' | true; "
+                 "/bin/test \"$GSH_DOT_VALUE\" = parent",
+                 fixtures->state) >= (int)sizeof(command) ||
+        run_case(executable, &test, false) != 0) {
+        return 1;
+    }
+    return 0;
+}
+
+static int source_return_cases(const char *executable,
+                               const source_fixtures *fixtures)
+{
+    char command[8192];
+    syntax_case test = {"dot", "dot return stops its source", command, 0,
+                        "beforeafter:7"};
+
+    if (snprintf(command, sizeof(command),
+                 ". '%s'; GSH_DOT_STATUS=$?; "
+                 "/usr/bin/printf 'after:%%s' \"$GSH_DOT_STATUS\"",
+                 fixtures->return_script) >= (int)sizeof(command) ||
+        run_case(executable, &test, false) != 0) {
+        return 1;
+    }
+    test.name = "dot return does not return from its caller function";
+    test.diagnostic = "beforecontinued";
+    if (snprintf(command, sizeof(command),
+                 "gsh_dot_call() { . '%s'; /usr/bin/printf continued; }; "
+                 "gsh_dot_call",
+                 fixtures->return_script) >= (int)sizeof(command) ||
+        run_case(executable, &test, false) != 0) {
+        return 1;
+    }
+    test.name = "return propagates through eval to the dot boundary";
+    test.diagnostic = "status:9";
+    if (snprintf(command, sizeof(command),
+                 ". '%s'; /usr/bin/printf 'status:%%s' \"$?\"",
+                 fixtures->eval_return) >= (int)sizeof(command) ||
+        run_case(executable, &test, false) != 0) {
+        return 1;
+    }
+    test.name = "nested dot return unwinds only its own source";
+    test.diagnostic = "innerouter:4";
+    if (snprintf(command, sizeof(command), ". '%s'", fixtures->outer) >=
+            (int)sizeof(command) ||
+        run_case(executable, &test, false) != 0) {
+        return 1;
+    }
+    return 0;
+}
+
+static int source_status_cases(const char *executable,
+                               const source_fixtures *fixtures)
+{
+    char command[8192];
+    syntax_case test = {"dot", "dot redirection spans its source", command,
+                        0, "DOT_REDIRECT_RESTORED"};
+
+    if (snprintf(command, sizeof(command),
+                 ". '%s' >'%s'; "
+                 "/bin/test \"$(/bin/cat '%s')\" = source; "
+                 "/usr/bin/printf DOT_REDIRECT_RESTORED",
+                 fixtures->print, fixtures->output, fixtures->output) >=
+            (int)sizeof(command) ||
+        run_case(executable, &test, false) != 0) {
+        return 1;
+    }
+    test.name = "dot supplies a pipeline stage";
+    test.diagnostic = "SOURCE";
+    if (snprintf(command, sizeof(command),
+                 ". '%s' | /usr/bin/tr a-z A-Z", fixtures->print) >=
+            (int)sizeof(command) ||
+        run_case(executable, &test, false) != 0) {
+        return 1;
+    }
+    test.name = "empty dot script returns zero";
+    test.diagnostic = NULL;
+    if (snprintf(command, sizeof(command), ". '%s'", fixtures->empty) >=
+            (int)sizeof(command) ||
+        run_case(executable, &test, false) != 0) {
+        return 1;
+    }
+    test.name = "dot returns the last command status";
+    if (snprintf(command, sizeof(command),
+                 ". '%s'; /bin/test \"$?\" -eq 1",
+                 fixtures->false_script) >= (int)sizeof(command) ||
+        run_case(executable, &test, false) != 0) {
+        return 1;
+    }
+    test.name = "dot supplies the last pipeline status";
+    test.status = 1;
+    test.diagnostic = NULL;
+    if (snprintf(command, sizeof(command),
+                 "/usr/bin/true | . '%s'", fixtures->false_script) >=
+            (int)sizeof(command) ||
+        run_case(executable, &test, false) != 0) {
+        return 1;
+    }
+    test.name = "directory mutation in dot persists";
+    test.status = 0;
+    if (snprintf(command, sizeof(command),
+                 ". '%s'; /bin/test \"$PWD\" = /", fixtures->cd) >=
+            (int)sizeof(command) ||
+        run_case(executable, &test, false) != 0) {
+        return 1;
+    }
+    return 0;
+}
+
+static int source_error_cases(const char *executable,
+                              const source_fixtures *fixtures)
+{
+    char command[8192];
+    syntax_case test = {"dot", "missing dot file aborts the shell", command,
+                        1, "No such file"};
+
+    if (snprintf(command, sizeof(command),
+                 ". '%s/missing'; /usr/bin/printf BAD_DOT",
+                 fixtures->directory) >= (int)sizeof(command) ||
+        run_case(executable, &test, false) != 0) {
+        return 1;
+    }
+    test.name = "dot syntax error aborts a non-interactive shell";
+    test.status = 2;
+    test.diagnostic = "incomplete";
+    if (snprintf(command, sizeof(command),
+                 ". '%s'; /usr/bin/printf BAD_DOT", fixtures->parse) >=
+            (int)sizeof(command) ||
+        run_case(executable, &test, false) != 0) {
+        return 1;
+    }
+    test.name = "dot rejects extra operands";
+    test.diagnostic = "exactly one file operand";
+    if (snprintf(command, sizeof(command), ". '%s' extra",
+                 fixtures->state) >= (int)sizeof(command) ||
+        run_case(executable, &test, false) != 0) {
+        return 1;
+    }
+    test.name = "command suppresses dot special error semantics";
+    test.status = 0;
+    test.diagnostic = "DOT_RECOVERED";
+    if (snprintf(command, sizeof(command),
+                 "command . '%s/missing'; /usr/bin/printf DOT_RECOVERED",
+                 fixtures->directory) >= (int)sizeof(command) ||
+        run_case(executable, &test, false) != 0) {
+        return 1;
+    }
+    return 0;
+}
+
+static int native_source_cases(const char *executable)
+{
+    source_fixtures fixtures;
+    int failed;
+
+    if (initialize_source_paths(&fixtures) == -1) {
+        destroy_source_fixtures(&fixtures);
+        return 1;
+    }
+    failed = initialize_source_files(&fixtures) == -1 ||
+             source_state_cases(executable, &fixtures) != 0 ||
+             source_return_cases(executable, &fixtures) != 0 ||
+             source_status_cases(executable, &fixtures) != 0 ||
+             source_error_cases(executable, &fixtures) != 0;
+    destroy_source_fixtures(&fixtures);
     return failed;
 }
 
@@ -869,6 +1271,30 @@ static int native_limit_cases(const char *executable)
     }
     test.name = "native nested source depth limit";
     test.status = 0;
+    test.diagnostic = "nested source workspace limit exceeded";
+    if (run_case(executable, &test, false) != 0) {
+        return 1;
+    }
+    test.status = 2;
+    test.diagnostic = "native execution unsupported";
+
+    if (build_nested_eval(command, sizeof(command),
+                          GSH_SOURCE_DEPTH_CAP - 1U) == -1) {
+        return 1;
+    }
+    test.name = "native nested eval depth boundary";
+    test.status = 0;
+    test.diagnostic = NULL;
+    if (run_case(executable, &test, false) != 0) {
+        return 1;
+    }
+
+    if (build_nested_eval(command, sizeof(command),
+                          GSH_SOURCE_DEPTH_CAP) == -1) {
+        return 1;
+    }
+    test.name = "native nested eval depth limit";
+    test.status = 125;
     test.diagnostic = "nested source workspace limit exceeded";
     if (run_case(executable, &test, false) != 0) {
         return 1;
@@ -2489,6 +2915,100 @@ int main(int argc, char **argv)
          "/bin/rm -rf \"$GSH_HASH_ROOT\"; "
          "/bin/test \"$GSH_HASH_STATUS\" -eq 0",
          0, NULL},
+        {"eval", "eval is identified as a special builtin",
+         "command -V eval", 0, "eval is a special builtin\n"},
+        {"eval", "eval without arguments succeeds", "eval", 0, NULL},
+        {"eval", "eval accepts the option terminator",
+         "eval -- '/usr/bin/printf EVAL_END'", 0, "EVAL_END"},
+        {"eval", "eval concatenates operands with spaces",
+         "eval '/usr/bin/printf' '\"<%s>\\n\"' '\"alpha beta\"'",
+         0, "<alpha beta>\n"},
+        {"eval", "eval mutates the current variable environment",
+         "GSH_EVAL_VALUE=before; eval 'GSH_EVAL_VALUE=after'; "
+         "/bin/test \"$GSH_EVAL_VALUE\" = after",
+         0, NULL},
+        {"eval", "leading special assignment persists through eval",
+         "GSH_EVAL_LEADING=visible eval "
+         "'/bin/test \"$GSH_EVAL_LEADING\" = visible'; "
+         "/bin/test \"$GSH_EVAL_LEADING\" = visible",
+         0, NULL},
+        {"eval", "eval returns its evaluated command status",
+         "eval false; /bin/test \"$?\" -eq 1", 0, NULL},
+        {"eval", "negation applies to the complete eval",
+         "! eval true", 1, NULL},
+        {"eval", "eval defines a persistent function",
+         "eval 'gsh_eval_function() { /usr/bin/printf function; }'; "
+         "gsh_eval_function",
+         0, "function"},
+        {"eval", "eval defines an alias for the next complete command",
+         "eval 'alias gsh_eval_alias=/usr/bin/printf'\n"
+         "gsh_eval_alias alias",
+         0, "alias"},
+        {"eval", "eval executes inside a conditional",
+         "if eval true; then /usr/bin/printf selected; else false; fi",
+         0, "selected"},
+        {"eval", "eval supplies a pipeline stage",
+         "eval '/usr/bin/printf pipeline' | /usr/bin/tr a-z A-Z",
+         0, "PIPELINE"},
+        {"eval", "pipeline eval mutation is isolated",
+         "GSH_EVAL_PIPE=parent; eval 'GSH_EVAL_PIPE=child' | true; "
+         "/bin/test \"$GSH_EVAL_PIPE\" = parent",
+         0, NULL},
+        {"eval", "subshell eval mutation is isolated",
+         "GSH_EVAL_SUBSHELL=parent; (eval 'GSH_EVAL_SUBSHELL=child'); "
+         "/bin/test \"$GSH_EVAL_SUBSHELL\" = parent",
+         0, NULL},
+        {"eval", "asynchronous eval mutation is isolated",
+         "GSH_EVAL_ASYNC=parent; eval 'GSH_EVAL_ASYNC=child' & wait; "
+         "/bin/test \"$GSH_EVAL_ASYNC\" = parent",
+         0, NULL},
+        {"eval", "eval runs inside command substitution",
+         "/bin/test \"$(eval '/usr/bin/printf substituted')\" = "
+         "substituted",
+         0, NULL},
+        {"eval", "eval loop control retains the caller context",
+         "GSH_EVAL_LOOPS=0; for item in one two; do "
+         "GSH_EVAL_LOOPS=$((GSH_EVAL_LOOPS + 1)); eval break; done; "
+         "/bin/test \"$GSH_EVAL_LOOPS\" -eq 1",
+         0, NULL},
+        {"eval", "return propagates through eval to its function",
+         "gsh_eval_return() { eval 'return 7'; /usr/bin/printf BAD; }; "
+         "gsh_eval_return; /bin/test \"$?\" -eq 7",
+         0, NULL},
+        {"eval", "eval can replace positional parameters",
+         "set -- old; eval 'set -- alpha beta'; "
+         "/bin/test \"$#:$1:$2\" = 2:alpha:beta",
+         0, NULL},
+        {"eval", "eval redirection spans evaluated commands and restores",
+         "GSH_EVAL_FILE=/tmp/gsh-eval-redirection-$$; "
+         "eval '/usr/bin/printf inner' >\"$GSH_EVAL_FILE\"; "
+         "/usr/bin/printf outer; /bin/cat \"$GSH_EVAL_FILE\"; "
+         "/bin/rm -f \"$GSH_EVAL_FILE\"",
+         0, "outerinner"},
+        {"eval", "eval syntax error aborts a non-interactive shell",
+         "eval 'if'; /usr/bin/printf BAD_EVAL", 2, "incomplete"},
+        {"eval", "command suppresses eval special error semantics",
+         "command eval 'if'; /usr/bin/printf EVAL_RECOVERED", 0,
+         "EVAL_RECOVERED"},
+        {"eval", "command eval exposes but restores its prefix assignment",
+         "unset GSH_COMMAND_EVAL; "
+         "GSH_COMMAND_EVAL=temp command eval "
+         "'/usr/bin/printenv GSH_COMMAND_EVAL; "
+         "GSH_COMMAND_EVAL=changed; GSH_EVAL_EFFECT=kept'; "
+         "/bin/test -z \"${GSH_COMMAND_EVAL+set}\"; "
+         "/bin/test \"$GSH_EVAL_EFFECT\" = kept",
+         0, "temp\n"},
+        {"eval", "command eval atomically restores a readonly prefix",
+         "GSH_COMMAND_EVAL=before; "
+         "GSH_COMMAND_EVAL=temp command eval "
+         "'readonly GSH_COMMAND_EVAL; GSH_EVAL_READONLY_EFFECT=kept'; "
+         "/bin/test \"$GSH_COMMAND_EVAL\" = before; "
+         "/bin/test \"$GSH_EVAL_READONLY_EFFECT\" = kept; "
+         "GSH_COMMAND_EVAL=after; "
+         "/bin/test \"$GSH_COMMAND_EVAL\" = after",
+         0, NULL},
+        {"dot", "dot is identified as a special builtin",
+         "command -V .", 0, ". is a special builtin\n"},
         {"exec", "exec is identified as a special builtin",
          "command -V exec", 0, "exec is a special builtin\n"},
         {"exec", "exec overlays the shell with an external utility",
@@ -2951,6 +3471,10 @@ int main(int argc, char **argv)
             unsupported++;
         }
     }
+    if (native_source_cases(argv[1]) != 0) {
+        return 1;
+    }
+    execution_passed += 19U;
     if (native_redirection_cases(argv[1]) != 0) {
         return 1;
     }
@@ -2998,7 +3522,7 @@ int main(int argc, char **argv)
     if (native_limit_cases(argv[1]) != 0) {
         return 1;
     }
-    limit_passed = 15;
+    limit_passed = 17;
     printf("POSIX native tranche: syntax=%zu execution=%zu limits=%zu "
            "unsupported=%zu delegated=0\n",
            passed + 1U, execution_passed, limit_passed, unsupported);

@@ -96,8 +96,8 @@ Command substitution and pathname enumeration execute only in isolated
 evaluator processes; neither can block the interactive reactor. Nested source
 evaluation uses an eight-slot LIFO arena allocated once at startup. Each slot
 owns parser, planner, transactional, function, alias, and 1 MiB source storage,
-so entering a command substitution performs no heap allocation and depth
-exhaustion is deterministic. The same allocation owns the persistent root
+so entering a command substitution, `eval`, or dot script performs no heap
+allocation and depth exhaustion is deterministic. The same allocation owns the persistent root
 alias and function stores, removing their former first-use allocations without
 faulting in their unused text and parser arenas. `-c` maps its command name and
 arguments to `$0` and the positional parameters, with native
@@ -166,6 +166,19 @@ the owning shell session with the utility's status. A direct interactive
 `exec` preserves the shell PID; a compound interactive `exec` still overlays
 the isolated evaluator child before its owner exits, so exact original-PID
 identity remains continuation-engine work.
+The `eval` and `.` special builtins are native in the non-interactive evaluator.
+`eval` concatenates operands with one space, supports an optional `--`, parses
+the result in a preallocated source slot, and executes it in the caller's
+environment. Dot accepts `--`, searches `PATH` for a readable file without
+requiring execute permission, and preserves variables, options, aliases,
+functions, positionals, directory changes, exit status, and invocation
+redirections. `return` unwinds the nearest dot boundary, including through a
+nested `eval`. Eval and dot also execute as isolated pipeline stages, in
+subshells, asynchronous lists, and command substitutions. Source ownership and descriptor restoration are strict LIFO on
+success and every failure path; the ninth simultaneously active source is
+rejected deterministically. Interactive `eval` and dot remain outside the
+native continuation engine: they currently take the unsupported-syntax
+compatibility bridge and therefore do not yet provide parent-state semantics.
 `hash` and ordinary external execution share a 128-entry, open-addressed
 command-location cache with allocation-free steady-state lookup. Every
 successful `PATH` assignment invalidates it, stale executable locations fall
@@ -186,8 +199,8 @@ incomplete. The interactive unsupported-syntax bridge and the external
 `ENOEXEC` script fallback must disappear from normal shell-language execution
 before `gsh` can claim POSIX.1-2024 shell-language conformance.
 
-The builtins implemented in `gsh` itself include `cd`, `command` within the
-target set described above, `exit`, `hash`, `pwd`, `export`,
+The builtins implemented in `gsh` itself include `.`, `cd`, `command` within the
+target set described above, `eval`, `exec`, `exit`, `hash`, `pwd`, `export`,
 `readonly`, `unset`, `ulimit`, `umask`, `times`, `:`, `true`, `false`, `fg`, `bg`,
 `set`, `shift`, `type`, `wait`, `break`, `continue`, `alias`, `unalias`,
 `help`, and `rt` within their currently documented contexts. The exact standalone
@@ -277,13 +290,14 @@ make fuzz-pty-sanitize
 make soak SOAK_SECONDS=60
 ```
 
-`check-fault` uses a separate test-only binary and exercises 77 deterministic
+`check-fault` uses a separate test-only binary and exercises 81 deterministic
 failure points. The production build contains neither the injection
 configuration nor its fault names. `check-resource` covers runtime descriptor
 and process exhaustion, data-limit capability, bounded single-line and
 multiline input, signal storms, recovery after a rejected command, and failed
 initialization. The conformance limit gate also exercises the last valid nested
-source slot and deterministic rejection of the next level. Limits applied
+command-substitution and `eval` source slots plus deterministic rejection of
+the next level. Limits applied
 after startup use gsh's native `ulimit`, so the
 dynamic loader is outside the measurement; translated architectures are
 reported as unsupported rather than native evidence. Native conformance also
@@ -528,7 +542,7 @@ source before evaluation. It rejects null bytes and oversized input
 deterministically. Streaming complete-command ingestion, the standard-input
 no-read-ahead rule, and removal of the temporary size ceiling remain required
 before the invocation interface is POSIX-complete. Interactive unsupported
-syntax and `ENOEXEC` handling for external text files still have compatibility
+syntax—including interactive `eval` and dot—and `ENOEXEC` handling for external text files still have compatibility
 fallbacks; non-interactive top-level input does not.
 
 ## Current scope
@@ -556,6 +570,12 @@ native.
 
 Function definition redirects, invocation redirects, and execution in
 pipelines, subshells, command substitutions, and asynchronous lists are native.
+Non-interactive `eval` and dot scripts reuse those semantics in the current
+environment, including function/alias definition and dot-local `return`.
+When `command` suppresses their special-builtin properties, leading
+assignments use an atomic fixed-store overlay: they are visible during the
+source and exported to nested utilities, their names are restored afterward
+even if made readonly, and all other source mutations still commit.
 Function command-search and error semantics, attached redirections on the
 remaining compound commands, the remaining required builtins, monitor-mode
 job selection/notification, and dynamic
@@ -582,8 +602,10 @@ replaces the worker.
 
 This is soft real-time engineering, not hard real-time or mission-grade status.
 The repository has executable conformance tranches, bounded fuzz/property
-checks, sanitizer builds, 77 deterministic fault cases, resource-pressure
-scenarios, and a configurable soak runner. The current same-source tranche
+checks, sanitizer builds, 81 deterministic fault cases, resource-pressure
+scenarios, and a configurable soak runner. The current native tranche contains
+491 execution cases, 30 syntax cases, and 17 deterministic limit cases with
+one explicitly unsupported case and no delegated cases. The current same-source tranche
 passes the local macOS matrix. The preceding pushed revision also passes the
 macOS arm64 and Ubuntu x86-64 GCC/Clang CI rows; the current worktree does not
 gain that same-revision remote evidence until those jobs run after publication.

@@ -75,8 +75,9 @@ static bool reserved_word_name(const char *name, size_t length)
 static bool implemented_special_name(const char *name, size_t length)
 {
     static const char *const names[] = {
-        ":",      "break", "continue", "exec", "exit", "export",
-        "readonly", "return", "set", "shift", "times", "unset",
+        ".",      ":",      "break", "continue", "eval", "exec",
+        "exit",   "export", "readonly", "return", "set", "shift",
+        "times",  "unset",
     };
 
     return name_in_table(name, length, names,
