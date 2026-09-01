@@ -8,6 +8,7 @@ TARGET := build/gsh
 HISTORY_AGENT_TARGET := build/gsh-history-agent
 SOURCES := src/gsh.c src/async_repl.c src/posix_lexer.c \
 	src/posix_parser.c src/native_plan.c \
+	src/source_workspace.c \
 	src/history_client.c src/history_store.c src/shell_config.c \
 	src/shell_variables.c src/builtin_common.c src/command_cache.c \
 	src/builtin_command.c \
@@ -36,6 +37,7 @@ ALIAS_TEST_TARGET := build/shell-aliases-test
 FUNCTION_TEST_TARGET := build/shell-functions-test
 FUNCTION_SANITIZE_TEST_TARGET := build/shell-functions-test-sanitize
 CONFIG_TEST_TARGET := build/shell-config-test
+SOURCE_WORKSPACE_TEST_TARGET := build/source-workspace-test
 BASH_BIN ?= $(shell command -v bash)
 ZSH_BIN ?= $(shell command -v zsh)
 SOAK_SECONDS ?= 60
@@ -59,7 +61,7 @@ SODIUM_LIBS := $(shell if command -v pkg-config >/dev/null 2>&1; then \
 	then echo -L$(SODIUM_PREFIX)/lib -lsodium; else echo -lsodium; fi)
 
 .PHONY: all analyze bench bench-record bench-alias bench-alias-record check check-fault check-resource check-sanitize clean
-.PHONY: check-aliases check-background check-command-cache check-config check-functions check-positionals check-variables conformance fuzz-libfuzzer fuzz-pty fuzz-pty-sanitize fuzz-sanitize
+.PHONY: check-aliases check-background check-command-cache check-config check-functions check-positionals check-source-workspaces check-variables conformance fuzz-libfuzzer fuzz-pty fuzz-pty-sanitize fuzz-sanitize
 .PHONY: fuzz-smoke policy soak
 .PHONY: verify-fast
 
@@ -153,6 +155,11 @@ $(CONFIG_TEST_TARGET): tests/shell_config_test.c src/shell_config.c | build
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/shell_config_test.c \
 		src/shell_config.c $(LDFLAGS) -o $@
 
+$(SOURCE_WORKSPACE_TEST_TARGET): tests/source_workspace_test.c \
+		src/source_workspace.c | build
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/source_workspace_test.c \
+		src/source_workspace.c $(LDFLAGS) -o $@
+
 check: $(TARGET) $(HISTORY_AGENT_TARGET) $(TEST_TARGET) $(PROBE_TARGET)
 	./$(TEST_TARGET) $(abspath $(TARGET))
 
@@ -238,6 +245,9 @@ check-functions: $(FUNCTION_TEST_TARGET)
 check-config: $(CONFIG_TEST_TARGET)
 	./$(CONFIG_TEST_TARGET)
 
+check-source-workspaces: $(SOURCE_WORKSPACE_TEST_TARGET)
+	./$(SOURCE_WORKSPACE_TEST_TARGET)
+
 soak: $(TARGET) $(TEST_TARGET)
 	./$(TEST_TARGET) --soak $(abspath $(TARGET)) $(SOAK_SECONDS)
 
@@ -251,6 +261,7 @@ verify-fast:
 	$(MAKE) -j1 check-positionals
 	$(MAKE) -j1 check-background
 	$(MAKE) -j1 check-config
+	$(MAKE) -j1 check-source-workspaces
 	$(MAKE) -j1 check-aliases
 	$(MAKE) -j1 check-functions
 	$(MAKE) -j1 check-fault
@@ -294,6 +305,7 @@ clean:
 	rm -f $(POSITIONAL_TEST_TARGET)
 	rm -f $(BACKGROUND_TEST_TARGET)
 	rm -f $(CONFIG_TEST_TARGET)
+	rm -f $(SOURCE_WORKSPACE_TEST_TARGET)
 	rm -f $(ALIAS_TEST_TARGET)
 	rm -f $(FUNCTION_TEST_TARGET)
 	rm -f $(FUNCTION_SANITIZE_TEST_TARGET)

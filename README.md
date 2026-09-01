@@ -93,8 +93,12 @@ transactional shell variables are implemented natively. Mutating expansions in
 a multi-command pipeline use one fixed-size scoped journal: effects are visible
 later in the same command but neither to sibling stages nor to the parent shell.
 Command substitution and pathname enumeration execute only in isolated
-evaluator processes; neither can block the interactive reactor. `-c` maps its
-command name and arguments to `$0` and the positional parameters, with native
+evaluator processes; neither can block the interactive reactor. Nested source
+evaluation uses an eight-slot LIFO arena allocated once at startup. Each slot
+owns parser, planner, transactional, function, alias, and 1 MiB source storage,
+so entering a command substitution performs no heap allocation and depth
+exhaustion is deterministic. `-c` maps its command name and arguments to `$0`
+and the positional parameters, with native
 `$#`, numbered parameters, `$@`, `$*`, and `$-`; quoted `$@` retains its
 multi-field semantics. `set --` and operand forms replace or clear positional
 parameters in a bounded zero-fill arena; `shift` validates an unsigned decimal
@@ -265,7 +269,9 @@ failure points. The production build contains neither the injection
 configuration nor its fault names. `check-resource` covers runtime descriptor
 and process exhaustion, data-limit capability, bounded single-line and
 multiline input, signal storms, recovery after a rejected command, and failed
-initialization. Limits applied after startup use gsh's native `ulimit`, so the
+initialization. The conformance limit gate also exercises the last valid nested
+source slot and deterministic rejection of the next level. Limits applied
+after startup use gsh's native `ulimit`, so the
 dynamic loader is outside the measurement; translated architectures are
 reported as unsupported rather than native evidence. Native conformance also
 checks the argument, expansion, pathname-result, redirection, pipeline,
@@ -520,7 +526,8 @@ compose every valid word. Positional replacement and
 shifting are native, but do not imply
 the rest of `set` is complete. The currently supported `$(...)` and backquoted
 forms capture a bounded result, reject embedded null bytes, remove trailing
-newlines, and are cancellable with their containing job. Arithmetic implements
+newlines, use the shared initialization-time source arena, and are cancellable
+with their containing job. Arithmetic implements
 bounded checked signed-`long` parsing with precedence, short-circuiting, nested
 parameter/command/arithmetic expansion, all eleven mandatory POSIX assignment
 operators, classified diagnostics, and the required interactive and non-
@@ -560,7 +567,7 @@ replaces the worker.
 
 This is soft real-time engineering, not hard real-time or mission-grade status.
 The repository has executable conformance tranches, bounded fuzz/property
-checks, sanitizer builds, 65 deterministic fault cases, resource-pressure
+checks, sanitizer builds, 69 deterministic fault cases, resource-pressure
 scenarios, and a configurable soak runner. The current same-source tranche
 passes the local macOS matrix and a native-ISA Ubuntu ARM64 GCC/Clang matrix.
 That Linux execution is not amd64 translation, but it still does not satisfy

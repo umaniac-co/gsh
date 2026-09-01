@@ -11,6 +11,7 @@
 #error "gsh requires the POSIX.1-2024 feature-test baseline"
 #endif
 
+#include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <fnmatch.h>
@@ -58,6 +59,7 @@
 #include "shell_functions.h"
 #include "shell_options.h"
 #include "shell_config.h"
+#include "source_workspace.h"
 
 extern char **environ;
 
@@ -75,7 +77,7 @@ enum {
     PROMPT_PROTOCOL_VERSION = 1,
     PROMPT_REQUEST_BRANCH = 1,
     PROMPT_REQUEST_REDIRECTION = 2,
-    NONINTERACTIVE_INPUT_CAP = 1024 * 1024,
+    NONINTERACTIVE_INPUT_CAP = GSH_SOURCE_INPUT_CAP,
     GSH_NATIVE_JOB_MEMBER_CAP =
         GSH_NATIVE_PIPELINE_CAP + GSH_NATIVE_HEREDOC_CAP,
     CHILD_ENVIRONMENT_CAP = GSH_VARIABLE_ENVIRONMENT_CAP,
@@ -248,6 +250,7 @@ typedef struct {
     gsh_variable_store *pipeline_variables;
     gsh_variable_journal *variable_commit;
     gsh_variable_journal *pipeline_changes;
+    gsh_source_workspace_stack *source_workspaces;
     char *alias_expansion;
     gsh_alias_store *aliases;
     gsh_alias_store *alias_scratch;
@@ -1281,6 +1284,9 @@ static int initialize_interactive(shell_state *state,
     state->pipeline_changes = fault_should_fail("allocation", ENOMEM)
                                   ? NULL
                                   : malloc(sizeof(*state->pipeline_changes));
+    state->source_workspaces = fault_should_fail("allocation", ENOMEM)
+                                   ? NULL
+                                   : malloc(sizeof(*state->source_workspaces));
     state->async_repl = fault_should_fail("allocation", ENOMEM)
                             ? NULL
                             : malloc(sizeof(*state->async_repl));
@@ -1289,10 +1295,12 @@ static int initialize_interactive(shell_state *state,
         state->variable_scratch == NULL ||
         state->pipeline_variables == NULL ||
         state->variable_commit == NULL || state->pipeline_changes == NULL ||
+        state->source_workspaces == NULL ||
         state->async_repl == NULL ||
         gsh_variables_import(state->variables, environ) == -1) {
         return -1;
     }
+    gsh_source_workspaces_initialize(state->source_workspaces);
     gsh_command_cache_initialize(
         state->command_cache,
         gsh_variables_path_generation(state->variables));
@@ -8347,6 +8355,8 @@ static void cleanup(shell_state *state)
     state->variable_commit = NULL;
     free(state->pipeline_changes);
     state->pipeline_changes = NULL;
+    free(state->source_workspaces);
+    state->source_workspaces = NULL;
     free(state->async_repl);
     state->async_repl = NULL;
     free(state->alias_expansion);
@@ -8949,8 +8959,9 @@ struct native_evaluator {
     const gsh_times_context *times_context;
     gsh_variable_store *scope_base;
     gsh_variable_journal *scope_changes;
+    gsh_source_workspace_stack *source_workspaces;
     pipeline_expansion_scope *pipeline_scope;
-    size_t substitution_depth;
+    size_t source_depth;
     size_t function_depth;
     bool function_active[GSH_FUNCTION_CAP];
     bool returning;
@@ -9655,260 +9666,232 @@ static bool native_preflight_node(native_evaluator *evaluator,
     return true;
 }
 
-static gsh_native_plan_status execute_command_substitution(
-    void *opaque, const char *commands, size_t command_length, char *output,
-    size_t output_capacity, size_t *output_length, int *exit_status)
+typedef struct {
+    size_t used;
+    int error;
+    bool overflow;
+    bool contains_null;
+    bool failed;
+} substitution_capture_result;
+
+static void initialize_substitution_functions(
+    native_evaluator *parent, gsh_source_workspace *workspace,
+    native_evaluator *nested)
 {
-    native_evaluator *parent = opaque;
-    gsh_parse_storage *storage;
-    gsh_native_pipeline *pipeline;
-    gsh_variable_store *variables;
-    gsh_variable_store *scope_base;
-    gsh_variable_journal *scope_changes;
-    gsh_function_store *local_functions = NULL;
-    gsh_function_store *local_function_scratch = NULL;
-    char *alias_expanded = NULL;
-    const char *nested_input = commands;
-    size_t nested_length = command_length;
-    gsh_parse_result parsed;
-    native_evaluator nested;
-    gsh_background_table nested_backgrounds;
-    int capture[2] = {-1, -1};
-    pid_t pid;
-    size_t used = 0;
-    bool overflow = false;
-    bool contains_null = false;
-    bool read_failed = false;
-    int read_error = 0;
-    int wait_status = 0;
+    if (!storage_has_function(&workspace->storage)) {
+        nested->functions = parent->functions;
+        nested->function_scratch = parent->function_scratch;
+        return;
+    }
+    if (parent->functions == NULL) {
+        gsh_functions_initialize(&workspace->functions);
+    } else {
+        memcpy(&workspace->functions, parent->functions,
+               sizeof(workspace->functions));
+    }
+    gsh_functions_initialize(&workspace->function_scratch);
+    nested->functions = &workspace->functions;
+    nested->function_scratch = &workspace->function_scratch;
+    assert(nested->functions != parent->functions);
+    assert(nested->function_scratch != NULL);
+}
 
-    *output_length = 0;
-    *exit_status = 125;
-    if (parent == NULL || parent->substitution_depth >= 32U) {
-        return GSH_NATIVE_PLAN_LIMIT;
-    }
-    if (fault_should_fail("substitution-allocation", ENOMEM)) {
-        errno = ENOMEM;
-        perror("gsh: command substitution allocation");
-        return GSH_NATIVE_PLAN_LIMIT;
-    }
-    storage = malloc(sizeof(*storage));
-    pipeline = malloc(sizeof(*pipeline));
-    variables = malloc(sizeof(*variables));
-    scope_base = malloc(sizeof(*scope_base));
-    scope_changes = malloc(sizeof(*scope_changes));
-    if (gsh_aliases_count(parent->aliases) != 0) {
-        alias_expanded = malloc(GSH_ALIAS_EXPANSION_CAP);
-    }
-    if (storage == NULL || pipeline == NULL || variables == NULL ||
-        scope_base == NULL || scope_changes == NULL ||
-        (gsh_aliases_count(parent->aliases) != 0 &&
-         alias_expanded == NULL)) {
-        int saved_errno = errno;
-
-        free(storage);
-        free(pipeline);
-        free(variables);
-        free(scope_base);
-        free(scope_changes);
-        free(alias_expanded);
-        errno = saved_errno;
-        perror("gsh: command substitution allocation");
-        return GSH_NATIVE_PLAN_LIMIT;
-    }
-    parsed = gsh_alias_parse(
-        commands, command_length, parent->aliases, alias_expanded,
-        GSH_ALIAS_EXPANSION_CAP, storage, &nested_input, &nested_length);
-    if (parsed.status != GSH_PARSE_OK) {
-        free(storage);
-        free(pipeline);
-        free(variables);
-        free(scope_base);
-        free(scope_changes);
-        free(alias_expanded);
-        return parsed.status == GSH_PARSE_LIMIT ? GSH_NATIVE_PLAN_LIMIT
-                                                : GSH_NATIVE_PLAN_UNSUPPORTED;
-    }
-    if (storage_has_function(storage)) {
-        local_functions =
-            fault_should_fail("substitution-function-allocation", ENOMEM)
-                ? NULL
-                : malloc(sizeof(*local_functions));
-        local_function_scratch = malloc(sizeof(*local_function_scratch));
-        if (local_functions == NULL || local_function_scratch == NULL) {
-            int saved_errno = errno;
-
-            free(storage);
-            free(pipeline);
-            free(variables);
-            free(scope_base);
-            free(scope_changes);
-            free(alias_expanded);
-            free(local_functions);
-            free(local_function_scratch);
-            errno = saved_errno;
-            perror("gsh: command substitution function allocation");
-            return GSH_NATIVE_PLAN_LIMIT;
-        }
-        if (parent->functions == NULL) {
-            gsh_functions_initialize(local_functions);
-        } else {
-            memcpy(local_functions, parent->functions,
-                   sizeof(*local_functions));
-        }
-        gsh_functions_initialize(local_function_scratch);
-    }
-    memset(&nested, 0, sizeof(nested));
-    nested.input = nested_input;
-    nested.input_length = nested_length;
-    nested.storage = storage;
-    nested.pipeline = pipeline;
-    nested.default_path = parent->default_path;
-    nested.last_status = parent->last_status;
-    nested.shell_pid = parent->shell_pid;
-    nested.last_background_pid = 0;
-    nested.parameter_zero = parent->parameter_zero;
-    nested.positionals = parent->positionals;
-    nested.options = parent->options;
-    memcpy(variables, parent->variables, sizeof(*variables));
-    nested.variables = variables;
-    nested.journal = NULL;
-    nested.aliases = parent->aliases;
-    nested.alias_journal = NULL;
-    nested.functions = local_functions != NULL ? local_functions
-                                                : parent->functions;
-    nested.function_scratch = local_function_scratch != NULL
-                                  ? local_function_scratch
-                                  : parent->function_scratch;
-    nested.command_cache = parent->command_cache;
-    nested.command_cache_base_generation =
+static void initialize_substitution_evaluator(
+    native_evaluator *parent, gsh_source_workspace *workspace,
+    const char *input, size_t input_length, native_evaluator *nested,
+    gsh_background_table *backgrounds)
+{
+    memset(nested, 0, sizeof(*nested));
+    nested->input = input;
+    nested->input_length = input_length;
+    nested->storage = &workspace->storage;
+    nested->pipeline = &workspace->pipeline;
+    nested->default_path = parent->default_path;
+    nested->last_status = parent->last_status;
+    nested->shell_pid = parent->shell_pid;
+    nested->parameter_zero = parent->parameter_zero;
+    nested->positionals = parent->positionals;
+    nested->options = parent->options;
+    memcpy(&workspace->variables, parent->variables,
+           sizeof(workspace->variables));
+    nested->variables = &workspace->variables;
+    nested->aliases = parent->aliases;
+    nested->command_cache = parent->command_cache;
+    nested->command_cache_base_generation =
         parent->command_cache_base_generation;
-    nested.scope_base = scope_base;
-    nested.scope_changes = scope_changes;
-    nested.pipeline_scope = NULL;
-    nested.substitution_depth = parent->substitution_depth + 1U;
-    nested.preflight = true;
-    nested.fatal_error = false;
-    nested.static_for_items = false;
-    nested.tail_exec_single = false;
-    nested.positional_mutation_possible = false;
-    nested.directory_mutation_possible = false;
-    nested.alias_mutation_possible = false;
-    nested.function_mutation_possible = false;
-    nested.command_cache_mutation_possible = false;
-    nested.state_commit_invalid = false;
-    gsh_background_initialize(&nested_backgrounds);
-    nested.backgrounds = &nested_backgrounds;
-    if (!native_preflight_node(&nested, parsed.root, 0)) {
-        free(storage);
-        free(pipeline);
-        free(variables);
-        free(scope_base);
-        free(scope_changes);
-        free(alias_expanded);
-        free(local_functions);
-        free(local_function_scratch);
+    nested->scope_base = &workspace->scope_base;
+    nested->scope_changes = &workspace->scope_changes;
+    nested->source_workspaces = parent->source_workspaces;
+    nested->source_depth = parent->source_depth + 1U;
+    nested->preflight = true;
+    gsh_background_initialize(backgrounds);
+    nested->backgrounds = backgrounds;
+    initialize_substitution_functions(parent, workspace, nested);
+    assert(nested->source_depth <= GSH_SOURCE_DEPTH_CAP);
+    assert(nested->variables != parent->variables);
+}
+
+static gsh_native_plan_status prepare_substitution(
+    native_evaluator *parent, const char *commands, size_t command_length,
+    gsh_source_workspace *workspace, native_evaluator *nested,
+    gsh_background_table *backgrounds, gsh_parse_result *parsed)
+{
+    const char *input = commands;
+    size_t input_length = command_length;
+
+    *parsed = gsh_alias_parse(
+        commands, command_length, parent->aliases,
+        workspace->alias_expansion, GSH_ALIAS_EXPANSION_CAP,
+        &workspace->storage, &input, &input_length);
+    if (parsed->status != GSH_PARSE_OK) {
+        return parsed->status == GSH_PARSE_LIMIT ? GSH_NATIVE_PLAN_LIMIT
+                                                 : GSH_NATIVE_PLAN_UNSUPPORTED;
+    }
+    initialize_substitution_evaluator(parent, workspace, input, input_length,
+                                      nested, backgrounds);
+    if (!native_preflight_node(nested, parsed->root, 0)) {
         return GSH_NATIVE_PLAN_UNSUPPORTED;
     }
-    memcpy(variables, parent->variables, sizeof(*variables));
-    nested.preflight = false;
-    nested.fatal_error = false;
+    memcpy(&workspace->variables, parent->variables,
+           sizeof(workspace->variables));
+    nested->preflight = false;
+    nested->fatal_error = false;
+    assert(nested->storage == &workspace->storage);
+    assert(nested->source_depth == parent->source_depth + 1U);
+    return GSH_NATIVE_PLAN_OK;
+}
+
+static pid_t start_substitution_child(native_evaluator *nested,
+                                      size_t root, int capture[2])
+{
+    pid_t pid;
+
     if (make_pipe(capture, false, "substitution-pipe") == -1) {
         perror("gsh: command substitution pipe");
-        free(storage);
-        free(pipeline);
-        free(variables);
-        free(scope_base);
-        free(scope_changes);
-        free(alias_expanded);
-        free(local_functions);
-        free(local_function_scratch);
-        return GSH_NATIVE_PLAN_UNSUPPORTED;
+        return -1;
     }
     pid = fault_should_fail("substitution-fork", EAGAIN) ? -1 : fork();
     if (pid == 0) {
         int status;
 
-        close(capture[0]);
+        (void)close(capture[0]);
         reset_child_signals();
         if (child_duplicate_descriptor(capture[1], STDOUT_FILENO) == -1) {
             child_exec_error("command substitution output", errno);
         }
         if (capture[1] != STDOUT_FILENO) {
-            close(capture[1]);
+            (void)close(capture[1]);
         }
-        status = native_evaluate_node(&nested, parsed.root, 0);
+        status = native_evaluate_node(nested, root, 0);
         _exit(status & 255);
     }
-    close(capture[1]);
+    (void)close(capture[1]);
     capture[1] = -1;
     if (pid == -1) {
         perror("gsh: command substitution fork");
-        close(capture[0]);
-        free(storage);
-        free(pipeline);
-        free(variables);
-        free(scope_base);
-        free(scope_changes);
-        free(alias_expanded);
-        free(local_functions);
-        free(local_function_scratch);
-        return GSH_NATIVE_PLAN_UNSUPPORTED;
+        (void)close(capture[0]);
+        capture[0] = -1;
     }
-    for (;;) {
+    assert(pid != 0);
+    assert(capture[1] == -1);
+    return pid;
+}
+
+static substitution_capture_result read_substitution_output(
+    int descriptor, char *output, size_t output_capacity)
+{
+    enum { READ_RETRY_CAP = 64 };
+    substitution_capture_result result = {0};
+    size_t attempt;
+    bool complete = false;
+
+    for (attempt = 0;
+         attempt < GSH_NATIVE_HEREDOC_TEXT_CAP + READ_RETRY_CAP &&
+         !complete;
+         attempt++) {
         unsigned char bytes[4096];
         ssize_t count = fault_should_fail("substitution-read", EIO)
                             ? -1
-                            : read(capture[0], bytes, sizeof(bytes));
+                            : read(descriptor, bytes, sizeof(bytes));
 
         if (count > 0) {
             size_t amount = (size_t)count;
 
-            if (memchr(bytes, '\0', amount) != NULL) {
-                contains_null = true;
-                break;
+            result.contains_null = memchr(bytes, '\0', amount) != NULL;
+            result.overflow = amount > output_capacity - result.used;
+            if (result.contains_null || result.overflow) {
+                complete = true;
+            } else {
+                memcpy(output + result.used, bytes, amount);
+                result.used += amount;
             }
-            if (amount > output_capacity - used) {
-                overflow = true;
-                break;
-            }
-            memcpy(output + used, bytes, amount);
-            used += amount;
         } else if (count == 0) {
-            break;
+            complete = true;
         } else if (errno != EINTR) {
-            read_failed = true;
-            read_error = errno;
-            break;
+            result.failed = true;
+            result.error = errno;
+            complete = true;
         }
     }
-    close(capture[0]);
-    if (overflow || contains_null || read_failed) {
+    if (!complete) {
+        result.failed = true;
+        result.error = EINTR;
+    }
+    assert(result.used <= output_capacity);
+    assert(descriptor >= 0);
+    return result;
+}
+
+static bool wait_substitution_child(pid_t pid, int *wait_status)
+{
+    enum { WAIT_RETRY_CAP = 1024 };
+    unsigned int attempt;
+
+    for (attempt = 0; attempt < WAIT_RETRY_CAP; attempt++) {
+        pid_t waited = waitpid(pid, wait_status, 0);
+
+        if (waited == pid) {
+            assert(pid > 0);
+            assert(wait_status != NULL);
+            return true;
+        }
+        if (waited == -1 && errno == EINTR) {
+            continue;
+        }
+        return false;
+    }
+    errno = EINTR;
+    return false;
+}
+
+static gsh_native_plan_status collect_substitution(
+    native_evaluator *nested, size_t root, char *output,
+    size_t output_capacity, size_t *output_length, int *exit_status)
+{
+    int capture[2] = {-1, -1};
+    int wait_status = 0;
+    pid_t pid = start_substitution_child(nested, root, capture);
+    substitution_capture_result result;
+    size_t trim;
+
+    if (pid == -1) {
+        return GSH_NATIVE_PLAN_UNSUPPORTED;
+    }
+    result = read_substitution_output(capture[0], output, output_capacity);
+    (void)close(capture[0]);
+    if (result.overflow || result.contains_null || result.failed) {
         (void)kill(pid, SIGKILL);
     }
-    while (waitpid(pid, &wait_status, 0) == -1) {
-        if (errno != EINTR) {
-            read_failed = true;
-            if (read_error == 0) {
-                read_error = errno;
-            }
-            break;
-        }
+    if (!wait_substitution_child(pid, &wait_status)) {
+        result.failed = true;
+        result.error = errno;
     }
-    free(storage);
-    free(pipeline);
-    free(variables);
-    free(scope_base);
-    free(scope_changes);
-    free(alias_expanded);
-    free(local_functions);
-    free(local_function_scratch);
-    if (overflow) {
+    if (result.overflow) {
         return GSH_NATIVE_PLAN_LIMIT;
     }
-    if (contains_null || read_failed) {
-        if (read_failed) {
-            errno = read_error != 0 ? read_error : EIO;
+    if (result.contains_null || result.failed) {
+        if (result.failed) {
+            errno = result.error != 0 ? result.error : EIO;
             perror("gsh: command substitution read");
         } else {
             fputs("gsh: command substitution contains a null byte\n",
@@ -9916,12 +9899,63 @@ static gsh_native_plan_status execute_command_substitution(
         }
         return GSH_NATIVE_PLAN_UNSUPPORTED;
     }
-    while (used > 0 && output[used - 1U] == '\n') {
-        used--;
+    for (trim = 0; trim < result.used &&
+                   output[result.used - 1U] == '\n'; trim++) {
+        result.used--;
     }
-    *output_length = used;
+    *output_length = result.used;
     *exit_status = wait_status_value(wait_status);
     return GSH_NATIVE_PLAN_OK;
+}
+
+static gsh_native_plan_status execute_command_substitution(
+    void *opaque, const char *commands, size_t command_length, char *output,
+    size_t output_capacity, size_t *output_length, int *exit_status)
+{
+    native_evaluator *parent = opaque;
+    gsh_source_workspace *workspace;
+    native_evaluator nested;
+    gsh_background_table backgrounds;
+    gsh_parse_result parsed;
+    gsh_native_plan_status status;
+    bool released;
+
+    if (output_length == NULL || exit_status == NULL) {
+        return GSH_NATIVE_PLAN_UNSUPPORTED;
+    }
+    *output_length = 0;
+    *exit_status = 125;
+    if (parent == NULL || commands == NULL || output == NULL ||
+        output_capacity > GSH_NATIVE_HEREDOC_TEXT_CAP ||
+        parent->source_workspaces == NULL ||
+        parent->source_depth !=
+            gsh_source_workspaces_depth(parent->source_workspaces) ||
+        fault_should_fail("source-workspace-exhaustion", EAGAIN)) {
+        fputs("gsh: nested source workspace limit exceeded\n", stderr);
+        return GSH_NATIVE_PLAN_LIMIT;
+    }
+    workspace = gsh_source_workspace_acquire(parent->source_workspaces);
+    if (workspace == NULL) {
+        fputs("gsh: nested source workspace limit exceeded\n", stderr);
+        return GSH_NATIVE_PLAN_LIMIT;
+    }
+    status = prepare_substitution(parent, commands, command_length,
+                                  workspace, &nested, &backgrounds, &parsed);
+    if (status == GSH_NATIVE_PLAN_OK) {
+        status = collect_substitution(&nested, parsed.root, output,
+                                      output_capacity, output_length,
+                                      exit_status);
+    }
+    released = gsh_source_workspace_release(parent->source_workspaces,
+                                            workspace);
+    if (!released) {
+        fputs("gsh: nested source workspace ownership failure\n", stderr);
+        return GSH_NATIVE_PLAN_UNSUPPORTED;
+    }
+    assert(parent->source_depth ==
+           gsh_source_workspaces_depth(parent->source_workspaces));
+    assert(*output_length <= output_capacity);
+    return status;
 }
 
 static int evaluate_return(native_evaluator *evaluator,
@@ -10953,7 +10987,8 @@ static bool native_node_is_supported(shell_state *state, size_t node_index)
     evaluator.scope_base = state->pipeline_variables;
     evaluator.scope_changes = state->pipeline_changes;
     evaluator.pipeline_scope = NULL;
-    evaluator.substitution_depth = 0;
+    evaluator.source_workspaces = state->source_workspaces;
+    evaluator.source_depth = 0;
     evaluator.preflight = true;
     evaluator.fatal_error = false;
     evaluator.static_for_items = false;
@@ -11232,8 +11267,9 @@ static void initialize_interactive_evaluator(native_evaluator *evaluator,
         state->command_cache_generation;
     evaluator->scope_base = state->pipeline_variables;
     evaluator->scope_changes = state->pipeline_changes;
+    evaluator->source_workspaces = state->source_workspaces;
     evaluator->pipeline_scope = NULL;
-    evaluator->substitution_depth = 0;
+    evaluator->source_depth = 0;
     evaluator->preflight = false;
     evaluator->fatal_error = false;
     evaluator->static_for_items = true;
@@ -12151,8 +12187,9 @@ static void start_native_compound(shell_state *state, size_t node_index)
         evaluator.times_context = &times_context;
         evaluator.scope_base = state->pipeline_variables;
         evaluator.scope_changes = state->pipeline_changes;
+        evaluator.source_workspaces = state->source_workspaces;
         evaluator.pipeline_scope = NULL;
-        evaluator.substitution_depth = 0;
+        evaluator.source_depth = 0;
         evaluator.preflight = false;
         evaluator.fatal_error = false;
         evaluator.static_for_items = false;
@@ -12323,6 +12360,7 @@ static int execute_native_script(
     gsh_variable_store *variables, gsh_variable_store *scratch,
     gsh_variable_store *scope_base, gsh_variable_journal *scope_changes,
     gsh_positional_store *positionals, gsh_command_cache *command_cache,
+    gsh_source_workspace_stack *source_workspaces,
     const char *default_path)
 {
     gsh_alias_store *aliases = NULL;
@@ -12338,7 +12376,8 @@ static int execute_native_script(
     if (input == NULL || parameter_zero == NULL || storage == NULL ||
         pipeline == NULL || variables == NULL || scratch == NULL ||
         scope_base == NULL || scope_changes == NULL || positionals == NULL ||
-        command_cache == NULL || default_path == NULL ||
+        command_cache == NULL || source_workspaces == NULL ||
+        default_path == NULL ||
         input_length > NONINTERACTIVE_INPUT_CAP) {
         errno = EINVAL;
         return 125;
@@ -12356,6 +12395,7 @@ static int execute_native_script(
     evaluator.aliases = NULL;
     evaluator.scope_base = scope_base;
     evaluator.scope_changes = scope_changes;
+    evaluator.source_workspaces = source_workspaces;
     gsh_background_initialize(&backgrounds);
     evaluator.backgrounds = &backgrounds;
 
@@ -12459,7 +12499,7 @@ static int execute_native_script(
         evaluator.function_scratch = function_scratch;
         evaluator.command_cache = command_cache;
         evaluator.pipeline_scope = NULL;
-        evaluator.substitution_depth = 0;
+        evaluator.source_depth = 0;
         evaluator.preflight = true;
         evaluator.fatal_error = false;
         evaluator.static_for_items = false;
@@ -12505,11 +12545,14 @@ static int execute_native_noninteractive(
     gsh_variable_journal *scope_changes = malloc(sizeof(*scope_changes));
     gsh_positional_store *positionals = malloc(sizeof(*positionals));
     gsh_command_cache *command_cache = malloc(sizeof(*command_cache));
+    gsh_source_workspace_stack *source_workspaces =
+        malloc(sizeof(*source_workspaces));
     int status = 125;
 
     if (storage == NULL || pipeline == NULL || variables == NULL ||
         scratch == NULL || scope_base == NULL || scope_changes == NULL ||
         positionals == NULL || command_cache == NULL ||
+        source_workspaces == NULL ||
         gsh_variables_import(variables, environ) == -1 ||
         gsh_positionals_assign(positionals, positional_count,
                                positional_parameters) == -1) {
@@ -12521,11 +12564,13 @@ static int execute_native_noninteractive(
         free(scope_changes);
         free(positionals);
         free(command_cache);
+        free(source_workspaces);
         perror("gsh: native allocation");
         return 125;
     }
     gsh_command_cache_initialize(
         command_cache, gsh_variables_path_generation(variables));
+    gsh_source_workspaces_initialize(source_workspaces);
     {
         size_t size = confstr(_CS_PATH, default_path, sizeof(default_path));
 
@@ -12536,7 +12581,7 @@ static int execute_native_noninteractive(
     status = execute_native_script(
         input, input_length, parameter_zero, storage, pipeline, variables,
         scratch, scope_base, scope_changes, positionals, command_cache,
-        default_path);
+        source_workspaces, default_path);
     free(storage);
     free(pipeline);
     free(variables);
@@ -12545,6 +12590,7 @@ static int execute_native_noninteractive(
     free(scope_changes);
     free(positionals);
     free(command_cache);
+    free(source_workspaces);
     return status;
 }
 

@@ -8,6 +8,9 @@
 #error "gsh conformance tests require the POSIX.1-2024 baseline"
 #endif
 
+#include "../src/source_workspace.h"
+
+#include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <locale.h>
@@ -31,6 +34,51 @@ typedef struct {
     int status;
     const char *diagnostic;
 } syntax_case;
+
+static int build_nested_substitution(char *command, size_t capacity,
+                                     size_t depth)
+{
+    static const char prefix[] = "/usr/bin/printf '<%s>\\n' \"";
+    static const char opening[] = "$(/usr/bin/printf '%s' \"";
+    static const char closing[] = "\")";
+    size_t used;
+    size_t index;
+
+    if (command == NULL || depth > GSH_SOURCE_DEPTH_CAP + 1U ||
+        sizeof(prefix) > capacity) {
+        return -1;
+    }
+    memcpy(command, prefix, sizeof(prefix));
+    used = sizeof(prefix) - 1U;
+    for (index = 0; index < GSH_SOURCE_DEPTH_CAP + 1U && index < depth;
+         index++) {
+        if (sizeof(opening) - 1U > capacity - used - 1U) {
+            return -1;
+        }
+        memcpy(command + used, opening, sizeof(opening) - 1U);
+        used += sizeof(opening) - 1U;
+    }
+    if (used + 1U >= capacity) {
+        return -1;
+    }
+    command[used++] = 'x';
+    for (index = 0; index < GSH_SOURCE_DEPTH_CAP + 1U && index < depth;
+         index++) {
+        if (sizeof(closing) - 1U > capacity - used - 1U) {
+            return -1;
+        }
+        memcpy(command + used, closing, sizeof(closing) - 1U);
+        used += sizeof(closing) - 1U;
+    }
+    if (used + 1U >= capacity) {
+        return -1;
+    }
+    command[used++] = '"';
+    command[used] = '\0';
+    assert(used < capacity);
+    assert(index == depth);
+    return 0;
+}
 
 static int configure_utf8_locale(void)
 {
@@ -800,6 +848,28 @@ static int native_limit_cases(const char *executable)
     test.name = "native command substitution output limit";
     test.status = 125;
     test.diagnostic = NULL;
+    if (run_case(executable, &test, false) != 0) {
+        return 1;
+    }
+
+    if (build_nested_substitution(command, sizeof(command),
+                                  GSH_SOURCE_DEPTH_CAP) == -1) {
+        return 1;
+    }
+    test.name = "native nested source depth boundary";
+    test.status = 0;
+    test.diagnostic = "<x>\n";
+    if (run_case(executable, &test, false) != 0) {
+        return 1;
+    }
+
+    if (build_nested_substitution(command, sizeof(command),
+                                  GSH_SOURCE_DEPTH_CAP + 1U) == -1) {
+        return 1;
+    }
+    test.name = "native nested source depth limit";
+    test.status = 0;
+    test.diagnostic = "nested source workspace limit exceeded";
     if (run_case(executable, &test, false) != 0) {
         return 1;
     }
@@ -2871,7 +2941,7 @@ int main(int argc, char **argv)
     if (native_limit_cases(argv[1]) != 0) {
         return 1;
     }
-    limit_passed = 13;
+    limit_passed = 15;
     printf("POSIX native tranche: syntax=%zu execution=%zu limits=%zu "
            "unsupported=%zu delegated=0\n",
            passed + 1U, execution_passed, limit_passed, unsupported);

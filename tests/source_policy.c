@@ -144,7 +144,7 @@ static int binary_excludes_fault_injection(const char *path)
         "worker-stale", "time-source-failure", "heredoc-pipe",
         "heredoc-fork", "heredoc-write", "substitution-pipe",
         "substitution-fork", "substitution-read",
-        "substitution-allocation", "state-commit-pipe",
+        "source-workspace-exhaustion", "state-commit-pipe",
         "state-commit-write", "state-commit-read",
         "state-commit-malformed", "positional-allocation",
         "positional-commit-allocation",
