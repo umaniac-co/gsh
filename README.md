@@ -176,13 +176,14 @@ format is re-executed through gsh's initialization-time canonical pathname,
 never through `/bin/sh`. The new native shell image preserves the child PID,
 process group, descriptors, exported environment, resolved script `$0`,
 operands, pipeline/background behavior, and `exec` overlay status.
-The non-interactive `exit` special builtin uses an explicit evaluator control
-record rather than terminating from an inner helper. It applies assignments
-and redirections first, crosses function, `eval`, and dot frames, ignores
-pipeline negation once termination is requested, and is naturally confined by
-the process boundaries of subshells, substitutions, pipelines, and asynchronous
-lists. Direct interactive `exit` remains native; parent-owned termination from
-an interactive compound evaluator is still continuation-engine work.
+The `exit` special builtin uses an explicit evaluator control record rather
+than terminating from an inner helper. It applies assignments and redirections
+first, crosses function, `eval`, and dot frames, ignores pipeline negation once
+termination is requested, and is naturally confined by the process boundaries
+of subshells, substitutions, pipelines, and asynchronous lists. In interactive
+compound evaluation, the versioned control record commits atomically with the
+state observed by `exit`; classic and managed owners terminate with that exact
+status only after validating the whole transaction.
 The non-interactive `trap` special builtin implements the Issue 8 `-p`,
 default, ignore, action, numeric-reset, and reinput-safe query forms over a
 fixed 1 MiB compact action arena. Signal handlers perform only bounded
@@ -196,7 +197,8 @@ non-interactive shell cannot be changed. A pristine subshell query can emit its
 entry snapshot for `save=$(trap -p)` without executing the parent's EXIT action.
 Interactive parent-owned trap state is not integrated into the continuation
 engine yet, so the overall signals/traps gate remains partial.
-The `eval` and `.` special builtins are native in the non-interactive evaluator.
+The `eval` and `.` special builtins are native in both non-interactive and
+interactive current-environment evaluation.
 `eval` concatenates operands with one space, supports an optional `--`, parses
 the result in a preallocated source slot, and executes it in the caller's
 environment. Dot accepts `--`, searches `PATH` for a readable file without
@@ -206,9 +208,12 @@ redirections. `return` unwinds the nearest dot boundary, including through a
 nested `eval`. Eval and dot also execute as isolated pipeline stages, in
 subshells, asynchronous lists, and command substitutions. Source ownership and descriptor restoration are strict LIFO on
 success and every failure path; the ninth simultaneously active source is
-rejected deterministically. Interactive `eval` and dot remain outside the
-native continuation engine: they currently take the unsupported-syntax
-compatibility bridge and therefore do not yet provide parent-state semantics.
+rejected deterministically. Interactive variables, aliases, functions,
+positionals, options, command cache and directory changes cross the evaluator
+boundary as one validated transaction. Source-local `return` status and inner
+`exit` control also reach the owning classic or managed session, while
+pipeline, subshell, substitution and asynchronous source execution remains
+isolated.
 `hash` and ordinary external execution share a 128-entry, open-addressed
 command-location cache with allocation-free steady-state lookup. Every
 successful `PATH` assignment invalidates it, stale executable locations fall
@@ -322,7 +327,7 @@ make fuzz-pty-sanitize
 make soak SOAK_SECONDS=60
 ```
 
-`check-fault` uses a separate test-only binary and exercises 93 deterministic
+`check-fault` uses a separate test-only binary and exercises 94 deterministic
 failure points. The production build contains neither the injection
 configuration nor its fault names. `check-resource` covers runtime descriptor
 and process exhaustion, data-limit capability, bounded single-line and
@@ -585,9 +590,9 @@ switched to blocking mode on the shared open file description before reading,
 as required. Empty and comment-only complete commands preserve the prior
 status. A trapped signal interrupts an otherwise idle input read, runs before
 another byte is required, and resumes the same partial command without source
-loss. Interactive unsupported syntax—including interactive `eval` and
-dot—still has a compatibility fallback; non-interactive top-level input and
-external `ENOEXEC` scripts do not.
+loss. Interactive unsupported syntax still has a compatibility fallback;
+interactive `eval` and dot, non-interactive top-level input, and external
+`ENOEXEC` scripts no longer use it.
 
 ## Current scope
 
@@ -646,7 +651,7 @@ replaces the worker.
 
 This is soft real-time engineering, not hard real-time or mission-grade status.
 The repository has executable conformance tranches, bounded fuzz/property
-checks, sanitizer builds, 93 deterministic fault cases, resource-pressure
+checks, sanitizer builds, 94 deterministic fault cases, resource-pressure
 scenarios, and a configurable soak runner. The current native tranche contains
 563 execution cases, 30 syntax cases, and 17 deterministic limit cases with
 one explicitly unsupported case and no delegated cases. The current same-source

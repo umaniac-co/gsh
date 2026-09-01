@@ -831,6 +831,36 @@ static int write_head(const char *root, bool blocking)
     return close(fd);
 }
 
+static int write_text_file(const char *path, const char *text, mode_t mode)
+{
+    size_t length = strlen(text);
+    size_t offset = 0;
+    size_t attempts;
+    int descriptor = open(path, O_WRONLY | O_CREAT | O_EXCL, mode);
+    int status = 0;
+
+    if (descriptor == -1) {
+        return -1;
+    }
+    for (attempts = 0; offset < length && attempts <= length; attempts++) {
+        ssize_t count = write(descriptor, text + offset, length - offset);
+
+        if (count > 0) {
+            offset += (size_t)count;
+        } else if (!(count == -1 && errno == EINTR)) {
+            status = -1;
+            break;
+        }
+    }
+    if (offset != length) {
+        status = -1;
+    }
+    if (close(descriptor) == -1) {
+        status = -1;
+    }
+    return status;
+}
+
 static void remove_fixture(const char *root)
 {
     char path[1024];
@@ -2474,6 +2504,245 @@ done:
     return failed;
 }
 
+static int interactive_source_state_case(const char *executable,
+                                         const char *fixture)
+{
+    char child[PATH_MAX];
+    char canonical_child[PATH_MAX];
+    pty_session session;
+    int failed = 0;
+
+    if (snprintf(child, sizeof(child), "%s/child", fixture) >=
+            (int)sizeof(child) ||
+        realpath(child, canonical_child) == NULL ||
+        setenv("GSH_SOURCE_CHILD", canonical_child, 1) == -1 ||
+        start_session(&session, executable, fixture, SHELL_GSH) == -1) {
+        perror("pty source: state setup");
+        (void)unsetenv("GSH_SOURCE_CHILD");
+        return 1;
+    }
+    (void)unsetenv("GSH_SOURCE_CHILD");
+    if (consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        send_text(&session,
+                  "eval 'GSH_EVAL_VALUE=committed; "
+                  "set -- eval-one \"eval two\"; set -f; "
+                  "alias gsh_eval_alias=\"/usr/bin/printf GSH_EVAL_ALIAS\"; "
+                  "gsh_eval_fn(){ /usr/bin/printf GSH_EVAL_FUNCTION; }; "
+                  "cd child'\r") == -1 ||
+        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        send_text(&session,
+                  "if /bin/test \"$GSH_EVAL_VALUE\" = committed && "
+                  "/bin/test \"$#\" -eq 2 && "
+                  "/bin/test \"$1\" = eval-one && "
+                  "/bin/test \"$2\" = 'eval two' && "
+                  "/bin/test \"$(/bin/pwd)\" = \"$GSH_SOURCE_CHILD\"; "
+                  "then case $- in *f*) /usr/bin/printf GSH_EVAL_STATE;; "
+                  "esac; fi\r") == -1 ||
+        consume_through(&session, "\r\nGSH_EVAL_STATE",
+                        TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        send_text(&session, "gsh_eval_alias\r") == -1 ||
+        consume_through(&session, "GSH_EVAL_ALIAS", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        send_text(&session, "gsh_eval_fn\r") == -1 ||
+        consume_through(&session, "GSH_EVAL_FUNCTION", TEST_TIMEOUT_MS) ==
+            -1 ||
+        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        send_text(&session, "set +f; cd ..\r") == -1 ||
+        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        send_text(&session, ". ./source-state.sh\r") == -1 ||
+        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        send_text(&session,
+                  "GSH_DOT_STATUS=$?; "
+                  "if /bin/test \"$GSH_DOT_STATUS\" -eq 6 && "
+                  "/bin/test \"$GSH_DOT_VALUE\" = committed && "
+                  "/bin/test \"$#\" -eq 2 && "
+                  "/bin/test \"$1\" = dot-one && "
+                  "/bin/test \"$2\" = 'dot two' && "
+                  "/bin/test \"$(/bin/pwd)\" = \"$GSH_SOURCE_CHILD\"; "
+                  "then case $- in *f*) /usr/bin/printf GSH_DOT_STATE;; "
+                  "esac; fi\r") == -1 ||
+        consume_through(&session, "\r\nGSH_DOT_STATE",
+                        TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        send_text(&session, "gsh_dot_alias\r") == -1 ||
+        consume_through(&session, "GSH_DOT_ALIAS", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        send_text(&session, "gsh_dot_fn\r") == -1 ||
+        consume_through(&session, "GSH_DOT_FUNCTION", TEST_TIMEOUT_MS) ==
+            -1 ||
+        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        send_text(&session, "set +f; cd ..; eval 'if'\r") == -1 ||
+        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        send_text(&session, "/usr/bin/printf GSH_EVAL_RECOVERED\r") == -1 ||
+        consume_through(&session, "\r\nGSH_EVAL_RECOVERED",
+                        TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        send_text(&session,
+                  "(eval 'exit 7'); /bin/test \"$?\" -eq 7 && "
+                  "/usr/bin/printf GSH_SUBSHELL_EXIT\r") == -1 ||
+        consume_through(&session, "\r\nGSH_SUBSHELL_EXIT",
+                        TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        send_text(&session,
+                  "eval 'exit 8' | /bin/cat; "
+                  "/usr/bin/printf GSH_PIPELINE_EXIT\r") == -1 ||
+        consume_through(&session, "\r\nGSH_PIPELINE_EXIT",
+                        TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        send_text(&session,
+                  "eval 'exit 9' & wait \"$!\"; "
+                  "/bin/test \"$?\" -eq 9 && "
+                  "/usr/bin/printf GSH_ASYNC_SOURCE_EXIT\r") == -1 ||
+        consume_through(&session, "\r\nGSH_ASYNC_SOURCE_EXIT",
+                        TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1) {
+        perror("pty source: state flow");
+        dump_capture(&session);
+        failed = 1;
+    }
+    if (!failed && process_child_count(session.pid) != 1) {
+        fprintf(stderr, "pty source: state flow left child processes\n");
+        failed = 1;
+    }
+    if (stop_session(&session) == -1) {
+        failed = 1;
+    }
+    return failed;
+}
+
+static int interactive_managed_source_case(const char *executable,
+                                           const char *fixture)
+{
+    pty_session session;
+    int failed = 0;
+
+    if (start_managed_session(&session, executable, fixture) == -1) {
+        perror("pty source: managed setup");
+        return 1;
+    }
+    if (consume_through(&session, "\033[90m[●]\033[0m $gsh> ",
+                        TEST_TIMEOUT_MS) == -1 ||
+        send_text(&session,
+                  "eval 'GSH_MANAGED_EVAL=committed'; "
+                  ". ./managed-source.sh\r") == -1 ||
+        consume_through(&session, "\033[90m[●]\033[0m $gsh> ",
+                        TEST_TIMEOUT_MS) == -1 ||
+        send_text(&session,
+                  "/bin/test \"$GSH_MANAGED_EVAL:$GSH_MANAGED_DOT\" = "
+                  "committed:committed && "
+                  "/usr/bin/printf GSH_MANAGED_SOURCE_STATE\r") == -1 ||
+        consume_through(&session, "\r\nGSH_MANAGED_SOURCE_STATE",
+                        TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "\033[90m[●]\033[0m $gsh> ",
+                        TEST_TIMEOUT_MS) == -1) {
+        perror("pty source: managed flow");
+        dump_capture(&session);
+        failed = 1;
+    }
+    if (stop_session(&session) == -1) {
+        failed = 1;
+    }
+    return failed;
+}
+
+static int interactive_exit_case(const char *executable,
+                                 const char *fixture, bool managed,
+                                 const char *setup, const char *command,
+                                 int expected_status)
+{
+    pty_session session;
+
+    if ((managed ? start_managed_session(&session, executable, fixture)
+                 : start_session(&session, executable, fixture, SHELL_GSH)) ==
+        -1) {
+        return 1;
+    }
+    if (consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        (setup != NULL &&
+         (send_text(&session, setup) == -1 ||
+          consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1)) ||
+        send_text(&session, command) == -1 ||
+        wait_session_exit(&session, expected_status, TEST_TIMEOUT_MS) == -1) {
+        fprintf(stderr, "pty source: exit case failed status=%d\n",
+                expected_status);
+        dump_capture(&session);
+        return 1;
+    }
+    return 0;
+}
+
+static int interactive_source_flow(const char *executable)
+{
+    static const char state_source[] =
+        "GSH_DOT_VALUE=committed\n"
+        "set -- dot-one 'dot two'\n"
+        "set -f\n"
+        "alias gsh_dot_alias='/usr/bin/printf GSH_DOT_ALIAS'\n"
+        "gsh_dot_fn() { /usr/bin/printf GSH_DOT_FUNCTION; }\n"
+        "cd child\n"
+        "return 6\n"
+        "/usr/bin/printf GSH_DOT_BAD\n";
+    char fixture[] = "/tmp/gsh-pty-source-XXXXXX";
+    char state_path[PATH_MAX] = {0};
+    char exit_path[PATH_MAX] = {0};
+    char managed_path[PATH_MAX] = {0};
+    char child_path[PATH_MAX] = {0};
+    int failed = 0;
+
+    if (mkdtemp(fixture) == NULL ||
+        snprintf(state_path, sizeof(state_path), "%s/source-state.sh",
+                 fixture) >= (int)sizeof(state_path) ||
+        snprintf(exit_path, sizeof(exit_path), "%s/source-exit.sh",
+                 fixture) >= (int)sizeof(exit_path) ||
+        snprintf(managed_path, sizeof(managed_path), "%s/managed-source.sh",
+                 fixture) >= (int)sizeof(managed_path) ||
+        snprintf(child_path, sizeof(child_path), "%s/child", fixture) >=
+            (int)sizeof(child_path) ||
+        mkdir(child_path, 0700) == -1 ||
+        write_text_file(state_path, state_source, 0600) == -1 ||
+        write_text_file(exit_path, "GSH_DOT_EXIT=committed\nexit 17\n",
+                        0600) == -1 ||
+        write_text_file(managed_path, "GSH_MANAGED_DOT=committed\n",
+                        0600) == -1) {
+        perror("pty source: fixture");
+        failed = 1;
+        goto done;
+    }
+    failed |= interactive_source_state_case(executable, fixture);
+    failed |= interactive_managed_source_case(executable, fixture);
+    failed |= interactive_exit_case(
+        executable, fixture, false, NULL,
+        "if true; then exit 23; fi\r", 23);
+    failed |= interactive_exit_case(
+        executable, fixture, false, NULL, "eval 'exit 19'\r", 19);
+    failed |= interactive_exit_case(
+        executable, fixture, false, NULL, ". ./source-exit.sh\r", 17);
+    failed |= interactive_exit_case(
+        executable, fixture, false,
+        "gsh_exit_fn(){ exit 21; }\r", "gsh_exit_fn\r", 21);
+    failed |= interactive_exit_case(
+        executable, fixture, false, NULL, "! { exit 26; }\r", 26);
+    failed |= interactive_exit_case(
+        executable, fixture, true, NULL, "eval 'exit 24'\r", 24);
+
+done:
+    if (state_path[0] != '\0') {
+        (void)unlink(state_path);
+    }
+    if (exit_path[0] != '\0') {
+        (void)unlink(exit_path);
+    }
+    if (managed_path[0] != '\0') {
+        (void)unlink(managed_path);
+    }
+    if (child_path[0] != '\0') {
+        (void)rmdir(child_path);
+    }
+    (void)rmdir(fixture);
+    return failed;
+}
+
 static int function_builtin_flow(const char *executable)
 {
     char fixture[] = "/tmp/gsh-pty-function-XXXXXX";
@@ -3470,6 +3739,9 @@ static int fault_injection_flow(const char *executable)
         {"state-commit-malformed",
          "if /usr/bin/true; then : \"${GSH_FAULT_STATE:=value}\"; fi\r",
          "gsh: state transaction rejected"},
+        {"state-control-commit-malformed",
+         "if /usr/bin/true; then exit 7; fi\r",
+         "gsh: state transaction rejected"},
         {"option-commit-malformed",
          "if /usr/bin/true; then set -f; fi\r",
          "gsh: state transaction rejected"},
@@ -3611,7 +3883,7 @@ static int fault_injection_flow(const char *executable)
         failed |= fatal_fault_case(executable, fatal_cases[index]);
     }
     if (!failed) {
-        puts("pty fault: 93 deterministic boundary failures passed");
+        puts("pty fault: 94 deterministic boundary failures passed");
     }
     return failed;
 }
@@ -6025,6 +6297,7 @@ int main(int argc, char **argv)
         times_builtin_flow(executable) != 0 ||
         exec_builtin_flow(executable) != 0 ||
         interactive_enoexec_flow(executable) != 0 ||
+        interactive_source_flow(executable) != 0 ||
         function_builtin_flow(executable) != 0 ||
         deferred_pattern_flow(executable) != 0 ||
         asynchronous_list_flow(executable) != 0 ||

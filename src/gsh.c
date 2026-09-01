@@ -167,6 +167,11 @@ typedef struct {
 enum { GSH_COMMAND_CACHE_COMMIT_VERSION = 1 };
 
 enum {
+    GSH_STATE_CONTROL_COMMIT_VERSION = 1,
+    GSH_STATE_CONTROL_EXIT = 1U,
+};
+
+enum {
     GSH_EXEC_DESCRIPTOR_COMMIT_VERSION = 1,
     GSH_EXEC_DESCRIPTOR_COMMIT_CAP = 128,
 };
@@ -186,6 +191,13 @@ typedef struct {
     uint64_t base_generation;
     uint64_t final_path_generation;
 } command_cache_commit_header;
+
+typedef struct {
+    uint32_t version;
+    uint32_t flags;
+    int32_t exit_status;
+    uint32_t reserved;
+} state_control_commit;
 
 typedef struct {
     int tty_fd;
@@ -287,6 +299,9 @@ typedef struct {
     gsh_positional_store *positionals;
     gsh_positional_store *positional_commit;
     gsh_shell_options option_commit;
+    state_control_commit control_commit;
+    bool committed_exit_requested;
+    int committed_exit_status;
     bool positional_commit_expected;
     bool pending_positional_commit;
     bool alias_commit_expected;
@@ -2033,7 +2048,8 @@ static size_t state_commit_size(const shell_state *state)
                        ? sizeof(state->command_cache_commit_header) +
                              sizeof(*state->command_cache_scratch)
                        : 0U) +
-                  sizeof(state->option_commit);
+                  sizeof(state->option_commit) +
+                  sizeof(state->control_commit);
 
     if (state->function_commit_expected) {
         size += sizeof(state->function_commit_header);
@@ -2045,6 +2061,27 @@ static size_t state_commit_size(const shell_state *state)
         }
     }
     return size;
+}
+
+/* ── Control Flow Commits with the State It Observed ───────────
+ * An evaluator child can execute in the current shell environment even
+ * though process isolation keeps blocking work out of the reactor. State
+ * journals alone could not tell the owner that an inner eval, dot script, or
+ * compound command executed exit. A fixed versioned record now travels in
+ * the same transaction, so the owner either commits both the final state and
+ * termination request or rejects both; subshell processes never send it.
+ * ─────────────────────────────────────────────────────────────── */
+static bool state_control_commit_valid(const state_control_commit *commit)
+{
+    if (commit == NULL ||
+        commit->version != GSH_STATE_CONTROL_COMMIT_VERSION ||
+        (commit->flags & ~GSH_STATE_CONTROL_EXIT) != 0U ||
+        commit->reserved != 0U) {
+        return false;
+    }
+    return (commit->flags & GSH_STATE_CONTROL_EXIT) != 0U
+               ? commit->exit_status >= 0 && commit->exit_status <= 255
+               : commit->exit_status == 0;
 }
 
 static void close_variable_commit(shell_state *state)
@@ -2083,6 +2120,7 @@ static void close_variable_commit(shell_state *state)
     state->pending_command_cache_commit = false;
     memset(&state->command_cache_commit_header, 0,
            sizeof(state->command_cache_commit_header));
+    memset(&state->control_commit, 0, sizeof(state->control_commit));
     if (state->directory_commit_socket >= 0) {
         close(state->directory_commit_socket);
     }
@@ -2133,6 +2171,7 @@ static void receive_variable_commit(shell_state *state, bool drain_all)
             size_t cache_store_begin = cache_begin + cache_header_size;
             size_t option_begin = cache_store_begin + cache_size;
             size_t option_end = option_begin + sizeof(state->option_commit);
+            size_t control_end = option_end + sizeof(state->control_commit);
 
             if (state->variable_commit_received < variable_size) {
                 size_t remaining = variable_size -
@@ -2198,12 +2237,21 @@ static void receive_variable_commit(shell_state *state, bool drain_all)
                 destination = (unsigned char *)&state->option_commit +
                               state->variable_commit_received -
                                   option_begin;
+            } else if (state->variable_commit_received < control_end) {
+                size_t remaining = control_end -
+                                   state->variable_commit_received;
+
+                if (capacity > remaining) {
+                    capacity = remaining;
+                }
+                destination = (unsigned char *)&state->control_commit +
+                              state->variable_commit_received - option_end;
             } else if (state->function_commit_expected &&
                        state->variable_commit_received <
-                           option_end +
+                           control_end +
                                sizeof(state->function_commit_header)) {
                 size_t header_offset = state->variable_commit_received -
-                                       option_end;
+                                       control_end;
                 size_t remaining = sizeof(state->function_commit_header) -
                                    header_offset;
 
@@ -2216,7 +2264,7 @@ static void receive_variable_commit(shell_state *state, bool drain_all)
             } else if (state->function_commit_expected &&
                        state->function_commit_header_complete) {
                 size_t payload_offset = state->variable_commit_received -
-                                        option_end -
+                                        control_end -
                                         sizeof(state->function_commit_header);
                 size_t available;
 
@@ -2264,6 +2312,7 @@ static void receive_variable_commit(shell_state *state, bool drain_all)
                                    sizeof(*state->command_cache_scratch)
                              : 0U) +
                         sizeof(state->option_commit) +
+                        sizeof(state->control_commit) +
                         sizeof(state->function_commit_header);
 
                     if (state->variable_commit_received >= header_end) {
@@ -2307,6 +2356,8 @@ static bool finish_variable_commit(shell_state *state, int wait_status)
     if (!state->variable_commit_active) {
         return true;
     }
+    state->committed_exit_requested = false;
+    state->committed_exit_status = 0;
     receive_variable_commit(state, true);
     valid = WIFEXITED(wait_status) && state->variable_commit_eof &&
             !state->variable_commit_invalid &&
@@ -2338,6 +2389,7 @@ static bool finish_variable_commit(shell_state *state, int wait_status)
                                 GSH_OPTION_INTERACTIVE) ==
                 gsh_options_enabled(&state->options,
                                     GSH_OPTION_INTERACTIVE) &&
+            state_control_commit_valid(&state->control_commit) &&
             state->variable_commit->base_generation ==
                 state->variable_generation;
     if (valid && receive_directory_descriptor(state) == -1) {
@@ -2403,6 +2455,9 @@ static bool finish_variable_commit(shell_state *state, int wait_status)
             state->command_cache_generation++;
         }
         state->options = state->option_commit;
+        state->committed_exit_requested =
+            (state->control_commit.flags & GSH_STATE_CONTROL_EXIT) != 0U;
+        state->committed_exit_status = state->control_commit.exit_status;
         if (directory_changed) {
             if (getcwd(state->current_directory,
                        sizeof(state->current_directory)) == NULL) {
@@ -2865,14 +2920,21 @@ static void finish_job(shell_state *state)
     bool silent = state->current_job.silent;
     int exec_outcome = finish_exec_outcome(state);
     bool overlaid = exec_outcome == GSH_EXEC_OUTCOME_OVERLAID;
+    bool current_environment_exit = false;
     int descriptor_commit_status =
         overlaid ? 0 : receive_exec_descriptor_commit(state);
 
     if (overlaid) {
         close_variable_commit(state);
-    } else if (state->current_job.pipeline_status_known &&
-        !finish_variable_commit(state, wait_status)) {
-        status = 125;
+    } else if (state->current_job.pipeline_status_known) {
+        bool commit_active = state->variable_commit_active;
+
+        if (!finish_variable_commit(state, wait_status)) {
+            status = 125;
+        } else if (commit_active && state->committed_exit_requested) {
+            current_environment_exit = true;
+            status = state->committed_exit_status;
+        }
     }
     if (exec_outcome == GSH_EXEC_OUTCOME_INVALID) {
         status = 125;
@@ -2885,7 +2947,7 @@ static void finish_job(shell_state *state)
     state->current_job.active = false;
     state->current_job.foreground = false;
     state->current_job.stopped = false;
-    if (state->current_job.negated) {
+    if (state->current_job.negated && !current_environment_exit) {
         status = status == 0 ? 1 : 0;
     }
     state->last_status = status;
@@ -2896,7 +2958,7 @@ static void finish_job(shell_state *state)
         (void)gsh_async_repl_reap(state->async_repl, pid, wait_status);
     }
 
-    if (overlaid) {
+    if (overlaid || current_environment_exit) {
         if (was_foreground) {
             reclaim_terminal(state, false);
         }
@@ -4181,6 +4243,7 @@ static bool native_pipeline_requires_evaluator(
     }
     command = &pipeline->commands[0];
     return native_exec_builtin(command) ||
+           native_source_builtin(command) ||
            (native_variable_builtin(command) &&
             (command->redirect_count != 0 ||
              (command->assignment_count != 0 &&
@@ -11184,11 +11247,6 @@ static bool native_preflight_node(native_evaluator *evaluator,
                         evaluator->traps == NULL) {
                         supported = false;
                     }
-                    if (supported && native_source_builtin(planned) &&
-                        gsh_options_enabled(&evaluator->options,
-                                            GSH_OPTION_INTERACTIVE)) {
-                        supported = false;
-                    }
                 }
             }
         }
@@ -14234,22 +14292,108 @@ static bool try_native_reactor_compound(shell_state *state)
     return true;
 }
 
-static int write_variable_commit(
-    int descriptor, gsh_variable_journal *journal,
-    gsh_alias_journal *alias_journal,
+enum {
+    GSH_STATE_COMMIT_PART_CAP = 7,
+    GSH_FUNCTION_COMMIT_SECTION_CAP = 5,
+    GSH_STATE_COMMIT_IO_BOUND = 8 * 1024 * 1024,
+};
+
+_Static_assert(sizeof(gsh_variable_journal) <= GSH_STATE_COMMIT_IO_BOUND,
+               "variable commit exceeds the bounded writer");
+_Static_assert(sizeof(gsh_alias_journal) <= GSH_STATE_COMMIT_IO_BOUND,
+               "alias commit exceeds the bounded writer");
+_Static_assert(sizeof(gsh_positional_store) <= GSH_STATE_COMMIT_IO_BOUND,
+               "positional commit exceeds the bounded writer");
+_Static_assert(sizeof(gsh_command_cache) <= GSH_STATE_COMMIT_IO_BOUND,
+               "cache commit exceeds the bounded writer");
+_Static_assert(sizeof(gsh_function_store) <= GSH_STATE_COMMIT_IO_BOUND,
+               "function commit exceeds the bounded writer");
+
+static int write_commit_bytes(int descriptor, const void *source,
+                              size_t length, const char *fault)
+{
+    const unsigned char *cursor = source;
+    size_t remaining = length;
+    size_t attempts;
+
+    if (descriptor < 0 || source == NULL || fault == NULL ||
+        length > GSH_STATE_COMMIT_IO_BOUND) {
+        errno = EINVAL;
+        return -1;
+    }
+    for (attempts = 0;
+         remaining != 0 && attempts < GSH_STATE_COMMIT_IO_BOUND;
+         attempts++) {
+        ssize_t written = fault_should_fail(fault, EIO)
+                              ? -1
+                              : write(descriptor, cursor, remaining);
+
+        if (written > 0) {
+            cursor += (size_t)written;
+            remaining -= (size_t)written;
+        } else if (!(written == -1 && errno == EINTR)) {
+            return -1;
+        }
+    }
+    if (remaining != 0) {
+        errno = EAGAIN;
+        return -1;
+    }
+    return 0;
+}
+
+static int write_function_commit(int descriptor,
+                                 const gsh_function_store *functions,
+                                 uint64_t generation)
+{
+    gsh_function_snapshot_header header;
+    size_t offset = 0;
+    size_t total;
+    size_t section;
+
+    if (functions == NULL) {
+        return 0;
+    }
+    gsh_functions_snapshot_header(functions, generation, &header);
+    if (fault_should_fail("function-commit-malformed", EPROTO)) {
+        header.reserved = 1;
+    }
+    if (write_commit_bytes(descriptor, &header, sizeof(header),
+                           "state-commit-write") == -1) {
+        return -1;
+    }
+    total = gsh_functions_snapshot_payload_size(&header);
+    for (section = 0;
+         offset < total && section < GSH_FUNCTION_COMMIT_SECTION_CAP;
+         section++) {
+        size_t available;
+        const void *source = gsh_functions_snapshot_source(
+            functions, &header, offset, &available);
+
+        if (source == NULL || available == 0) {
+            errno = EPROTO;
+            return -1;
+        }
+        if (write_commit_bytes(descriptor, source, available,
+                               "function-commit-write") == -1) {
+            return -1;
+        }
+        offset += available;
+    }
+    if (offset != total) {
+        errno = EPROTO;
+        return -1;
+    }
+    return 0;
+}
+
+static void inject_state_commit_faults(
+    gsh_variable_journal *journal, gsh_alias_journal *alias_journal,
     const gsh_positional_store *positionals,
     const gsh_command_cache *command_cache,
-    uint64_t command_cache_generation,
-    uint64_t final_path_generation,
-    const gsh_shell_options *options,
-    const gsh_function_store *functions,
-    uint64_t function_generation)
+    command_cache_commit_header *cache_header,
+    const gsh_shell_options *options, state_control_commit *control)
 {
-    command_cache_commit_header cache_header = {
-        GSH_COMMAND_CACHE_COMMIT_VERSION, 0,
-        command_cache_generation, final_path_generation};
-    unsigned int part;
-
     if (fault_should_fail("state-commit-malformed", EPROTO)) {
         journal->version++;
     }
@@ -14266,110 +14410,56 @@ static int write_variable_commit(
     }
     if (command_cache != NULL &&
         fault_should_fail("command-cache-commit-malformed", EPROTO)) {
-        cache_header.reserved = 1;
+        cache_header->reserved = 1U;
     }
-    for (part = 0; part < 6U; part++) {
-        const unsigned char *cursor;
-        size_t remaining;
+    if (fault_should_fail("state-control-commit-malformed", EPROTO)) {
+        control->reserved = 1U;
+    }
+}
 
-        if (part == 0) {
-            cursor = (const unsigned char *)journal;
-            remaining = sizeof(*journal);
-        } else if (part == 1) {
-            if (alias_journal == NULL) {
-                continue;
-            }
-            cursor = (const unsigned char *)alias_journal;
-            remaining = sizeof(*alias_journal);
-        } else if (part == 2) {
-            if (positionals == NULL) {
-                continue;
-            }
-            cursor = (const unsigned char *)positionals;
-            remaining = sizeof(*positionals);
-        } else if (part == 3) {
-            if (command_cache == NULL) {
-                continue;
-            }
-            cursor = (const unsigned char *)&cache_header;
-            remaining = sizeof(cache_header);
-        } else if (part == 4) {
-            if (command_cache == NULL) {
-                continue;
-            }
-            cursor = (const unsigned char *)command_cache;
-            remaining = sizeof(*command_cache);
-        } else {
-            cursor = (const unsigned char *)options;
-            remaining = sizeof(*options);
-        }
-        while (remaining > 0) {
-            ssize_t written = fault_should_fail("state-commit-write", EIO)
-                                  ? -1
-                                  : write(descriptor, cursor, remaining);
+static int write_variable_commit(
+    int descriptor, gsh_variable_journal *journal,
+    gsh_alias_journal *alias_journal,
+    const gsh_positional_store *positionals,
+    const gsh_command_cache *command_cache,
+    uint64_t command_cache_generation, uint64_t final_path_generation,
+    const gsh_shell_options *options, bool exiting, int exit_status,
+    const gsh_function_store *functions, uint64_t function_generation)
+{
+    command_cache_commit_header cache_header = {
+        GSH_COMMAND_CACHE_COMMIT_VERSION, 0,
+        command_cache_generation, final_path_generation};
+    state_control_commit control = {
+        GSH_STATE_CONTROL_COMMIT_VERSION,
+        exiting ? GSH_STATE_CONTROL_EXIT : 0U,
+        exiting ? exit_status : 0, 0};
+    const void *parts[GSH_STATE_COMMIT_PART_CAP] = {
+        journal, alias_journal, positionals,
+        command_cache == NULL ? NULL : &cache_header,
+        command_cache, options, &control};
+    const size_t lengths[GSH_STATE_COMMIT_PART_CAP] = {
+        sizeof(*journal), sizeof(*alias_journal), sizeof(*positionals),
+        sizeof(cache_header), sizeof(*command_cache), sizeof(*options),
+        sizeof(control)};
+    size_t part;
 
-            if (written > 0) {
-                cursor += (size_t)written;
-                remaining -= (size_t)written;
-            } else if (written == -1 && errno == EINTR) {
-                continue;
-            } else {
-                return -1;
-            }
+    if (journal == NULL || options == NULL ||
+        (exiting && (exit_status < 0 || exit_status > 255))) {
+        errno = EINVAL;
+        return -1;
+    }
+    inject_state_commit_faults(journal, alias_journal, positionals,
+                               command_cache, &cache_header, options,
+                               &control);
+    for (part = 0; part < GSH_STATE_COMMIT_PART_CAP; part++) {
+        if (parts[part] != NULL &&
+            write_commit_bytes(descriptor, parts[part], lengths[part],
+                               "state-commit-write") == -1) {
+            return -1;
         }
     }
-    if (functions != NULL) {
-        gsh_function_snapshot_header header;
-        size_t offset = 0;
-        size_t total;
-        const unsigned char *cursor;
-        size_t remaining;
-
-        gsh_functions_snapshot_header(functions, function_generation,
-                                      &header);
-        if (fault_should_fail("function-commit-malformed", EPROTO)) {
-            header.reserved = 1;
-        }
-        cursor = (const unsigned char *)&header;
-        remaining = sizeof(header);
-        while (remaining > 0) {
-            ssize_t written = fault_should_fail("state-commit-write", EIO)
-                                  ? -1
-                                  : write(descriptor, cursor, remaining);
-
-            if (written > 0) {
-                cursor += (size_t)written;
-                remaining -= (size_t)written;
-            } else if (written == -1 && errno == EINTR) {
-                continue;
-            } else {
-                return -1;
-            }
-        }
-        total = gsh_functions_snapshot_payload_size(&header);
-        while (offset < total) {
-            size_t available;
-            const void *source = gsh_functions_snapshot_source(
-                functions, &header, offset, &available);
-            ssize_t written;
-
-            if (source == NULL || available == 0) {
-                errno = EPROTO;
-                return -1;
-            }
-            written = fault_should_fail("function-commit-write", EIO)
-                          ? -1
-                          : write(descriptor, source, available);
-            if (written > 0) {
-                offset += (size_t)written;
-            } else if (written == -1 && errno == EINTR) {
-                continue;
-            } else {
-                return -1;
-            }
-        }
-    }
-    return 0;
+    return write_function_commit(descriptor, functions,
+                                 function_generation);
 }
 
 static int build_exec_descriptor_commit(
@@ -14914,7 +15004,8 @@ static void start_native_compound(shell_state *state, size_t node_index)
                     : NULL,
                 state->command_cache_generation,
                 gsh_variables_path_generation(evaluator.variables),
-                &evaluator.options,
+                &evaluator.options, evaluator.exiting,
+                evaluator.exit_status,
                 state->function_commit_expected ? state->functions : NULL,
                 state->function_generation) == -1) {
             status = 125;
@@ -15009,6 +15100,9 @@ static void start_native_compound(shell_state *state, size_t node_index)
                sizeof(*state->command_cache_scratch));
     }
     state->option_commit.enabled = 0;
+    memset(&state->control_commit, 0, sizeof(state->control_commit));
+    state->committed_exit_requested = false;
+    state->committed_exit_status = 0;
 
     initialize_job(&state->current_job, pid, pid, &pid, 1, true, false);
     state->current_job.modes = state->original_modes;
