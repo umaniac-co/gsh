@@ -49,6 +49,7 @@ typedef struct {
     uint16_t hash_slots[GSH_VARIABLE_HASH_CAP];
     uint32_t count;
     uint32_t text_used;
+    uint64_t path_generation;
     char text[GSH_VARIABLE_TEXT_CAP];
 } gsh_variable_store;
 
@@ -98,6 +99,7 @@ const char *gsh_variables_assignment(const gsh_variable_store *store,
                                      size_t index,
                                      unsigned int *attributes);
 bool gsh_variables_is_set(const gsh_variable_store *store, size_t index);
+uint64_t gsh_variables_path_generation(const gsh_variable_store *store);
 
 void gsh_variable_journal_initialize(gsh_variable_journal *journal,
                                      uint64_t base_generation);

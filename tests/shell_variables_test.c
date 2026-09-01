@@ -72,6 +72,7 @@ int main(void)
     gsh_variable_journal *journal = malloc(sizeof(*journal));
     gsh_variable_journal_value_state value_state;
     unsigned int attributes = 0;
+    uint64_t path_generation;
     const char *assignment;
     bool failed = false;
 
@@ -86,6 +87,20 @@ int main(void)
     assignment = gsh_variables_assignment(store, 0, &attributes);
     if (assignment == NULL ||
         (attributes & GSH_VARIABLE_EXPORTED) == 0) {
+        failed = true;
+        goto done;
+    }
+    path_generation = gsh_variables_path_generation(store);
+    if (gsh_variables_set(store, "PATH", 4, "/bin", 4, 0, 0) == -1 ||
+        gsh_variables_path_generation(store) != path_generation + 1U) {
+        failed = true;
+        goto done;
+    }
+    path_generation = gsh_variables_path_generation(store);
+    if (gsh_variables_set_attributes(store, "PATH", 4,
+                                     GSH_VARIABLE_EXPORTED,
+                                     GSH_VARIABLE_EXPORTED) == -1 ||
+        gsh_variables_path_generation(store) != path_generation) {
         failed = true;
         goto done;
     }

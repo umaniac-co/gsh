@@ -6,19 +6,14 @@
 
 #include <errno.h>
 #include <string.h>
-#include <sys/stat.h>
 #include <unistd.h>
 
 enum {
     GSH_COMMAND_ARGUMENT_CAP = 128,
-    GSH_COMMAND_PATH_CAP = 4096,
-    GSH_COMMAND_PATH_SCAN_CAP = 32768,
 };
 
 _Static_assert(GSH_COMMAND_PATH_CAP > 4,
                "command paths need room for a directory and name");
-_Static_assert(GSH_COMMAND_PATH_SCAN_CAP >= GSH_COMMAND_PATH_CAP,
-               "PATH scan budget must cover one command path");
 
 typedef enum {
     GSH_COMMAND_NOT_FOUND = 0,
@@ -92,12 +87,18 @@ static bool regular_builtin_name(const char *name, size_t length)
 {
     static const char *const names[] = {
         "alias", "bg",      "cd",    "command", "false", "fg",
-        "help",  "pwd",     "rt",    "true",    "type",  "ulimit",
-        "umask", "unalias", "wait",
+        "hash",  "help",    "pwd",   "rt",      "true",  "type",
+        "ulimit", "umask",  "unalias", "wait",
     };
 
     return name_in_table(name, length, names,
                          sizeof(names) / sizeof(names[0]));
+}
+
+bool gsh_command_intrinsic_name(const char *name, size_t length)
+{
+    return implemented_special_name(name, length) ||
+           regular_builtin_name(name, length);
 }
 
 /* ── One Bounded Search Defines Command Identity ────────────────────────
@@ -107,87 +108,10 @@ static bool regular_builtin_name(const char *name, size_t length)
  * byte and candidate before touching the filesystem.  Inspection therefore
  * stays allocation-free and cannot monopolize the interactive reactor.
  * ─────────────────────────────────────────────────────────────── */
-static bool executable_candidate(const char *candidate)
-{
-    struct stat status;
-
-    if (candidate == NULL || access(candidate, X_OK) == -1 ||
-        stat(candidate, &status) == -1) {
-        return false;
-    }
-    return !S_ISDIR(status.st_mode);
-}
-
-static bool copy_candidate(const char *directory, size_t directory_length,
-                           const char *name, size_t name_length,
-                           char output[GSH_COMMAND_PATH_CAP])
-{
-    size_t used = directory_length == 0 ? 1U : directory_length;
-
-    if (used + 1U + name_length + 1U > GSH_COMMAND_PATH_CAP) {
-        return false;
-    }
-    if (directory_length == 0) {
-        output[0] = '.';
-    } else {
-        memcpy(output, directory, directory_length);
-    }
-    output[used++] = '/';
-    memcpy(output + used, name, name_length + 1U);
-    return true;
-}
-
-static bool resolve_external(const char *name, const char *path,
-                             char output[GSH_COMMAND_PATH_CAP])
-{
-    size_t name_length;
-    size_t path_length;
-    size_t offset = 0;
-    size_t components = 0;
-
-    if (name == NULL || path == NULL) {
-        return false;
-    }
-    name_length = strnlen(name, GSH_COMMAND_PATH_CAP);
-    if (name_length == 0 || name_length == GSH_COMMAND_PATH_CAP) {
-        return false;
-    }
-    if (strchr(name, '/') != NULL) {
-        if (!executable_candidate(name)) {
-            return false;
-        }
-        memcpy(output, name, name_length + 1U);
-        return true;
-    }
-    path_length = strnlen(path, GSH_COMMAND_PATH_SCAN_CAP + 1U);
-    if (path_length > GSH_COMMAND_PATH_SCAN_CAP) {
-        return false;
-    }
-    while (offset <= path_length &&
-           components <= GSH_COMMAND_PATH_SCAN_CAP) {
-        size_t end = offset;
-
-        while (end < path_length &&
-               end < GSH_COMMAND_PATH_SCAN_CAP && path[end] != ':') {
-            end++;
-        }
-        if (end - offset <= GSH_COMMAND_PATH_CAP &&
-            copy_candidate(path + offset, end - offset, name, name_length,
-                           output) && executable_candidate(output)) {
-            return true;
-        }
-        if (end == path_length) {
-            return false;
-        }
-        offset = end + 1U;
-        components++;
-    }
-    return false;
-}
-
 static gsh_command_result resolve_name(
     const char *name, const char *path, const gsh_alias_store *aliases,
-    const gsh_function_store *functions)
+    const gsh_function_store *functions, gsh_command_cache *cache,
+    uint64_t path_generation, bool *cache_changed)
 {
     gsh_command_result result = {0};
     size_t length = name == NULL
@@ -210,8 +134,18 @@ static gsh_command_result resolve_name(
         result.kind = GSH_COMMAND_FUNCTION;
     } else if (regular_builtin_name(name, length)) {
         result.kind = GSH_COMMAND_REGULAR;
-    } else if (resolve_external(name, path, result.path)) {
-        result.kind = GSH_COMMAND_EXTERNAL;
+    } else {
+        bool changed = false;
+        int found = gsh_command_cache_resolve(
+            cache, path_generation, name, path, false, &changed,
+            result.path);
+
+        if (changed && cache_changed != NULL) {
+            *cache_changed = true;
+        }
+        if (found == 1) {
+            result.kind = GSH_COMMAND_EXTERNAL;
+        }
     }
     return result;
 }
@@ -368,6 +302,9 @@ static int inspect_operands(size_t argc, char *const argv[], size_t first,
                             bool verbose, const char *path,
                             const gsh_alias_store *aliases,
                             const gsh_function_store *functions,
+                            gsh_command_cache *cache,
+                            uint64_t path_generation,
+                            bool *cache_changed,
                             const gsh_builtin_io *io)
 {
     size_t index;
@@ -384,7 +321,8 @@ static int inspect_operands(size_t argc, char *const argv[], size_t first,
     for (index = first; index < argc &&
                         index < GSH_COMMAND_ARGUMENT_CAP; index++) {
         gsh_command_result result = resolve_name(
-            argv[index], path, aliases, functions);
+            argv[index], path, aliases, functions, cache,
+            path_generation, cache_changed);
 
         if (result.kind == GSH_COMMAND_NOT_FOUND) {
             status = 1;
@@ -399,7 +337,9 @@ static int inspect_operands(size_t argc, char *const argv[], size_t first,
 int gsh_builtin_command_inspect(
     size_t argc, char *const argv[], const char *path,
     const char *default_path, const gsh_alias_store *aliases,
-    const gsh_function_store *functions, const gsh_builtin_io *io)
+    const gsh_function_store *functions, gsh_command_cache *cache,
+    uint64_t path_generation, bool cacheable, bool *cache_changed,
+    const gsh_builtin_io *io)
 {
     gsh_command_invocation invocation = gsh_command_parse(argc, argv);
 
@@ -416,12 +356,16 @@ int gsh_builtin_command_inspect(
     return inspect_operands(
         argc, argv, invocation.first_operand, invocation.verbose,
         invocation.use_default_path ? default_path : path,
-        aliases, functions, io);
+        aliases, functions,
+        cacheable && !invocation.use_default_path ? cache : NULL,
+        path_generation, cache_changed, io);
 }
 
 int gsh_builtin_type(size_t argc, char *const argv[], const char *path,
                      const gsh_alias_store *aliases,
                      const gsh_function_store *functions,
+                     gsh_command_cache *cache, uint64_t path_generation,
+                     bool *cache_changed,
                      const gsh_builtin_io *io)
 {
     size_t first = 1U;
@@ -444,5 +388,115 @@ int gsh_builtin_type(size_t argc, char *const argv[], const char *path,
         return gsh_builtin_error(io, "type", "invalid option");
     }
     return inspect_operands(argc, argv, first, true, path, aliases,
-                            functions, io);
+                            functions, cache, path_generation,
+                            cache_changed, io);
+}
+
+static int hash_report(const gsh_command_cache *cache,
+                       const gsh_builtin_io *io)
+{
+    size_t index;
+
+    for (index = 0; index < gsh_command_cache_count(cache); index++) {
+        const char *name = gsh_command_cache_name(cache, index);
+        const char *path = gsh_command_cache_path(cache, index);
+
+        if (write_output(io, STDOUT_FILENO, name) != 0 ||
+            write_output(io, STDOUT_FILENO, "=") != 0 ||
+            write_output(io, STDOUT_FILENO, path) != 0 ||
+            write_output(io, STDOUT_FILENO, "\n") != 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* -- Explicit Hashing Shares the Execution Resolver ------------------
+ * Builtins and functions never enter the table. Every external operand is
+ * resolved by the same bounded search used by execution, while -r and PATH
+ * epochs make invalidation observable immediately in the current shell.
+ * -------------------------------------------------------------------- */
+int gsh_builtin_hash(size_t argc, char *const argv[], const char *path,
+                     const gsh_function_store *functions,
+                     gsh_command_cache *cache, uint64_t path_generation,
+                     bool *cache_changed, const gsh_builtin_io *io)
+{
+    size_t first = 1U;
+    size_t index;
+    bool reset = false;
+    int status = 0;
+
+    if (cache_changed != NULL) {
+        *cache_changed = false;
+    }
+    if (argc == 0 || argc > GSH_COMMAND_ARGUMENT_CAP || argv == NULL ||
+        path == NULL || cache == NULL || io == NULL || io->output == NULL ||
+        strcmp(argv[0], "hash") != 0) {
+        errno = EINVAL;
+        return 125;
+    }
+    if (gsh_command_cache_sync(cache, path_generation) &&
+        cache_changed != NULL) {
+        *cache_changed = true;
+    }
+    if (first < argc && strcmp(argv[first], "--") == 0) {
+        first++;
+    } else if (first < argc && strcmp(argv[first], "-r") == 0) {
+        reset = true;
+        first++;
+        if (first < argc && strcmp(argv[first], "--") == 0) {
+            first++;
+        }
+    } else if (first < argc && argv[first][0] == '-' &&
+               argv[first][1] != '\0') {
+        return gsh_builtin_error(io, "hash", "invalid option");
+    }
+    if (reset) {
+        if (first != argc) {
+            return gsh_builtin_error(io, "hash", "-r does not accept operands");
+        }
+        gsh_command_cache_clear(cache, path_generation);
+        if (cache_changed != NULL) {
+            *cache_changed = true;
+        }
+        return 0;
+    }
+    if (first == argc) {
+        return hash_report(cache, io);
+    }
+    for (index = first; index < argc; index++) {
+        size_t length = strnlen(argv[index], GSH_COMMAND_PATH_CAP);
+        bool changed = false;
+        char resolved[GSH_COMMAND_PATH_CAP];
+        int found;
+
+        if (length == 0 || length == GSH_COMMAND_PATH_CAP ||
+            strchr(argv[index], '/') != NULL ||
+            memchr(argv[index], '\n', length) != NULL) {
+            status = gsh_builtin_error(io, "hash", "invalid utility name");
+            continue;
+        }
+        if (gsh_command_intrinsic_name(argv[index], length) ||
+            (functions != NULL &&
+             gsh_functions_lookup(functions, argv[index], length) != NULL)) {
+            continue;
+        }
+        found = gsh_command_cache_resolve(
+            cache, path_generation, argv[index], path, true, &changed,
+            resolved);
+        if (changed && cache_changed != NULL) {
+            *cache_changed = true;
+        }
+        if (found != 1) {
+            const char *message =
+                found == 0 ? "utility not found"
+                           : (errno == ENOSPC
+                                  ? "command cache capacity exceeded"
+                                  : "utility lookup failed");
+
+            status = gsh_builtin_error(
+                io, "hash", message);
+        }
+    }
+    return status;
 }

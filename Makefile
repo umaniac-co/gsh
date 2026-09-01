@@ -9,7 +9,8 @@ HISTORY_AGENT_TARGET := build/gsh-history-agent
 SOURCES := src/gsh.c src/async_repl.c src/posix_lexer.c \
 	src/posix_parser.c src/native_plan.c \
 	src/history_client.c src/history_store.c src/shell_config.c \
-	src/shell_variables.c src/builtin_common.c src/builtin_command.c \
+	src/shell_variables.c src/builtin_common.c src/command_cache.c \
+	src/builtin_command.c \
 	src/builtin_cd.c src/builtin_ulimit.c \
 	src/builtin_umask.c src/builtin_variables.c src/shell_aliases.c \
 	src/alias_expansion.c src/builtin_alias.c src/builtin_unalias.c \
@@ -27,6 +28,8 @@ FUZZ_TARGET := build/lexer-fuzz
 POLICY_TARGET := build/source-policy
 CONFORMANCE_TARGET := build/posix-conformance
 VARIABLE_TEST_TARGET := build/shell-variables-test
+COMMAND_CACHE_TEST_TARGET := build/command-cache-test
+COMMAND_CACHE_SANITIZE_TEST_TARGET := build/command-cache-test-sanitize
 POSITIONAL_TEST_TARGET := build/positional-parameters-test
 BACKGROUND_TEST_TARGET := build/background-jobs-test
 ALIAS_TEST_TARGET := build/shell-aliases-test
@@ -56,7 +59,7 @@ SODIUM_LIBS := $(shell if command -v pkg-config >/dev/null 2>&1; then \
 	then echo -L$(SODIUM_PREFIX)/lib -lsodium; else echo -lsodium; fi)
 
 .PHONY: all analyze bench bench-record bench-alias bench-alias-record check check-fault check-resource check-sanitize clean
-.PHONY: check-aliases check-background check-config check-functions check-positionals check-variables conformance fuzz-libfuzzer fuzz-pty fuzz-pty-sanitize fuzz-sanitize
+.PHONY: check-aliases check-background check-command-cache check-config check-functions check-positionals check-variables conformance fuzz-libfuzzer fuzz-pty fuzz-pty-sanitize fuzz-sanitize
 .PHONY: fuzz-smoke policy soak
 .PHONY: verify-fast
 
@@ -108,6 +111,17 @@ $(VARIABLE_TEST_TARGET): tests/shell_variables_test.c src/shell_variables.c | bu
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/shell_variables_test.c \
 	src/shell_variables.c $(LDFLAGS) -o $@
 
+$(COMMAND_CACHE_TEST_TARGET): tests/command_cache_test.c \
+		src/command_cache.c | build
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/command_cache_test.c \
+		src/command_cache.c $(LDFLAGS) -o $@
+
+$(COMMAND_CACHE_SANITIZE_TEST_TARGET): tests/command_cache_test.c \
+		src/command_cache.c | build
+	clang $(CPPFLAGS) -O1 -g -std=c17 -Wall -Wextra -Wpedantic \
+		-Werror -fsanitize=address,undefined \
+		tests/command_cache_test.c src/command_cache.c $(LDFLAGS) -o $@
+
 $(POSITIONAL_TEST_TARGET): tests/positional_parameters_test.c src/positional_parameters.c | build
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/positional_parameters_test.c \
 		src/positional_parameters.c $(LDFLAGS) -o $@
@@ -148,12 +162,16 @@ check-fault: $(FAULT_TARGET) $(TEST_TARGET)
 check-resource: $(TARGET) $(TEST_TARGET)
 	./$(TEST_TARGET) --resource $(abspath $(TARGET))
 
-check-sanitize: $(SANITIZE_TARGET) $(HISTORY_AGENT_TARGET) $(FUNCTION_SANITIZE_TEST_TARGET) \
+check-sanitize: $(SANITIZE_TARGET) $(HISTORY_AGENT_TARGET) \
+		$(FUNCTION_SANITIZE_TEST_TARGET) \
+		$(COMMAND_CACHE_SANITIZE_TEST_TARGET) \
 		$(TEST_TARGET) $(PROBE_TARGET)
 	ASAN_OPTIONS=abort_on_error=1 UBSAN_OPTIONS=halt_on_error=1 \
 		./$(TEST_TARGET) $(abspath $(SANITIZE_TARGET))
 	ASAN_OPTIONS=abort_on_error=1 UBSAN_OPTIONS=halt_on_error=1 \
 		./$(FUNCTION_SANITIZE_TEST_TARGET)
+	ASAN_OPTIONS=abort_on_error=1 UBSAN_OPTIONS=halt_on_error=1 \
+		./$(COMMAND_CACHE_SANITIZE_TEST_TARGET)
 
 fuzz-smoke: $(FUZZ_SMOKE_TARGET)
 	./$(FUZZ_SMOKE_TARGET) $(FUZZ_CASES)
@@ -202,6 +220,9 @@ conformance: $(TARGET) $(CONFORMANCE_TARGET)
 check-variables: $(VARIABLE_TEST_TARGET)
 	./$(VARIABLE_TEST_TARGET)
 
+check-command-cache: $(COMMAND_CACHE_TEST_TARGET)
+	./$(COMMAND_CACHE_TEST_TARGET)
+
 check-positionals: $(POSITIONAL_TEST_TARGET)
 	./$(POSITIONAL_TEST_TARGET)
 
@@ -226,6 +247,7 @@ verify-fast:
 	$(MAKE) -j1 conformance
 	$(MAKE) -j1 check
 	$(MAKE) -j1 check-variables
+	$(MAKE) -j1 check-command-cache
 	$(MAKE) -j1 check-positionals
 	$(MAKE) -j1 check-background
 	$(MAKE) -j1 check-config
@@ -267,6 +289,8 @@ clean:
 	rm -f $(SANITIZE_TARGET) $(FUZZ_SMOKE_TARGET) $(FUZZ_TARGET) $(POLICY_TARGET)
 	rm -f $(CONFORMANCE_TARGET)
 	rm -f $(VARIABLE_TEST_TARGET)
+	rm -f $(COMMAND_CACHE_TEST_TARGET)
+	rm -f $(COMMAND_CACHE_SANITIZE_TEST_TARGET)
 	rm -f $(POSITIONAL_TEST_TARGET)
 	rm -f $(BACKGROUND_TEST_TARGET)
 	rm -f $(CONFIG_TEST_TARGET)

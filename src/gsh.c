@@ -149,6 +149,15 @@ typedef struct {
     char branch[PROMPT_BRANCH_CAP];
 } prompt_result;
 
+enum { GSH_COMMAND_CACHE_COMMIT_VERSION = 1 };
+
+typedef struct {
+    uint32_t version;
+    uint32_t reserved;
+    uint64_t base_generation;
+    uint64_t final_path_generation;
+} command_cache_commit_header;
+
 typedef struct {
     int tty_fd;
     int signal_pipe[2];
@@ -231,6 +240,8 @@ typedef struct {
     gsh_parse_storage *parse_storage;
     gsh_parse_result pending_parse;
     gsh_native_pipeline *native_pipeline;
+    gsh_command_cache *command_cache;
+    gsh_command_cache *command_cache_scratch;
     gsh_variable_store *variables;
     gsh_variable_store *variable_scratch;
     gsh_variable_store *pipeline_variables;
@@ -253,6 +264,10 @@ typedef struct {
     bool function_commit_expected;
     bool pending_function_commit;
     bool function_commit_header_complete;
+    command_cache_commit_header command_cache_commit_header;
+    uint64_t command_cache_generation;
+    bool pending_command_cache_commit;
+    bool command_cache_commit_expected;
     int directory_commit_socket;
     int directory_commit_fd;
     bool directory_commit_expected;
@@ -299,6 +314,21 @@ static void start_async_external(shell_state *state, simple_command *direct);
 static void start_async_native_pipeline(
     shell_state *state, const gsh_native_pipeline *pipeline,
     const pipeline_expansion_scope *scope);
+static bool command_uses_persistent_path(
+    const gsh_native_command *command);
+static uint64_t command_cache_path_generation(
+    const gsh_variable_store *variables,
+    const gsh_native_command *command);
+static const char *hash_command_path_value(
+    const gsh_variable_store *variables,
+    const gsh_native_command *command, const char *default_path);
+static uint64_t hash_command_path_generation(
+    const gsh_variable_store *variables,
+    const gsh_native_command *command);
+static bool cache_planned_external(
+    gsh_command_cache *cache, const gsh_variable_store *variables,
+    const gsh_native_command *command, const char *default_path,
+    const gsh_function_store *functions);
 static bool native_command_is_supported(shell_state *state);
 static bool try_native_reactor_compound(shell_state *state);
 static void start_native_compound(shell_state *state, size_t node_index);
@@ -1228,6 +1258,13 @@ static int initialize_interactive(shell_state *state,
     if (state->native_pipeline == NULL) {
         return -1;
     }
+    state->command_cache = fault_should_fail("allocation", ENOMEM)
+                               ? NULL
+                               : malloc(sizeof(*state->command_cache));
+    state->command_cache_scratch =
+        fault_should_fail("allocation", ENOMEM)
+            ? NULL
+            : malloc(sizeof(*state->command_cache_scratch));
     state->variables = fault_should_fail("allocation", ENOMEM)
                            ? NULL
                            : malloc(sizeof(*state->variables));
@@ -1246,13 +1283,22 @@ static int initialize_interactive(shell_state *state,
     state->async_repl = fault_should_fail("allocation", ENOMEM)
                             ? NULL
                             : malloc(sizeof(*state->async_repl));
-    if (state->variables == NULL || state->variable_scratch == NULL ||
+    if (state->command_cache == NULL ||
+        state->command_cache_scratch == NULL || state->variables == NULL ||
+        state->variable_scratch == NULL ||
         state->pipeline_variables == NULL ||
         state->variable_commit == NULL || state->pipeline_changes == NULL ||
         state->async_repl == NULL ||
         gsh_variables_import(state->variables, environ) == -1) {
         return -1;
     }
+    gsh_command_cache_initialize(
+        state->command_cache,
+        gsh_variables_path_generation(state->variables));
+    gsh_command_cache_initialize(
+        state->command_cache_scratch,
+        gsh_variables_path_generation(state->variables));
+    state->command_cache_generation = 1;
     state->async_desired = managed_repl_requested(&state->config);
     gsh_async_repl_initialize(state->async_repl, state->async_desired);
     state->variable_generation = 1;
@@ -1962,6 +2008,10 @@ static size_t state_commit_size(const shell_state *state)
                   (state->positional_commit_expected
                        ? sizeof(*state->positional_commit)
                        : 0U) +
+                  (state->command_cache_commit_expected
+                       ? sizeof(state->command_cache_commit_header) +
+                             sizeof(*state->command_cache_scratch)
+                       : 0U) +
                   sizeof(state->option_commit);
 
     if (state->function_commit_expected) {
@@ -1997,6 +2047,10 @@ static void close_variable_commit(shell_state *state)
     state->function_commit_header_complete = false;
     memset(&state->function_commit_header, 0,
            sizeof(state->function_commit_header));
+    state->command_cache_commit_expected = false;
+    state->pending_command_cache_commit = false;
+    memset(&state->command_cache_commit_header, 0,
+           sizeof(state->command_cache_commit_header));
     if (state->directory_commit_socket >= 0) {
         close(state->directory_commit_socket);
     }
@@ -2035,8 +2089,17 @@ static void receive_variable_commit(shell_state *state, bool drain_all)
                 state->positional_commit_expected
                     ? sizeof(*state->positional_commit)
                     : 0U;
-            size_t option_begin = variable_size + alias_size +
-                                  positional_size;
+            size_t cache_header_size =
+                state->command_cache_commit_expected
+                    ? sizeof(state->command_cache_commit_header)
+                    : 0U;
+            size_t cache_size = state->command_cache_commit_expected
+                                    ? sizeof(*state->command_cache_scratch)
+                                    : 0U;
+            size_t cache_begin = variable_size + alias_size +
+                                 positional_size;
+            size_t cache_store_begin = cache_begin + cache_header_size;
+            size_t option_begin = cache_store_begin + cache_size;
             size_t option_end = option_begin + sizeof(state->option_commit);
 
             if (state->variable_commit_received < variable_size) {
@@ -2071,6 +2134,28 @@ static void receive_variable_commit(shell_state *state, bool drain_all)
                 destination = (unsigned char *)state->positional_commit +
                               state->variable_commit_received -
                                   variable_size - alias_size;
+            } else if (state->variable_commit_received <
+                       cache_store_begin) {
+                size_t offset = state->variable_commit_received -
+                                cache_begin;
+                size_t remaining = cache_header_size - offset;
+
+                if (capacity > remaining) {
+                    capacity = remaining;
+                }
+                destination =
+                    (unsigned char *)&state->command_cache_commit_header +
+                    offset;
+            } else if (state->variable_commit_received < option_begin) {
+                size_t offset = state->variable_commit_received -
+                                cache_store_begin;
+                size_t remaining = cache_size - offset;
+
+                if (capacity > remaining) {
+                    capacity = remaining;
+                }
+                destination =
+                    (unsigned char *)state->command_cache_scratch + offset;
             } else if (state->variable_commit_received < option_end) {
                 size_t remaining = option_end -
                                    state->variable_commit_received;
@@ -2142,6 +2227,10 @@ static void receive_variable_commit(shell_state *state, bool drain_all)
                         (state->positional_commit_expected
                              ? sizeof(*state->positional_commit)
                              : 0U) +
+                        (state->command_cache_commit_expected
+                             ? sizeof(state->command_cache_commit_header) +
+                                   sizeof(*state->command_cache_scratch)
+                             : 0U) +
                         sizeof(state->option_commit) +
                         sizeof(state->function_commit_header);
 
@@ -2204,6 +2293,14 @@ static bool finish_variable_commit(shell_state *state, int wait_status)
               gsh_functions_snapshot_finalize(
                   state->function_scratch,
                   &state->function_commit_header))) &&
+            (!state->command_cache_commit_expected ||
+             (state->command_cache_commit_header.version ==
+                  GSH_COMMAND_CACHE_COMMIT_VERSION &&
+              state->command_cache_commit_header.reserved == 0 &&
+              state->command_cache_commit_header.base_generation ==
+                  state->command_cache_generation &&
+              gsh_command_cache_validate(
+                  state->command_cache_scratch))) &&
             gsh_options_validate(&state->option_commit) &&
             gsh_options_enabled(&state->option_commit,
                                 GSH_OPTION_INTERACTIVE) ==
@@ -2239,6 +2336,12 @@ static bool finish_variable_commit(shell_state *state, int wait_status)
                 valid = false;
             }
         }
+        if (valid && state->command_cache_commit_expected) {
+            gsh_command_cache_rebind(
+                state->command_cache_scratch,
+                state->command_cache_commit_header.final_path_generation,
+                gsh_variables_path_generation(state->variable_scratch));
+        }
     }
     if (valid) {
         memcpy(state->variables, state->variable_scratch,
@@ -2261,6 +2364,11 @@ static bool finish_variable_commit(shell_state *state, int wait_status)
             }
             memcpy(state->positionals, state->positional_commit,
                    sizeof(*state->positionals));
+        }
+        if (state->command_cache_commit_expected) {
+            memcpy(state->command_cache, state->command_cache_scratch,
+                   sizeof(*state->command_cache));
+            state->command_cache_generation++;
         }
         state->options = state->option_commit;
         if (directory_changed) {
@@ -3084,7 +3192,9 @@ static void child_try_exec(const char *path, char *const arguments[],
 }
 
 static void child_exec_direct(char *const arguments[], const char *path_value,
-                              char *const environment[])
+                              char *const environment[],
+                              const gsh_command_cache *cache,
+                              uint64_t path_generation, bool cacheable)
 {
     const char *name = arguments[0];
     size_t name_length = child_string_length(name, EXEC_PATH_CAP);
@@ -3097,6 +3207,14 @@ static void child_exec_direct(char *const arguments[], const char *path_value,
     if (child_string_contains(name, '/')) {
         child_try_exec(name, arguments, environment);
         child_exec_error(name, errno);
+    }
+    if (cacheable) {
+        const char *cached = gsh_command_cache_lookup(
+            cache, path_generation, name);
+
+        if (cached != NULL) {
+            child_try_exec(cached, arguments, environment);
+        }
     }
 
     cursor = path_value;
@@ -3242,6 +3360,11 @@ static bool native_alias_builtin(const gsh_native_command *command)
     return command->argc > 0 &&
            (strcmp(command->argv[0], "alias") == 0 ||
             strcmp(command->argv[0], "unalias") == 0);
+}
+
+static bool native_hash_builtin(const gsh_native_command *command)
+{
+    return command->argc > 0 && strcmp(command->argv[0], "hash") == 0;
 }
 
 static bool native_command_inspection_builtin(
@@ -3393,6 +3516,8 @@ static bool native_pipeline_requires_evaluator(
             command->redirect_count != 0) ||
            (native_alias_builtin(command) &&
             command->redirect_count != 0) ||
+           (native_hash_builtin(command) &&
+            command->redirect_count != 0) ||
            (native_command_inspection_builtin(command) &&
             command->redirect_count != 0) ||
            (native_colon_builtin(command) &&
@@ -3515,15 +3640,28 @@ static int run_native_alias_builtin(
 static int run_native_command_inspection(
     const gsh_native_command *command, const char *path,
     const char *default_path, const gsh_alias_store *aliases,
-    const gsh_function_store *functions, const gsh_builtin_io *io)
+    const gsh_function_store *functions, gsh_command_cache *cache,
+    uint64_t path_generation, bool cacheable, bool *cache_changed,
+    const gsh_builtin_io *io)
 {
     if (strcmp(command->argv[0], "type") == 0) {
         return gsh_builtin_type(command->argc, command->argv, path, aliases,
-                                functions, io);
+                                functions, cache, path_generation,
+                                cache_changed, io);
     }
     return gsh_builtin_command_inspect(
         command->argc, command->argv, path, default_path, aliases,
-        functions, io);
+        functions, cache, path_generation, cacheable, cache_changed, io);
+}
+
+static int run_native_hash_builtin(
+    const gsh_native_command *command, const char *path,
+    const gsh_function_store *functions, gsh_command_cache *cache,
+    uint64_t path_generation, bool *cache_changed,
+    const gsh_builtin_io *io)
+{
+    return gsh_builtin_hash(command->argc, command->argv, path, functions,
+                            cache, path_generation, cache_changed, io);
 }
 
 static const gsh_builtin_io descriptor_builtin_io = {
@@ -3741,6 +3879,9 @@ static bool native_planned_command_is_supported(
                native->redirect_count == 0;
     }
     if (native_alias_builtin(native)) {
+        return true;
+    }
+    if (native_hash_builtin(native)) {
         return true;
     }
     if (native_command_inspection_builtin(native)) {
@@ -4179,6 +4320,40 @@ static int run_evaluator_alias_builtin(
                                               : status);
 }
 
+static int run_evaluator_hash_builtin(
+    const gsh_native_pipeline *pipeline, gsh_variable_store *variables,
+    const char *default_path, const gsh_function_store *functions,
+    gsh_command_cache *cache, const gsh_shell_options *options)
+{
+    const gsh_native_command *command = &pipeline->commands[0];
+    gsh_saved_descriptor saved[GSH_NATIVE_REDIRECT_CAP];
+    size_t saved_count;
+    const char *path;
+    int status;
+
+    if (save_redirect_descriptors(command, saved, &saved_count) == -1) {
+        perror("gsh: hash redirection save");
+        return 125;
+    }
+    if (apply_evaluator_redirects(pipeline, command, options) == -1) {
+        perror("gsh: hash redirection");
+        (void)restore_redirect_descriptors(saved, saved_count);
+        return 1;
+    }
+    path = hash_command_path_value(variables, command, default_path);
+    status = run_native_hash_builtin(
+        command, path, functions, cache,
+        hash_command_path_generation(variables, command), NULL,
+        &descriptor_builtin_io);
+    if (restore_redirect_descriptors(saved, saved_count) == -1) {
+        perror("gsh: hash redirection restore");
+        return 125;
+    }
+    return status == 125 ? 125
+                         : (pipeline->negated ? (status == 0 ? 1 : 0)
+                                              : status);
+}
+
 static int run_evaluator_state_builtin(
     const gsh_native_pipeline *pipeline, gsh_variable_store *variables,
     gsh_variable_journal *journal, gsh_positional_store *positionals,
@@ -4468,6 +4643,21 @@ static void start_native_pipeline(shell_state *state,
     sigset_t previous;
     size_t index;
 
+    if (scope == NULL) {
+        bool cache_changed = false;
+
+        for (index = 0; index < pipeline->command_count; index++) {
+            cache_changed = cache_planned_external(
+                                state->command_cache, state->variables,
+                                &pipeline->commands[index],
+                                state->default_path, state->functions) ||
+                            cache_changed;
+        }
+        if (cache_changed) {
+            state->command_cache_generation++;
+        }
+    }
+
     if (state->async_repl != NULL && state->async_repl->enabled) {
         start_async_native_pipeline(state, pipeline, scope);
         return;
@@ -4651,6 +4841,19 @@ static void start_native_pipeline(shell_state *state,
                         &pipeline->commands[index], state->aliases, NULL,
                         &descriptor_builtin_io));
                 }
+                if (native_hash_builtin(&pipeline->commands[index])) {
+                    const gsh_native_command *command =
+                        &pipeline->commands[index];
+                    const char *path = hash_command_path_value(
+                        state->variables, command, state->default_path);
+
+                    _exit(run_native_hash_builtin(
+                        command, path, state->functions,
+                        state->command_cache,
+                        hash_command_path_generation(state->variables,
+                                                     command),
+                        NULL, &descriptor_builtin_io));
+                }
                 if (native_command_inspection_builtin(
                         &pipeline->commands[index])) {
                     const gsh_native_command *command =
@@ -4661,6 +4864,9 @@ static void start_native_pipeline(shell_state *state,
                     _exit(run_native_command_inspection(
                         command, path, state->default_path,
                         state->aliases, state->functions,
+                        state->command_cache,
+                        gsh_variables_path_generation(state->variables),
+                        command_uses_persistent_path(command), NULL,
                         &descriptor_builtin_io));
                 }
             }
@@ -4675,7 +4881,11 @@ static void start_native_pipeline(shell_state *state,
                     command_path_value(state->variables,
                                        &pipeline->commands[index],
                                        state->default_path),
-                    environment);
+                    environment, state->command_cache,
+                    command_cache_path_generation(
+                        state->variables, &pipeline->commands[index]),
+                    command_uses_persistent_path(
+                        &pipeline->commands[index]));
             }
         }
         if (pid == -1) {
@@ -4921,7 +5131,9 @@ static void child_exec_managed_external(shell_state *state,
         child_exec_direct(direct->argv,
                           store_path_value(state->variables,
                                            state->default_path),
-                          environment);
+                          environment, state->command_cache,
+                          gsh_variables_path_generation(state->variables),
+                          true);
     }
     execve("/bin/sh", shell_arguments, environment);
     child_exec_error("/bin/sh", errno);
@@ -5023,6 +5235,18 @@ static void start_external(shell_state *state, simple_command *direct)
     if (direct != NULL && !direct_path_is_bounded(direct, path_value)) {
         direct = NULL;
     }
+    if (direct != NULL) {
+        char resolved[GSH_COMMAND_PATH_CAP];
+        bool cache_changed = false;
+
+        (void)gsh_command_cache_resolve(
+            state->command_cache,
+            gsh_variables_path_generation(state->variables),
+            direct->argv[0], path_value, false, &cache_changed, resolved);
+        if (cache_changed) {
+            state->command_cache_generation++;
+        }
+    }
     if (state->async_repl != NULL && state->async_repl->enabled) {
         start_async_external(state, direct);
         return;
@@ -5081,7 +5305,10 @@ static void start_external(shell_state *state, simple_command *direct)
             if (fault_should_fail("exec", EIO)) {
                 child_exec_error(direct->argv[0], errno);
             }
-            child_exec_direct(direct->argv, path_value, environment);
+            child_exec_direct(
+                direct->argv, path_value, environment,
+                state->command_cache,
+                gsh_variables_path_generation(state->variables), true);
         }
         if (fault_should_fail("exec", EIO)) {
             child_exec_error("/bin/sh", errno);
@@ -5175,6 +5402,100 @@ static const char *command_path_override(
         }
     }
     return path;
+}
+
+static bool command_uses_persistent_path(
+    const gsh_native_command *command)
+{
+    size_t index;
+
+    if (command == NULL || command->command_uses_default_path) {
+        return false;
+    }
+    for (index = 0; index < command->assignment_count; index++) {
+        if (memcmp(command->assignments[index], "PATH=", 5) == 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static uint64_t command_cache_path_generation(
+    const gsh_variable_store *variables,
+    const gsh_native_command *command)
+{
+    uint64_t generation = gsh_variables_path_generation(variables);
+
+    if (command_uses_persistent_path(command)) {
+        return generation;
+    }
+    return ~generation;
+}
+
+static const char *hash_command_path_value(
+    const gsh_variable_store *variables,
+    const gsh_native_command *command, const char *default_path)
+{
+    return command_path_override(
+        command, store_path_value(variables, default_path));
+}
+
+static uint64_t hash_command_path_generation(
+    const gsh_variable_store *variables,
+    const gsh_native_command *command)
+{
+    uint64_t generation = gsh_variables_path_generation(variables);
+    size_t index;
+
+    for (index = 0; index < command->assignment_count; index++) {
+        if (memcmp(command->assignments[index], "PATH=", 5) == 0) {
+            return ~generation;
+        }
+    }
+    return generation;
+}
+
+static bool command_can_populate_cache(
+    const gsh_native_command *command,
+    const gsh_function_store *functions)
+{
+    const char *name;
+    size_t length;
+
+    if (command == NULL || command->argc == 0 ||
+        !command_uses_persistent_path(command)) {
+        return false;
+    }
+    name = command->argv[0];
+    length = strnlen(name, GSH_COMMAND_PATH_CAP);
+    return length != 0 && length != GSH_COMMAND_PATH_CAP &&
+           strchr(name, '/') == NULL &&
+           memchr(name, '\n', length) == NULL &&
+           !gsh_command_intrinsic_name(name, length) &&
+           (command->command_suppresses_functions || functions == NULL ||
+            gsh_functions_lookup(functions, name, length) == NULL);
+}
+
+static bool cache_planned_external(
+    gsh_command_cache *cache, const gsh_variable_store *variables,
+    const gsh_native_command *command, const char *default_path,
+    const gsh_function_store *functions)
+{
+    char resolved[GSH_COMMAND_PATH_CAP];
+    const char *name;
+    const char *path;
+    bool changed = false;
+
+    if (cache == NULL ||
+        !command_can_populate_cache(command, functions)) {
+        return false;
+    }
+    name = command->argv[0];
+    path = command_path_value(variables, command, default_path);
+    (void)gsh_command_cache_resolve(
+        cache, gsh_variables_path_generation(variables), name, path,
+        false, &changed, resolved);
+    return changed;
 }
 
 static const char *command_path_value(
@@ -5531,6 +5852,26 @@ static bool run_planned_main_builtin(shell_state *state,
         queue_prompt(state);
         return true;
     }
+    if (native_hash_builtin(command) && command->redirect_count == 0) {
+        const gsh_builtin_io io = {reactor_builtin_output, state};
+        const char *path = hash_command_path_value(
+            state->variables, command, state->default_path);
+        bool cache_changed = false;
+        int status = run_native_hash_builtin(
+            command, path, state->functions, state->command_cache,
+            hash_command_path_generation(state->variables, command),
+            &cache_changed, &io);
+
+        if (cache_changed) {
+            state->command_cache_generation++;
+        }
+        state->last_status = pipeline->negated
+                                 ? (status == 0 ? 1 : 0)
+                                 : status;
+        state->mode = MODE_EDITOR;
+        queue_prompt(state);
+        return true;
+    }
     if (native_command_inspection_builtin(command) &&
         command->redirect_count == 0 &&
         gsh_functions_lookup(state->functions, command->argv[0],
@@ -5538,9 +5879,16 @@ static bool run_planned_main_builtin(shell_state *state,
         const gsh_builtin_io io = {reactor_builtin_output, state};
         const char *path = command_path_value(
             state->variables, command, state->default_path);
+        bool cache_changed = false;
         int status = run_native_command_inspection(
             command, path, state->default_path, state->aliases,
-            state->functions, &io);
+            state->functions, state->command_cache,
+            gsh_variables_path_generation(state->variables),
+            command_uses_persistent_path(command), &cache_changed, &io);
+
+        if (cache_changed) {
+            state->command_cache_generation++;
+        }
 
         state->last_status = pipeline->negated
                                  ? (status == 0 ? 1 : 0)
@@ -7478,9 +7826,11 @@ static bool async_transition_has_live_shell_state(const shell_state *state)
            state->pending_and_or_active || state->wait_target_count != 0 ||
            state->wait_all || state->pending_positional_commit ||
            state->pending_alias_commit || state->pending_function_commit ||
+           state->pending_command_cache_commit ||
            state->pending_directory_commit ||
            state->positional_commit_expected || state->alias_commit_expected ||
            state->function_commit_expected ||
+           state->command_cache_commit_expected ||
            state->directory_commit_expected;
 }
 
@@ -7897,6 +8247,10 @@ static void cleanup(shell_state *state)
     state->parse_storage = NULL;
     free(state->native_pipeline);
     state->native_pipeline = NULL;
+    free(state->command_cache);
+    state->command_cache = NULL;
+    free(state->command_cache_scratch);
+    state->command_cache_scratch = NULL;
     free(state->variables);
     state->variables = NULL;
     free(state->variable_scratch);
@@ -8036,6 +8390,8 @@ static int native_wait_status_value(int status, bool negated)
 }
 
 typedef struct native_evaluator native_evaluator;
+static gsh_command_cache *evaluator_command_cache(
+    native_evaluator *evaluator);
 
 static int run_pipeline_function(native_evaluator *parent,
                                  gsh_native_pipeline *pipeline,
@@ -8064,6 +8420,14 @@ static int run_native_noninteractive_pipeline(
     pid_t status_pid = -1;
     int last_wait_status = 0;
     bool last_status_known = false;
+
+    if (scope == NULL && evaluator_command_cache(evaluator) != NULL) {
+        for (index = 0; index < pipeline->command_count; index++) {
+            (void)cache_planned_external(
+                evaluator_command_cache(evaluator), variables,
+                &pipeline->commands[index], default_path, functions);
+        }
+    }
 
     if (pipeline->command_count == 1 &&
         pipeline->commands[0].argc == 0 &&
@@ -8152,6 +8516,22 @@ static int run_native_noninteractive_pipeline(
                               ? (builtin_status == 0 ? 1 : 0)
                               : builtin_status);
         }
+        if (native_hash_builtin(&pipeline->commands[0])) {
+            const gsh_native_command *command = &pipeline->commands[0];
+            const char *path = hash_command_path_value(
+                variables, command, default_path);
+
+            builtin_status = run_native_hash_builtin(
+                command, path, functions,
+                evaluator_command_cache(evaluator),
+                hash_command_path_generation(variables, command), NULL,
+                &descriptor_builtin_io);
+            return builtin_status == 125
+                       ? 125
+                       : (pipeline->negated
+                              ? (builtin_status == 0 ? 1 : 0)
+                              : builtin_status);
+        }
         if (native_command_inspection_builtin(&pipeline->commands[0])) {
             const gsh_native_command *command = &pipeline->commands[0];
             const char *path = command_path_value(
@@ -8159,6 +8539,9 @@ static int run_native_noninteractive_pipeline(
 
             builtin_status = run_native_command_inspection(
                 command, path, default_path, aliases, functions,
+                evaluator_command_cache(evaluator),
+                gsh_variables_path_generation(variables),
+                command_uses_persistent_path(command), NULL,
                 &descriptor_builtin_io);
             return builtin_status == 125
                        ? 125
@@ -8296,6 +8679,18 @@ static int run_native_noninteractive_pipeline(
                         &pipeline->commands[index], aliases, NULL,
                         &descriptor_builtin_io));
                 }
+                if (native_hash_builtin(&pipeline->commands[index])) {
+                    const gsh_native_command *command =
+                        &pipeline->commands[index];
+                    const char *path = hash_command_path_value(
+                        variables, command, default_path);
+
+                    _exit(run_native_hash_builtin(
+                        command, path, functions,
+                        evaluator_command_cache(evaluator),
+                        hash_command_path_generation(variables, command),
+                        NULL, &descriptor_builtin_io));
+                }
                 if (native_command_inspection_builtin(
                         &pipeline->commands[index])) {
                     const gsh_native_command *command =
@@ -8305,6 +8700,9 @@ static int run_native_noninteractive_pipeline(
 
                     _exit(run_native_command_inspection(
                         command, path, default_path, aliases, functions,
+                        evaluator_command_cache(evaluator),
+                        gsh_variables_path_generation(variables),
+                        command_uses_persistent_path(command), NULL,
                         &descriptor_builtin_io));
                 }
             }
@@ -8319,7 +8717,11 @@ static int run_native_noninteractive_pipeline(
                     command_path_value(variables,
                                        &pipeline->commands[index],
                                        default_path),
-                    environment);
+                    environment, evaluator_command_cache(evaluator),
+                    command_cache_path_generation(
+                        variables, &pipeline->commands[index]),
+                    command_uses_persistent_path(
+                        &pipeline->commands[index]));
             }
         }
         if (pid == -1) {
@@ -8424,6 +8826,8 @@ struct native_evaluator {
     gsh_alias_journal *alias_journal;
     gsh_function_store *functions;
     gsh_function_store *function_scratch;
+    gsh_command_cache *command_cache;
+    uint64_t command_cache_base_generation;
     gsh_variable_store *scope_base;
     gsh_variable_journal *scope_changes;
     pipeline_expansion_scope *pipeline_scope;
@@ -8443,9 +8847,16 @@ struct native_evaluator {
     bool directory_mutation_possible;
     bool alias_mutation_possible;
     bool function_mutation_possible;
+    bool command_cache_mutation_possible;
     bool state_commit_invalid;
     gsh_background_table *backgrounds;
 };
+
+static gsh_command_cache *evaluator_command_cache(
+    native_evaluator *evaluator)
+{
+    return evaluator == NULL ? NULL : evaluator->command_cache;
+}
 
 static bool native_preflight_node(native_evaluator *evaluator,
                                   size_t node_index, size_t depth);
@@ -9064,12 +9475,20 @@ static bool native_preflight_node(native_evaluator *evaluator,
                     native_function_mutates(command)) {
                     evaluator->function_mutation_possible = true;
                 }
+                if (evaluator->pipeline->command_count == 1U &&
+                    (native_hash_builtin(command) ||
+                     native_command_inspection_builtin(command) ||
+                     command_can_populate_cache(command,
+                                                evaluator->functions))) {
+                    evaluator->command_cache_mutation_possible = true;
+                }
             }
             if (deferred_work) {
                 evaluator->positional_mutation_possible = true;
                 evaluator->directory_mutation_possible = true;
                 evaluator->alias_mutation_possible = true;
                 evaluator->function_mutation_possible = true;
+                evaluator->command_cache_mutation_possible = true;
             }
         }
         return supported;
@@ -9236,6 +9655,9 @@ static gsh_native_plan_status execute_command_substitution(
     nested.function_scratch = local_function_scratch != NULL
                                   ? local_function_scratch
                                   : parent->function_scratch;
+    nested.command_cache = parent->command_cache;
+    nested.command_cache_base_generation =
+        parent->command_cache_base_generation;
     nested.scope_base = scope_base;
     nested.scope_changes = scope_changes;
     nested.pipeline_scope = NULL;
@@ -9247,6 +9669,8 @@ static gsh_native_plan_status execute_command_substitution(
     nested.positional_mutation_possible = false;
     nested.directory_mutation_possible = false;
     nested.alias_mutation_possible = false;
+    nested.function_mutation_possible = false;
+    nested.command_cache_mutation_possible = false;
     nested.state_commit_invalid = false;
     gsh_background_initialize(&nested_backgrounds);
     nested.backgrounds = &nested_backgrounds;
@@ -9700,6 +10124,7 @@ static int native_evaluate_pipeline(native_evaluator *evaluator,
             !native_environment_builtin(tail) &&
             !native_variable_builtin(tail) && !native_state_builtin(tail) &&
             !native_wait_builtin(tail) && !native_alias_builtin(tail) &&
+            !native_hash_builtin(tail) &&
             !native_command_inspection_builtin(tail) &&
             !native_return_builtin(tail) &&
             !native_loop_control_builtin(tail) && function == NULL) {
@@ -9722,7 +10147,9 @@ static int native_evaluate_pipeline(native_evaluator *evaluator,
                 tail->argv,
                 command_path_value(evaluator->variables, tail,
                                    evaluator->default_path),
-                environment);
+                environment, evaluator->command_cache,
+                command_cache_path_generation(evaluator->variables, tail),
+                command_uses_persistent_path(tail));
         }
     }
     if (function != NULL) {
@@ -9868,6 +10295,12 @@ static int native_evaluate_pipeline(native_evaluator *evaluator,
         if (status == 125 && evaluator->alias_journal != NULL) {
             evaluator->state_commit_invalid = true;
         }
+    } else if (evaluator->pipeline->command_count == 1 &&
+               native_hash_builtin(&evaluator->pipeline->commands[0])) {
+        status = run_evaluator_hash_builtin(
+            evaluator->pipeline, evaluator->variables,
+            evaluator->default_path, evaluator->functions,
+            evaluator->command_cache, &evaluator->options);
     } else {
         status = run_native_noninteractive_pipeline(
             evaluator->pipeline, evaluator->default_path,
@@ -9881,6 +10314,7 @@ static int native_evaluate_pipeline(native_evaluator *evaluator,
          native_state_builtin(&evaluator->pipeline->commands[0]) ||
          native_cd_builtin(&evaluator->pipeline->commands[0]) ||
          native_alias_builtin(&evaluator->pipeline->commands[0]) ||
+         native_hash_builtin(&evaluator->pipeline->commands[0]) ||
          native_loop_control_builtin(
              &evaluator->pipeline->commands[0]) ||
          (evaluator->pipeline->commands[0].argc == 0 &&
@@ -10371,6 +10805,9 @@ static bool native_node_is_supported(shell_state *state, size_t node_index)
                                       : state->functions;
     evaluator.function_scratch = definitions ? NULL
                                               : state->function_scratch;
+    evaluator.command_cache = state->command_cache;
+    evaluator.command_cache_base_generation =
+        state->command_cache_generation;
     evaluator.scope_base = state->pipeline_variables;
     evaluator.scope_changes = state->pipeline_changes;
     evaluator.pipeline_scope = NULL;
@@ -10382,6 +10819,8 @@ static bool native_node_is_supported(shell_state *state, size_t node_index)
     evaluator.positional_mutation_possible = false;
     evaluator.directory_mutation_possible = false;
     evaluator.alias_mutation_possible = false;
+    evaluator.function_mutation_possible = false;
+    evaluator.command_cache_mutation_possible = false;
     evaluator.state_commit_invalid = false;
     evaluator.backgrounds = &state->background_jobs;
     state->pending_positional_commit =
@@ -10391,6 +10830,7 @@ static bool native_node_is_supported(shell_state *state, size_t node_index)
         state->pending_directory_commit = false;
         state->pending_alias_commit = false;
         state->pending_function_commit = false;
+        state->pending_command_cache_commit = false;
         return false;
     }
     state->pending_directory_commit =
@@ -10399,6 +10839,8 @@ static bool native_node_is_supported(shell_state *state, size_t node_index)
         evaluator.positional_mutation_possible;
     state->pending_alias_commit = evaluator.alias_mutation_possible;
     state->pending_function_commit = evaluator.function_mutation_possible;
+    state->pending_command_cache_commit =
+        evaluator.command_cache_mutation_possible;
     return true;
 }
 
@@ -10643,6 +11085,9 @@ static void initialize_interactive_evaluator(native_evaluator *evaluator,
     evaluator->alias_journal = NULL;
     evaluator->functions = state->functions;
     evaluator->function_scratch = state->function_scratch;
+    evaluator->command_cache = state->command_cache;
+    evaluator->command_cache_base_generation =
+        state->command_cache_generation;
     evaluator->scope_base = state->pipeline_variables;
     evaluator->scope_changes = state->pipeline_changes;
     evaluator->pipeline_scope = NULL;
@@ -10654,6 +11099,8 @@ static void initialize_interactive_evaluator(native_evaluator *evaluator,
     evaluator->positional_mutation_possible = false;
     evaluator->directory_mutation_possible = false;
     evaluator->alias_mutation_possible = false;
+    evaluator->function_mutation_possible = false;
+    evaluator->command_cache_mutation_possible = false;
     evaluator->state_commit_invalid = false;
     evaluator->backgrounds = &state->background_jobs;
 }
@@ -11186,10 +11633,16 @@ static int write_variable_commit(
     int descriptor, gsh_variable_journal *journal,
     gsh_alias_journal *alias_journal,
     const gsh_positional_store *positionals,
+    const gsh_command_cache *command_cache,
+    uint64_t command_cache_generation,
+    uint64_t final_path_generation,
     const gsh_shell_options *options,
     const gsh_function_store *functions,
     uint64_t function_generation)
 {
+    command_cache_commit_header cache_header = {
+        GSH_COMMAND_CACHE_COMMIT_VERSION, 0,
+        command_cache_generation, final_path_generation};
     unsigned int part;
 
     if (fault_should_fail("state-commit-malformed", EPROTO)) {
@@ -11206,7 +11659,11 @@ static int write_variable_commit(
     if (fault_should_fail("option-commit-malformed", EPROTO)) {
         ((gsh_shell_options *)options)->enabled |= 1U << 29;
     }
-    for (part = 0; part < 4U; part++) {
+    if (command_cache != NULL &&
+        fault_should_fail("command-cache-commit-malformed", EPROTO)) {
+        cache_header.reserved = 1;
+    }
+    for (part = 0; part < 6U; part++) {
         const unsigned char *cursor;
         size_t remaining;
 
@@ -11225,6 +11682,18 @@ static int write_variable_commit(
             }
             cursor = (const unsigned char *)positionals;
             remaining = sizeof(*positionals);
+        } else if (part == 3) {
+            if (command_cache == NULL) {
+                continue;
+            }
+            cursor = (const unsigned char *)&cache_header;
+            remaining = sizeof(cache_header);
+        } else if (part == 4) {
+            if (command_cache == NULL) {
+                continue;
+            }
+            cursor = (const unsigned char *)command_cache;
+            remaining = sizeof(*command_cache);
         } else {
             cursor = (const unsigned char *)options;
             remaining = sizeof(*options);
@@ -11428,6 +11897,10 @@ static void start_native_compound(shell_state *state, size_t node_index)
     state->function_commit_header_complete = false;
     memset(&state->function_commit_header, 0,
            sizeof(state->function_commit_header));
+    state->command_cache_commit_expected =
+        state->pending_command_cache_commit;
+    memset(&state->command_cache_commit_header, 0,
+           sizeof(state->command_cache_commit_header));
     state->positional_commit_expected = state->pending_positional_commit;
     if (state->positional_commit_expected) {
         state->positional_commit =
@@ -11452,6 +11925,8 @@ static void start_native_compound(shell_state *state, size_t node_index)
             state->pending_alias_commit = false;
             state->function_commit_expected = false;
             state->pending_function_commit = false;
+            state->command_cache_commit_expected = false;
+            state->pending_command_cache_commit = false;
             state->directory_commit_expected = false;
             state->pending_directory_commit = false;
             output_format(state, "gsh: positional transaction: %s\r\n",
@@ -11520,6 +11995,9 @@ static void start_native_compound(shell_state *state, size_t node_index)
                                       : NULL;
         evaluator.functions = state->functions;
         evaluator.function_scratch = state->function_scratch;
+        evaluator.command_cache = state->command_cache;
+        evaluator.command_cache_base_generation =
+            state->command_cache_generation;
         evaluator.scope_base = state->pipeline_variables;
         evaluator.scope_changes = state->pipeline_changes;
         evaluator.pipeline_scope = NULL;
@@ -11531,6 +12009,8 @@ static void start_native_compound(shell_state *state, size_t node_index)
         evaluator.positional_mutation_possible = false;
         evaluator.directory_mutation_possible = false;
         evaluator.alias_mutation_possible = false;
+        evaluator.function_mutation_possible = false;
+        evaluator.command_cache_mutation_possible = false;
         evaluator.state_commit_invalid = false;
         gsh_background_initialize(&evaluator_backgrounds);
         evaluator.backgrounds = &evaluator_backgrounds;
@@ -11549,6 +12029,11 @@ static void start_native_compound(shell_state *state, size_t node_index)
                 state->positional_commit_expected
                     ? state->positional_commit
                     : NULL,
+                state->command_cache_commit_expected
+                    ? state->command_cache
+                    : NULL,
+                state->command_cache_generation,
+                gsh_variables_path_generation(evaluator.variables),
                 &evaluator.options,
                 state->function_commit_expected ? state->functions : NULL,
                 state->function_generation) == -1) {
@@ -11584,6 +12069,8 @@ static void start_native_compound(shell_state *state, size_t node_index)
         state->pending_alias_commit = false;
         state->function_commit_expected = false;
         state->pending_function_commit = false;
+        state->command_cache_commit_expected = false;
+        state->pending_command_cache_commit = false;
         state->directory_commit_expected = false;
         state->pending_directory_commit = false;
         (void)sigprocmask(SIG_SETMASK, &previous, NULL);
@@ -11614,6 +12101,12 @@ static void start_native_compound(shell_state *state, size_t node_index)
         memset(&state->function_commit_header, 0,
                sizeof(state->function_commit_header));
         state->function_commit_header_complete = false;
+    }
+    if (state->command_cache_commit_expected) {
+        memset(&state->command_cache_commit_header, 0,
+               sizeof(state->command_cache_commit_header));
+        memset(state->command_cache_scratch, 0,
+               sizeof(*state->command_cache_scratch));
     }
     state->option_commit.enabled = 0;
 
@@ -11678,7 +12171,8 @@ static int execute_native_script(
     gsh_parse_storage *storage, gsh_native_pipeline *pipeline,
     gsh_variable_store *variables, gsh_variable_store *scratch,
     gsh_variable_store *scope_base, gsh_variable_journal *scope_changes,
-    gsh_positional_store *positionals, const char *default_path)
+    gsh_positional_store *positionals, gsh_command_cache *command_cache,
+    const char *default_path)
 {
     gsh_alias_store *aliases = NULL;
     gsh_function_store *functions = NULL;
@@ -11693,7 +12187,8 @@ static int execute_native_script(
     if (input == NULL || parameter_zero == NULL || storage == NULL ||
         pipeline == NULL || variables == NULL || scratch == NULL ||
         scope_base == NULL || scope_changes == NULL || positionals == NULL ||
-        default_path == NULL || input_length > NONINTERACTIVE_INPUT_CAP) {
+        command_cache == NULL || default_path == NULL ||
+        input_length > NONINTERACTIVE_INPUT_CAP) {
         errno = EINVAL;
         return 125;
     }
@@ -11704,6 +12199,8 @@ static int execute_native_script(
     evaluator.shell_pid = (long)getpid();
     evaluator.parameter_zero = parameter_zero;
     evaluator.positionals = positionals;
+    evaluator.command_cache = command_cache;
+    evaluator.command_cache_base_generation = 1;
     gsh_options_initialize(&evaluator.options, false);
     evaluator.aliases = NULL;
     evaluator.scope_base = scope_base;
@@ -11809,6 +12306,7 @@ static int execute_native_script(
         evaluator.alias_journal = NULL;
         evaluator.functions = functions;
         evaluator.function_scratch = function_scratch;
+        evaluator.command_cache = command_cache;
         evaluator.pipeline_scope = NULL;
         evaluator.substitution_depth = 0;
         evaluator.preflight = true;
@@ -11819,6 +12317,7 @@ static int execute_native_script(
         evaluator.directory_mutation_possible = false;
         evaluator.alias_mutation_possible = false;
         evaluator.function_mutation_possible = false;
+        evaluator.command_cache_mutation_possible = false;
         evaluator.state_commit_invalid = false;
         if (!native_preflight_node(&evaluator, parsed.root, 0)) {
             fprintf(stderr, "gsh: native execution unsupported\n");
@@ -11854,11 +12353,12 @@ static int execute_native_noninteractive(
     gsh_variable_store *scope_base = malloc(sizeof(*scope_base));
     gsh_variable_journal *scope_changes = malloc(sizeof(*scope_changes));
     gsh_positional_store *positionals = malloc(sizeof(*positionals));
+    gsh_command_cache *command_cache = malloc(sizeof(*command_cache));
     int status = 125;
 
     if (storage == NULL || pipeline == NULL || variables == NULL ||
         scratch == NULL || scope_base == NULL || scope_changes == NULL ||
-        positionals == NULL ||
+        positionals == NULL || command_cache == NULL ||
         gsh_variables_import(variables, environ) == -1 ||
         gsh_positionals_assign(positionals, positional_count,
                                positional_parameters) == -1) {
@@ -11869,9 +12369,12 @@ static int execute_native_noninteractive(
         free(scope_base);
         free(scope_changes);
         free(positionals);
+        free(command_cache);
         perror("gsh: native allocation");
         return 125;
     }
+    gsh_command_cache_initialize(
+        command_cache, gsh_variables_path_generation(variables));
     {
         size_t size = confstr(_CS_PATH, default_path, sizeof(default_path));
 
@@ -11881,7 +12384,8 @@ static int execute_native_noninteractive(
     }
     status = execute_native_script(
         input, input_length, parameter_zero, storage, pipeline, variables,
-        scratch, scope_base, scope_changes, positionals, default_path);
+        scratch, scope_base, scope_changes, positionals, command_cache,
+        default_path);
     free(storage);
     free(pipeline);
     free(variables);
@@ -11889,6 +12393,7 @@ static int execute_native_noninteractive(
     free(scope_base);
     free(scope_changes);
     free(positionals);
+    free(command_cache);
     return status;
 }
 

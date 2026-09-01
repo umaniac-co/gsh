@@ -2316,6 +2316,109 @@ int main(int argc, char **argv)
          "command /bin/echo pipeline | /bin/cat", 0, "pipeline\n"},
         {"type", "type shares command resolution",
          "type true", 0, "true is a regular builtin\n"},
+        {"hash", "hash remembers an explicit utility location",
+         "PATH=/bin; hash sh; hash", 0, "sh=/bin/sh\n"},
+        {"hash", "command inspection identifies hash as a builtin",
+         "command -V hash", 0, "hash is a regular builtin\n"},
+        {"hash", "shell function keeps ordinary hash precedence",
+         "hash() { /usr/bin/printf FUNCTION_HASH; }; hash",
+         0, "FUNCTION_HASH"},
+        {"hash", "command suppresses a function named hash",
+         "hash() { /usr/bin/printf BAD_HASH; }; PATH=/bin; "
+         "command hash sh; command hash",
+         0, "sh=/bin/sh\n"},
+        {"hash", "normal command search populates the hash table",
+         "PATH=/bin; sh -c 'exit 0'; hash", 0, "sh=/bin/sh\n"},
+        {"hash", "compound external search populates the hash table",
+         "PATH=/bin; if true; then sh -c 'exit 0'; fi; hash",
+         0, "sh=/bin/sh\n"},
+        {"hash", "hash -r forgets remembered locations",
+         "GSH_HASH_FILE=/tmp/gsh-hash-reset-$$; PATH=/bin; hash sh; "
+         "hash -r; hash >\"$GSH_HASH_FILE\"; "
+         "/bin/test ! -s \"$GSH_HASH_FILE\"; "
+         "/bin/rm -f \"$GSH_HASH_FILE\"",
+         0, NULL},
+        {"hash", "PATH assignment clears remembered locations",
+         "GSH_HASH_FILE=/tmp/gsh-hash-path-$$; PATH=/bin; hash sh; "
+         "PATH=$PATH; hash >\"$GSH_HASH_FILE\"; "
+         "/bin/test ! -s \"$GSH_HASH_FILE\"; "
+         "/bin/rm -f \"$GSH_HASH_FILE\"",
+         0, NULL},
+        {"hash", "hash does not report intrinsic builtins",
+         "GSH_HASH_FILE=/tmp/gsh-hash-builtin-$$; PATH=/bin; hash cd; "
+         "hash >\"$GSH_HASH_FILE\"; /bin/test ! -s \"$GSH_HASH_FILE\"; "
+         "/bin/rm -f \"$GSH_HASH_FILE\"",
+         0, NULL},
+        {"hash", "hash does not report shell functions",
+         "GSH_HASH_FILE=/tmp/gsh-hash-function-$$; "
+         "gsh_hash_function() { :; }; hash gsh_hash_function; "
+         "hash >\"$GSH_HASH_FILE\"; /bin/test ! -s \"$GSH_HASH_FILE\"; "
+         "/bin/rm -f \"$GSH_HASH_FILE\"",
+         0, NULL},
+        {"hash", "hash accepts the option terminator",
+         "PATH=/bin; hash -- sh; hash", 0, "sh=/bin/sh\n"},
+        {"hash", "hash -r accepts the option terminator",
+         "PATH=/bin; hash sh; hash -r --; "
+         "GSH_HASH_FILE=/tmp/gsh-hash-r-end-$$; "
+         "hash >\"$GSH_HASH_FILE\"; /bin/test ! -s \"$GSH_HASH_FILE\"; "
+         "/bin/rm -f \"$GSH_HASH_FILE\"",
+         0, NULL},
+        {"hash", "hash diagnoses an unknown utility",
+         "hash gsh_definitely_missing", 1, "utility not found"},
+        {"hash", "hash rejects operands after -r",
+         "hash -r sh", 1, "-r does not accept operands"},
+        {"hash", "hash entry accelerates utility execution",
+         "PATH=/bin; hash sh; sh -c 'exit 7'", 7, NULL},
+        {"hash", "hash redirection preserves the remembered location",
+         "PATH=/bin; hash sh >/dev/null; hash", 0, "sh=/bin/sh\n"},
+        {"hash", "failed hash redirection has no cache side effect",
+         "GSH_HASH_FILE=/tmp/gsh-hash-redir-$$; PATH=/bin; "
+         "hash sh >/tmp/gsh-hash-missing-$$/out; GSH_HASH_STATUS=$?; "
+         "hash >\"$GSH_HASH_FILE\"; "
+         "/bin/test \"$GSH_HASH_STATUS\" -ne 0; "
+         "/bin/test ! -s \"$GSH_HASH_FILE\"; "
+         "/bin/rm -f \"$GSH_HASH_FILE\"",
+         0, NULL},
+        {"hash", "pipeline hash mutation is isolated",
+         "GSH_HASH_FILE=/tmp/gsh-hash-pipeline-$$; PATH=/bin; "
+         "hash sh | :; hash >\"$GSH_HASH_FILE\"; "
+         "/bin/test ! -s \"$GSH_HASH_FILE\"; "
+         "/bin/rm -f \"$GSH_HASH_FILE\"",
+         0, NULL},
+        {"hash", "subshell hash mutation is isolated",
+         "GSH_HASH_FILE=/tmp/gsh-hash-subshell-$$; PATH=/bin; "
+         "(hash sh); hash >\"$GSH_HASH_FILE\"; "
+         "/bin/test ! -s \"$GSH_HASH_FILE\"; "
+         "/bin/rm -f \"$GSH_HASH_FILE\"",
+         0, NULL},
+        {"hash", "temporary PATH hashing is cleared on scope exit",
+         "GSH_HASH_FILE=/tmp/gsh-hash-temporary-$$; PATH=/bin; "
+         "PATH=/definitely/missing hash sh >/dev/null 2>&1; "
+         "hash >\"$GSH_HASH_FILE\"; /bin/test ! -s \"$GSH_HASH_FILE\"; "
+         "/bin/rm -f \"$GSH_HASH_FILE\"",
+         0, NULL},
+        {"hash", "command -p does not replace hash's PATH environment",
+         "PATH=/definitely/missing; command -p hash sh >/dev/null 2>&1; "
+         "/bin/test $? -ne 0",
+         0, NULL},
+        {"hash", "stale locations repeat PATH search and update inspection",
+         "GSH_HASH_ROOT=/tmp/gsh-hash-failover-$$; "
+         "/bin/mkdir -p \"$GSH_HASH_ROOT/first\" "
+         "\"$GSH_HASH_ROOT/second\"; "
+         "/bin/cp /bin/sh \"$GSH_HASH_ROOT/second/probe\"; "
+         "PATH=$GSH_HASH_ROOT/first:$GSH_HASH_ROOT/second; hash probe; "
+         "/bin/cp /bin/sh \"$GSH_HASH_ROOT/first/probe\"; "
+         "command -v probe >\"$GSH_HASH_ROOT/before\"; "
+         "/usr/bin/grep -q \"$GSH_HASH_ROOT/second/probe\" "
+         "\"$GSH_HASH_ROOT/before\"; "
+         "/bin/mv \"$GSH_HASH_ROOT/second/probe\" "
+         "\"$GSH_HASH_ROOT/retired\"; probe -c 'exit 0'; "
+         "command -v probe >\"$GSH_HASH_ROOT/after\"; "
+         "/usr/bin/grep -q \"$GSH_HASH_ROOT/first/probe\" "
+         "\"$GSH_HASH_ROOT/after\"; GSH_HASH_STATUS=$?; "
+         "/bin/rm -rf \"$GSH_HASH_ROOT\"; "
+         "/bin/test \"$GSH_HASH_STATUS\" -eq 0",
+         0, NULL},
         {"export", "native export assignment",
          "export GSH_EXPORT_VALUE='alpha beta'; "
          "/usr/bin/printenv GSH_EXPORT_VALUE",

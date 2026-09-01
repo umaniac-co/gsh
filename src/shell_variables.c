@@ -169,6 +169,15 @@ static int write_assignment(char *destination, const char *name,
     return 0;
 }
 
+static int successful_update(gsh_variable_store *store, const char *name,
+                             size_t name_length, bool set_value)
+{
+    if (set_value && name_length == 4U && memcmp(name, "PATH", 4) == 0) {
+        store->path_generation++;
+    }
+    return 0;
+}
+
 static int set_variable(gsh_variable_store *store, const char *name,
                         size_t name_length, const char *value,
                         size_t value_length, unsigned int attribute_mask,
@@ -226,7 +235,7 @@ static int set_variable(gsh_variable_store *store, const char *name,
             entry->attributes = (uint16_t)(
                 (entry->attributes & ~attribute_mask) |
                 (attributes & attribute_mask));
-            return 0;
+            return successful_update(store, name, name_length, set_value);
         }
         if (new_length > old_length &&
             new_length - old_length >
@@ -259,7 +268,7 @@ static int set_variable(gsh_variable_store *store, const char *name,
             (entry->attributes & ~attribute_mask) |
             (attributes & attribute_mask));
         entry->attributes &= (uint16_t)~GSH_VARIABLE_INTERNAL_UNSET;
-        return 0;
+        return successful_update(store, name, name_length, set_value);
     }
     if (store->count == GSH_VARIABLE_CAP) {
         errno = ENOSPC;
@@ -286,7 +295,7 @@ static int set_variable(gsh_variable_store *store, const char *name,
         store->text_used -= (uint32_t)new_length;
         return -1;
     }
-    return 0;
+    return successful_update(store, name, name_length, set_value);
 }
 
 int gsh_variables_set(gsh_variable_store *store, const char *name,
@@ -334,7 +343,7 @@ int gsh_variables_unset(gsh_variable_store *store, const char *name,
     hash = variable_hash(name, name_length);
     index = variable_index(store, name, name_length, hash);
     if (index == GSH_VARIABLE_CAP) {
-        return 0;
+        return successful_update(store, name, name_length, true);
     }
     if ((store->entries[index].attributes & GSH_VARIABLE_READONLY) != 0) {
         errno = EROFS;
@@ -356,7 +365,7 @@ int gsh_variables_unset(gsh_variable_store *store, const char *name,
         }
     }
     rebuild_hash(store);
-    return 0;
+    return successful_update(store, name, name_length, true);
 }
 
 int gsh_variables_import(gsh_variable_store *store,
@@ -426,6 +435,11 @@ bool gsh_variables_is_set(const gsh_variable_store *store, size_t index)
     return index < store->count &&
            (store->entries[index].attributes &
             GSH_VARIABLE_INTERNAL_UNSET) == 0;
+}
+
+uint64_t gsh_variables_path_generation(const gsh_variable_store *store)
+{
+    return store == NULL ? 0U : store->path_generation;
 }
 
 void gsh_variable_journal_initialize(gsh_variable_journal *journal,

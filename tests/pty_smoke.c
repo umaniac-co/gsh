@@ -2054,6 +2054,85 @@ static int alias_builtin_flow(const char *executable)
     return failed;
 }
 
+static void remove_hash_fixture(const char *fixture)
+{
+    static const char *const names[] = {
+        "hash.out", "after.out", "clear.out"};
+    char path[PATH_MAX];
+    size_t index;
+
+    for (index = 0; index < sizeof(names) / sizeof(names[0]); index++) {
+        if (snprintf(path, sizeof(path), "%s/%s", fixture,
+                     names[index]) < (int)sizeof(path)) {
+            (void)unlink(path);
+        }
+    }
+    (void)rmdir(fixture);
+}
+
+static int command_hash_flow(const char *executable)
+{
+    char fixture[] = "/tmp/gsh-pty-hash-XXXXXX";
+    pty_session session;
+    int failed = 0;
+
+    if (mkdtemp(fixture) == NULL ||
+        start_session(&session, executable, fixture, SHELL_GSH) == -1) {
+        perror("pty hash: setup");
+        remove_hash_fixture(fixture);
+        return 1;
+    }
+    if (consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        send_text(&session, "PATH=/bin; hash sh >hash.out\r") == -1 ||
+        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        send_text(&session, "hash\r") == -1 ||
+        consume_through(&session, "sh=/bin/sh\r\n", TEST_TIMEOUT_MS) ==
+            -1 ||
+        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        send_text(&session, "(hash -r)\r") == -1 ||
+        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        send_text(&session, "hash\r") == -1 ||
+        consume_through(&session, "sh=/bin/sh\r\n", TEST_TIMEOUT_MS) ==
+            -1 ||
+        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        send_text(&session, "PATH=$PATH\r") == -1 ||
+        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        send_text(&session,
+                  "hash >after.out; /bin/test ! -s after.out && "
+                  "/usr/bin/printf GSH_HASH_PATH_CLEAR\r") == -1 ||
+        consume_through(&session, "GSH_HASH_PATH_CLEAR",
+                        TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        send_text(&session,
+                  "if true; then sh -c 'exit 0'; fi\r") == -1 ||
+        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        send_text(&session, "hash\r") == -1 ||
+        consume_through(&session, "sh=/bin/sh\r\n", TEST_TIMEOUT_MS) ==
+            -1 ||
+        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        send_text(&session, "hash -r >clear.out\r") == -1 ||
+        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        send_text(&session,
+                  "hash >clear.out; /bin/test ! -s clear.out && "
+                  "/usr/bin/printf GSH_HASH_COMMIT_CLEAR\r") == -1 ||
+        consume_through(&session, "GSH_HASH_COMMIT_CLEAR",
+                        TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1) {
+        perror("pty hash: flow");
+        dump_capture(&session);
+        failed = 1;
+    }
+    if (!failed && process_child_count(session.pid) != 1) {
+        fprintf(stderr, "pty hash: command left child processes\n");
+        failed = 1;
+    }
+    if (stop_session(&session) == -1) {
+        failed = 1;
+    }
+    remove_hash_fixture(fixture);
+    return failed;
+}
+
 static int function_builtin_flow(const char *executable)
 {
     char fixture[] = "/tmp/gsh-pty-function-XXXXXX";
@@ -2653,6 +2732,45 @@ static int alias_commit_fault_case(const char *executable)
     return failed;
 }
 
+static int command_cache_commit_fault_case(const char *executable)
+{
+    char fixture[] = "/tmp/gsh-fault-command-cache-XXXXXX";
+    pty_session session;
+    int failed = 0;
+
+    if (mkdtemp(fixture) == NULL ||
+        setenv("GSH_FAULT", "command-cache-commit-malformed", 1) == -1 ||
+        start_session(&session, executable, fixture, SHELL_GSH) == -1) {
+        perror("pty fault: command cache commit setup");
+        (void)unsetenv("GSH_FAULT");
+        (void)rmdir(fixture);
+        return 1;
+    }
+    (void)unsetenv("GSH_FAULT");
+    if (consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        send_text(&session, "PATH=/bin\r") == -1 ||
+        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        send_text(&session, "hash sh\r") == -1 ||
+        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        send_text(&session, "if true; then hash -r; fi\r") == -1 ||
+        consume_through(&session, "gsh: state transaction rejected",
+                        TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        send_text(&session, "hash\r") == -1 ||
+        consume_through(&session, "sh=/bin/sh\r\n", TEST_TIMEOUT_MS) ==
+            -1 ||
+        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1) {
+        fprintf(stderr, "pty fault: command cache rollback failed\n");
+        dump_capture(&session);
+        failed = 1;
+    }
+    if (stop_session(&session) == -1) {
+        failed = 1;
+    }
+    (void)rmdir(fixture);
+    return failed;
+}
+
 static int function_commit_fault_case(const char *executable,
                                       const char *fault)
 {
@@ -2831,6 +2949,9 @@ static int fault_injection_flow(const char *executable)
         "allocation:5",
         "allocation:6",
         "allocation:7",
+        "allocation:8",
+        "allocation:9",
+        "allocation:10",
         "tty-open",
         "signal-pipe",
         "poll",
@@ -2882,6 +3003,7 @@ static int fault_injection_flow(const char *executable)
         executable, "directory-commit-apply",
         "gsh: state transaction rejected");
     failed |= alias_commit_fault_case(executable);
+    failed |= command_cache_commit_fault_case(executable);
     failed |= function_commit_fault_case(executable,
                                          "function-commit-malformed");
     failed |= function_commit_fault_case(executable,
@@ -2891,7 +3013,7 @@ static int fault_injection_flow(const char *executable)
         failed |= fatal_fault_case(executable, fatal_cases[index]);
     }
     if (!failed) {
-        puts("pty fault: 65 deterministic boundary failures passed");
+        puts("pty fault: 69 deterministic boundary failures passed");
     }
     return failed;
 }
@@ -4536,6 +4658,7 @@ static int latency_benchmark(const char *gsh, const char *bash,
     uint64_t execution[BENCH_SHELLS][BENCH_EXEC_SAMPLES];
     uint64_t lookup[BENCH_SHELLS][BENCH_EXEC_SAMPLES];
     uint64_t command_lookup[BENCH_SHELLS][BENCH_EXEC_SAMPLES];
+    uint64_t command_path_cache[BENCH_SHELLS][BENCH_EXEC_SAMPLES];
     uint64_t assignment[BENCH_SHELLS][BENCH_EXEC_SAMPLES];
     uint64_t assign_default[BENCH_SHELLS][BENCH_EXEC_SAMPLES];
     uint64_t arithmetic_assignment[BENCH_SHELLS][BENCH_EXEC_SAMPLES];
@@ -4661,6 +4784,9 @@ static int latency_benchmark(const char *gsh, const char *bash,
         benchmark_prompt_command(
             sessions, specs, command_lookup, NULL,
             "command -v true\r", "command lookup") == -1 ||
+        benchmark_prompt_command(
+            sessions, specs, command_path_cache, "hash sh\r",
+            "command -v sh\r", "cached command path lookup") == -1 ||
         benchmark_prompt_command(sessions, specs, assignment, NULL,
                                  "GSH_BENCH_ASSIGN=value\r",
                                  "variable assignment") == -1 ||
@@ -4816,6 +4942,8 @@ done:
                           lookup[offset], BENCH_EXEC_SAMPLES);
         print_raw_samples(specs[offset].name, "command-lookup",
                           command_lookup[offset], BENCH_EXEC_SAMPLES);
+        print_raw_samples(specs[offset].name, "command-path-cache",
+                          command_path_cache[offset], BENCH_EXEC_SAMPLES);
         print_raw_samples(specs[offset].name, "variable-assignment",
                           assignment[offset], BENCH_EXEC_SAMPLES);
         print_raw_samples(specs[offset].name, "parameter-assign-default",
@@ -4882,6 +5010,8 @@ done:
         print_metric("variable-lookup", lookup[offset],
                      BENCH_EXEC_SAMPLES, 5000000ULL);
         print_metric("command-lookup", command_lookup[offset],
+                     BENCH_EXEC_SAMPLES, 5000000ULL);
+        print_metric("command-path-cache", command_path_cache[offset],
                      BENCH_EXEC_SAMPLES, 5000000ULL);
         print_metric("variable-assignment", assignment[offset],
                      BENCH_EXEC_SAMPLES, 5000000ULL);
@@ -5278,6 +5408,7 @@ int main(int argc, char **argv)
         managed_async_repl_flow(executable) != 0 ||
         variable_builtin_flow(executable) != 0 ||
         alias_builtin_flow(executable) != 0 ||
+        command_hash_flow(executable) != 0 ||
         function_builtin_flow(executable) != 0 ||
         deferred_pattern_flow(executable) != 0 ||
         asynchronous_list_flow(executable) != 0 ||

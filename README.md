@@ -149,8 +149,13 @@ redirections, pipelines, and missing-name status are native. The execution form
 of `command` is also native for the implemented target set, including nested
 wrappers, function suppression, `-p`, declaration assignments, temporary
 special-builtin prefixes, redirections, pipelines, and 126/127 propagation.
-It remains incomplete for target builtins not implemented yet; the
-command-location cache required by `hash` is also still missing.
+`hash` and ordinary external execution share a 128-entry, open-addressed
+command-location cache with allocation-free steady-state lookup. Every
+successful `PATH` assignment invalidates it, stale executable locations fall
+back to a fresh search, and compound mutations commit atomically while
+pipelines and subshells remain isolated. Command-local `PATH` and `command -p`
+do not pollute the owning shell's cache. Command execution remains incomplete
+for target builtins not implemented yet.
 Function definition, deferred expansion, positional invocation scope,
 environment mutation, `return`, redefinition, and `unset -f` have native
 bounded implementations. Definition/call redirections and function execution
@@ -165,7 +170,7 @@ incomplete. The interactive unsupported-syntax bridge and the external
 before `gsh` can claim POSIX.1-2024 shell-language conformance.
 
 The builtins implemented in `gsh` itself include `cd`, `command` within the
-target set described above, `exit`, `pwd`, `export`,
+target set described above, `exit`, `hash`, `pwd`, `export`,
 `readonly`, `unset`, `ulimit`, `umask`, `:`, `true`, `false`, `fg`, `bg`,
 `set`, `shift`, `type`, `wait`, `break`, `continue`, `alias`, `unalias`,
 `help`, and `rt` within their currently documented contexts. The exact standalone
@@ -252,7 +257,7 @@ make fuzz-pty-sanitize
 make soak SOAK_SECONDS=60
 ```
 
-`check-fault` uses a separate test-only binary and exercises 65 deterministic
+`check-fault` uses a separate test-only binary and exercises 69 deterministic
 failure points. The production build contains neither the injection
 configuration nor its fault names. `check-resource` covers runtime descriptor
 and process exhaustion, data-limit capability, bounded single-line and
@@ -304,7 +309,7 @@ It alternates `gsh`, Bash without startup files, and Zsh with `-f`, reporting
 the tool versions, every ordered raw nanosecond sample, p50, p95, p99, maximum,
 and samples over 5 ms. All three shells emit the same-length base prompt.
 Workloads currently cover startup, idle key echo,
-`/usr/bin/true`, variable and command lookup, assignment,
+`/usr/bin/true`, variable, builtin-command, and cached `PATH` lookup, assignment,
 `${parameter:=word}`, arithmetic
 assignment, a mutating expansion in a two-stage pipeline, `ulimit -S -n`,
 `umask`, `export`, `unset`, `readonly`, finite explicit-list `for`,
