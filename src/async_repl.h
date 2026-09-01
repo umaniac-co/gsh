@@ -41,7 +41,6 @@ typedef struct {
     bool control;
     bool output_closed;
     bool output_truncated;
-    bool last_was_cr;
     bool focused;
     bool input_requested;
     bool input_probe_pending;
@@ -66,6 +65,8 @@ typedef struct {
     size_t input_length;
     char output[GSH_ASYNC_CELL_OUTPUT_CAP];
     size_t output_length;
+    size_t output_line_start;
+    size_t output_cursor;
     char passthrough_utf8[4];
     unsigned char passthrough_utf8_length;
     unsigned char passthrough_utf8_expected;

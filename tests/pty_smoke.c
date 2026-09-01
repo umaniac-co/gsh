@@ -1887,6 +1887,30 @@ static int managed_repl_contains_output(pty_session *session)
     return 0;
 }
 
+static int managed_repl_rewrites_progress(pty_session *session)
+{
+    if (send_text(session,
+                  "/bin/sh -c 'for n in 10 20 DONE; do "
+                  "printf \"GSH_PROGRESS_%s\\r\" \"$n\"; "
+                  "sleep 0.05; done; printf \"\\n\"'\r") == -1 ||
+        wait_for_output(session, "GSH_PROGRESS_DONE",
+                        TEST_TIMEOUT_MS) == -1 ||
+        wait_for_output(session, "gsh$ ", TEST_TIMEOUT_MS) == -1) {
+        return -1;
+    }
+    session->capture_length = 0;
+    if (send_text(session, "X") == -1 ||
+        wait_for_output(session, "gsh$ X", TEST_TIMEOUT_MS) == -1 ||
+        !capture_contains(session, "GSH_PROGRESS_DONE") ||
+        capture_contains(session, "GSH_PROGRESS_10") ||
+        capture_contains(session, "GSH_PROGRESS_20") ||
+        send_bytes(session, "\025", 1) == -1) {
+        errno = ETIMEDOUT;
+        return -1;
+    }
+    return 0;
+}
+
 static int managed_repl_resize(pty_session *session)
 {
     if (send_text(session, "RESIZE_KEEP") == -1 ||
@@ -2025,6 +2049,7 @@ static int managed_async_repl_flow(const char *executable)
         managed_repl_pipeline(&session) == -1 ||
         managed_repl_ordering(&session) == -1 ||
         managed_repl_contains_output(&session) == -1 ||
+        managed_repl_rewrites_progress(&session) == -1 ||
         managed_repl_resize(&session) == -1 ||
         managed_repl_toggle(&session) == -1 ||
         managed_repl_saturation(&session) == -1) {

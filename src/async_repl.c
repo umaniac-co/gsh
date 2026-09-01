@@ -7,6 +7,7 @@
 
 #include "async_repl.h"
 
+#include <assert.h>
 #include <errno.h>
 #include <signal.h>
 #include <string.h>
@@ -426,15 +427,60 @@ int gsh_async_repl_reap(gsh_async_repl *repl, pid_t pid, int wait_status)
     return cell_index;
 }
 
-static int append_visible_byte(gsh_async_cell *cell, unsigned char byte)
+/* ── Carriage Returns Rewrite One Logical Row ──────────────────
+ * Progress producers such as Git use carriage return to revisit one row.
+ * Treating that byte as a newline retained every percentage as scrollback.
+ * Each cell now keeps a bounded cursor inside its current logical output row.
+ * Carriage return resets that cursor, visible bytes overwrite in place, and
+ * only newline commits another row, matching the terminal behavior we retain.
+ * Invalid internal offsets recover to the bounded buffer end before use.
+ * ─────────────────────────────────────────────────────────────── */
+static void recover_output_cursor(gsh_async_cell *cell)
 {
+    if (cell->output_length >= sizeof(cell->output)) {
+        cell->output_length = sizeof(cell->output) - 1U;
+        cell->output[cell->output_length] = '\0';
+        cell->output_truncated = true;
+    }
+    if (cell->output_line_start > cell->output_length ||
+        cell->output_cursor < cell->output_line_start ||
+        cell->output_cursor > cell->output_length) {
+        cell->output_line_start = cell->output_length;
+        cell->output_cursor = cell->output_length;
+    }
+    assert(cell->output_line_start <= cell->output_cursor);
+    assert(cell->output_cursor <= cell->output_length);
+    assert(cell->output_length < sizeof(cell->output));
+}
+
+static void write_visible_byte(gsh_async_cell *cell, unsigned char byte)
+{
+    recover_output_cursor(cell);
+    if (cell->output_cursor < cell->output_length) {
+        cell->output[cell->output_cursor++] = (char)byte;
+        return;
+    }
     if (cell->output_length >= sizeof(cell->output) - 1U) {
         cell->output_truncated = true;
-        return 0;
+        return;
     }
     cell->output[cell->output_length++] = (char)byte;
+    cell->output_cursor = cell->output_length;
     cell->output[cell->output_length] = '\0';
-    return 0;
+}
+
+static void append_visible_newline(gsh_async_cell *cell)
+{
+    recover_output_cursor(cell);
+    if (cell->output_length >= sizeof(cell->output) - 1U) {
+        cell->output_truncated = true;
+        cell->output_cursor = cell->output_length;
+        return;
+    }
+    cell->output[cell->output_length++] = '\n';
+    cell->output[cell->output_length] = '\0';
+    cell->output_line_start = cell->output_length;
+    cell->output_cursor = cell->output_length;
 }
 
 static void append_terminal_byte(gsh_async_cell *cell, unsigned char byte)
@@ -460,19 +506,14 @@ static void append_terminal_byte(gsh_async_cell *cell, unsigned char byte)
     if (byte == 0x1bU) {
         cell->escape_state = 1U;
     } else if (byte == '\r') {
-        (void)append_visible_byte(cell, '\n');
-        cell->last_was_cr = true;
+        recover_output_cursor(cell);
+        cell->output_cursor = cell->output_line_start;
     } else if (byte == '\n') {
-        if (!cell->last_was_cr) {
-            (void)append_visible_byte(cell, '\n');
-        }
-        cell->last_was_cr = false;
+        append_visible_newline(cell);
     } else if (byte == '\t') {
-        (void)append_visible_byte(cell, ' ');
-        cell->last_was_cr = false;
+        write_visible_byte(cell, ' ');
     } else if (byte >= 0x20U) {
-        (void)append_visible_byte(cell, byte);
-        cell->last_was_cr = false;
+        write_visible_byte(cell, byte);
     }
 }
 
@@ -718,13 +759,13 @@ int gsh_async_repl_request_input(gsh_async_repl *repl, int cell_index,
             size_t offset;
 
             cell->output_length = 0;
+            cell->output_line_start = 0;
+            cell->output_cursor = 0;
             cell->output[0] = '\0';
             cell->output_truncated = false;
             cell->escape_state = 0;
-            cell->last_was_cr = false;
             for (offset = 0; offset < sizeof(marker) - 1U; offset++) {
-                (void)append_visible_byte(cell,
-                                          (unsigned char)marker[offset]);
+                append_terminal_byte(cell, (unsigned char)marker[offset]);
             }
             cell->fullscreen_recorded = true;
         }

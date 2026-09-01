@@ -562,7 +562,9 @@ wakes; it is not a guarantee about external commands or the host OS. `gsh$`
 means every prior command is terminal and its output source is closed. `gsh*`
 means at least one command is queued, running, stopped, has pending input or
 output, or still owns a PTY. The prompt changes automatically from `gsh*` to
-`gsh$` when the session settles.
+`gsh$` when the session settles. Progress output that uses carriage return,
+including Git's compression and object-writing counters, rewrites one retained
+row instead of turning every intermediate percentage into scrollback.
 
 One command can also be executed without an interactive terminal:
 
