@@ -3571,6 +3571,9 @@ static int fault_injection_flow(const char *executable)
         executable, "source-workspace-exhaustion", "eval :", 125,
         "nested source workspace limit exceeded");
     failed |= noninteractive_fault_case(
+        executable, "trap-workspace-exhaustion", "trap ':' EXIT; :", 125,
+        "trap source workspace limit exceeded");
+    failed |= noninteractive_fault_case(
         executable, "descriptor-save", "eval : >/dev/null", 125,
         "source redirection save");
     failed |= noninteractive_fault_case(
@@ -3608,7 +3611,7 @@ static int fault_injection_flow(const char *executable)
         failed |= fatal_fault_case(executable, fatal_cases[index]);
     }
     if (!failed) {
-        puts("pty fault: 92 deterministic boundary failures passed");
+        puts("pty fault: 93 deterministic boundary failures passed");
     }
     return failed;
 }

@@ -183,6 +183,19 @@ pipeline negation once termination is requested, and is naturally confined by
 the process boundaries of subshells, substitutions, pipelines, and asynchronous
 lists. Direct interactive `exit` remains native; parent-owned termination from
 an interactive compound evaluator is still continuation-engine work.
+The non-interactive `trap` special builtin implements the Issue 8 `-p`,
+default, ignore, action, numeric-reset, and reinput-safe query forms over a
+fixed 1 MiB compact action arena. Signal handlers perform only bounded
+`sig_atomic_t` reporting; the evaluator parses actions at dispatch time,
+preserves `$?`, and defers foreground traps while allowing `wait` and an idle
+standard-input read to return immediately. EXIT actions retain the terminating
+environment and can replace the final status with `exit`. Caught actions reset
+across pipeline, subshell, command-substitution, and asynchronous process
+boundaries, ignored dispositions persist, and ignored signals inherited by a
+non-interactive shell cannot be changed. A pristine subshell query can emit its
+entry snapshot for `save=$(trap -p)` without executing the parent's EXIT action.
+Interactive parent-owned trap state is not integrated into the continuation
+engine yet, so the overall signals/traps gate remains partial.
 The `eval` and `.` special builtins are native in the non-interactive evaluator.
 `eval` concatenates operands with one space, supports an optional `--`, parses
 the result in a preallocated source slot, and executes it in the caller's
@@ -218,7 +231,8 @@ shell-language conformance.
 
 The builtins implemented in `gsh` itself include `.`, `cd`, `command` within the
 target set described above, `eval`, `exec`, `exit`, `hash`, `pwd`, `export`,
-`readonly`, `unset`, `ulimit`, `umask`, `times`, `:`, `true`, `false`, `fg`, `bg`,
+`readonly`, `unset`, `ulimit`, `umask`, `times`, `trap`, `:`, `true`, `false`,
+`fg`, `bg`,
 `set`, `shift`, `type`, `wait`, `break`, `continue`, `alias`, `unalias`,
 `help`, and `rt` within their currently documented contexts. The exact standalone
 interactive control submission `/async` toggles the managed REPL for the
@@ -299,6 +313,7 @@ make check-resource
 make check-positionals
 make check-background
 make check-functions
+make check-traps
 make analyze
 make fuzz-smoke
 make fuzz-sanitize
@@ -307,7 +322,7 @@ make fuzz-pty-sanitize
 make soak SOAK_SECONDS=60
 ```
 
-`check-fault` uses a separate test-only binary and exercises 92 deterministic
+`check-fault` uses a separate test-only binary and exercises 93 deterministic
 failure points. The production build contains neither the injection
 configuration nor its fault names. `check-resource` covers runtime descriptor
 and process exhaustion, data-limit capability, bounded single-line and
@@ -568,7 +583,9 @@ input limit: address space and filesystem exhaustion are reported as system
 resource failures. Null bytes remain invalid. Non-blocking standard input is
 switched to blocking mode on the shared open file description before reading,
 as required. Empty and comment-only complete commands preserve the prior
-status. Interactive unsupported syntax—including interactive `eval` and
+status. A trapped signal interrupts an otherwise idle input read, runs before
+another byte is required, and resumes the same partial command without source
+loss. Interactive unsupported syntax—including interactive `eval` and
 dot—still has a compatibility fallback; non-interactive top-level input and
 external `ENOEXEC` scripts do not.
 
@@ -629,9 +646,9 @@ replaces the worker.
 
 This is soft real-time engineering, not hard real-time or mission-grade status.
 The repository has executable conformance tranches, bounded fuzz/property
-checks, sanitizer builds, 92 deterministic fault cases, resource-pressure
+checks, sanitizer builds, 93 deterministic fault cases, resource-pressure
 scenarios, and a configurable soak runner. The current native tranche contains
-525 execution cases, 30 syntax cases, and 17 deterministic limit cases with
+563 execution cases, 30 syntax cases, and 17 deterministic limit cases with
 one explicitly unsupported case and no delegated cases. The current same-source
 tranche passes the local macOS matrix, but does not gain same-revision remote
 evidence until the macOS arm64 and Ubuntu x86-64 GCC/Clang jobs run after

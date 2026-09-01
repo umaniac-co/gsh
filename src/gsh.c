@@ -43,6 +43,7 @@
 #include "builtin_alias.h"
 #include "builtin_command.h"
 #include "builtin_times.h"
+#include "builtin_trap.h"
 #include "builtin_unalias.h"
 #include "builtin_ulimit.h"
 #include "builtin_umask.h"
@@ -63,6 +64,7 @@
 #include "shell_aliases.h"
 #include "shell_functions.h"
 #include "shell_options.h"
+#include "shell_traps.h"
 #include "shell_config.h"
 #include "source_workspace.h"
 
@@ -83,7 +85,6 @@ enum {
     PROMPT_REQUEST_BRANCH = 1,
     PROMPT_REQUEST_REDIRECTION = 2,
     NONINTERACTIVE_INPUT_FAST_CAP = GSH_SOURCE_INPUT_CAP,
-    NATIVE_INPUT_RETRY_CAP = 1024 * 1024,
     GSH_NATIVE_JOB_MEMBER_CAP =
         GSH_NATIVE_PIPELINE_CAP + GSH_NATIVE_HEREDOC_CAP,
     CHILD_ENVIRONMENT_CAP = GSH_VARIABLE_ENVIRONMENT_CAP,
@@ -3972,6 +3973,11 @@ static bool native_times_builtin(const gsh_native_command *command)
     return command->argc > 0 && strcmp(command->argv[0], "times") == 0;
 }
 
+static bool native_trap_builtin(const gsh_native_command *command)
+{
+    return command->argc > 0 && strcmp(command->argv[0], "trap") == 0;
+}
+
 static bool native_exec_builtin(const gsh_native_command *command)
 {
     return command->argc > 0 && strcmp(command->argv[0], "exec") == 0;
@@ -4567,6 +4573,9 @@ static bool native_planned_command_is_supported(
         return true;
     }
     if (native_times_builtin(native)) {
+        return true;
+    }
+    if (native_trap_builtin(native)) {
         return true;
     }
     if (native_exec_builtin(native)) {
@@ -5345,6 +5354,50 @@ static int run_evaluator_state_builtin(
     }
     if (restore_redirect_descriptors(saved, saved_count) == -1) {
         perror("gsh: redirection restore");
+        return 125;
+    }
+    return status == 125 ? 125
+                         : (pipeline->negated ? (status == 0 ? 1 : 0)
+                                              : status);
+}
+
+static int run_evaluator_trap_builtin(
+    const gsh_native_pipeline *pipeline, gsh_variable_store *variables,
+    gsh_variable_journal *journal, const gsh_shell_options *options,
+    gsh_trap_store *traps, bool *builtin_failed)
+{
+    const gsh_native_command *command = &pipeline->commands[0];
+    gsh_saved_descriptor saved[GSH_NATIVE_REDIRECT_CAP];
+    size_t saved_count;
+    int status;
+
+    *builtin_failed = false;
+    if (traps == NULL ||
+        save_redirect_descriptors(command, saved, &saved_count) == -1) {
+        perror("gsh: trap redirection save");
+        *builtin_failed = true;
+        return 125;
+    }
+    if (apply_evaluator_redirects(pipeline, command, options) == -1) {
+        perror("gsh: trap redirection");
+        (void)restore_redirect_descriptors(saved, saved_count);
+        *builtin_failed = true;
+        return 1;
+    }
+    status = apply_special_builtin_assignments(
+        variables, journal, command, options);
+    if (status != GSH_ASSIGNMENT_OK) {
+        perror("gsh: trap assignment");
+        status = status == GSH_ASSIGNMENT_JOURNAL_ERROR ? 125 : 1;
+        *builtin_failed = true;
+    } else {
+        status = gsh_builtin_trap((int)command->argc, command->argv,
+                                  traps, &descriptor_builtin_io);
+        *builtin_failed = status == 2 || status == 125;
+    }
+    if (restore_redirect_descriptors(saved, saved_count) == -1) {
+        perror("gsh: trap redirection restore");
+        *builtin_failed = true;
         return 125;
     }
     return status == 125 ? 125
@@ -9368,6 +9421,10 @@ static gsh_command_cache *evaluator_command_cache(
 static const gsh_times_context *evaluator_times_context(
     native_evaluator *evaluator);
 static int evaluator_last_status(const native_evaluator *evaluator);
+static gsh_trap_store *evaluator_trap_store(native_evaluator *evaluator);
+static int finish_native_evaluator(native_evaluator *evaluator,
+                                   int status);
+static void enter_native_subshell_or_exit(native_evaluator *evaluator);
 
 static int run_pipeline_function(native_evaluator *parent,
                                  gsh_native_pipeline *pipeline,
@@ -9598,6 +9655,7 @@ static int run_native_noninteractive_pipeline(
             size_t close_index;
 
             reset_child_signals();
+            enter_native_subshell_or_exit(evaluator);
             close_evaluator_exec_transaction(evaluator);
             if (pipeline->commands[index].expansion_error) {
                 _exit(1);
@@ -9634,7 +9692,9 @@ static int run_native_noninteractive_pipeline(
                     &function_found);
 
                 if (function_found) {
-                    _exit(function_status & 255);
+                    _exit(finish_native_evaluator(
+                              evaluator, function_status) &
+                          255);
                 }
             }
             if (fault_should_fail("exec", EIO)) {
@@ -9704,8 +9764,11 @@ static int run_native_noninteractive_pipeline(
                         positionals, options, &descriptor_builtin_io));
                 }
                 if (native_source_builtin(&pipeline->commands[index])) {
-                    _exit(run_pipeline_source(evaluator, pipeline, index,
-                                              variables) &
+                    int source_status = run_pipeline_source(
+                        evaluator, pipeline, index, variables);
+
+                    _exit(finish_native_evaluator(
+                              evaluator, source_status) &
                           255);
                 }
                 if (native_wait_builtin(&pipeline->commands[index])) {
@@ -9768,6 +9831,24 @@ static int run_native_noninteractive_pipeline(
                     _exit(run_native_times_builtin(
                         &pipeline->commands[index], NULL,
                         &descriptor_builtin_io));
+                }
+                if (native_trap_builtin(&pipeline->commands[index])) {
+                    int trap_status;
+
+                    if (apply_special_builtin_assignments(
+                            variables, NULL,
+                            &pipeline->commands[index], options) !=
+                        GSH_ASSIGNMENT_OK) {
+                        child_exec_error("trap assignment", errno);
+                    }
+                    trap_status = gsh_builtin_trap(
+                        (int)pipeline->commands[index].argc,
+                        pipeline->commands[index].argv,
+                        evaluator_trap_store(evaluator),
+                        &descriptor_builtin_io);
+                    _exit(finish_native_evaluator(evaluator,
+                                                  trap_status) &
+                          255);
                 }
                 if (native_command_inspection_builtin(
                         &pipeline->commands[index])) {
@@ -9910,6 +9991,7 @@ struct native_evaluator {
     gsh_variable_store *scope_base;
     gsh_variable_journal *scope_changes;
     gsh_source_workspace_stack *source_workspaces;
+    gsh_trap_store *traps;
     pipeline_expansion_scope *pipeline_scope;
     size_t source_depth;
     size_t dot_depth;
@@ -9919,6 +10001,8 @@ struct native_evaluator {
     int return_status;
     bool exiting;
     int exit_status;
+    bool exit_trap_running;
+    bool exit_trap_complete;
     size_t active_loops;
     native_loop_control loop_control;
     size_t loop_levels;
@@ -9954,6 +10038,19 @@ struct native_evaluator {
     size_t source_request_saved_count;
     gsh_background_table *backgrounds;
 };
+
+static gsh_trap_store *evaluator_trap_store(native_evaluator *evaluator)
+{
+    return evaluator == NULL ? NULL : evaluator->traps;
+}
+
+static void enter_native_subshell_or_exit(native_evaluator *evaluator)
+{
+    if (evaluator != NULL && evaluator->traps != NULL &&
+        gsh_traps_enter_subshell(evaluator->traps) == -1) {
+        child_exec_error("trap subshell reset", errno);
+    }
+}
 
 typedef struct {
     const char *input;
@@ -11083,6 +11180,10 @@ static bool native_preflight_node(native_evaluator *evaluator,
 
                     supported = native_planned_command_is_supported(
                         evaluator->pipeline, index, path);
+                    if (supported && native_trap_builtin(planned) &&
+                        evaluator->traps == NULL) {
+                        supported = false;
+                    }
                     if (supported && native_source_builtin(planned) &&
                         gsh_options_enabled(&evaluator->options,
                                             GSH_OPTION_INTERACTIVE)) {
@@ -11261,6 +11362,7 @@ static void initialize_substitution_evaluator(
     nested->scope_base = &workspace->scope_base;
     nested->scope_changes = &workspace->scope_changes;
     nested->source_workspaces = parent->source_workspaces;
+    nested->traps = parent->traps;
     nested->source_depth = parent->source_depth + 1U;
     nested->preflight = true;
     gsh_background_initialize(backgrounds);
@@ -11315,6 +11417,7 @@ static pid_t start_substitution_child(native_evaluator *nested,
 
         (void)close(capture[0]);
         reset_child_signals();
+        enter_native_subshell_or_exit(nested);
         close_evaluator_exec_transaction(nested);
         if (child_duplicate_descriptor(capture[1], STDOUT_FILENO) == -1) {
             child_exec_error("command substitution output", errno);
@@ -11323,6 +11426,7 @@ static pid_t start_substitution_child(native_evaluator *nested,
             (void)close(capture[1]);
         }
         status = native_evaluate_node(nested, root, 0);
+        status = finish_native_evaluator(nested, status);
         _exit(status & 255);
     }
     (void)close(capture[1]);
@@ -11877,6 +11981,7 @@ static int native_evaluate_pipeline(native_evaluator *evaluator,
             !native_wait_builtin(tail) && !native_alias_builtin(tail) &&
             !native_hash_builtin(tail) &&
             !native_times_builtin(tail) &&
+            !native_trap_builtin(tail) &&
             !native_source_builtin(tail) &&
             !native_exec_builtin(tail) &&
             !native_exit_builtin(tail) &&
@@ -11946,6 +12051,7 @@ static int native_evaluate_pipeline(native_evaluator *evaluator,
             status = 1;
         } else {
             size_t argument;
+            bool trap_interrupted = false;
 
             status = wait_command->argc == 1 ? 0 : 127;
             if (evaluator->backgrounds != NULL) {
@@ -11988,20 +12094,41 @@ static int native_evaluate_pipeline(native_evaluator *evaluator,
                                      &wait_status);
 
                     if (known && !done) {
-                        pid_t waited;
+                        pid_t waited = -1;
+                        int trapped_signal;
 
-                        do {
+                        for (;;) {
+                            trapped_signal = gsh_traps_pending_signal(
+                                evaluator->traps);
+                            if (trapped_signal != 0) {
+                                status = 128 + trapped_signal;
+                                trap_interrupted = true;
+                                break;
+                            }
                             waited = waitpid(targets[argument], &wait_status,
                                              0);
-                        } while (waited == -1 && errno == EINTR);
+                            trapped_signal = gsh_traps_pending_signal(
+                                evaluator->traps);
+                            if (trapped_signal != 0) {
+                                status = 128 + trapped_signal;
+                                trap_interrupted = true;
+                                break;
+                            }
+                            if (!(waited == -1 && errno == EINTR)) {
+                                break;
+                            }
+                        }
                         if (waited == targets[argument]) {
                             (void)gsh_background_record(
                                 evaluator->backgrounds, targets[argument],
                                 wait_status);
                             done = true;
-                        } else {
+                        } else if (!trap_interrupted) {
                             known = false;
                         }
+                    }
+                    if (trap_interrupted) {
+                        break;
                     }
                     if (known && done &&
                         gsh_background_consume(evaluator->backgrounds,
@@ -12016,7 +12143,7 @@ static int native_evaluate_pipeline(native_evaluator *evaluator,
                         status = 127;
                     }
                 }
-                if (wait_command->argc == 1) {
+                if (wait_command->argc == 1 && !trap_interrupted) {
                     status = 0;
                 }
             }
@@ -12076,6 +12203,20 @@ static int native_evaluate_pipeline(native_evaluator *evaluator,
             evaluator->fatal_error = true;
         }
     } else if (evaluator->pipeline->command_count == 1 &&
+               native_trap_builtin(&evaluator->pipeline->commands[0])) {
+        bool builtin_failed;
+
+        status = run_evaluator_trap_builtin(
+            evaluator->pipeline, evaluator->variables,
+            evaluator->journal, &evaluator->options, evaluator->traps,
+            &builtin_failed);
+        if (builtin_failed &&
+            !evaluator->pipeline->commands[0].command_regular_context &&
+            !gsh_options_enabled(&evaluator->options,
+                                 GSH_OPTION_INTERACTIVE)) {
+            evaluator->fatal_error = true;
+        }
+    } else if (evaluator->pipeline->command_count == 1 &&
                native_source_builtin(
                    &evaluator->pipeline->commands[0])) {
         const gsh_native_command *source_command =
@@ -12122,6 +12263,7 @@ static int native_evaluate_pipeline(native_evaluator *evaluator,
          native_alias_builtin(&evaluator->pipeline->commands[0]) ||
          native_hash_builtin(&evaluator->pipeline->commands[0]) ||
          native_times_builtin(&evaluator->pipeline->commands[0]) ||
+         native_trap_builtin(&evaluator->pipeline->commands[0]) ||
          native_source_builtin(&evaluator->pipeline->commands[0]) ||
          native_exec_builtin(&evaluator->pipeline->commands[0]) ||
          native_exit_builtin(&evaluator->pipeline->commands[0]) ||
@@ -12410,6 +12552,7 @@ static int native_evaluate_node_inner(native_evaluator *evaluator,
             native_evaluator child = *evaluator;
             int child_status;
 
+            enter_native_subshell_or_exit(&child);
             child.active_loops = 0;
             child.loop_control = NATIVE_LOOP_CONTROL_NONE;
             child.loop_levels = 0;
@@ -12417,6 +12560,7 @@ static int native_evaluate_node_inner(native_evaluator *evaluator,
             close_evaluator_exec_transaction(&child);
             child_status = native_evaluate_node(
                 &child, node->first_child, depth + 1U);
+            child_status = finish_native_evaluator(&child, child_status);
             _exit(child_status & 255);
         }
         if (pid == -1) {
@@ -12906,6 +13050,7 @@ static int native_evaluate_async(native_evaluator *evaluator,
 
         (void)setpgid(0, 0);
         reset_child_signals();
+        enter_native_subshell_or_exit(&child);
         null_descriptor = open("/dev/null", O_RDONLY);
         if (null_descriptor == -1 ||
             child_duplicate_descriptor(null_descriptor, STDIN_FILENO) ==
@@ -12927,6 +13072,7 @@ static int native_evaluate_async(native_evaluator *evaluator,
             async_node_has_single_pipeline(evaluator, node_index);
         close_evaluator_exec_transaction(&child);
         status = native_evaluate_node_sync(&child, node_index, depth);
+        status = finish_native_evaluator(&child, status);
         _exit(status & 255);
     }
     if (pid == -1) {
@@ -12948,6 +13094,235 @@ static int native_evaluate_async(native_evaluator *evaluator,
     return 0;
 }
 
+typedef struct {
+    const char *input;
+    size_t input_length;
+    const gsh_parse_storage *storage;
+    gsh_native_pipeline *pipeline;
+    gsh_variable_store *variables;
+    gsh_function_store *functions;
+    gsh_function_store *function_scratch;
+    size_t source_depth;
+    bool preflight;
+} native_trap_frame;
+
+static void enter_native_trap_frame(native_evaluator *evaluator,
+                                    gsh_source_workspace *workspace,
+                                    const char *input,
+                                    size_t input_length,
+                                    native_trap_frame *frame)
+{
+    frame->input = evaluator->input;
+    frame->input_length = evaluator->input_length;
+    frame->storage = evaluator->storage;
+    frame->pipeline = evaluator->pipeline;
+    frame->variables = evaluator->variables;
+    frame->functions = evaluator->functions;
+    frame->function_scratch = evaluator->function_scratch;
+    frame->source_depth = evaluator->source_depth;
+    frame->preflight = evaluator->preflight;
+    evaluator->input = input;
+    evaluator->input_length = input_length;
+    evaluator->storage = &workspace->storage;
+    evaluator->pipeline = &workspace->pipeline;
+    evaluator->source_depth++;
+}
+
+static void leave_native_trap_frame(native_evaluator *evaluator,
+                                    const native_trap_frame *frame)
+{
+    evaluator->preflight = frame->preflight;
+    evaluator->function_scratch = frame->function_scratch;
+    evaluator->functions = frame->functions;
+    evaluator->variables = frame->variables;
+    evaluator->source_depth = frame->source_depth;
+    evaluator->pipeline = frame->pipeline;
+    evaluator->storage = frame->storage;
+    evaluator->input_length = frame->input_length;
+    evaluator->input = frame->input;
+}
+
+static bool preflight_native_trap_action(
+    native_evaluator *evaluator, gsh_source_workspace *workspace,
+    size_t root, const native_trap_frame *frame)
+{
+    bool defines_functions = storage_has_function(&workspace->storage);
+    bool supported;
+
+    memcpy(&workspace->variables, frame->variables,
+           sizeof(workspace->variables));
+    evaluator->variables = &workspace->variables;
+    if (defines_functions) {
+        if (frame->functions == NULL) {
+            gsh_functions_initialize(&workspace->functions);
+        } else {
+            memcpy(&workspace->functions, frame->functions,
+                   sizeof(workspace->functions));
+        }
+        gsh_functions_initialize(&workspace->function_scratch);
+        evaluator->functions = &workspace->functions;
+        evaluator->function_scratch = &workspace->function_scratch;
+    }
+    evaluator->preflight = true;
+    supported = native_preflight_node(evaluator, root, 0);
+    evaluator->preflight = false;
+    evaluator->function_scratch = frame->function_scratch;
+    evaluator->functions = frame->functions;
+    evaluator->variables = frame->variables;
+    return supported;
+}
+
+/* ── Trap Actions Borrow One Nested Source Frame ─────────────────
+ * Trap text must be parsed when the condition arises, after later variable
+ * and alias changes are visible. Copying it into the next fixed source slot
+ * prevents a trap command inside the action from invalidating its own input.
+ * Preflight uses workspace copies; execution then borrows the caller's state,
+ * so action mutations persist while parser ownership unwinds in strict LIFO.
+ * ─────────────────────────────────────────────────────────────── */
+static int evaluate_native_trap_workspace(
+    native_evaluator *evaluator, gsh_source_workspace *workspace,
+    const char *input, size_t input_length,
+    const gsh_parse_result *parsed, int prior_status)
+{
+    native_trap_frame frame;
+    int status;
+
+    enter_native_trap_frame(evaluator, workspace, input, input_length,
+                            &frame);
+    evaluator->last_status = prior_status;
+    if (parsed->status != GSH_PARSE_OK) {
+        fprintf(stderr, "gsh: trap action %s at byte %zu\n",
+                gsh_parse_status_name(parsed->status),
+                parsed->error_offset);
+        evaluator->fatal_error = true;
+        status = 2;
+    } else if (!preflight_native_trap_action(
+                   evaluator, workspace, parsed->root, &frame)) {
+        fputs("gsh: trap action execution unsupported\n", stderr);
+        evaluator->fatal_error = true;
+        status = 2;
+    } else {
+        status = native_evaluate_node(evaluator, parsed->root, 0);
+    }
+    leave_native_trap_frame(evaluator, &frame);
+    return status;
+}
+
+static int execute_native_trap_action(native_evaluator *evaluator,
+                                      size_t condition, int prior_status)
+{
+    gsh_source_workspace *workspace;
+    gsh_parse_result parsed;
+    const char *action;
+    const char *input;
+    size_t action_length;
+    size_t input_length;
+    int status = prior_status;
+
+    action = gsh_traps_action(evaluator->traps, condition, &action_length);
+    if (action == NULL || action_length > GSH_SOURCE_INPUT_CAP ||
+        evaluator->source_depth != gsh_source_workspaces_depth(
+                                       evaluator->source_workspaces)) {
+        if (action != NULL) {
+            fputs("gsh: trap source workspace ownership failure\n", stderr);
+            evaluator->fatal_error = true;
+        }
+        return action == NULL ? prior_status : 125;
+    }
+    workspace = fault_should_fail("trap-workspace-exhaustion", EAGAIN)
+                    ? NULL
+                    : gsh_source_workspace_acquire(
+                          evaluator->source_workspaces);
+    if (workspace == NULL) {
+        fputs("gsh: trap source workspace limit exceeded\n", stderr);
+        evaluator->fatal_error = true;
+        return 125;
+    }
+    memcpy(workspace->input, action, action_length);
+    workspace->input[action_length] = '\0';
+    input = workspace->input;
+    input_length = action_length;
+    parsed = gsh_alias_parse(
+        workspace->input, action_length, evaluator->aliases,
+        workspace->alias_expansion, GSH_ALIAS_EXPANSION_CAP,
+        &workspace->storage, &input, &input_length);
+    status = evaluate_native_trap_workspace(
+        evaluator, workspace, input, input_length, &parsed, prior_status);
+    if (!gsh_source_workspace_release(evaluator->source_workspaces,
+                                      workspace)) {
+        fputs("gsh: trap source workspace ownership failure\n", stderr);
+        evaluator->fatal_error = true;
+        status = 125;
+    }
+    assert(evaluator->source_depth == gsh_source_workspaces_depth(
+                                           evaluator->source_workspaces));
+    return status;
+}
+
+static int run_pending_native_traps(native_evaluator *evaluator,
+                                    int status)
+{
+    size_t dispatched;
+
+    if (evaluator->preflight || evaluator->exiting ||
+        evaluator->exit_trap_running ||
+        !gsh_traps_have_pending(evaluator->traps)) {
+        return status;
+    }
+    for (dispatched = 0;
+         dispatched < gsh_traps_condition_count(); dispatched++) {
+        size_t condition;
+
+        if (!gsh_traps_take_pending(evaluator->traps, &condition)) {
+            break;
+        }
+        (void)execute_native_trap_action(evaluator, condition, status);
+        evaluator->last_status = status;
+        if (evaluator->fatal_error || evaluator->exiting) {
+            return evaluator->exiting ? evaluator->exit_status : 2;
+        }
+    }
+    return status;
+}
+
+static int finish_native_evaluator(native_evaluator *evaluator,
+                                   int status)
+{
+    bool was_exiting;
+    bool was_fatal;
+    int saved_exit_status;
+    int action_status;
+
+    if (evaluator == NULL || evaluator->traps == NULL ||
+        evaluator->exit_trap_running || evaluator->exit_trap_complete ||
+        gsh_traps_state(evaluator->traps, 0) != GSH_TRAP_ACTION) {
+        return status;
+    }
+    was_exiting = evaluator->exiting;
+    was_fatal = evaluator->fatal_error;
+    saved_exit_status = evaluator->exit_status;
+    evaluator->exit_trap_running = true;
+    evaluator->exiting = false;
+    evaluator->fatal_error = false;
+    evaluator->last_status = status;
+    action_status = execute_native_trap_action(evaluator, 0, status);
+    evaluator->exit_trap_complete = true;
+    evaluator->exit_trap_running = false;
+    if (evaluator->exiting) {
+        status = evaluator->exit_status;
+    } else if (evaluator->fatal_error && action_status != status) {
+        status = action_status;
+        evaluator->exiting = was_exiting;
+        evaluator->exit_status = status;
+    } else {
+        evaluator->exiting = was_exiting;
+        evaluator->exit_status = saved_exit_status;
+    }
+    evaluator->fatal_error = was_fatal || evaluator->fatal_error;
+    evaluator->last_status = status;
+    return status;
+}
+
 static int native_evaluate_node(native_evaluator *evaluator,
                                 size_t node_index, size_t depth)
 {
@@ -12964,6 +13339,7 @@ static int native_evaluate_node(native_evaluator *evaluator,
                  ? native_evaluate_async(evaluator, node_index, depth)
                  : native_evaluate_node_sync(evaluator, node_index, depth);
 
+    status = run_pending_native_traps(evaluator, status);
     evaluator->last_status = status;
     return status;
 }
@@ -14702,6 +15078,7 @@ static void initialize_native_script_session(
     gsh_variable_journal *scope_changes,
     gsh_positional_store *positionals, gsh_command_cache *command_cache,
     gsh_source_workspace_stack *source_workspaces,
+    gsh_trap_store *traps,
     const char *default_path)
 {
     native_evaluator *evaluator = &session->evaluator;
@@ -14726,6 +15103,7 @@ static void initialize_native_script_session(
     evaluator->scope_base = scope_base;
     evaluator->scope_changes = scope_changes;
     evaluator->source_workspaces = source_workspaces;
+    evaluator->traps = traps;
     gsh_background_initialize(&session->backgrounds);
     evaluator->backgrounds = &session->backgrounds;
 }
@@ -14878,6 +15256,7 @@ typedef struct {
     gsh_positional_store *positionals;
     gsh_command_cache *command_cache;
     gsh_source_workspace_stack *source_workspaces;
+    gsh_trap_store *traps;
     char default_path[EXEC_PATH_CAP];
     native_script_session session;
 } native_script_resources;
@@ -14894,6 +15273,7 @@ static void release_native_script_resources(
     free(resources->positionals);
     free(resources->command_cache);
     free(resources->source_workspaces);
+    free(resources->traps);
     memset(resources, 0, sizeof(*resources));
 }
 
@@ -14914,15 +15294,18 @@ static int initialize_native_script_resources(
     resources->command_cache = malloc(sizeof(*resources->command_cache));
     resources->source_workspaces =
         malloc(sizeof(*resources->source_workspaces));
+    resources->traps = malloc(sizeof(*resources->traps));
     if (resources->storage == NULL || resources->pipeline == NULL ||
         resources->variables == NULL || resources->scratch == NULL ||
         resources->scope_base == NULL || resources->scope_changes == NULL ||
         resources->positionals == NULL ||
         resources->command_cache == NULL ||
         resources->source_workspaces == NULL ||
+        resources->traps == NULL ||
         gsh_variables_import(resources->variables, environ) == -1 ||
         gsh_positionals_assign(resources->positionals, positional_count,
-                               positional_parameters) == -1) {
+                               positional_parameters) == -1 ||
+        gsh_traps_initialize(resources->traps) == -1) {
         release_native_script_resources(resources);
         return -1;
     }
@@ -14941,6 +15324,7 @@ static int initialize_native_script_resources(
         resources->pipeline, resources->variables, resources->scope_base,
         resources->scope_changes, resources->positionals,
         resources->command_cache, resources->source_workspaces,
+        resources->traps,
         resources->default_path);
     return 0;
 }
@@ -14962,11 +15346,19 @@ static int execute_native_noninteractive(
     status = execute_native_script(
         input, input_length, &resources.session, resources.storage,
         resources.variables, resources.scratch, 0);
+    status = finish_native_evaluator(&resources.session.evaluator,
+                                     status);
     release_native_script_resources(&resources);
     return status;
 }
 
 enum { NATIVE_INPUT_READ_CAP = 16384 };
+
+enum {
+    NATIVE_INPUT_EOF = 0,
+    NATIVE_INPUT_BYTE = 1,
+    NATIVE_INPUT_INTERRUPTED = 2,
+};
 
 typedef struct {
     int descriptor;
@@ -15001,6 +15393,7 @@ typedef struct {
     size_t source_mapping_length;
     void *alias_mapping;
     size_t alias_mapping_length;
+    bool collecting;
 } native_input_command;
 
 static void initialize_native_input_command(native_input_command *command,
@@ -15020,6 +15413,7 @@ static void initialize_native_input_command(native_input_command *command,
     command->source_mapping_length = 0;
     command->alias_mapping = NULL;
     command->alias_mapping_length = 0;
+    command->collecting = false;
 }
 
 static int release_native_input_views(native_input_command *command)
@@ -15221,15 +15615,13 @@ static int initialize_native_input_reader(native_input_reader *reader,
 static int read_native_input_byte(native_input_reader *reader,
                                   unsigned char *byte)
 {
-    size_t attempts;
-
     if (reader->next < reader->used) {
         *byte = reader->bytes[reader->next++];
-        return 1;
+        return NATIVE_INPUT_BYTE;
     }
     reader->next = 0;
     reader->used = 0;
-    for (attempts = 0; attempts < NATIVE_INPUT_RETRY_CAP; attempts++) {
+    {
         size_t capacity = reader->buffered ? sizeof(reader->bytes) : 1U;
         ssize_t count = fault_should_fail("input-read", EIO)
                             ? -1
@@ -15239,17 +15631,13 @@ static int read_native_input_byte(native_input_reader *reader,
         if (count > 0) {
             reader->used = (size_t)count;
             *byte = reader->bytes[reader->next++];
-            return 1;
+            return NATIVE_INPUT_BYTE;
         }
         if (count == 0) {
-            return 0;
+            return NATIVE_INPUT_EOF;
         }
-        if (errno != EINTR) {
-            return -1;
-        }
+        return errno == EINTR ? NATIVE_INPUT_INTERRUPTED : -1;
     }
-    errno = EINTR;
-    return -1;
 }
 
 static int synchronize_native_input(native_input_reader *reader)
@@ -15385,60 +15773,84 @@ static int parse_native_input_command(native_input_command *command,
     return 0;
 }
 
+static void begin_native_input_command(native_input_reader *reader,
+                                       native_input_command *command)
+{
+    if (!command->collecting) {
+        assert(command->spill_descriptor == -1);
+        assert(command->length == 0U);
+        command->source_offset = reader->source_offset;
+        command->collecting = true;
+    }
+}
+
+static int append_native_reader_byte(native_input_reader *reader,
+                                     native_input_command *command,
+                                     unsigned char byte)
+{
+    if (byte == '\0') {
+        errno = EILSEQ;
+        return -1;
+    }
+    if (append_native_input_byte(command, byte) == -1) {
+        return -1;
+    }
+    if (reader->source_offset == SIZE_MAX) {
+        errno = EOVERFLOW;
+        return -1;
+    }
+    reader->source_offset++;
+    return 0;
+}
+
 static int read_native_input_command(
     native_input_reader *reader, native_script_session *session,
     native_input_command *command)
 {
     size_t scanned;
 
-    assert(command->spill_descriptor == -1);
     assert(command->source_mapping == NULL);
     assert(command->alias_mapping == NULL);
-    command->length = 0;
-    command->source_offset = reader->source_offset;
+    begin_native_input_command(reader, command);
     for (scanned = 0; scanned < SIZE_MAX; scanned++) {
         unsigned char byte = 0;
         int read_status = read_native_input_byte(reader, &byte);
-        bool parse_now = read_status == 0 || byte == '\n';
+        bool parse_now = read_status == NATIVE_INPUT_EOF || byte == '\n';
 
         if (read_status == -1) {
             return -1;
         }
-        if (read_status != 0 && read_status != 1) {
+        if (read_status == NATIVE_INPUT_INTERRUPTED) {
+            return NATIVE_INPUT_INTERRUPTED;
+        }
+        if (read_status != NATIVE_INPUT_EOF &&
+            read_status != NATIVE_INPUT_BYTE) {
             errno = EIO;
             return -1;
         }
-        if (read_status == 1) {
-            if (byte == '\0') {
-                errno = EILSEQ;
-                return -1;
-            }
-            if (append_native_input_byte(command, byte) == -1) {
-                return -1;
-            }
-            if (reader->source_offset == SIZE_MAX) {
-                errno = EOVERFLOW;
-                return -1;
-            }
-            reader->source_offset++;
+        if (read_status == NATIVE_INPUT_BYTE &&
+            append_native_reader_byte(reader, command, byte) == -1) {
+            return -1;
         }
         if (!parse_now) {
             continue;
         }
-        if (command->length == 0 && read_status == 0) {
-            return 0;
+        if (command->length == 0 && read_status == NATIVE_INPUT_EOF) {
+            command->collecting = false;
+            return NATIVE_INPUT_EOF;
         }
         if (parse_native_input_command(command, session) == -1) {
             return -1;
         }
         if (command->parsed.status == GSH_PARSE_INCOMPLETE &&
-            read_status != 0) {
+            read_status != NATIVE_INPUT_EOF) {
             if (release_native_input_views(command) == -1) {
                 return -1;
             }
             continue;
         }
-        return 1;
+        command->collecting = false;
+        return NATIVE_INPUT_BYTE;
     }
     errno = EOVERFLOW;
     return -1;
@@ -15479,8 +15891,24 @@ static int execute_native_descriptor(
         int read_status = read_native_input_command(
             &reader, &resources.session, &command);
 
-        if (read_status == 0) {
+        if (read_status == NATIVE_INPUT_EOF) {
             break;
+        }
+        /* ── Idle Input Does Not Delay Traps ─────────────────────
+         * Retrying an interrupted descriptor read kept a non-interactive
+         * shell asleep until another byte arrived.  The input accumulator now
+         * retains its partial complete command across EINTR and yields to the
+         * evaluator.  Trap code runs with the preceding command's status, then
+         * the same byte stream resumes without read-ahead or source loss.
+         * ─────────────────────────────────────────────────────────────── */
+        if (read_status == NATIVE_INPUT_INTERRUPTED) {
+            status = run_pending_native_traps(
+                &resources.session.evaluator, status);
+            if (resources.session.evaluator.fatal_error ||
+                resources.session.evaluator.exiting) {
+                break;
+            }
+            continue;
         }
         if (read_status == -1) {
             int input_errno = errno;
@@ -15542,6 +15970,8 @@ static int execute_native_descriptor(
                 strerror(errno));
         status = 125;
     }
+    status = finish_native_evaluator(&resources.session.evaluator,
+                                     status);
     release_native_script_resources(&resources);
     return status;
 }

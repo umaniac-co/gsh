@@ -77,7 +77,7 @@ static bool implemented_special_name(const char *name, size_t length)
     static const char *const names[] = {
         ".",      ":",      "break", "continue", "eval", "exec",
         "exit",   "export", "readonly", "return", "set", "shift",
-        "times",  "unset",
+        "times",  "trap",   "unset",
     };
 
     return name_in_table(name, length, names,

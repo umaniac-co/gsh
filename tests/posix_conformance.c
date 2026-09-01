@@ -271,7 +271,10 @@ static int run_case_arguments(
     }
     close(descriptors[0]);
 
-    if (!WIFEXITED(status) || WEXITSTATUS(status) != test->status ||
+    if (!((test->status >= 0 && WIFEXITED(status) &&
+           WEXITSTATUS(status) == test->status) ||
+          (test->status < 0 && WIFSIGNALED(status) &&
+           WTERMSIG(status) == -test->status)) ||
         (test->diagnostic != NULL &&
          !bytes_contain(diagnostic, diagnostic_length, test->diagnostic))) {
         fprintf(stderr,
@@ -2534,6 +2537,173 @@ static int native_pwd_cases(const char *executable)
     return run_case(executable, &test, false);
 }
 
+static bool wait_for_path(const char *path, size_t attempts)
+{
+    size_t attempt;
+
+    for (attempt = 0; attempt < attempts; attempt++) {
+        if (access(path, F_OK) == 0) {
+            return true;
+        }
+        if (errno != ENOENT) {
+            return false;
+        }
+        (void)poll(NULL, 0, 10);
+    }
+    return false;
+}
+
+static bool file_equals(const char *path, const char *expected)
+{
+    char contents[64];
+    size_t expected_length = strlen(expected);
+    int descriptor = open(path, O_RDONLY);
+    ssize_t count;
+
+    if (descriptor == -1 || expected_length >= sizeof(contents)) {
+        if (descriptor >= 0) {
+            (void)close(descriptor);
+        }
+        return false;
+    }
+    do {
+        count = read(descriptor, contents, sizeof(contents));
+    } while (count == -1 && errno == EINTR);
+    (void)close(descriptor);
+    return count == (ssize_t)expected_length &&
+           memcmp(contents, expected, expected_length) == 0;
+}
+
+static int inherited_ignored_trap_case(const char *executable)
+{
+    struct sigaction ignore;
+    struct sigaction previous;
+    syntax_case test = {
+        "trap/2.12", "inherited ignored signal cannot be changed",
+        "trap '/usr/bin/printf BAD' USR1; /bin/kill -USR1 $$; "
+        "/usr/bin/printf INHERITED_OK; trap -p USR1",
+        0, "INHERITED_OKtrap -- '' USR1\n"};
+    int failed;
+
+    memset(&ignore, 0, sizeof(ignore));
+    ignore.sa_handler = SIG_IGN;
+    sigemptyset(&ignore.sa_mask);
+    if (sigaction(SIGUSR1, &ignore, &previous) == -1) {
+        return 1;
+    }
+    failed = run_case(executable, &test, false);
+    if (sigaction(SIGUSR1, &previous, NULL) == -1) {
+        failed = 1;
+    }
+    return failed;
+}
+
+static pid_t start_stdin_shell(const char *executable, int input[2])
+{
+    pid_t pid;
+
+    if (pipe(input) == -1) {
+        return -1;
+    }
+    pid = fork();
+    if (pid == 0) {
+        (void)close(input[1]);
+        if (dup2(input[0], STDIN_FILENO) == -1) {
+            _exit(126);
+        }
+        (void)close(input[0]);
+        execl(executable, executable, (char *)NULL);
+        _exit(127);
+    }
+    (void)close(input[0]);
+    input[0] = -1;
+    if (pid == -1) {
+        (void)close(input[1]);
+        input[1] = -1;
+    }
+    return pid;
+}
+
+static ssize_t write_text_once(int descriptor, const char *text)
+{
+    ssize_t count;
+
+    do {
+        count = write(descriptor, text, strlen(text));
+    } while (count == -1 && errno == EINTR);
+    return count;
+}
+
+static pid_t wait_child(pid_t pid, int *status)
+{
+    size_t attempt;
+
+    for (attempt = 0; attempt < 64U; attempt++) {
+        pid_t waited = waitpid(pid, status, 0);
+
+        if (waited != -1 || errno != EINTR) {
+            return waited;
+        }
+    }
+    errno = EINTR;
+    return -1;
+}
+
+static int idle_input_trap_case(const char *executable)
+{
+    char directory[] = "/tmp/gsh-trap-input-XXXXXX";
+    char ready[1024] = {0};
+    char trapped[1024] = {0};
+    char result[1024] = {0};
+    char prefix[4096] = {0};
+    char suffix[2048] = {0};
+    int input[2] = {-1, -1};
+    int wait_status = 0;
+    bool passed = false;
+    pid_t pid = -1;
+
+    if (mkdtemp(directory) != NULL &&
+        snprintf(ready, sizeof(ready), "%s/ready", directory) <
+            (int)sizeof(ready) &&
+        snprintf(trapped, sizeof(trapped), "%s/trapped", directory) <
+            (int)sizeof(trapped) &&
+        snprintf(result, sizeof(result), "%s/result", directory) <
+            (int)sizeof(result) &&
+        snprintf(prefix, sizeof(prefix),
+                 "trap ': >%s' USR1\n: >%s\n"
+                 "/usr/bin/printf PART",
+                 trapped, ready) < (int)sizeof(prefix) &&
+        snprintf(suffix, sizeof(suffix), "IAL >%s\n", result) <
+            (int)sizeof(suffix)) {
+        pid = start_stdin_shell(executable, input);
+    }
+    if (pid > 0) {
+        ssize_t prefix_count = write_text_once(input[1], prefix);
+        ssize_t suffix_count = -1;
+
+        if (prefix_count == (ssize_t)strlen(prefix) &&
+            wait_for_path(ready, 100U) && kill(pid, SIGUSR1) == 0 &&
+            wait_for_path(trapped, 50U)) {
+            suffix_count = write_text_once(input[1], suffix);
+        }
+        (void)close(input[1]);
+        input[1] = -1;
+        passed = suffix_count == (ssize_t)strlen(suffix) &&
+                 wait_child(pid, &wait_status) == pid &&
+                 WIFEXITED(wait_status) && WEXITSTATUS(wait_status) == 0 &&
+                 file_equals(result, "PARTIAL");
+    }
+    (void)unlink(result);
+    (void)unlink(trapped);
+    (void)unlink(ready);
+    (void)rmdir(directory);
+    if (!passed) {
+        fprintf(stderr,
+                "conformance: idle input did not dispatch and resume trap\n");
+    }
+    return passed ? 0 : 1;
+}
+
 int main(int argc, char **argv)
 {
     static const syntax_case cases[] = {
@@ -3536,6 +3706,151 @@ int main(int argc, char **argv)
         {"times", "command suppresses times special error semantics",
          "command times unexpected; /usr/bin/printf TIMES_RECOVERED",
          0, "TIMES_RECOVERED"},
+        {"trap", "trap is identified as a special builtin",
+         "command -V trap", 0, "trap is a special builtin\n"},
+        {"trap", "EXIT action runs on normal shell termination",
+         "trap '/usr/bin/printf EXIT_OK' EXIT; true", 0, "EXIT_OK"},
+        {"trap", "EXIT action observes and preserves final status",
+         "trap '/bin/test \"$?\" -eq 1' EXIT; false", 1, NULL},
+        {"trap", "exit inside EXIT action replaces final status",
+         "trap 'exit 9' EXIT; exit 3", 9, NULL},
+        {"trap", "signal action mutates state and preserves status",
+         "trap 'GSH_TRAP_SIGNAL=changed; /usr/bin/false' USR1; "
+         "/bin/kill -USR1 $$; "
+         "/usr/bin/printf '%s:%s' \"$?\" \"$GSH_TRAP_SIGNAL\"",
+         0, "0:changed"},
+        {"2.12", "signal action waits for foreground completion",
+         "trap '/usr/bin/printf TRAP' TERM; "
+         "/bin/sh -c 'kill -TERM $PPID; sleep 0.05; "
+         "/usr/bin/printf CHILD'; /usr/bin/printf AFTER",
+         0, "CHILDTRAPAFTER"},
+        {"trap", "null action ignores a signal",
+         "trap '' TERM; /bin/kill -TERM $$; "
+         "/usr/bin/printf IGNORE_OK",
+         0, "IGNORE_OK"},
+        {"trap", "default action terminates after reset",
+         "trap '' TERM; trap - TERM; /bin/kill -TERM $$; "
+         "/usr/bin/printf BAD_DEFAULT",
+         -SIGTERM, NULL},
+        {"2.12", "external command inherits ignored trap disposition",
+         "trap '' TERM; "
+         "/bin/sh -c 'kill -TERM $$; /usr/bin/printf CHILD_IGNORE'",
+         0, "CHILD_IGNORE"},
+        {"2.12", "external command resets caught trap disposition",
+         "unset GSH_CHILD_TRAP; trap 'GSH_CHILD_TRAP=bad' TERM; "
+         "/bin/sh -c 'kill -TERM $$'; "
+         "/bin/test -z \"${GSH_CHILD_TRAP+set}\"",
+         0, NULL},
+        {"trap", "dash action resets a condition to default",
+         "trap '/usr/bin/printf BAD' EXIT; trap - EXIT; true",
+         0, NULL},
+        {"trap", "numeric-only form resets EXIT",
+         "trap '/usr/bin/printf BAD' EXIT; trap 0; true",
+         0, NULL},
+        {"trap", "leading-zero numeric condition resets EXIT",
+         "trap '/usr/bin/printf BAD' EXIT; trap 00; true",
+         0, NULL},
+        {"trap", "subshell resets inherited caught actions",
+         "unset GSH_SUBSHELL_TRAP; "
+         "trap 'GSH_SUBSHELL_TRAP=bad' TERM; "
+         "(/bin/sh -c 'kill -TERM $PPID'); "
+         "/bin/test -z \"${GSH_SUBSHELL_TRAP+set}\"; trap - TERM",
+         0, NULL},
+        {"trap", "subshell executes its own EXIT action",
+         "trap '/usr/bin/printf PARENT' EXIT; "
+         "(trap '/usr/bin/printf CHILD' EXIT; true)",
+         0, "CHILDPARENT"},
+        {"trap", "pipeline trap state and EXIT action are isolated",
+         "trap '/usr/bin/printf PIPE' EXIT | /bin/cat; "
+         "/usr/bin/printf PARENT",
+         0, "PIPEPARENT"},
+        {"trap", "asynchronous child executes its own EXIT action",
+         "trap '/usr/bin/printf ASYNC' EXIT & wait \"$!\"",
+         0, "ASYNC"},
+        {"trap", "command substitution captures its own EXIT action",
+         "GSH_TRAP_CAPTURE=$(trap '/usr/bin/printf SUB' EXIT); "
+         "/usr/bin/printf '<%s>' \"$GSH_TRAP_CAPTURE\"",
+         0, "<SUB>"},
+        {"trap", "command substitution can snapshot and restore traps",
+         "trap '/usr/bin/printf ROUNDTRIP' EXIT; "
+         "GSH_TRAP_SAVED=$(trap -p EXIT); trap - EXIT; "
+         "eval \"$GSH_TRAP_SAVED\"",
+         0, "ROUNDTRIP"},
+        {"trap", "trap listing quotes apostrophes for reinput",
+         "trap \"GSH_Q='value'\" EXIT; trap",
+         0, "trap -- 'GSH_Q='\\''value'\\''' EXIT\n"},
+        {"trap", "trap -p names default conditions",
+         "trap -p EXIT TERM", 0, "trap -- - TERM\n"},
+        {"trap", "function trap mutation persists in its caller",
+         "gsh_trap_function() { "
+         "trap '/usr/bin/printf FUNCTION' EXIT; }; "
+         "gsh_trap_function",
+         0, "FUNCTION"},
+        {"trap", "eval trap mutation persists in its caller",
+         "eval \"trap '/usr/bin/printf EVAL_TRAP' EXIT\"",
+         0, "EVAL_TRAP"},
+        {"trap", "an action can replace itself safely",
+         "trap 'trap - EXIT; /usr/bin/printf SELF_REPLACED' EXIT; :",
+         0, "SELF_REPLACED"},
+        {"trap", "action text is alias-expanded when dispatched",
+         "trap 'gsh_trap_alias' EXIT\n"
+         "alias 'gsh_trap_alias=/usr/bin/printf ALIAS_TRAP'",
+         0, "ALIAS_TRAP"},
+        {"trap", "return in a signal action unwinds its function",
+         "trap 'return 7' USR1; "
+         "gsh_trap_return() { /bin/kill -USR1 $$; "
+         "/usr/bin/printf BAD_RETURN; }; "
+         "gsh_trap_return; /bin/test $? -eq 7",
+         0, NULL},
+        {"trap", "exit in a signal action terminates immediately",
+         "trap 'exit 7' USR1; /bin/kill -USR1 $$; "
+         "/usr/bin/printf BAD_EXIT",
+         7, NULL},
+        {"trap", "invalid EXIT action text is fatal at dispatch",
+         "trap 'if' EXIT; :", 2, "trap action incomplete"},
+        {"trap", "special-builtin assignment persists through trap",
+         "GSH_TRAP_ASSIGN=value trap -p EXIT >/dev/null; "
+         "/bin/test \"$GSH_TRAP_ASSIGN\" = value",
+         0, NULL},
+        {"trap", "invalid condition does not abort the shell",
+         "trap ':' GSH_INVALID_SIGNAL; GSH_TRAP_INVALID_STATUS=$?; "
+         "/bin/test \"$GSH_TRAP_INVALID_STATUS\" -ne 0; "
+         "/usr/bin/printf TRAP_RECOVERED",
+         0, "TRAP_RECOVERED"},
+        {"trap", "command suppresses trap special error semantics",
+         "command trap ':' GSH_INVALID_SIGNAL; "
+         "/usr/bin/printf TRAP_RECOVERED",
+         0, "TRAP_RECOVERED"},
+        {"trap", "invalid option aborts a non-interactive shell",
+         "trap -x; /usr/bin/printf BAD_TRAP_OPTION",
+         2, "invalid option"},
+        {"trap", "command suppresses trap option fatality",
+         "command trap -x; /usr/bin/printf TRAP_OPTION_RECOVERED",
+         0, "TRAP_OPTION_RECOVERED"},
+        {"trap", "option terminator permits a dash-prefixed action",
+         "trap -- -x EXIT; trap -p EXIT; trap - EXIT",
+         0, "trap -- '-x' EXIT\n"},
+        {"trap", "trap redirection is restored before EXIT action",
+         "GSH_TRAP_FILE=/tmp/gsh-trap-redirection-$$; "
+         "trap '/usr/bin/printf EXIT_REDIRECT' EXIT "
+         ">\"$GSH_TRAP_FILE\"; "
+         "/bin/test ! -s \"$GSH_TRAP_FILE\"; "
+         "/bin/rm -f \"$GSH_TRAP_FILE\"",
+         0, "EXIT_REDIRECT"},
+        {"wait/trap", "wait returns immediately for a trapped signal",
+         "trap 'GSH_TRAPPED_STATUS=$?; "
+         "/bin/kill \"$GSH_WAIT_TARGET\" "
+         "\"$GSH_WAIT_TRIGGER\" 2>/dev/null; "
+         "/usr/bin/printf WAIT_TRAP' USR1; "
+         "/bin/sleep 5 & GSH_WAIT_TARGET=$!; "
+         "/bin/sh -c '/bin/sleep 0.10; /bin/kill -USR1 $PPID' & "
+         "GSH_WAIT_TRIGGER=$!; wait \"$GSH_WAIT_TARGET\"; "
+         "GSH_WAIT_STATUS=$?; "
+         "/bin/test \"$GSH_WAIT_STATUS\" -gt 128; "
+         "/bin/test \"$GSH_TRAPPED_STATUS\" -eq "
+         "\"$GSH_WAIT_STATUS\"; "
+         "/usr/bin/printf :WAIT_DONE",
+         0, "WAIT_TRAP:WAIT_DONE"},
         {"export", "native export assignment",
          "export GSH_EXPORT_VALUE='alpha beta'; "
          "/usr/bin/printenv GSH_EXPORT_VALUE",
@@ -3914,6 +4229,11 @@ int main(int argc, char **argv)
             unsupported++;
         }
     }
+    if (inherited_ignored_trap_case(argv[1]) != 0 ||
+        idle_input_trap_case(argv[1]) != 0) {
+        return 1;
+    }
+    execution_passed += 2U;
     if (native_source_cases(argv[1]) != 0) {
         return 1;
     }

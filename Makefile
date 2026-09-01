@@ -15,7 +15,7 @@ SOURCES := src/gsh.c src/async_repl.c src/posix_lexer.c \
 	src/builtin_cd.c src/builtin_times.c src/builtin_ulimit.c \
 	src/builtin_umask.c src/builtin_variables.c src/shell_aliases.c \
 	src/alias_expansion.c src/builtin_alias.c src/builtin_unalias.c \
-	src/shell_functions.c \
+	src/shell_functions.c src/shell_traps.c src/builtin_trap.c \
 	src/positional_parameters.c src/shell_options.c src/builtin_set.c \
 	src/builtin_shift.c src/background_jobs.c
 TEST_TARGET := build/pty-harness
@@ -38,6 +38,8 @@ FUNCTION_TEST_TARGET := build/shell-functions-test
 FUNCTION_SANITIZE_TEST_TARGET := build/shell-functions-test-sanitize
 CONFIG_TEST_TARGET := build/shell-config-test
 SOURCE_WORKSPACE_TEST_TARGET := build/source-workspace-test
+SHELL_TRAPS_TEST_TARGET := build/shell-traps-test
+SHELL_TRAPS_SANITIZE_TEST_TARGET := build/shell-traps-test-sanitize
 BASH_BIN ?= $(shell command -v bash)
 ZSH_BIN ?= $(shell command -v zsh)
 SOAK_SECONDS ?= 60
@@ -61,7 +63,7 @@ SODIUM_LIBS := $(shell if command -v pkg-config >/dev/null 2>&1; then \
 	then echo -L$(SODIUM_PREFIX)/lib -lsodium; else echo -lsodium; fi)
 
 .PHONY: all analyze bench bench-record bench-alias bench-alias-record check check-fault check-resource check-sanitize clean
-.PHONY: check-aliases check-background check-command-cache check-config check-functions check-positionals check-source-workspaces check-variables conformance fuzz-libfuzzer fuzz-pty fuzz-pty-sanitize fuzz-sanitize
+.PHONY: check-aliases check-background check-command-cache check-config check-functions check-positionals check-source-workspaces check-traps check-variables conformance fuzz-libfuzzer fuzz-pty fuzz-pty-sanitize fuzz-sanitize
 .PHONY: fuzz-smoke policy soak
 .PHONY: verify-fast
 
@@ -162,6 +164,17 @@ $(SOURCE_WORKSPACE_TEST_TARGET): tests/source_workspace_test.c \
 		src/source_workspace.c src/shell_aliases.c \
 		src/shell_functions.c $(LDFLAGS) -o $@
 
+$(SHELL_TRAPS_TEST_TARGET): tests/shell_traps_test.c \
+		src/shell_traps.c | build
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/shell_traps_test.c \
+		src/shell_traps.c $(LDFLAGS) -o $@
+
+$(SHELL_TRAPS_SANITIZE_TEST_TARGET): tests/shell_traps_test.c \
+		src/shell_traps.c | build
+	clang $(CPPFLAGS) -O1 -g -std=c17 -Wall -Wextra -Wpedantic \
+		-Werror -fsanitize=address,undefined \
+		tests/shell_traps_test.c src/shell_traps.c $(LDFLAGS) -o $@
+
 check: $(TARGET) $(HISTORY_AGENT_TARGET) $(TEST_TARGET) $(PROBE_TARGET)
 	./$(TEST_TARGET) $(abspath $(TARGET))
 
@@ -174,6 +187,7 @@ check-resource: $(TARGET) $(TEST_TARGET)
 check-sanitize: $(SANITIZE_TARGET) $(HISTORY_AGENT_TARGET) \
 		$(FUNCTION_SANITIZE_TEST_TARGET) \
 		$(COMMAND_CACHE_SANITIZE_TEST_TARGET) \
+		$(SHELL_TRAPS_SANITIZE_TEST_TARGET) \
 		$(TEST_TARGET) $(PROBE_TARGET)
 	ASAN_OPTIONS=abort_on_error=1 UBSAN_OPTIONS=halt_on_error=1 \
 		./$(TEST_TARGET) $(abspath $(SANITIZE_TARGET))
@@ -181,6 +195,8 @@ check-sanitize: $(SANITIZE_TARGET) $(HISTORY_AGENT_TARGET) \
 		./$(FUNCTION_SANITIZE_TEST_TARGET)
 	ASAN_OPTIONS=abort_on_error=1 UBSAN_OPTIONS=halt_on_error=1 \
 		./$(COMMAND_CACHE_SANITIZE_TEST_TARGET)
+	ASAN_OPTIONS=abort_on_error=1 UBSAN_OPTIONS=halt_on_error=1 \
+		./$(SHELL_TRAPS_SANITIZE_TEST_TARGET)
 
 fuzz-smoke: $(FUZZ_SMOKE_TARGET)
 	./$(FUZZ_SMOKE_TARGET) $(FUZZ_CASES)
@@ -250,6 +266,9 @@ check-config: $(CONFIG_TEST_TARGET)
 check-source-workspaces: $(SOURCE_WORKSPACE_TEST_TARGET)
 	./$(SOURCE_WORKSPACE_TEST_TARGET)
 
+check-traps: $(SHELL_TRAPS_TEST_TARGET)
+	./$(SHELL_TRAPS_TEST_TARGET)
+
 soak: $(TARGET) $(TEST_TARGET)
 	./$(TEST_TARGET) --soak $(abspath $(TARGET)) $(SOAK_SECONDS)
 
@@ -264,6 +283,7 @@ verify-fast:
 	$(MAKE) -j1 check-background
 	$(MAKE) -j1 check-config
 	$(MAKE) -j1 check-source-workspaces
+	$(MAKE) -j1 check-traps
 	$(MAKE) -j1 check-aliases
 	$(MAKE) -j1 check-functions
 	$(MAKE) -j1 check-fault
@@ -308,6 +328,8 @@ clean:
 	rm -f $(BACKGROUND_TEST_TARGET)
 	rm -f $(CONFIG_TEST_TARGET)
 	rm -f $(SOURCE_WORKSPACE_TEST_TARGET)
+	rm -f $(SHELL_TRAPS_TEST_TARGET)
+	rm -f $(SHELL_TRAPS_SANITIZE_TEST_TARGET)
 	rm -f $(ALIAS_TEST_TARGET)
 	rm -f $(FUNCTION_TEST_TARGET)
 	rm -f $(FUNCTION_SANITIZE_TEST_TARGET)
