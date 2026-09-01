@@ -59,12 +59,9 @@ The MVP already follows the central shape described by
   `jobs`, `kill`, `fg`, `bg`, and `wait` use the process that owns the live
   PID/PGID state;
 - shell output uses a fixed-size nonblocking queue;
-- the base prompt is immediate and independent from optional integrations;
-- a persistent process computes Git prompt enrichment and services eligible
-  stateless output redirections concurrently through a bounded `socketpair()`
-  protocol;
-- prompt requests have identity, generation, and a 100 ms monotonic deadline;
-  stale results are discarded and a stalled or malformed worker is disabled;
+- the base prompt is immediate and has no repository integration;
+- a persistent process services eligible stateless output redirections
+  through a bounded `socketpair()` protocol;
 - a redirection worker blocked in the kernel remains cancellable: `Ctrl-C`
   terminates it, the reactor reaps it, and a fresh worker is started.
 
@@ -320,9 +317,9 @@ make conformance
 
 The test and its lifecycle probe are also written in C. They launch the real
 executable through a pseudo-terminal and verify direct execution, shell
-fallback, stop/`fg`/`Ctrl-C` job control, asynchronous Git prompt enrichment,
-isolation of a worker blocked on filesystem I/O, and exact terminal-mode
-restoration. It also exercises encrypted history across agent and shell
+fallback, stop/`fg`/`Ctrl-C` job control, settled and pending prompts,
+isolation of a redirection worker blocked on filesystem I/O, and exact
+terminal-mode restoration. It also exercises encrypted history across agent and shell
 restarts, arrow-key recall, incremental `Ctrl-R`, private commands, and timed
 passphrase reminders.
 
@@ -343,7 +340,7 @@ make fuzz-pty-sanitize
 make soak SOAK_SECONDS=60
 ```
 
-`check-fault` uses a separate test-only binary and exercises 94 deterministic
+`check-fault` uses a separate test-only binary and exercises 88 deterministic
 failure points. The production build contains neither the injection
 configuration nor its fault names. `check-resource` covers runtime descriptor
 and process exhaustion, data-limit capability, bounded single-line and
@@ -480,25 +477,25 @@ Start the interactive shell from a terminal:
 For example:
 
 ```text
-[main] [●] $gsh> long-running-command
-
-[main] [○] $gsh> printf 'hello\n' | tr a-z A-Z
+gsh$ long-running-command
+gsh* printf 'hello\n' | tr a-z A-Z
 HELLO
-[main] [○] $gsh> cd /tmp
-[main] [○] $gsh> pwd
+gsh* cd /tmp
+gsh* pwd
 /tmp
-[main] [○] $gsh> sleep 1 &
+gsh* sleep 1 &
 [1] 12345
-[main] [○] $gsh> wait "$!" && printf 'done\n'
+gsh* wait "$!" && printf 'done\n'
 done
-[main] [●] $gsh> rt
+gsh$ rt
 reactor cycles=... async_jobs=... focus=editor ...
 ```
 
-Enter freezes the submitted prompt and command into a cell with one initial
-output row. The cell grows when additional output rows arrive. The fresh editor
-at the bottom accepts input immediately while independent cells run and finish
-in any order. Shell-state mutations and `$?` dependencies remain ordered. A
+Enter freezes the submitted prompt and command into a cell. Output adds rows
+only when bytes arrive, so a silent command does not leave a blank row. The
+fresh editor at the bottom accepts input immediately while independent cells
+run and finish in any order. Shell-state mutations and `$?` dependencies remain
+ordered. A
 private-input program such as `sudo` receives focus automatically when its PTY
 disables echo; the preserved editor remains unchanged and normal editing
 resumes when the job settles. Non-canonical applications such as `htop`,
@@ -561,14 +558,11 @@ for the passphrase before decrypting the existing vault.
 
 `rt` exposes the bounded reactor's local service-time diagnostics. Its 5 ms
 deadline applies only to work performed by the interactive core after `poll()`
-wakes; it is not a guarantee about external commands or the host OS. In a Git
-working tree, the optional branch segment appears asynchronously, for example
-`[main] [●] $gsh>`. The branch and `[●]` or `[○]` indicator are muted
-gray, while an explicit style reset keeps `$gsh>`, typed text, and command
-output in the terminal's default color. `[●]` means every prior command is
-terminal and its output source is closed; `[○]` means at least one command
-is queued, running, stopped, has pending input/output, or still owns a PTY.
-Typing and the base prompt never wait for Git enrichment.
+wakes; it is not a guarantee about external commands or the host OS. `gsh$`
+means every prior command is terminal and its output source is closed. `gsh*`
+means at least one command is queued, running, stopped, has pending input or
+output, or still owns a PTY. The prompt changes automatically from `gsh*` to
+`gsh$` when the session settles.
 
 One command can also be executed without an interactive terminal:
 
@@ -674,16 +668,15 @@ process group; bounded here-document writers join that job and may block only
 outside the reactor; persistent worker processes isolate potentially blocking
 optional work. Background AND-OR lists use direct child processes, and simple
 external jobs tail-`exec` without an evaluator wrapper. The current worker
-allows one in-flight request plus one
-coalesced Git refresh; it cannot mutate shell state or write to the terminal,
-and the reactor validates every result before a redisplay or status commit.
-Eligible stateless output redirections are serialized through the same worker.
+allows one in-flight stateless output redirection. It cannot mutate shell state
+or write to the terminal, and the reactor validates every result before a
+status commit. Eligible redirections are serialized through that worker.
 If one blocks on a FIFO, the reactor remains responsive and cancellation
 replaces the worker.
 
 This is soft real-time engineering, not hard real-time or mission-grade status.
 The repository has executable conformance tranches, bounded fuzz/property
-checks, sanitizer builds, 94 deterministic fault cases, resource-pressure
+checks, sanitizer builds, 88 deterministic fault cases, resource-pressure
 scenarios, and a configurable soak runner. The current native tranche contains
 612 execution cases, 30 syntax cases, and 18 deterministic limit cases with
 one explicitly unsupported case and no delegated cases. The current same-source

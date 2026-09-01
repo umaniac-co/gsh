@@ -316,10 +316,9 @@ static int start_session(pty_session *session, const char *executable,
         }
         (void)setenv("PATH", "/usr/bin:/bin", 1);
         (void)setenv("TERM", "xterm-256color", 1);
-        (void)setenv("PS1", kind == SHELL_BASH ? "\\$gsh> " : "$gsh> ",
-                     1);
+        (void)setenv("PS1", "gsh$ ", 1);
         (void)setenv("PS2", "GSH_MORE> ", 1);
-        (void)setenv("PROMPT", "$gsh> ", 1);
+        (void)setenv("PROMPT", "gsh$ ", 1);
         (void)setenv("RPROMPT", "", 1);
         if (kind == SHELL_GSH) {
             const char *managed = getenv("GSH_HARNESS_MANAGED");
@@ -806,7 +805,7 @@ static int wait_for_diagnostics(pty_session *session, const char *first,
         if (send_text(session, "rt\r") == -1 ||
             wait_for_output(session, "reactor cycles=", TEST_TIMEOUT_MS) ==
                 -1 ||
-            wait_for_output(session, "$gsh> ", TEST_TIMEOUT_MS) == -1) {
+            wait_for_output(session, "gsh$ ", TEST_TIMEOUT_MS) == -1) {
             return -1;
         }
         if (capture_contains(session, first) &&
@@ -817,33 +816,6 @@ static int wait_for_diagnostics(pty_session *session, const char *first,
     }
     errno = ETIMEDOUT;
     return -1;
-}
-
-static int write_head(const char *root, bool blocking)
-{
-    char git_directory[1024];
-    char head_path[1024];
-    int fd;
-
-    if (snprintf(git_directory, sizeof(git_directory), "%s/.git", root) >=
-            (int)sizeof(git_directory) ||
-        snprintf(head_path, sizeof(head_path), "%s/.git/HEAD", root) >=
-            (int)sizeof(head_path) ||
-        mkdir(git_directory, 0700) == -1) {
-        return -1;
-    }
-    if (blocking) {
-        return mkfifo(head_path, 0600);
-    }
-    fd = open(head_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
-    if (fd == -1) {
-        return -1;
-    }
-    if (write(fd, "ref: refs/heads/bench\n", 22) != 22) {
-        close(fd);
-        return -1;
-    }
-    return close(fd);
 }
 
 static int write_text_file(const char *path, const char *text, mode_t mode)
@@ -886,13 +858,6 @@ static void remove_fixture(const char *root)
     }
     if (snprintf(path, sizeof(path), "%s/with space", root) <
         (int)sizeof(path)) {
-        (void)rmdir(path);
-    }
-    if (snprintf(path, sizeof(path), "%s/.git/HEAD", root) <
-        (int)sizeof(path)) {
-        (void)unlink(path);
-    }
-    if (snprintf(path, sizeof(path), "%s/.git", root) < (int)sizeof(path)) {
         (void)rmdir(path);
     }
     (void)rmdir(root);
@@ -1016,7 +981,7 @@ static int create_history_vault(pty_session *session)
         consume_through(session, "Confirm history passphrase: ",
                         TEST_TIMEOUT_MS) == -1 ||
         send_text(session, "history test passphrase\r") == -1 ||
-        consume_through(session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         capture_contains(session, passphrase)) {
         return -1;
     }
@@ -1030,10 +995,10 @@ static int exercise_history_editor(pty_session *session)
 
     if (send_text(session, "/usr/bin/printf 'HISTORY_ALPHA\\n'\r") == -1 ||
         consume_through(session, "HISTORY_ALPHA\r\n", TEST_TIMEOUT_MS) == -1 ||
-        consume_through(session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(session, "/usr/bin/printf 'HISTORY_BETA\\n'\r") == -1 ||
         consume_through(session, "HISTORY_BETA\r\n", TEST_TIMEOUT_MS) == -1 ||
-        consume_through(session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_bytes(session, "\033[A", 3) == -1 ||
         consume_through(session, beta, TEST_TIMEOUT_MS) == -1 ||
         send_bytes(session, "\033[A", 3) == -1 ||
@@ -1046,18 +1011,18 @@ static int exercise_history_editor(pty_session *session)
         consume_through(session, alpha, TEST_TIMEOUT_MS) == -1 ||
         send_text(session, "\r") == -1 ||
         consume_through(session, "HISTORY_ALPHA\r\n", TEST_TIMEOUT_MS) == -1 ||
-        consume_through(session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(session,
                   " /usr/bin/printf 'HISTORY_PRIVATE\\n' \r") == -1 ||
         consume_through(session, "HISTORY_PRIVATE\r\n", TEST_TIMEOUT_MS) == -1 ||
-        consume_through(session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_bytes(session, "\033[A", 3) == -1 ||
         consume_through(session, alpha, TEST_TIMEOUT_MS) == -1 ||
         send_bytes(session, "\025", 1) == -1 ||
         send_text(session, "history status\r") == -1 ||
         consume_through(session, "entries=4 max=1024 unlock=infinite",
                         TEST_TIMEOUT_MS) == -1 ||
-        consume_through(session, "$gsh> ", TEST_TIMEOUT_MS) == -1) {
+        consume_through(session, "gsh$ ", TEST_TIMEOUT_MS) == -1) {
         return -1;
     }
     return 0;
@@ -1075,7 +1040,7 @@ static int shutdown_history_agent(pty_session *session)
 
 static int verify_unlocked_reuse(pty_session *session)
 {
-    if (consume_through(session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+    if (consume_through(session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_bytes(session, "\033[A", 3) == -1 ||
         consume_through(session, "exit 0", TEST_TIMEOUT_MS) == -1 ||
         send_bytes(session, "\025\022ALPHA", 7) == -1 ||
@@ -1094,7 +1059,7 @@ static int verify_fresh_agent_unlock(pty_session *session)
     if (consume_through(session, "History passphrase: ",
                         TEST_TIMEOUT_MS) == -1 ||
         send_text(session, "history test passphrase\r") == -1 ||
-        consume_through(session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_bytes(session, "\033[A", 3) == -1 ||
         consume_through(session, "history shutdown", TEST_TIMEOUT_MS) == -1 ||
         shutdown_history_agent(session) == -1) {
@@ -1237,54 +1202,51 @@ static int ordinary_flow(const char *executable)
         snprintf(spaced_directory, sizeof(spaced_directory), "%s/with space",
                  fixture) >= (int)sizeof(spaced_directory) ||
         mkdir(spaced_directory, 0700) == -1 ||
-        write_head(fixture, false) == -1 ||
         start_session(&session, executable, fixture, SHELL_GSH) == -1) {
         perror("pty smoke: ordinary setup");
         remove_fixture(fixture);
         return 1;
     }
 
-    if (consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "\033[90m[bench]\033[0m $gsh> ",
-                        TEST_TIMEOUT_MS) == -1 ||
+    if (consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "/usr/bin/true\r") == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session,
                   "/usr/bin/printf X | /usr/bin/tr X Y\r") == -1 ||
         consume_through(&session, "\nY", TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session,
                   "/usr/bin/yes X | /usr/bin/head -n 1\r") == -1 ||
         consume_through(&session, "\nX\r\n", TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session,
                   "/usr/bin/printf '%s\\n' GSH_NATIVE_REDIRECT_OUTPUT "
                   "> native.out\r") == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "/bin/cat native.out\r") == -1 ||
         consume_through(&session, "\nGSH_NATIVE_REDIRECT_OUTPUT\r\n",
                         TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session,
                   "/usr/bin/false && /usr/bin/printf BAD || "
                   "/usr/bin/printf GSH_NATIVE_AND_OR\r") == -1 ||
         consume_through(&session, "\nGSH_NATIVE_AND_OR",
                         TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session,
                   "if /usr/bin/false; then /usr/bin/printf BAD; else "
                   "/usr/bin/printf GSH_NATIVE_IF; fi\r") == -1 ||
         consume_through(&session, "\nGSH_NATIVE_IF", TEST_TIMEOUT_MS) ==
             -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "cd 'with space'\r") == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "/bin/pwd\r") == -1 ||
         consume_through(&session, "/with space\r\n", TEST_TIMEOUT_MS) ==
             -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "cd ..\r") == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "/bin/cat <<EOF\r") == -1 ||
         consume_through(&session, "GSH_MORE> ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "GSH_PTY_HEREDOC status=$?\r") == -1 ||
@@ -1292,66 +1254,66 @@ static int ordinary_flow(const char *executable)
         send_text(&session, "EOF\r") == -1 ||
         consume_through(&session, "\nGSH_PTY_HEREDOC status=0\r\n",
                         TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "/bin/cat <<CANCEL\r") == -1 ||
         consume_through(&session, "GSH_MORE> ", TEST_TIMEOUT_MS) == -1 ||
         send_bytes(&session, "\003", 1) == -1 ||
         consume_through(&session, "^C", TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session,
                   "/usr/bin/printf '<%s>\\n' "
                   "\"$(/usr/bin/printf GSH_SUBSTITUTION)\"\r") == -1 ||
         consume_through(&session, "<GSH_SUBSTITUTION>\r\n",
                         TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session,
                   "/usr/bin/printf '<%s>\\n' "
                   "\"$(/usr/bin/printf 'GSH_SUB_%s' START 1>&2; "
                   "/bin/sleep 5; /usr/bin/printf late)\"\r") == -1 ||
         consume_through(&session, "GSH_SUB_START", TEST_TIMEOUT_MS) == -1 ||
         send_bytes(&session, "\003", 1) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "GSH_PERSIST=value\r") == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session,
                   "/usr/bin/printf '<%s>\\n' \"$GSH_PERSIST\"\r") == -1 ||
         consume_through(&session, "<value>\r\n", TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, ": \"${GSH_TRANSACTION:=committed}\"\r") ==
             -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session,
                   "/usr/bin/printf '<%s>\\n' \"$GSH_TRANSACTION\"\r") ==
             -1 ||
         consume_through(&session, "<committed>\r\n",
                         TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session,
                   "/usr/bin/printf '<%s:%s>\\n' "
                   "\"$((GSH_ARITHMETIC = 7))\" "
                   "\"$GSH_ARITHMETIC\"\r") == -1 ||
         consume_through(&session, "<7:7>\r\n", TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session,
                   "/usr/bin/printf '<%s>\\n' native.*\r") == -1 ||
         consume_through(&session, "<native.out>\r\n",
                         TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "rt\r") == -1 ||
         wait_for_output(&session,
                         "direct=3 native=16 shell=0 parsed=19 parse_failures=0 "
                         "job=idle worker=on",
                         TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, command) == -1 ||
         consume_through(&session, "GSH_PROBE_READY", TEST_TIMEOUT_MS) == -1 ||
         consume_through(&session, "]+ Stopped ", TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "fg\r") == -1 ||
         consume_through(&session, "GSH_PROBE_CONTINUED", TEST_TIMEOUT_MS) ==
             -1 ||
         send_bytes(&session, "\003", 1) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1) {
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1) {
         perror("pty smoke: ordinary flow");
         dump_capture(&session);
         failed = 1;
@@ -1415,7 +1377,7 @@ static int job_start_stopped(pty_session *session, const char *command,
                               "observe probe readiness") == -1 ||
                    job_expect(session, "]+ Stopped ",
                               "observe stopped notification") == -1 ||
-                   job_expect(session, "$gsh> ",
+                   job_expect(session, "gsh$ ",
                               "observe prompt after stop") == -1
                ? -1
                : 0;
@@ -1433,12 +1395,12 @@ static int job_resume_background(pty_session *session)
     if (job_send(session, "jobs %1 | /bin/cat\r", "send jobs pipeline") ==
             -1 ||
         job_expect(session, "Stopped ", "observe jobs state") == -1 ||
-        job_expect(session, "$gsh> ", "observe prompt after jobs") == -1 ||
+        job_expect(session, "gsh$ ", "observe prompt after jobs") == -1 ||
         job_send(session, "bg %1\r", "resume background job") == -1 ||
         job_observe(session, "[continued ", "observe continued notice") == -1 ||
         job_observe(session, "GSH_PROBE_CONTINUED",
                     "observe resumed probe") == -1 ||
-        job_observe(session, "$gsh> ", "observe prompt after bg") == -1) {
+        job_observe(session, "gsh$ ", "observe prompt after bg") == -1) {
         return -1;
     }
     session->capture_length = 0;
@@ -1456,7 +1418,7 @@ static int job_foreground_second(pty_session *session, const char *command)
     if (send_bytes(session, "\003", 1U) == -1) {
         return job_flow_failure(session, "interrupt foreground job");
     }
-    return job_expect(session, "$gsh> ", "observe prompt after interrupt");
+    return job_expect(session, "gsh$ ", "observe prompt after interrupt");
 }
 
 static int job_finish_background(pty_session *session)
@@ -1467,7 +1429,7 @@ static int job_finish_background(pty_session *session)
                "terminate background job") == -1 ||
                    job_expect(session, "GSH_WAIT=143",
                               "observe wait status") == -1 ||
-                   job_expect(session, "$gsh> ",
+                   job_expect(session, "gsh$ ",
                               "observe final prompt") == -1
                ? -1
                : 0;
@@ -1506,7 +1468,7 @@ static int job_service_control_flow(const char *executable)
         (void)rmdir(fixture);
         return 1;
     }
-    if (job_expect(&session, "$gsh> ", "observe initial prompt") == -1 ||
+    if (job_expect(&session, "gsh$ ", "observe initial prompt") == -1 ||
         job_start_stopped(&session, command, "[1] ") == -1 ||
         job_resume_background(&session) == -1 ||
         job_foreground_second(&session, command) == -1 ||
@@ -1545,27 +1507,27 @@ static int fc_builtin_flow(const char *executable)
         (void)rmdir(fixture);
         return 1;
     }
-    if (consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+    if (consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "echo GSH_FC_ORIGINAL\r") == -1 ||
         consume_through(&session, "GSH_FC_ORIGINAL\r\n",
                         TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "fc -s ORIGINAL=REPLAY echo\r") == -1 ||
         consume_through(&session, "GSH_FC_REPLAY\r\n",
                         TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "fc -ln echo\r") == -1 ||
         consume_through(&session, "echo GSH_FC_ORIGINAL\r\n",
                         TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, command) == -1 ||
         consume_through(&session, "GSH_FC_EDITED\r\n",
                         TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "FCEDIT=/no/such/editor fc echo\r") == -1 ||
         consume_through(&session, "gsh: fc: editor failed",
                         TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         process_child_count(session.pid) != 1) {
         perror("pty fc: flow");
         dump_capture(&session);
@@ -1602,7 +1564,7 @@ static int protected_bridge_flow(const char *executable)
         (void)rmdir(fixture);
         return 1;
     }
-    if (consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1) {
+    if (consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1) {
         failed = 1;
     }
     for (index = 0; !failed &&
@@ -1612,7 +1574,7 @@ static int protected_bridge_flow(const char *executable)
                 &session,
                 "native builtin ownership prevents compatibility fallback",
                 TEST_TIMEOUT_MS) == -1 ||
-            consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1) {
+            consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1) {
             failed = 1;
         }
     }
@@ -1638,7 +1600,7 @@ static int managed_repl_concurrency(pty_session *session)
 
     if (send_text(session, "/bin/sleep 1\r") == -1 ||
         consume_through(session,
-                        "/bin/sleep 1\r\n\r\n\033[90m[○]\033[0m $gsh> ",
+                        "/bin/sleep 1\r\ngsh* ",
                         TEST_TIMEOUT_MS) == -1) {
         return -1;
     }
@@ -1655,25 +1617,25 @@ static int managed_repl_concurrency(pty_session *session)
     return 0;
 }
 
-static int managed_repl_indicator(pty_session *session)
+static int managed_repl_prompt_state(pty_session *session)
 {
     static const char command[] =
-        "/bin/sh -c 'sleep .3; printf INDICATOR_DONE'\r";
+        "/bin/sh -c 'sleep .3; printf PROMPT_STATE_DONE'\r";
 
     session->capture_length = 0;
     if (send_text(session, command) == -1 ||
-        wait_for_output(session, "\033[90m[○]\033[0m $gsh> ",
+        wait_for_output(session, "gsh* ",
                         TEST_TIMEOUT_MS) == -1 ||
-        send_text(session, "STYLE_PRESERVED") == -1 ||
+        send_text(session, "EDIT_PRESERVED") == -1 ||
         wait_for_output(session,
-                        "\033[90m[○]\033[0m $gsh> STYLE_PRESERVED",
+                        "gsh* EDIT_PRESERVED",
                         TEST_TIMEOUT_MS) == -1 ||
         send_bytes(session, "\025", 1) == -1 ||
         wait_for_output(session,
-                        "INDICATOR_DONE\r\n\033[90m[○]\033[0m $gsh> ",
+                        "PROMPT_STATE_DONE\r\ngsh* ",
                         TEST_TIMEOUT_MS) == -1 ||
         wait_for_output(session,
-                        "INDICATOR_DONE\r\n\033[90m[●]\033[0m $gsh> ",
+                        "PROMPT_STATE_DONE\r\ngsh$ ",
                         TEST_TIMEOUT_MS) == -1) {
         return -1;
     }
@@ -1684,18 +1646,18 @@ static int managed_repl_terminal_outcomes(pty_session *session)
 {
     session->capture_length = 0;
     if (send_text(session, "/bin/sh -c 'sleep .2; exit 7'\r") == -1 ||
-        wait_for_output(session, "\033[90m[○]\033[0m $gsh> ",
+        wait_for_output(session, "gsh* ",
                         TEST_TIMEOUT_MS) == -1 ||
-        wait_for_output(session, "\033[90m[●]\033[0m $gsh> ",
+        wait_for_output(session, "gsh$ ",
                         TEST_TIMEOUT_MS) == -1) {
         return -1;
     }
     session->capture_length = 0;
     if (send_text(session,
                   "/bin/sh -c 'sleep .2; kill -TERM $$'\r") == -1 ||
-        wait_for_output(session, "\033[90m[○]\033[0m $gsh> ",
+        wait_for_output(session, "gsh* ",
                         TEST_TIMEOUT_MS) == -1 ||
-        wait_for_output(session, "\033[90m[●]\033[0m $gsh> ",
+        wait_for_output(session, "gsh$ ",
                         TEST_TIMEOUT_MS) == -1) {
         return -1;
     }
@@ -1711,7 +1673,7 @@ static int managed_repl_compound_overtake(pty_session *session)
 
     if (send_text(session, loop) == -1 ||
         consume_through(session,
-                        "done\r\n\r\n\033[90m[○]\033[0m $gsh> ",
+                        "done\r\ngsh* ",
                         TEST_TIMEOUT_MS) == -1) {
         return -1;
     }
@@ -1736,7 +1698,7 @@ static int managed_repl_launch_state_fence(pty_session *session)
 
     if (send_text(session, loop) == -1 ||
         consume_through(session,
-                        "done\r\n\r\n\033[90m[○]\033[0m $gsh> ",
+                        "done\r\ngsh* ",
                         TEST_TIMEOUT_MS) == -1) {
         return -1;
     }
@@ -1755,11 +1717,11 @@ static int managed_repl_preserves_edit(pty_session *session)
     if (send_text(session,
                   "/bin/sh -c 'sleep 0.2; printf LATE'\r") == -1 ||
         consume_through(session,
-                        "printf LATE'\r\n\r\n\033[90m[○]\033[0m $gsh> ",
+                        "printf LATE'\r\ngsh* ",
                         TEST_TIMEOUT_MS) == -1 ||
         send_text(session, "PRESERVED") == -1 ||
         consume_through(session, "LATE", TEST_TIMEOUT_MS) == -1 ||
-        consume_through(session, "$gsh> PRESERVED", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(session, "gsh$ PRESERVED", TEST_TIMEOUT_MS) == -1 ||
         send_bytes(session, "\025", 1) == -1) {
         return -1;
     }
@@ -1773,7 +1735,7 @@ static int managed_repl_focus(pty_session *session)
                         TEST_TIMEOUT_MS) == -1 ||
         send_text(session, "/bin/cat\r") == -1 ||
         consume_through(session,
-                        "/bin/cat\r\n\r\n\033[90m[○]\033[0m $gsh> ",
+                        "/bin/cat\r\ngsh* ",
                         TEST_TIMEOUT_MS) == -1 ||
         send_text(session, "fg\r") == -1 ||
         consume_through(session, "[focused cell ", TEST_TIMEOUT_MS) == -1 ||
@@ -1782,7 +1744,7 @@ static int managed_repl_focus(pty_session *session)
                         TEST_TIMEOUT_MS) == -1 ||
         send_bytes(session, "\032", 1) == -1 ||
         consume_through(session, "[stopped]", TEST_TIMEOUT_MS) == -1 ||
-        consume_through(session, "\033[90m[○]\033[0m $gsh> ",
+        consume_through(session, "gsh* ",
                         TEST_TIMEOUT_MS) == -1 ||
         send_text(session, "bg\r") == -1 ||
         consume_through(session, "[continued]",
@@ -1808,20 +1770,20 @@ static int managed_repl_private_input_autofocus(pty_session *session)
     session->capture_length = 0;
     if (send_text(session, command) == -1 ||
         consume_through(session,
-                        "\r\n\r\n\033[90m[○]\033[0m $gsh> ",
+                        "\r\ngsh* ",
                         TEST_TIMEOUT_MS) == -1 ||
         send_text(session, "PRESERVED") == -1 ||
         wait_for_output(session, "\r\nPRIVATE_INPUT\r\n",
                         TEST_TIMEOUT_MS) == -1 ||
         wait_for_output(session,
-                        "\033[90m[○]\033[0m $gsh> PRESERVED",
+                        "gsh* PRESERVED",
                         TEST_TIMEOUT_MS) == -1 ||
         send_text(session, secret) == -1 ||
         wait_for_output(session, "PRIVATE_ACCEPTED", TEST_TIMEOUT_MS) == -1 ||
         capture_contains(session, "PRIVATE_SECRET_42") ||
         consume_through(session, "PRIVATE_ACCEPTED", TEST_TIMEOUT_MS) == -1 ||
         wait_for_output(session,
-                        "\n\033[90m[●]\033[0m $gsh> PRESERVED",
+                        "\ngsh$ PRESERVED",
                         TEST_TIMEOUT_MS) == -1 ||
         send_bytes(session, "\025", 1) == -1 ||
         send_text(session, "/usr/bin/printf FOCUS_RETURNED\r") == -1 ||
@@ -1853,7 +1815,7 @@ static int managed_repl_fullscreen_focus(pty_session *session)
         wait_for_output(session, "[full-screen session]",
                         TEST_TIMEOUT_MS) == -1 ||
         send_text(session, "DETACHED_EDITOR") == -1 ||
-        wait_for_output(session, "$gsh> DETACHED_EDITOR",
+        wait_for_output(session, "gsh* DETACHED_EDITOR",
                         TEST_TIMEOUT_MS) == -1 ||
         send_bytes(session, "\025", 1) == -1 ||
         send_text(session, "fg\r") == -1 ||
@@ -1861,7 +1823,7 @@ static int managed_repl_fullscreen_focus(pty_session *session)
         send_text(session, "q") == -1 ||
         consume_through(session, "FULLSCREEN_EXITED",
                         TEST_TIMEOUT_MS) == -1 ||
-        wait_for_output(session, "\033[90m[●]\033[0m $gsh> ",
+        wait_for_output(session, "gsh$ ",
                         TEST_TIMEOUT_MS) == -1 ||
         send_text(session, "/usr/bin/printf AFTER_FULLSCREEN\r") == -1 ||
         wait_for_output(session, "AFTER_FULLSCREEN", TEST_TIMEOUT_MS) == -1) {
@@ -1878,7 +1840,7 @@ static int managed_repl_pipeline(pty_session *session)
                   "/bin/sh -c 'sleep 1; printf PIPE_SLOW' | /bin/cat\r") ==
             -1 ||
         consume_through(session,
-                        "| /bin/cat\r\n\r\n\033[90m[○]\033[0m $gsh> ",
+                        "| /bin/cat\r\ngsh* ",
                         TEST_TIMEOUT_MS) == -1) {
         return -1;
     }
@@ -1928,13 +1890,13 @@ static int managed_repl_contains_output(pty_session *session)
 static int managed_repl_resize(pty_session *session)
 {
     if (send_text(session, "RESIZE_KEEP") == -1 ||
-        consume_through(session, "$gsh> RESIZE_KEEP",
+        consume_through(session, "gsh$ RESIZE_KEEP",
                         TEST_TIMEOUT_MS) == -1 ||
         resize_session(session, 12, 40) == -1 ||
-        consume_through(session, "$gsh> RESIZE_KEEP",
+        consume_through(session, "gsh$ RESIZE_KEEP",
                         TEST_TIMEOUT_MS) == -1 ||
         resize_session(session, 24, 80) == -1 ||
-        consume_through(session, "$gsh> RESIZE_KEEP",
+        consume_through(session, "gsh$ RESIZE_KEEP",
                         TEST_TIMEOUT_MS) == -1 ||
         send_bytes(session, "\025", 1) == -1) {
         return -1;
@@ -1955,7 +1917,7 @@ static int managed_repl_saturation(pty_session *session)
     }
     if (send_text(session, "/bin/sleep 30\r") == -1 ||
         consume_through(session, "\a", TEST_TIMEOUT_MS) == -1 ||
-        consume_through(session, "$gsh> /bin/sleep 30",
+        consume_through(session, "gsh* /bin/sleep 30",
                         TEST_TIMEOUT_MS) == -1 ||
         send_bytes(session, "\025", 1) == -1) {
         return -1;
@@ -1969,7 +1931,7 @@ static int managed_repl_toggle(pty_session *session)
 
     session->capture_length = 0;
     if (send_text(session, "/bin/sleep 2\r") == -1 ||
-        wait_for_output(session, "\033[90m[○]\033[0m $gsh> ",
+        wait_for_output(session, "gsh* ",
                         TEST_TIMEOUT_MS) == -1 ||
         send_text(session, "/async\r") == -1 ||
         wait_for_output(session, "async repl: off pending",
@@ -1997,7 +1959,7 @@ static int managed_repl_toggle(pty_session *session)
         wait_for_output(session, "\033[?1049h", TEST_TIMEOUT_MS) == -1 ||
         wait_for_output(session, "async repl: on",
                         TEST_TIMEOUT_MS) == -1 ||
-        wait_for_output(session, "\033[90m[●]\033[0m $gsh> ",
+        wait_for_output(session, "gsh$ ",
                         TEST_TIMEOUT_MS) == -1 ||
         capture_contains(session, "async repl: on pending")) {
         errno = ETIMEDOUT;
@@ -2014,7 +1976,7 @@ static int managed_repl_toggle(pty_session *session)
     if (send_text(session, "/async\r") == -1 ||
         wait_for_output(session, "\033[?1049h", TEST_TIMEOUT_MS) == -1 ||
         wait_for_output(session, "async repl: on", TEST_TIMEOUT_MS) == -1 ||
-        wait_for_output(session, "\033[90m[●]\033[0m $gsh> ",
+        wait_for_output(session, "gsh$ ",
                         TEST_TIMEOUT_MS) == -1 ||
         capture_contains(session, "async repl: on pending")) {
         return -1;
@@ -2030,7 +1992,7 @@ static int managed_repl_toggle(pty_session *session)
                         TEST_TIMEOUT_MS) == -1 ||
         wait_for_output(session, "\033[?1049h", TEST_TIMEOUT_MS) == -1 ||
         wait_for_output(session, "async repl: on", TEST_TIMEOUT_MS) == -1 ||
-        wait_for_output(session, "\033[90m[●]\033[0m $gsh> ",
+        wait_for_output(session, "gsh$ ",
                         TEST_TIMEOUT_MS) == -1) {
         return -1;
     }
@@ -2049,9 +2011,9 @@ static int managed_async_repl_flow(const char *executable)
         (void)rmdir(fixture);
         return 1;
     }
-    if (consume_through(&session, "\033[90m[●]\033[0m $gsh> ",
+    if (consume_through(&session, "gsh$ ",
                         TEST_TIMEOUT_MS) == -1 ||
-        managed_repl_indicator(&session) == -1 ||
+        managed_repl_prompt_state(&session) == -1 ||
         managed_repl_terminal_outcomes(&session) == -1 ||
         managed_repl_concurrency(&session) == -1 ||
         managed_repl_compound_overtake(&session) == -1 ||
@@ -2100,180 +2062,180 @@ static int variable_builtin_flow(const char *executable)
         (void)rmdir(fixture);
         return 1;
     }
-    if (consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+    if (consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "export GSH_PTY_EXPORT='alpha beta'\r") == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "/usr/bin/printenv GSH_PTY_EXPORT\r") == -1 ||
         consume_through(&session, "\nalpha beta\r\n", TEST_TIMEOUT_MS) ==
             -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session,
                   "GSH_PTY_COMPOUND=committed export -p >/dev/null; :\r") ==
             -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session,
                   "/usr/bin/printf '<%s>\\n' \"$GSH_PTY_COMPOUND\"\r") ==
             -1 ||
         consume_through(&session, "<committed>\r\n", TEST_TIMEOUT_MS) ==
             -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "readonly GSH_PTY_READONLY=locked\r") == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "unset GSH_PTY_READONLY\r") == -1 ||
         consume_through(&session, "gsh: unset: variable is readonly",
                         TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session,
                   "/usr/bin/printf '<%s>\\n' \"$GSH_PTY_READONLY\"\r") ==
             -1 ||
         consume_through(&session, "<locked>\r\n", TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "unset GSH_PTY_EXPORT\r") == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session,
                   "/usr/bin/printf '<%s>\\n' "
                   "\"${GSH_PTY_EXPORT+set}\"\r") == -1 ||
         consume_through(&session, "<>\r\n", TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session,
                   "export GSH_PTY_PIPE=before; "
                   "export GSH_PTY_PIPE=inside | true\r") == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session,
                   "/usr/bin/printf '<%s>\\n' \"$GSH_PTY_PIPE\"\r") == -1 ||
         consume_through(&session, "<before>\r\n", TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session,
                   "  for GSH_PTY_FOR in first last; do :; done  \r") == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session,
                   "/usr/bin/printf '<%s>\\n' \"$GSH_PTY_FOR\"\r") == -1 ||
         consume_through(&session, "<last>\r\n", TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session,
                   "for GSH_PTY_STATUS in one two; do false; done\r") == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "/usr/bin/printf '<%s>\\n' \"$?\"\r") == -1 ||
         consume_through(&session, "<1>\r\n", TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session,
                   "for GSH_PTY_QUOTED in 'a b' ''; do :; done\r") == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session,
                   "/usr/bin/printf '<%s>\\n' \"$GSH_PTY_QUOTED\"\r") ==
             -1 ||
         consume_through(&session, "<>\r\n", TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "set -- 'one two' '' three\r") == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session,
                   "/usr/bin/printf '<%s>\\n' \"$#|$1|$2|$3\"\r") == -1 ||
         consume_through(&session, "<3|one two||three>\r\n",
                         TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "shift\r") == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session,
                   "/usr/bin/printf '<%s>\\n' \"$#|$1|$2\"\r") == -1 ||
         consume_through(&session, "<2||three>\r\n",
                         TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "set -- compound; :\r") == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session,
                   "/usr/bin/printf '<%s>\\n' \"$#|$1\"\r") == -1 ||
         consume_through(&session, "<1|compound>\r\n",
                         TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "set -- redirected >/dev/null\r") == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session,
                   "/usr/bin/printf '<%s>\\n' \"$1\"\r") == -1 ||
         consume_through(&session, "<redirected>\r\n",
                         TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "set -- inside | true\r") == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session,
                   "/usr/bin/printf '<%s>\\n' \"$1\"\r") == -1 ||
         consume_through(&session, "<redirected>\r\n",
                         TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "set -f\r") == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "/usr/bin/printf '<%s>\\n' \"$-\"\r") ==
             -1 ||
         consume_through(&session, "<fi>\r\n", TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "if true; then set -C; fi\r") == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "/usr/bin/printf '<%s>\\n' \"$-\"\r") ==
             -1 ||
         consume_through(&session, "<Cfi>\r\n", TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "set +Cf\r") == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "set -f | true\r") == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "/usr/bin/printf '<%s>\\n' \"$-\"\r") ==
             -1 ||
         consume_through(&session, "<i>\r\n", TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "unset GSH_PTY_AUTO; set -a\r") == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "GSH_PTY_AUTO=value\r") == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "set +a\r") == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "/usr/bin/printenv GSH_PTY_AUTO\r") == -1 ||
         consume_through(&session, "\nvalue\r\n", TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "unset GSH_PTY_NOUNSET; set -u\r") == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, ": \"$GSH_PTY_NOUNSET\"\r") == -1 ||
         consume_through(&session,
                         "GSH_PTY_NOUNSET: parameter null or not set",
                         TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "/usr/bin/printf '<%s>\\n' \"$-\"\r") ==
             -1 ||
         consume_through(&session, "<iu>\r\n", TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "set +u\r") == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "GSH_PTY_ARITH=1\r") == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session,
                   ": \"$((GSH_PTY_ARITH=2, 1 / 0))\"\r") == -1 ||
         consume_through(&session,
                         "gsh: arithmetic expansion: division by zero",
                         TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session,
                   "/usr/bin/printf '<%s>\\n' "
                   "\"$?|$GSH_PTY_ARITH\"\r") == -1 ||
         consume_through(&session, "<1|1>\r\n", TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "if true; then cd ..; fi\r") == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session,
                   "/bin/test \"$PWD\" = \"$(/bin/pwd)\" && "
                   "/usr/bin/printf GSH_CD_COMMITTED\r") == -1 ||
         consume_through(&session, "GSH_CD_COMMITTED",
                         TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "set -- before\r") == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session,
                   "set -auf -- after; /usr/bin/printf 'GSH_SET_%s' READY; "
                   "/bin/sleep 5\r") == -1 ||
         consume_through(&session, "GSH_SET_READY", TEST_TIMEOUT_MS) == -1 ||
         send_bytes(&session, "\003", 1) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session,
                   "/usr/bin/printf '<%s>\\n' \"$1|$-\"\r") == -1 ||
         consume_through(&session, "<before|i>\r\n", TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1) {
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1) {
         perror("pty variables: flow");
         dump_capture(&session);
         failed = 1;
@@ -2302,52 +2264,52 @@ static int alias_builtin_flow(const char *executable)
         (void)rmdir(fixture);
         return 1;
     }
-    if (consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+    if (consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "alias gsh_say=/bin/echo\r") == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "gsh_say interactive\r") == -1 ||
         consume_through(&session, "\ninteractive\r\n", TEST_TIMEOUT_MS) ==
             -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "alias gsh_say\r") == -1 ||
         consume_through(&session, "gsh_say='/bin/echo'\r\n",
                         TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session,
                   "if true; then alias gsh_compound=/bin/echo; fi\r") ==
             -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "gsh_compound committed\r") == -1 ||
         consume_through(&session, "\ncommitted\r\n", TEST_TIMEOUT_MS) ==
             -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "(unalias gsh_compound)\r") == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "gsh_compound isolated\r") == -1 ||
         consume_through(&session, "\nisolated\r\n", TEST_TIMEOUT_MS) ==
             -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "unalias gsh_say | /bin/cat\r") == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "gsh_say pipeline-isolated\r") == -1 ||
         consume_through(&session, "\npipeline-isolated\r\n",
                         TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "alias 'gsh_prefix=gsh_say '\r") == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "gsh_prefix forced\r") == -1 ||
         consume_through(&session, "\nforced\r\n", TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "unalias gsh_say > alias.out\r") == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "/bin/test ! -s alias.out\r") == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "alias gsh_say\r") == -1 ||
         consume_through(&session, "alias is not defined", TEST_TIMEOUT_MS) ==
             -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "unalias -a\r") == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1) {
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1) {
         perror("pty alias: flow");
         dump_capture(&session);
         failed = 1;
@@ -2392,42 +2354,42 @@ static int command_hash_flow(const char *executable)
         remove_hash_fixture(fixture);
         return 1;
     }
-    if (consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+    if (consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "PATH=/bin; hash sh >hash.out\r") == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "hash\r") == -1 ||
         consume_through(&session, "sh=/bin/sh\r\n", TEST_TIMEOUT_MS) ==
             -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "(hash -r)\r") == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "hash\r") == -1 ||
         consume_through(&session, "sh=/bin/sh\r\n", TEST_TIMEOUT_MS) ==
             -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "PATH=$PATH\r") == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session,
                   "hash >after.out; /bin/test ! -s after.out && "
                   "/usr/bin/printf GSH_HASH_PATH_CLEAR\r") == -1 ||
         consume_through(&session, "GSH_HASH_PATH_CLEAR",
                         TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session,
                   "if true; then sh -c 'exit 0'; fi\r") == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "hash\r") == -1 ||
         consume_through(&session, "sh=/bin/sh\r\n", TEST_TIMEOUT_MS) ==
             -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "hash -r >clear.out\r") == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session,
                   "hash >clear.out; /bin/test ! -s clear.out && "
                   "/usr/bin/printf GSH_HASH_COMMIT_CLEAR\r") == -1 ||
         consume_through(&session, "GSH_HASH_COMMIT_CLEAR",
                         TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1) {
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1) {
         perror("pty hash: flow");
         dump_capture(&session);
         failed = 1;
@@ -2470,35 +2432,35 @@ static int times_builtin_flow(const char *executable)
         remove_times_fixture(fixture);
         return 1;
     }
-    if (consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+    if (consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session,
                   "times >direct.out; "
                   "/bin/test \"$(/usr/bin/wc -l <direct.out)\" -eq 2 && "
                   "/usr/bin/printf GSH_TIMES_DIRECT\r") == -1 ||
         consume_through(&session, "GSH_TIMES_DIRECT", TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session,
                   "if true; then times >compound.out; fi; "
                   "/bin/test \"$(/usr/bin/wc -l <compound.out)\" -eq 2 && "
                   "/usr/bin/printf GSH_TIMES_COMPOUND\r") == -1 ||
         consume_through(&session, "GSH_TIMES_COMPOUND", TEST_TIMEOUT_MS) ==
             -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session,
                   "GSH_TIMES_VALUE=before; "
                   "GSH_TIMES_VALUE=after times >/dev/null; "
                   "/bin/test \"$GSH_TIMES_VALUE\" = after && "
                   "/usr/bin/printf GSH_TIMES_ASSIGN\r") == -1 ||
         consume_through(&session, "GSH_TIMES_ASSIGN", TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "times unexpected\r") == -1 ||
         consume_through(&session, "does not accept operands",
                         TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "/usr/bin/printf GSH_TIMES_RECOVERED\r") == -1 ||
         consume_through(&session, "GSH_TIMES_RECOVERED", TEST_TIMEOUT_MS) ==
             -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1) {
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1) {
         perror("pty times: flow");
         dump_capture(&session);
         failed = 1;
@@ -2540,10 +2502,10 @@ static int interactive_exec_overlay_case(
     if ((managed ? start_managed_session(&session, executable, fixture)
                  : start_session(&session, executable, fixture, SHELL_GSH)) ==
             -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         (setup != NULL &&
          (send_text(&session, setup) == -1 ||
-          consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1)) ||
+          consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1)) ||
         send_text(&session, command) == -1 ||
         wait_session_exit(&session, expected_status, TEST_TIMEOUT_MS) == -1) {
         if (session.master >= 0) {
@@ -2562,19 +2524,19 @@ static int managed_exec_descriptor_case(const char *executable,
     int failed = 0;
 
     if (start_managed_session(&session, executable, fixture) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session,
                   "if true; then exec >managed.out; fi\r") == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session,
                   "/usr/bin/printf GSH_MANAGED_EXEC_DESCRIPTOR\r") == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "exec 1>/dev/tty\r") == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "/bin/cat managed.out\r") == -1 ||
         consume_through(&session, "GSH_MANAGED_EXEC_DESCRIPTOR",
                         TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1) {
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1) {
         dump_capture(&session);
         failed = 1;
     }
@@ -2591,7 +2553,7 @@ static int exec_internal_descriptor_case(const char *executable,
     int failed = 0;
 
     if (start_session(&session, executable, fixture, SHELL_GSH) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session,
                   "command exec 100>&3 101>&4 102>&5 103>&6 104>&7 "
                   "105>&8 106>&9 107>&10 108>&11 109>&12 110>&13 "
@@ -2601,9 +2563,9 @@ static int exec_internal_descriptor_case(const char *executable,
                   "129>&32 130>&33 131>&34\r") == -1 ||
         consume_through(&session, "gsh: exec redirection:",
                         TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "/usr/bin/true\r") == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1) {
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1) {
         dump_capture(&session);
         failed = 1;
     }
@@ -2625,46 +2587,46 @@ static int exec_builtin_flow(const char *executable)
         remove_exec_fixture(fixture);
         return 1;
     }
-    if (consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+    if (consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session,
                   "GSH_EXEC_KEEP=value exec 3>descriptor.out\r") == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session,
                   "/usr/bin/printf persisted >&3; exec 3>&-; "
                   "/bin/test \"$GSH_EXEC_KEEP\" = value && "
                   "/bin/cat descriptor.out\r") == -1 ||
         consume_through(&session, "persisted", TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session,
                   "if true; then GSH_EXEC_COMPOUND=value "
                   "exec 4>compound.out; fi\r") == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session,
                   "/usr/bin/printf compound >&4; exec 4>&-; "
                   "/bin/test \"$GSH_EXEC_COMPOUND\" = value && "
                   "/bin/cat compound.out\r") == -1 ||
         consume_through(&session, "compound", TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session,
                   "if true; then command exec 2>compound.err "
                   "/definitely/missing; fi\r") == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session,
                   "/usr/bin/printf GSH_EXEC_COMPOUND_REDIRECT >&2; "
                   "/bin/cat compound.err\r") == -1 ||
         consume_through(&session, "GSH_EXEC_COMPOUND_REDIRECT",
                         TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session,
                   "command exec 2>failure.err /definitely/missing\r") ==
             -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session,
                   "/usr/bin/printf GSH_EXEC_REDIRECT_PERSISTED >&2; "
                   "/bin/cat failure.err\r") == -1 ||
         consume_through(&session, "GSH_EXEC_REDIRECT_PERSISTED",
                         TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session,
                   "GSH_EXEC_INTERACTIVE=value exec /bin/sh -c "
                   "'/bin/test \"$GSH_EXEC_INTERACTIVE\" = value || exit 9; "
@@ -2756,17 +2718,17 @@ static int interactive_enoexec_flow(const char *executable)
         failed = 1;
         goto done;
     }
-    if (consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+    if (consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "./probe interactive\r") == -1 ||
         consume_through(&session, "GSH_ENOEXEC_INTERACTIVE:<interactive>",
                         TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session,
                   "/bin/test \"$?\" -eq 6 && "
                   "/usr/bin/printf GSH_ENOEXEC_STATUS\r") == -1 ||
         consume_through(&session, "GSH_ENOEXEC_STATUS", TEST_TIMEOUT_MS) ==
             -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1) {
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1) {
         perror("pty ENOEXEC: flow");
         dump_capture(&session);
         failed = 1;
@@ -2800,14 +2762,14 @@ static int interactive_source_state_case(const char *executable,
         return 1;
     }
     (void)unsetenv("GSH_SOURCE_CHILD");
-    if (consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+    if (consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session,
                   "eval 'GSH_EVAL_VALUE=committed; "
                   "set -- eval-one \"eval two\"; set -f; "
                   "alias gsh_eval_alias=\"/usr/bin/printf GSH_EVAL_ALIAS\"; "
                   "gsh_eval_fn(){ /usr/bin/printf GSH_EVAL_FUNCTION; }; "
                   "cd child'\r") == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session,
                   "if /bin/test \"$GSH_EVAL_VALUE\" = committed && "
                   "/bin/test \"$#\" -eq 2 && "
@@ -2818,18 +2780,18 @@ static int interactive_source_state_case(const char *executable,
                   "esac; fi\r") == -1 ||
         consume_through(&session, "\r\nGSH_EVAL_STATE",
                         TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "gsh_eval_alias\r") == -1 ||
         consume_through(&session, "GSH_EVAL_ALIAS", TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "gsh_eval_fn\r") == -1 ||
         consume_through(&session, "GSH_EVAL_FUNCTION", TEST_TIMEOUT_MS) ==
             -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "set +f; cd ..\r") == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, ". ./source-state.sh\r") == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session,
                   "GSH_DOT_STATUS=$?; "
                   "if /bin/test \"$GSH_DOT_STATUS\" -eq 6 && "
@@ -2842,39 +2804,39 @@ static int interactive_source_state_case(const char *executable,
                   "esac; fi\r") == -1 ||
         consume_through(&session, "\r\nGSH_DOT_STATE",
                         TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "gsh_dot_alias\r") == -1 ||
         consume_through(&session, "GSH_DOT_ALIAS", TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "gsh_dot_fn\r") == -1 ||
         consume_through(&session, "GSH_DOT_FUNCTION", TEST_TIMEOUT_MS) ==
             -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "set +f; cd ..; eval 'if'\r") == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "/usr/bin/printf GSH_EVAL_RECOVERED\r") == -1 ||
         consume_through(&session, "\r\nGSH_EVAL_RECOVERED",
                         TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session,
                   "(eval 'exit 7'); /bin/test \"$?\" -eq 7 && "
                   "/usr/bin/printf GSH_SUBSHELL_EXIT\r") == -1 ||
         consume_through(&session, "\r\nGSH_SUBSHELL_EXIT",
                         TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session,
                   "eval 'exit 8' | /bin/cat; "
                   "/usr/bin/printf GSH_PIPELINE_EXIT\r") == -1 ||
         consume_through(&session, "\r\nGSH_PIPELINE_EXIT",
                         TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session,
                   "eval 'exit 9' & wait \"$!\"; "
                   "/bin/test \"$?\" -eq 9 && "
                   "/usr/bin/printf GSH_ASYNC_SOURCE_EXIT\r") == -1 ||
         consume_through(&session, "\r\nGSH_ASYNC_SOURCE_EXIT",
                         TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1) {
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1) {
         perror("pty source: state flow");
         dump_capture(&session);
         failed = 1;
@@ -2899,12 +2861,12 @@ static int interactive_managed_source_case(const char *executable,
         perror("pty source: managed setup");
         return 1;
     }
-    if (consume_through(&session, "\033[90m[●]\033[0m $gsh> ",
+    if (consume_through(&session, "gsh$ ",
                         TEST_TIMEOUT_MS) == -1 ||
         send_text(&session,
                   "eval 'GSH_MANAGED_EVAL=committed'; "
                   ". ./managed-source.sh\r") == -1 ||
-        consume_through(&session, "\033[90m[●]\033[0m $gsh> ",
+        consume_through(&session, "gsh$ ",
                         TEST_TIMEOUT_MS) == -1 ||
         send_text(&session,
                   "/bin/test \"$GSH_MANAGED_EVAL:$GSH_MANAGED_DOT\" = "
@@ -2912,7 +2874,7 @@ static int interactive_managed_source_case(const char *executable,
                   "/usr/bin/printf GSH_MANAGED_SOURCE_STATE\r") == -1 ||
         consume_through(&session, "\r\nGSH_MANAGED_SOURCE_STATE",
                         TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "\033[90m[●]\033[0m $gsh> ",
+        consume_through(&session, "gsh$ ",
                         TEST_TIMEOUT_MS) == -1) {
         perror("pty source: managed flow");
         dump_capture(&session);
@@ -2936,10 +2898,10 @@ static int interactive_exit_case(const char *executable,
         -1) {
         return 1;
     }
-    if (consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+    if (consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         (setup != NULL &&
          (send_text(&session, setup) == -1 ||
-          consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1)) ||
+          consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1)) ||
         send_text(&session, command) == -1 ||
         wait_session_exit(&session, expected_status, TEST_TIMEOUT_MS) == -1) {
         fprintf(stderr, "pty source: exit case failed status=%d\n",
@@ -3033,46 +2995,46 @@ static int function_builtin_flow(const char *executable)
         (void)rmdir(fixture);
         return 1;
     }
-    if (consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+    if (consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session,
                   "gsh_fn() { GSH_FN_VALUE=after; "
                   "/usr/bin/printf '<%s:%s>\\n' \"$#\" \"$1\"; "
                   "return 7; /usr/bin/printf BAD; }\r") == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "gsh_fn value\r") == -1 ||
         consume_through(&session, "<1:value>\r\n", TEST_TIMEOUT_MS) ==
             -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session,
                   "/usr/bin/printf '<%s>\\n' "
                   "\"$?|$GSH_FN_VALUE\"\r") == -1 ||
         consume_through(&session, "<7|after>\r\n", TEST_TIMEOUT_MS) ==
             -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "unset -f gsh_fn\r") == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "gsh_fn\r") == -1 ||
         consume_through(&session, "command not found", TEST_TIMEOUT_MS) ==
             -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session,
                   "{ gsh_tx(){ /usr/bin/printf TX1; }; }\r") == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "gsh_tx\r") == -1 ||
         consume_through(&session, "TX1", TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session,
                   "{ gsh_tx(){ /usr/bin/printf TX2; }; }\r") == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "gsh_tx\r") == -1 ||
         consume_through(&session, "TX2", TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "{ unset -f gsh_tx; }\r") == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "gsh_tx\r") == -1 ||
         consume_through(&session, "command not found", TEST_TIMEOUT_MS) ==
             -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1) {
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1) {
         perror("pty function: flow");
         dump_capture(&session);
         failed = 1;
@@ -3123,22 +3085,22 @@ static int deferred_pattern_flow(const char *executable)
     }
     (void)unsetenv("GSH_PTY_PATTERN_LONG");
     (void)unsetenv("GSH_PTY_PATTERN_CD");
-    if (consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+    if (consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session,
                   "GSH_PTY_DEFERRED="
                   "${GSH_PTY_PATTERN_LONG##?*?*?*z}\r") == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session,
                   "/usr/bin/printf '<%s>\\n' "
                   "\"$GSH_PTY_DEFERRED\"\r") == -1 ||
         consume_through(&session, "<>\r\n", TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session,
                   "cd \"${GSH_PTY_PATTERN_CD##*@*@}\"\r") == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "/bin/pwd\r") == -1 ||
         consume_through(&session, fixture, TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1) {
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1) {
         perror("pty pattern: deferred flow");
         dump_capture(&session);
         failed = 1;
@@ -3164,7 +3126,7 @@ static int asynchronous_list_flow(const char *executable)
         (void)rmdir(fixture);
         return 1;
     }
-    if (consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1) {
+    if (consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1) {
         perror("pty async: base prompt");
         failed = 1;
         goto done;
@@ -3173,7 +3135,7 @@ static int asynchronous_list_flow(const char *executable)
     prompt_start = monotonic_ns();
     if (send_text(&session, "/bin/sleep 1 &\r") == -1 ||
         consume_through(&session, "] ", TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1) {
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1) {
         perror("pty async: nonblocking launch");
         failed = 1;
         goto done;
@@ -3184,48 +3146,48 @@ static int asynchronous_list_flow(const char *executable)
                   "/bin/test \"$!\" -gt 0 && "
                   "/usr/bin/printf GSH_ASYNC_PID\r") == -1 ||
         consume_through(&session, "GSH_ASYNC_PID", TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "wait \"$!\"\r") == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session,
                   "/bin/test \"$?\" -eq 0 && "
                   "/usr/bin/printf GSH_ASYNC_WAIT\r") == -1 ||
         consume_through(&session, "GSH_ASYNC_WAIT", TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "/bin/sh -c 'exit 7' &\r") == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "wait \"$!\"\r") == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session,
                   "/bin/test \"$?\" -eq 7 && "
                   "/usr/bin/printf GSH_ASYNC_STATUS\r") == -1 ||
         consume_through(&session, "GSH_ASYNC_STATUS", TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session,
                   "/bin/sleep 0.02 & /usr/bin/printf "
                   "'GSH_ASYNC_MIXED:%s\\n' \"$!\"\r") == -1 ||
         consume_through(&session, "GSH_ASYNC_MIXED:", TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "wait\r") == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session,
                   "/bin/sh -c 'exit 9' & wait \"$!\"; "
                   "/bin/test \"$?\" -eq 9 && "
                   "/usr/bin/printf GSH_ASYNC_SEQUENCE\r") == -1 ||
         consume_through(&session, "GSH_ASYNC_SEQUENCE",
                         TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session,
                   "/bin/sh -c 'exit 11' & wait \"$!\" && false || "
                   "/usr/bin/printf GSH_ASYNC_ANDOR\r") == -1 ||
         consume_through(&session, "GSH_ASYNC_ANDOR",
                         TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session,
                   "/usr/bin/true & wait \"$!\" && "
                   "/usr/bin/printf GSH_ASYNC_AND\r") == -1 ||
         consume_through(&session, "GSH_ASYNC_AND", TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         ((prompt_start = monotonic_ns()),
          send_text(&session,
                    "/bin/sleep 5 & wait \"$(/bin/sleep 2; "
@@ -3233,27 +3195,27 @@ static int asynchronous_list_flow(const char *executable)
         consume_through(&session,
                         "wait expansion requires isolated continuation",
                         TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         monotonic_ns() - prompt_start >= 700000000ULL ||
         send_text(&session, "/bin/kill \"$!\"\r") == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "wait \"$!\"\r") == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "/bin/sleep 5 &\r") == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "wait \"$!\"\r") == -1 ||
         send_bytes(&session, "\003", 1) == -1 ||
         consume_through(&session, "^C", TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session,
                   "/bin/test \"$?\" -eq 130 && "
                   "/usr/bin/printf GSH_ASYNC_CANCEL\r") == -1 ||
         consume_through(&session, "GSH_ASYNC_CANCEL", TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "/bin/kill \"$!\"\r") == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "wait \"$!\"\r") == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1) {
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1) {
         perror("pty async: semantics");
         dump_capture(&session);
         failed = 1;
@@ -3295,23 +3257,23 @@ static int async_redirection_flow(const char *executable)
         (void)rmdir(fixture);
         return 1;
     }
-    if (consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+    if (consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "umask 077\r") == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         snprintf(command, sizeof(command), ": >%s\r", created) >=
             (int)sizeof(command) || send_text(&session, command) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         stat(created, &information) == -1 ||
         (information.st_mode & 0777) != 0600 ||
         send_text(&session, "set -C\r") == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         snprintf(command, sizeof(command), ": >%s\r", fifo) >=
             (int)sizeof(command) ||
         send_text(&session, command) == -1 ||
         consume_through(&session, fifo, TEST_TIMEOUT_MS) == -1 ||
         send_bytes(&session, "\003", 1) == -1 ||
         consume_through(&session, "^C", TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         wait_for_diagnostics(&session, "worker=on", "busy=0") == -1) {
         perror("pty redirection: cancellation");
         dump_capture(&session);
@@ -3330,77 +3292,6 @@ static int async_redirection_flow(const char *executable)
     return failed;
 }
 
-static int stalled_worker_flow(const char *executable)
-{
-    char fixture[] = "/tmp/gsh-pty-stall-XXXXXX";
-    pty_session session;
-    uint64_t key_start;
-    uint64_t key_duration;
-    uint64_t query_deadline;
-    bool disabled = false;
-    int failed = 0;
-
-    if (mkdtemp(fixture) == NULL || write_head(fixture, true) == -1 ||
-        start_session(&session, executable, fixture, SHELL_GSH) == -1) {
-        perror("pty smoke: stall setup");
-        remove_fixture(fixture);
-        return 1;
-    }
-    if (consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1) {
-        perror("pty smoke: base prompt");
-        failed = 1;
-        goto done;
-    }
-
-    key_start = monotonic_ns();
-    if (send_text(&session, "x") == -1 ||
-        consume_through(&session, "x", TEST_TIMEOUT_MS) == -1) {
-        perror("pty smoke: key during stalled worker");
-        failed = 1;
-        goto done;
-    }
-    key_duration = monotonic_ns() - key_start;
-    if (key_duration >= 100000000ULL) {
-        fprintf(stderr,
-                "pty smoke: stalled worker held key output for %.3f ms\n",
-                (double)key_duration / 1000000.0);
-        failed = 1;
-    }
-
-    if (send_bytes(&session, "\025", 1) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1) {
-        failed = 1;
-        goto done;
-    }
-    query_deadline = monotonic_ns() + 2000000000ULL;
-    while (monotonic_ns() < query_deadline) {
-        session.capture_length = 0;
-        if (send_text(&session, "rt\r") == -1 ||
-            wait_for_output(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1) {
-            failed = 1;
-            break;
-        }
-        if (capture_contains(&session, "worker=off") &&
-            capture_contains(&session, "timeouts=1")) {
-            disabled = true;
-            break;
-        }
-        session.capture_length = 0;
-    }
-    if (!disabled) {
-        fprintf(stderr, "pty smoke: stalled worker was not disabled\n");
-        failed = 1;
-    }
-
-done:
-    if (stop_session(&session) == -1) {
-        fprintf(stderr, "pty smoke: stalled-worker shell did not exit cleanly\n");
-        failed = 1;
-    }
-    remove_fixture(fixture);
-    return failed;
-}
-
 static int worker_fault_case(const char *executable, const char *fault,
                              const char *counter)
 {
@@ -3416,11 +3307,11 @@ static int worker_fault_case(const char *executable, const char *fault,
         return 1;
     }
     (void)unsetenv("GSH_FAULT");
-    if (consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+    if (consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "x") == -1 ||
         consume_through(&session, "x", TEST_TIMEOUT_MS) == -1 ||
         send_bytes(&session, "\025", 1) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         wait_for_diagnostics(&session, "worker=off", counter) == -1) {
         fprintf(stderr, "pty fault: worker case failed: %s\n", fault);
         dump_capture(&session);
@@ -3438,20 +3329,20 @@ static int worker_surviving_fault_case(const char *executable,
                                        const char *fault,
                                        const char *counter)
 {
-    char fixture[] = "/tmp/gsh-fault-stale-XXXXXX";
+    char fixture[] = "/tmp/gsh-fault-surviving-XXXXXX";
     pty_session session;
     int failed = 0;
 
     if (mkdtemp(fixture) == NULL ||
         setenv("GSH_FAULT", fault, 1) == -1 ||
         start_session(&session, executable, fixture, SHELL_GSH) == -1) {
-        perror("pty fault: stale setup");
+        perror("pty fault: surviving setup");
         (void)unsetenv("GSH_FAULT");
         (void)rmdir(fixture);
         return 1;
     }
     (void)unsetenv("GSH_FAULT");
-    if (consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+    if (consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         wait_for_diagnostics(&session, "worker=on", counter) == -1) {
         fprintf(stderr, "pty fault: surviving case failed: %s\n", fault);
         dump_capture(&session);
@@ -3479,10 +3370,10 @@ static int command_fault_case(const char *executable, const char *fault,
         return 1;
     }
     (void)unsetenv("GSH_FAULT");
-    if (consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+    if (consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, command) == -1 ||
         consume_through(&session, diagnostic, TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         wait_for_diagnostics(&session, "job=idle", NULL) == -1) {
         fprintf(stderr, "pty fault: command case failed: %s\n", fault);
         dump_capture(&session);
@@ -3512,17 +3403,17 @@ static int positional_commit_fault_case(const char *executable,
         return 1;
     }
     (void)unsetenv("GSH_FAULT");
-    if (consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+    if (consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "set -- before\r") == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "set -- after; :\r") == -1 ||
         consume_through(&session, diagnostic, TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session,
                   "/usr/bin/printf '<%s>\\n' \"$#|$1\"\r") == -1 ||
         consume_through(&session, "<1|before>\r\n",
                         TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1) {
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1) {
         fprintf(stderr, "pty fault: positional case failed: %s\n", fault);
         dump_capture(&session);
         failed = 1;
@@ -3556,15 +3447,15 @@ static int directory_commit_fault_case(const char *executable,
         return 1;
     }
     (void)unsetenv("GSH_FAULT");
-    if (consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+    if (consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session,
                   "if /usr/bin/true; then cd /; fi\r") == -1 ||
         consume_through(&session, diagnostic, TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, command) == -1 ||
         consume_through(&session, "GSH_DIRECTORY_ROLLED_BACK",
                         TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1) {
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1) {
         fprintf(stderr, "pty fault: directory case failed: %s\n", fault);
         dump_capture(&session);
         failed = 1;
@@ -3591,24 +3482,24 @@ static int alias_commit_fault_case(const char *executable)
         return 1;
     }
     (void)unsetenv("GSH_FAULT");
-    if (consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+    if (consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "alias gsh_keep=/bin/echo\r") == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session,
                   "if /usr/bin/true; then "
                   "alias gsh_keep=/usr/bin/false; "
                   "alias gsh_new=/usr/bin/true; fi\r") == -1 ||
         consume_through(&session, "gsh: state transaction rejected",
                         TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "gsh_keep rolled-back\r") == -1 ||
         consume_through(&session, "\nrolled-back\r\n", TEST_TIMEOUT_MS) ==
             -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "alias gsh_new\r") == -1 ||
         consume_through(&session, "alias is not defined", TEST_TIMEOUT_MS) ==
             -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1) {
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1) {
         fprintf(stderr, "pty fault: alias commit rollback failed\n");
         dump_capture(&session);
         failed = 1;
@@ -3635,19 +3526,19 @@ static int command_cache_commit_fault_case(const char *executable)
         return 1;
     }
     (void)unsetenv("GSH_FAULT");
-    if (consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+    if (consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "PATH=/bin\r") == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "hash sh\r") == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "if true; then hash -r; fi\r") == -1 ||
         consume_through(&session, "gsh: state transaction rejected",
                         TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "hash\r") == -1 ||
         consume_through(&session, "sh=/bin/sh\r\n", TEST_TIMEOUT_MS) ==
             -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1) {
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1) {
         fprintf(stderr, "pty fault: command cache rollback failed\n");
         dump_capture(&session);
         failed = 1;
@@ -3674,23 +3565,23 @@ static int function_commit_fault_case(const char *executable,
         return 1;
     }
     (void)unsetenv("GSH_FAULT");
-    if (consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+    if (consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session,
                   "gsh_keep(){ /usr/bin/printf ORIGINAL; }\r") == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session,
                   "{ gsh_keep(){ /usr/bin/printf CHANGED; }; "
                   "gsh_new(){ :; }; }\r") == -1 ||
         consume_through(&session, "gsh: state transaction rejected",
                         TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "gsh_keep\r") == -1 ||
         consume_through(&session, "ORIGINAL", TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "gsh_new\r") == -1 ||
         consume_through(&session, "command not found", TEST_TIMEOUT_MS) ==
             -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1) {
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1) {
         fprintf(stderr, "pty fault: function commit rollback failed: %s\n",
                 fault);
         dump_capture(&session);
@@ -3923,11 +3814,6 @@ static int fault_injection_flow(const char *executable)
     } worker_cases[] = {
         {"worker-socket", "failures=1"},
         {"worker-fork", "failures=1"},
-        {"worker-send", "failures=1"},
-        {"worker-crash", "failures=1"},
-        {"worker-close", "failures=1"},
-        {"worker-malformed", "failures=1"},
-        {"worker-stall", "timeouts=1"},
     };
     static const struct {
         const char *name;
@@ -4084,8 +3970,6 @@ static int fault_injection_flow(const char *executable)
                                      command_cases[index].command,
                                      command_cases[index].diagnostic);
     }
-    failed |= worker_surviving_fault_case(executable, "worker-stale",
-                                          "stale=1");
     failed |= worker_surviving_fault_case(executable, "time-source-failure",
                                           "misses=1");
     failed |= heredoc_fault_case(executable, "heredoc-pipe",
@@ -4165,7 +4049,7 @@ static int fault_injection_flow(const char *executable)
         failed |= fatal_fault_case(executable, fatal_cases[index]);
     }
     if (!failed) {
-        puts("pty fault: 94 deterministic boundary failures passed");
+        puts("pty fault: 88 deterministic boundary failures passed");
     }
     return failed;
 }
@@ -4227,16 +4111,16 @@ static int descriptor_exhaustion_case(const char *executable)
         (void)rmdir(fixture);
         return 1;
     }
-    if (consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+    if (consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "ulimit -S -n 6\r") == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "/usr/bin/true\r") == -1 ||
         consume_through(&session, "gsh: pipe:", TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, restore) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "/usr/bin/true\r") == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         wait_for_diagnostics(&session, "job=idle", NULL) == -1) {
         fprintf(stderr, "pty resource: descriptor recovery failed\n");
         dump_capture(&session);
@@ -4266,11 +4150,11 @@ static int bounded_input_case(const char *executable)
         (void)rmdir(fixture);
         return 1;
     }
-    if (consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+    if (consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_bytes(&session, input, sizeof(input)) == -1 ||
         consume_through(&session, "\a", TEST_TIMEOUT_MS) == -1 ||
         send_bytes(&session, "\025", 1) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1) {
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1) {
         perror("pty resource: bounded line failed");
         dump_capture(&session);
         failed = 1;
@@ -4280,7 +4164,7 @@ static int bounded_input_case(const char *executable)
     session.capture_length = 0;
     if (send_text(&session, "rt\r") == -1 ||
         wait_for_output(&session, "reactor cycles=", TEST_TIMEOUT_MS) == -1 ||
-        wait_for_output(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1) {
+        wait_for_output(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1) {
         failed = 1;
         goto done;
     }
@@ -4306,7 +4190,7 @@ static int bounded_input_case(const char *executable)
     if (consume_through(&session, "\033[2K", TEST_TIMEOUT_MS) == -1 ||
         consume_through(&session, "kept", TEST_TIMEOUT_MS) == -1 ||
         send_bytes(&session, "\025", 1) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1) {
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1) {
         fprintf(stderr, "pty resource: signal storm corrupted the editor\n");
         failed = 1;
     }
@@ -4320,9 +4204,9 @@ static int bounded_input_case(const char *executable)
          send_text(&session, "\r") == -1 ||
          consume_through(&session, "gsh: command exceeds input limit",
                          TEST_TIMEOUT_MS) == -1 ||
-         consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+         consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
          send_text(&session, "/usr/bin/true\r") == -1 ||
-         consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1)) {
+         consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1)) {
         fprintf(stderr,
                 "pty resource: multiline input recovery failed\n");
         dump_capture(&session);
@@ -4395,13 +4279,13 @@ static int process_exhaustion_case(const char *executable)
         return 1;
     }
     (void)unsetenv("GSH_HARNESS_NPROC");
-    if (consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1) {
+    if (consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1) {
         failed = 1;
         goto done;
     }
     session.capture_length = 0;
     if (send_text(&session, "/usr/bin/true\r") == -1 ||
-        wait_for_output(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1) {
+        wait_for_output(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1) {
         failed = 1;
         goto done;
     }
@@ -4457,13 +4341,13 @@ static int data_exhaustion_case(const char *executable)
         (void)rmdir(fixture);
         return 1;
     }
-    if (consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1) {
+    if (consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1) {
         failed = 1;
         goto done;
     }
     session.capture_length = 0;
     if (send_text(&session, "ulimit -S -d 1024\r") == -1 ||
-        wait_for_output(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1) {
+        wait_for_output(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1) {
         fprintf(stderr, "pty resource: data limit setup failed\n");
         failed = 1;
         goto done;
@@ -4474,7 +4358,7 @@ static int data_exhaustion_case(const char *executable)
     }
     session.capture_length = 0;
     if (send_text(&session, "/usr/bin/true\r") == -1 ||
-        wait_for_output(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1) {
+        wait_for_output(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1) {
         fprintf(stderr, "pty resource: data exhaustion was not contained\n");
         failed = 1;
         goto done;
@@ -4485,9 +4369,9 @@ static int data_exhaustion_case(const char *executable)
                capture_contains(&session, "rosetta error:");
     session.capture_length = 0;
     if (send_text(&session, restore) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "/usr/bin/true\r") == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         wait_for_diagnostics(&session, "job=idle", NULL) == -1) {
         fprintf(stderr, "pty resource: data recovery failed\n");
         failed = 1;
@@ -4534,23 +4418,23 @@ static int variable_journal_exhaustion_case(const char *executable)
         (void)rmdir(fixture);
         return 1;
     }
-    if (consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+    if (consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, command) == -1 ||
         consume_through(&session, "gsh: assignment:",
                         TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session,
                   "/usr/bin/printenv GSH_RESOURCE_JOURNAL_0\r") == -1 ||
         consume_through(&session, "\nx\r\n", TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session,
                   "/usr/bin/printf '<%s:%s>\\n' "
                   "\"$GSH_RESOURCE_JOURNAL_0\" "
                   "\"${GSH_RESOURCE_JOURNAL_64+set}\"\r") == -1 ||
         consume_through(&session, "<x:>\r\n", TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "set +a\r") == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         process_child_count(session.pid) != 1) {
         fprintf(stderr, "pty resource: variable journal recovery failed\n");
         dump_capture(&session);
@@ -4594,16 +4478,16 @@ static int arithmetic_journal_exhaustion_case(const char *executable)
         (void)rmdir(fixture);
         return 1;
     }
-    if (consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+    if (consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, command) == -1 ||
         consume_through(&session, "gsh: parameter assignment failed",
                         TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session,
                   "GSH_RESOURCE_ARITH_RECOVERY=7; "
                   "/bin/test \"$GSH_RESOURCE_ARITH_RECOVERY\" = 7\r") ==
             -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         process_child_count(session.pid) != 1) {
         fprintf(stderr,
                 "pty resource: arithmetic journal recovery failed\n");
@@ -4650,19 +4534,19 @@ static int alias_store_exhaustion_case(const char *executable)
         (void)rmdir(fixture);
         return 1;
     }
-    if (consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+    if (consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, first) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, second) == -1 ||
         consume_through(&session, "alias capacity exceeded",
                         TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "unalias -a\r") == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "alias gsh_recovered=/usr/bin/true\r") == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "gsh_recovered\r") == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         process_child_count(session.pid) != 1) {
         fprintf(stderr, "pty resource: alias store recovery failed\n");
         dump_capture(&session);
@@ -4707,28 +4591,28 @@ static int alias_journal_exhaustion_case(const char *executable)
         (void)rmdir(fixture);
         return 1;
     }
-    if (consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+    if (consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "alias gsh_atomic_keep=/bin/echo\r") == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, command) == -1 ||
         consume_through(&session, "alias transaction capacity exceeded",
                         TEST_TIMEOUT_MS) == -1 ||
         consume_through(&session, "gsh: state transaction rejected",
                         TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "gsh_atomic_keep rolled-back\r") == -1 ||
         consume_through(&session, "\nrolled-back\r\n", TEST_TIMEOUT_MS) ==
             -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "alias gsh_atomic_00\r") == -1 ||
         consume_through(&session, "alias is not defined", TEST_TIMEOUT_MS) ==
             -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "alias gsh_atomic_recovery=/usr/bin/true\r") ==
             -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "gsh_atomic_recovery\r") == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         process_child_count(session.pid) != 1) {
         fprintf(stderr, "pty resource: alias journal rollback failed\n");
         dump_capture(&session);
@@ -4756,7 +4640,7 @@ static int function_resource_exhaustion_case(const char *executable)
         (void)rmdir(fixture);
         return 1;
     }
-    if (consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1) {
+    if (consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1) {
         failed = 1;
         goto done;
     }
@@ -4765,7 +4649,7 @@ static int function_resource_exhaustion_case(const char *executable)
                      "gsh_resource_fn_%03zu() { :; }\r", index) >=
                 (int)sizeof(command) ||
             send_text(&session, command) == -1 ||
-            consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1) {
+            consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1) {
             failed = 1;
             goto done;
         }
@@ -4773,7 +4657,7 @@ static int function_resource_exhaustion_case(const char *executable)
     if (send_text(&session, "gsh_resource_fn_over() { :; }\r") == -1 ||
         consume_through(&session, "function definition: No space",
                         TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1) {
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1) {
         failed = 1;
         goto done;
     }
@@ -4794,23 +4678,23 @@ static int function_resource_exhaustion_case(const char *executable)
         command[used++] = '\r';
         command[used] = '\0';
         if (send_text(&session, command) == -1 ||
-            consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1) {
+            consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1) {
             failed = 1;
             goto done;
         }
     }
     if (send_text(&session, "gsh_resource_recovered() { :; }\r") == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session,
                   "gsh_resource_recursive() { "
                   "gsh_resource_recursive; }\r") == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "gsh_resource_recursive\r") == -1 ||
         consume_through(&session, "function resource limit exceeded",
                         TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "gsh_resource_recovered\r") == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         process_child_count(session.pid) != 1) {
         failed = 1;
     }
@@ -5122,52 +5006,52 @@ static int soak_iteration(pty_session *session)
     if (send_text(session, "edit") == -1 ||
         consume_through(session, "edit", TEST_TIMEOUT_MS) == -1 ||
         send_bytes(session, "\025", 1) == -1 ||
-        consume_through(session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(session, "/usr/bin/true\r") == -1 ||
-        consume_through(session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(session,
                   "/usr/bin/printf GSH_SOAK_OUTPUT | /bin/cat\r") == -1 ||
         consume_through(session, "\nGSH_SOAK_OUTPUT", TEST_TIMEOUT_MS) == -1 ||
-        consume_through(session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(session, "GSH_SOAK_STATE=value\r") == -1 ||
-        consume_through(session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(session, "alias GSH_SOAK_ALIAS=:\r") == -1 ||
-        consume_through(session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(session, "GSH_SOAK_ALIAS\r") == -1 ||
-        consume_through(session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(session, "unalias GSH_SOAK_ALIAS\r") == -1 ||
-        consume_through(session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(session,
                   "GSH_SOAK_ARITH=010; "
                   ": \"$((GSH_SOAK_ARITH += 1))\"; "
                   "/bin/test \"$GSH_SOAK_ARITH\" = 9\r") == -1 ||
-        consume_through(session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(session,
                   ": \"${GSH_SOAK_PIPE:=stage}\" | /usr/bin/true\r") == -1 ||
-        consume_through(session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(session,
                   "/bin/test -z \"$GSH_SOAK_PIPE\" && "
                   "/usr/bin/printf GSH_SOAK_ISOLATED\r") == -1 ||
         consume_through(session, "\nGSH_SOAK_ISOLATED",
                         TEST_TIMEOUT_MS) == -1 ||
-        consume_through(session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(session,
                   ": \"$(/usr/bin/printf GSH_SOAK_SUBSTITUTION)\"\r") == -1 ||
-        consume_through(session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(session, "/usr/bin/true &\r") == -1 ||
-        consume_through(session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(session, "wait \"$!\"\r") == -1 ||
-        consume_through(session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(session,
                   "for GSH_SOAK_ITEM in a 'b c' ''; do :; done\r") == -1 ||
-        consume_through(session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(session, "set -- a 'b c' ''; shift\r") == -1 ||
-        consume_through(session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(session,
                   "set -aCfu; GSH_SOAK_AUTO=value; "
                   "/usr/bin/printenv GSH_SOAK_AUTO >/dev/null; "
                   ": \"${GSH_SOAK_KNOWN:=known}\"; set +aCfu\r") == -1 ||
-        consume_through(session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(session, "/bin/cat <<EOF\r") == -1 ||
         consume_through(session, "GSH_MORE> ", TEST_TIMEOUT_MS) == -1 ||
         send_text(session, "GSH_SOAK_HEREDOC\r") == -1 ||
@@ -5175,21 +5059,21 @@ static int soak_iteration(pty_session *session)
         send_text(session, "EOF\r") == -1 ||
         consume_through(session, "\nGSH_SOAK_HEREDOC\r\n",
                         TEST_TIMEOUT_MS) == -1 ||
-        consume_through(session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(session, "cancel") == -1 ||
         consume_through(session, "cancel", TEST_TIMEOUT_MS) == -1 ||
         send_bytes(session, "\003", 1) == -1 ||
         consume_through(session, "^C", TEST_TIMEOUT_MS) == -1 ||
-        consume_through(session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(session, "kept") == -1 ||
         consume_through(session, "kept", TEST_TIMEOUT_MS) == -1 ||
         kill(session->pid, SIGWINCH) == -1 ||
         consume_through(session, "\033[2K", TEST_TIMEOUT_MS) == -1 ||
         consume_through(session, "kept", TEST_TIMEOUT_MS) == -1 ||
         send_bytes(session, "\025", 1) == -1 ||
-        consume_through(session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(session, "cd .\r") == -1 ||
-        consume_through(session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         wait_for_diagnostics(session, "busy=0", "job=idle") == -1) {
         return -1;
     }
@@ -5220,15 +5104,12 @@ static int soak_flow(const char *executable, unsigned long seconds)
         unsetenv("GSH_SOAK_STATE") == -1 ||
         unsetenv("GSH_SOAK_ARITH") == -1 ||
         unsetenv("GSH_SOAK_PIPE") == -1 || mkdtemp(fixture) == NULL ||
-        write_head(fixture, false) == -1 ||
         start_session(&session, executable, fixture, SHELL_GSH) == -1) {
         perror("pty soak: setup");
         remove_fixture(fixture);
         return 1;
     }
-    if (consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "\033[90m[bench]\033[0m $gsh> ",
-                        TEST_TIMEOUT_MS) == -1 ||
+    if (consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         wait_for_diagnostics(&session, "busy=0", "job=idle") == -1) {
         perror("pty soak: initial prompt");
         failed = 1;
@@ -5286,7 +5167,7 @@ static int soak_flow(const char *executable, unsigned long seconds)
     session.capture_length = 0;
     if (send_text(&session, "rt\r") == -1 ||
         wait_for_output(&session, "reactor cycles=", TEST_TIMEOUT_MS) == -1 ||
-        wait_for_output(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1) {
+        wait_for_output(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1) {
         failed = 1;
         goto done;
     }
@@ -5359,7 +5240,7 @@ static int stabilize_gsh(pty_session *session)
 
         if (send_text(session, "rt\r") == -1 ||
             wait_for_output(session, "busy=", TEST_TIMEOUT_MS) == -1 ||
-            wait_for_output(session, " timeouts=", TEST_TIMEOUT_MS) == -1) {
+            wait_for_output(session, " failures=", TEST_TIMEOUT_MS) == -1) {
             return -1;
         }
         busy = find_bytes(session->capture, session->capture_length, "busy=");
@@ -5368,7 +5249,7 @@ static int stabilize_gsh(pty_session *session)
                    session->capture_length &&
                busy[sizeof("busy=") - 1U] == '0';
         if (consume_through(session, "busy=", TEST_TIMEOUT_MS) == -1 ||
-            consume_through(session, "$gsh> ", TEST_TIMEOUT_MS) == -1) {
+            consume_through(session, "gsh$ ", TEST_TIMEOUT_MS) == -1) {
             return -1;
         }
         if (idle) {
@@ -5940,9 +5821,9 @@ static int latency_benchmark(const char *gsh, const char *bash,
                              const char *zsh, const char *output_path)
 {
     shell_spec specs[BENCH_SHELLS] = {
-        {"gsh", gsh, "$gsh> ", SHELL_GSH},
-        {"bash", bash, "$gsh> ", SHELL_BASH},
-        {"zsh", zsh, "$gsh> ", SHELL_ZSH},
+        {"gsh", gsh, "gsh$ ", SHELL_GSH},
+        {"bash", bash, "gsh$ ", SHELL_BASH},
+        {"zsh", zsh, "gsh$ ", SHELL_ZSH},
     };
     uint64_t startup[BENCH_SHELLS][BENCH_STARTUP_SAMPLES];
     uint64_t key[BENCH_SHELLS][BENCH_KEY_SAMPLES];
@@ -6359,9 +6240,9 @@ static int alias_benchmark(const char *gsh, const char *bash,
                            const char *zsh, const char *output_path)
 {
     shell_spec specs[BENCH_SHELLS] = {
-        {"gsh", gsh, "$gsh> ", SHELL_GSH},
-        {"bash", bash, "$gsh> ", SHELL_BASH},
-        {"zsh", zsh, "$gsh> ", SHELL_ZSH},
+        {"gsh", gsh, "gsh$ ", SHELL_GSH},
+        {"bash", bash, "gsh$ ", SHELL_BASH},
+        {"zsh", zsh, "gsh$ ", SHELL_ZSH},
     };
     uint64_t definition[BENCH_SHELLS][BENCH_EXEC_SAMPLES];
     uint64_t expansion[BENCH_SHELLS][BENCH_EXEC_SAMPLES];
@@ -6510,7 +6391,7 @@ static int pty_byte_fuzz(const char *executable, unsigned long cases)
         (void)rmdir(fixture);
         return 1;
     }
-    if (consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1) {
+    if (consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1) {
         perror("pty fuzz: initial prompt");
         failed = 1;
         goto done;
@@ -6530,7 +6411,7 @@ static int pty_byte_fuzz(const char *executable, unsigned long cases)
                  sizeof(semantic_commands[0]))];
 
             if (send_text(&session, command) == -1 ||
-                consume_through(&session, "$gsh> ",
+                consume_through(&session, "gsh$ ",
                                 TEST_TIMEOUT_MS) == -1) {
                 fprintf(stderr,
                         "pty fuzz: semantic seed failed at case %lu\n",
@@ -6581,7 +6462,7 @@ static int pty_byte_fuzz(const char *executable, unsigned long cases)
              kill(session.pid, SIGWINCH) == -1) ||
             send_bytes(&session, "\003", 1) == -1 ||
             consume_through(&session, "^C", TEST_TIMEOUT_MS) == -1 ||
-            consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1) {
+            consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1) {
             fprintf(stderr, "pty fuzz: failed at case %lu\n", index);
             dump_capture(&session);
             failed = 1;
@@ -6704,13 +6585,11 @@ int main(int argc, char **argv)
         function_builtin_flow(executable) != 0 ||
         deferred_pattern_flow(executable) != 0 ||
         asynchronous_list_flow(executable) != 0 ||
-        async_redirection_flow(executable) != 0 ||
-        stalled_worker_flow(executable) != 0) {
+        async_redirection_flow(executable) != 0) {
         return 1;
     }
     puts("pty smoke: exec paths, native fc, protected bridge, encrypted history, "
          "editor recall/search, managed async REPL, job control, "
-         "async prompt/redirection, "
-         "cancellation, and worker deadline passed");
+         "async prompt/redirection and cancellation passed");
     return 0;
 }

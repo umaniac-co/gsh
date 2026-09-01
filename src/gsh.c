@@ -83,12 +83,8 @@ enum {
     SIMPLE_ARG_CAP = 128,
     EXEC_PATH_CAP = 4096,
     PATH_SCAN_CAP = 32768,
-    PROMPT_BRANCH_CAP = 128,
     SECONDARY_PROMPT_CAP = 128,
-    PROMPT_ANCESTOR_CAP = 32,
-    PROMPT_PROTOCOL_VERSION = 1,
-    PROMPT_REQUEST_BRANCH = 1,
-    PROMPT_REQUEST_REDIRECTION = 2,
+    REDIRECTION_WORKER_PROTOCOL_VERSION = 1,
     NONINTERACTIVE_INPUT_FAST_CAP = GSH_SOURCE_INPUT_CAP,
     GSH_NATIVE_JOB_MEMBER_CAP =
         GSH_NATIVE_PIPELINE_CAP + GSH_NATIVE_HEREDOC_CAP,
@@ -104,13 +100,9 @@ _Static_assert((unsigned int)GSH_POSITIONAL_TEXT_CAP ==
 _Static_assert(sizeof(off_t) >= sizeof(int64_t),
                "descriptor-backed source offsets require 64-bit off_t");
 
-static const char PROMPT[] = "$gsh> ";
-static const char PROMPT_MUTED[] = "\033[90m";
-static const char PROMPT_RESET[] = "\033[0m";
-static const char ASYNC_SETTLED_INDICATOR[] = "[●]";
-static const char ASYNC_PENDING_INDICATOR[] = "[○]";
+static const char PROMPT[] = "gsh$ ";
+static const char ASYNC_PENDING_PROMPT[] = "gsh* ";
 static const uint64_t REACTOR_DEADLINE_NS = 5U * 1000U * 1000U;
-static const uint64_t PROMPT_WORKER_DEADLINE_NS = 100U * 1000U * 1000U;
 static char g_shell_executable[EXEC_PATH_CAP];
 static dev_t g_shell_executable_device;
 static ino_t g_shell_executable_inode;
@@ -119,7 +111,7 @@ typedef enum {
     MODE_EDITOR,
     MODE_DISPATCH,
     MODE_FOREGROUND,
-    MODE_ASYNC_WORKER,
+    MODE_ASYNC_REDIRECTION,
     MODE_WAIT,
 } run_mode;
 
@@ -148,26 +140,20 @@ typedef struct {
 
 typedef struct {
     uint32_t version;
-    uint32_t type;
     uint64_t request_id;
-    uint64_t generation;
-    uint64_t deadline_ns;
     uint32_t operator_kind;
     uint32_t option_bits;
     uint32_t creation_mode;
     int32_t builtin_status;
     char directory[PATH_MAX];
-} prompt_request;
+} redirection_request;
 
 typedef struct {
     uint32_t version;
-    uint32_t type;
     uint64_t request_id;
-    uint64_t generation;
     int32_t status;
     int32_t error;
-    char branch[PROMPT_BRANCH_CAP];
-} prompt_result;
+} redirection_result;
 
 enum { GSH_COMMAND_CACHE_COMMIT_VERSION = 1 };
 
@@ -269,7 +255,6 @@ typedef struct {
     char default_path[EXEC_PATH_CAP];
     const char *parameter_zero;
     char current_directory[PATH_MAX];
-    char prompt_branch[PROMPT_BRANCH_CAP];
 
     char output[OUTPUT_CAP];
     size_t output_offset;
@@ -301,19 +286,15 @@ typedef struct {
     int last_status;
     gsh_shell_options options;
 
-    int prompt_worker_fd;
-    pid_t prompt_worker_pid;
-    bool prompt_worker_alive;
-    bool prompt_worker_busy;
-    bool prompt_worker_restart_pending;
-    bool prompt_request_pending;
-    uint64_t prompt_next_request_id;
-    uint64_t prompt_active_request_id;
-    uint32_t prompt_active_request_type;
-    uint64_t prompt_generation;
-    uint64_t prompt_worker_deadline_ns;
-    bool worker_pipeline_negated;
-    char worker_redirection_target[PATH_MAX];
+    int redirection_worker_fd;
+    pid_t redirection_worker_pid;
+    bool redirection_worker_alive;
+    bool redirection_worker_busy;
+    bool redirection_worker_restart_pending;
+    uint64_t redirection_next_request_id;
+    uint64_t redirection_active_request_id;
+    bool redirection_pipeline_negated;
+    char redirection_target[PATH_MAX];
     gsh_parse_storage *parse_storage;
     gsh_parse_result pending_parse;
     gsh_native_pipeline *native_pipeline;
@@ -384,9 +365,7 @@ typedef struct {
     uint64_t protected_bridge_dispatches;
     uint64_t parsed_dispatches;
     uint64_t parse_failures;
-    uint64_t prompt_worker_timeouts;
-    uint64_t prompt_worker_failures;
-    uint64_t prompt_stale_results;
+    uint64_t redirection_worker_failures;
 } shell_state;
 
 static int g_signal_write_fd = -1;
@@ -968,39 +947,21 @@ static void verify_history_reminder(shell_state *state)
 }
 
 static size_t primary_prompt_text(const shell_state *state, char *prompt,
-                                  size_t capacity, bool include_indicator)
+                                  size_t capacity, bool include_async_state)
 {
-    const char *indicator = NULL;
-    int written;
+    const char *text = PROMPT;
+    size_t length;
 
-    if (include_indicator) {
-        indicator = gsh_async_repl_all_settled(state->async_repl)
-                        ? ASYNC_SETTLED_INDICATOR
-                        : ASYNC_PENDING_INDICATOR;
+    if (include_async_state &&
+        !gsh_async_repl_all_settled(state->async_repl)) {
+        text = ASYNC_PENDING_PROMPT;
     }
-    if (state->prompt_branch[0] != '\0' && indicator != NULL) {
-        written = snprintf(prompt, capacity, "%s[%s] %s%s %s",
-                           PROMPT_MUTED, state->prompt_branch, indicator,
-                           PROMPT_RESET, PROMPT);
-    } else if (state->prompt_branch[0] != '\0') {
-        written = snprintf(prompt, capacity, "%s[%s]%s %s", PROMPT_MUTED,
-                           state->prompt_branch, PROMPT_RESET, PROMPT);
-    } else if (indicator != NULL) {
-        written = snprintf(prompt, capacity, "%s%s%s %s", PROMPT_MUTED,
-                           indicator, PROMPT_RESET, PROMPT);
-    } else {
-        written = snprintf(prompt, capacity, "%s", PROMPT);
+    length = strlen(text);
+    if (length >= capacity) {
+        return 0;
     }
-    if (written < 0 || (size_t)written >= capacity) {
-        size_t fallback = sizeof(PROMPT) - 1U;
-
-        if (fallback >= capacity) {
-            return 0;
-        }
-        memcpy(prompt, PROMPT, fallback + 1U);
-        return fallback;
-    }
-    return (size_t)written;
+    memcpy(prompt, text, length + 1U);
+    return length;
 }
 
 static void queue_prompt(shell_state *state)
@@ -1269,8 +1230,8 @@ static int initialize_interactive(shell_state *state,
     state->tty_fd = -1;
     state->signal_pipe[0] = -1;
     state->signal_pipe[1] = -1;
-    state->prompt_worker_fd = -1;
-    state->prompt_worker_pid = -1;
+    state->redirection_worker_fd = -1;
+    state->redirection_worker_pid = -1;
     state->variable_commit_fd = -1;
     state->job_service_socket = -1;
     state->job_service_wait_reply_fd = -1;
@@ -1308,8 +1269,7 @@ static int initialize_interactive(shell_state *state,
     gsh_history_initialize(state->history);
     gsh_options_initialize(&state->options, true);
     gsh_background_initialize(&state->background_jobs);
-    state->prompt_generation = 1;
-    state->prompt_next_request_id = 1;
+    state->redirection_next_request_id = 1;
     state->parse_storage = fault_should_fail("allocation", ENOMEM)
                                ? NULL
                                : malloc(sizeof(*state->parse_storage));
@@ -1464,112 +1424,11 @@ static void reset_child_signals(void)
     }
 }
 
-static bool prompt_path(char destination[PATH_MAX], const char *directory,
-                        const char *suffix)
-{
-    size_t directory_length = strnlen(directory, PATH_MAX);
-    size_t suffix_length = strlen(suffix);
-    bool needs_separator;
-
-    if (directory_length == PATH_MAX) {
-        return false;
-    }
-    needs_separator = directory_length == 0 ||
-                      directory[directory_length - 1] != '/';
-    if (directory_length + (needs_separator ? 1U : 0U) + suffix_length + 1U >
-        PATH_MAX) {
-        return false;
-    }
-    memcpy(destination, directory, directory_length);
-    if (needs_separator) {
-        destination[directory_length++] = '/';
-    }
-    memcpy(destination + directory_length, suffix, suffix_length + 1U);
-    return true;
-}
-
-static void prompt_worker_find_branch(const char *requested_directory,
-                                      char branch[PROMPT_BRANCH_CAP])
-{
-    static const char prefix[] = "ref: refs/heads/";
-    char directory[PATH_MAX];
-    unsigned int ancestor;
-
-    branch[0] = '\0';
-    if (strnlen(requested_directory, sizeof(directory)) >= sizeof(directory)) {
-        return;
-    }
-    memcpy(directory, requested_directory, strlen(requested_directory) + 1U);
-
-    for (ancestor = 0; ancestor < PROMPT_ANCESTOR_CAP; ancestor++) {
-        char head_path[PATH_MAX];
-        char head[512];
-        ssize_t length;
-        int fd;
-
-        if (!prompt_path(head_path, directory, ".git/HEAD")) {
-            return;
-        }
-        fd = fault_should_fail("worker-open", EIO)
-                 ? -1
-                 : open(head_path, O_RDONLY);
-        if (fd >= 0) {
-            do {
-                length = read(fd, head, sizeof(head) - 1U);
-            } while (length == -1 && errno == EINTR);
-            close(fd);
-            if (length > 0) {
-                size_t prefix_length = sizeof(prefix) - 1U;
-                size_t index;
-                size_t output = 0;
-
-                head[(size_t)length] = '\0';
-                if ((size_t)length < prefix_length ||
-                    memcmp(head, prefix, prefix_length) != 0) {
-                    return;
-                }
-                for (index = prefix_length; index < (size_t)length &&
-                                            output + 1U < PROMPT_BRANCH_CAP;
-                     index++) {
-                    unsigned char byte = (unsigned char)head[index];
-
-                    if (byte == '\n' || byte == '\r') {
-                        break;
-                    }
-                    if (byte < 0x20U || byte == 0x7fU) {
-                        branch[0] = '\0';
-                        return;
-                    }
-                    branch[output++] = (char)byte;
-                }
-                branch[output] = '\0';
-                return;
-            }
-        }
-
-        {
-            char *separator = strrchr(directory, '/');
-
-            if (separator == NULL) {
-                return;
-            }
-            if (separator == directory) {
-                if (directory[1] == '\0') {
-                    return;
-                }
-                directory[1] = '\0';
-            } else {
-                *separator = '\0';
-            }
-        }
-    }
-}
-
-static void prompt_worker_loop(int fd)
+static void redirection_worker_loop(int fd)
 {
     for (;;) {
-        prompt_request request;
-        prompt_result result;
+        redirection_request request;
+        redirection_result result;
         ssize_t received;
 
         do {
@@ -1578,34 +1437,16 @@ static void prompt_worker_loop(int fd)
         if (received != (ssize_t)sizeof(request)) {
             _exit(received == -1 ? 1 : 0);
         }
-        if (request.version != PROMPT_PROTOCOL_VERSION ||
-            (request.type != PROMPT_REQUEST_BRANCH &&
-             request.type != PROMPT_REQUEST_REDIRECTION) ||
+        if (request.version != REDIRECTION_WORKER_PROTOCOL_VERSION ||
             memchr(request.directory, '\0', sizeof(request.directory)) ==
                 NULL) {
             _exit(1);
         }
-        if (fault_should_fail("worker-crash", EIO)) {
-            _exit(70);
-        }
-        if (fault_should_fail("worker-close", EPIPE)) {
-            _exit(0);
-        }
-        if (fault_should_fail("worker-stall", ETIMEDOUT)) {
-            for (;;) {
-                pause();
-            }
-        }
 
         memset(&result, 0, sizeof(result));
-        result.version = PROMPT_PROTOCOL_VERSION;
-        result.type = request.type;
+        result.version = REDIRECTION_WORKER_PROTOCOL_VERSION;
         result.request_id = request.request_id;
-        result.generation = request.generation;
-        if (request.type == PROMPT_REQUEST_BRANCH &&
-            monotonic_ns() < request.deadline_ns) {
-            prompt_worker_find_branch(request.directory, result.branch);
-        } else if (request.type == PROMPT_REQUEST_REDIRECTION) {
+        {
             gsh_shell_options options = {request.option_bits, 1U, 1U, 0U};
             int descriptor = open_redirect_path(
                 request.directory, (gsh_token_kind)request.operator_kind,
@@ -1619,12 +1460,6 @@ static void prompt_worker_loop(int fd)
                 result.status = request.builtin_status;
             }
         }
-        if (fault_should_fail("worker-malformed", EPROTO)) {
-            result.version++;
-        }
-        if (fault_should_fail("worker-stale", ESTALE)) {
-            result.generation++;
-        }
         do {
             received = send(fd, &result, sizeof(result), 0);
         } while (received == -1 && errno == EINTR);
@@ -1634,24 +1469,21 @@ static void prompt_worker_loop(int fd)
     }
 }
 
-static void disable_prompt_worker(shell_state *state, bool terminate)
+static void disable_redirection_worker(shell_state *state, bool terminate)
 {
-    if (state->prompt_worker_fd >= 0) {
-        close(state->prompt_worker_fd);
-        state->prompt_worker_fd = -1;
+    if (state->redirection_worker_fd >= 0) {
+        close(state->redirection_worker_fd);
+        state->redirection_worker_fd = -1;
     }
-    if (terminate && state->prompt_worker_pid > 0) {
-        (void)kill(state->prompt_worker_pid, SIGKILL);
+    if (terminate && state->redirection_worker_pid > 0) {
+        (void)kill(state->redirection_worker_pid, SIGKILL);
     }
-    state->prompt_worker_alive = false;
-    state->prompt_worker_busy = false;
-    state->prompt_request_pending = false;
-    state->prompt_worker_deadline_ns = 0;
-    state->prompt_active_request_id = 0;
-    state->prompt_active_request_type = 0;
+    state->redirection_worker_alive = false;
+    state->redirection_worker_busy = false;
+    state->redirection_active_request_id = 0;
 }
 
-static int start_prompt_worker(shell_state *state)
+static int start_redirection_worker(shell_state *state)
 {
     int sockets[2];
     sigset_t blocked;
@@ -1697,7 +1529,7 @@ static int start_prompt_worker(shell_state *state)
         close(STDOUT_FILENO);
         close(STDERR_FILENO);
         (void)umask(0);
-        prompt_worker_loop(sockets[1]);
+        redirection_worker_loop(sockets[1]);
     }
 
     close(sockets[1]);
@@ -1711,83 +1543,32 @@ static int start_prompt_worker(shell_state *state)
     }
 
     (void)setpgid(pid, pid);
-    state->prompt_worker_fd = sockets[0];
-    state->prompt_worker_pid = pid;
-    state->prompt_worker_alive = true;
-    state->prompt_request_pending = state->current_directory[0] != '\0';
+    state->redirection_worker_fd = sockets[0];
+    state->redirection_worker_pid = pid;
+    state->redirection_worker_alive = true;
     (void)sigprocmask(SIG_SETMASK, &previous, NULL);
     return 0;
 }
 
-static void schedule_prompt_refresh(shell_state *state)
+static void receive_redirection_result(shell_state *state)
 {
-    state->prompt_generation++;
-    state->prompt_branch[0] = '\0';
-    if (state->prompt_worker_alive && state->current_directory[0] != '\0') {
-        state->prompt_request_pending = true;
-    }
-}
-
-static void send_prompt_request(shell_state *state)
-{
-    prompt_request request;
-    ssize_t sent;
-
-    if (!state->prompt_worker_alive || state->prompt_worker_busy ||
-        !state->prompt_request_pending || state->output_len != 0) {
-        return;
-    }
-    memset(&request, 0, sizeof(request));
-    request.version = PROMPT_PROTOCOL_VERSION;
-    request.type = PROMPT_REQUEST_BRANCH;
-    request.request_id = state->prompt_next_request_id++;
-    request.generation = state->prompt_generation;
-    request.deadline_ns = monotonic_ns() + PROMPT_WORKER_DEADLINE_NS;
-    memcpy(request.directory, state->current_directory,
-           strlen(state->current_directory) + 1U);
-
-    do {
-        sent = fault_should_fail("worker-send", EPIPE)
-                   ? -1
-                   : send(state->prompt_worker_fd, &request, sizeof(request),
-                          0);
-    } while (sent == -1 && errno == EINTR);
-    if (sent == (ssize_t)sizeof(request)) {
-        state->prompt_request_pending = false;
-        state->prompt_worker_busy = true;
-        state->prompt_active_request_id = request.request_id;
-        state->prompt_active_request_type = request.type;
-        state->prompt_worker_deadline_ns = request.deadline_ns;
-    } else if (sent == -1 &&
-               (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS)) {
-        return;
-    } else {
-        state->prompt_worker_failures++;
-        disable_prompt_worker(state, true);
-    }
-}
-
-static void receive_prompt_result(shell_state *state)
-{
-    prompt_result result;
+    redirection_result result;
     ssize_t received;
 
     do {
-        received = recv(state->prompt_worker_fd, &result, sizeof(result), 0);
+        received = recv(state->redirection_worker_fd, &result,
+                        sizeof(result), 0);
     } while (received == -1 && errno == EINTR);
     if (received == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
         return;
     }
     if (received != (ssize_t)sizeof(result) ||
-        result.version != PROMPT_PROTOCOL_VERSION ||
-        result.type != state->prompt_active_request_type ||
-        result.request_id != state->prompt_active_request_id ||
-        (result.type == PROMPT_REQUEST_BRANCH &&
-         memchr(result.branch, '\0', sizeof(result.branch)) == NULL)) {
-        bool command = state->mode == MODE_ASYNC_WORKER;
+        result.version != REDIRECTION_WORKER_PROTOCOL_VERSION ||
+        result.request_id != state->redirection_active_request_id) {
+        bool command = state->mode == MODE_ASYNC_REDIRECTION;
 
-        state->prompt_worker_failures++;
-        disable_prompt_worker(state, true);
+        state->redirection_worker_failures++;
+        disable_redirection_worker(state, true);
         if (command) {
             output_text(state, "gsh: asynchronous redirection failed\r\n");
             state->last_status = 1;
@@ -1797,44 +1578,24 @@ static void receive_prompt_result(shell_state *state)
         return;
     }
 
-    state->prompt_worker_busy = false;
-    state->prompt_worker_deadline_ns = 0;
-    state->prompt_active_request_id = 0;
-    state->prompt_active_request_type = 0;
-    if (result.type == PROMPT_REQUEST_REDIRECTION) {
-        int status = result.status;
-
-        if (result.error != 0) {
-            output_format(state, "gsh: %s: %s\r\n",
-                          state->worker_redirection_target,
-                          strerror(result.error));
-        }
-        if (state->worker_pipeline_negated) {
-            status = status == 0 ? 1 : 0;
-        }
-        state->last_status = status;
-        state->mode = MODE_EDITOR;
-        state->worker_redirection_target[0] = '\0';
-        queue_prompt(state);
-        return;
+    state->redirection_worker_busy = false;
+    state->redirection_active_request_id = 0;
+    if (result.error != 0) {
+        output_format(state, "gsh: %s: %s\r\n",
+                      state->redirection_target,
+                      strerror(result.error));
     }
-    if (result.generation != state->prompt_generation) {
-        state->prompt_stale_results++;
-        return;
+    if (state->redirection_pipeline_negated) {
+        result.status = result.status == 0 ? 1 : 0;
     }
-    if (strcmp(state->prompt_branch, result.branch) != 0) {
-        memcpy(state->prompt_branch, result.branch, sizeof(result.branch));
-        if (state->mode == MODE_EDITOR) {
-            queue_redraw(state);
-        }
-    }
+    state->last_status = result.status;
+    state->mode = MODE_EDITOR;
+    state->redirection_target[0] = '\0';
+    queue_prompt(state);
 }
 
-static int prompt_poll_timeout(const shell_state *state)
+static int history_poll_timeout(const shell_state *state)
 {
-    bool prompt_deadline =
-        state->prompt_worker_busy &&
-        state->prompt_active_request_type != PROMPT_REQUEST_REDIRECTION;
     bool history_deadline =
         state->history_persistent &&
         state->history_reminder_deadline_ns != 0 &&
@@ -1844,50 +1605,17 @@ static int prompt_poll_timeout(const shell_state *state)
     uint64_t now;
     uint64_t remaining;
     uint64_t milliseconds;
-    int timeout = -1;
 
-    if (!prompt_deadline && !history_deadline) {
+    if (!history_deadline) {
         return -1;
     }
     now = monotonic_ns();
-    if (prompt_deadline) {
-        if (now >= state->prompt_worker_deadline_ns) {
-            timeout = 0;
-        } else {
-            remaining = state->prompt_worker_deadline_ns - now;
-            milliseconds = (remaining + 999999U) / 1000000U;
-            timeout = milliseconds > (uint64_t)INT_MAX
-                          ? INT_MAX
-                          : (int)milliseconds;
-        }
+    if (now >= state->history_reminder_deadline_ns) {
+        return 0;
     }
-    if (history_deadline) {
-        int history_timeout;
-
-        if (now >= state->history_reminder_deadline_ns) {
-            history_timeout = 0;
-        } else {
-            remaining = state->history_reminder_deadline_ns - now;
-            milliseconds = (remaining + 999999U) / 1000000U;
-            history_timeout = milliseconds > (uint64_t)INT_MAX
-                                  ? INT_MAX
-                                  : (int)milliseconds;
-        }
-        if (timeout < 0 || history_timeout < timeout) {
-            timeout = history_timeout;
-        }
-    }
-    return timeout;
-}
-
-static void enforce_prompt_deadline(shell_state *state)
-{
-    if (state->prompt_worker_busy &&
-        state->prompt_active_request_type == PROMPT_REQUEST_BRANCH &&
-        monotonic_ns() >= state->prompt_worker_deadline_ns) {
-        state->prompt_worker_timeouts++;
-        disable_prompt_worker(state, true);
-    }
+    remaining = state->history_reminder_deadline_ns - now;
+    milliseconds = (remaining + 999999U) / 1000000U;
+    return milliseconds > (uint64_t)INT_MAX ? INT_MAX : (int)milliseconds;
 }
 
 static void reclaim_terminal(shell_state *state, bool save_job_modes)
@@ -2527,7 +2255,6 @@ static bool finish_variable_commit(shell_state *state, int wait_status)
                        sizeof(state->current_directory)) == NULL) {
                 state->current_directory[0] = '\0';
             }
-            schedule_prompt_refresh(state);
         }
         state->variable_generation++;
     } else if (WIFEXITED(wait_status) || state->variable_commit_invalid) {
@@ -2762,7 +2489,7 @@ static int protect_exec_owner_descriptors(
 {
     int *owned[] = {
         &state->tty_fd, &state->signal_pipe[0],
-        &state->prompt_worker_fd, &state->history_client.descriptor,
+        &state->redirection_worker_fd, &state->history_client.descriptor,
         &state->variable_commit_fd, &state->exec_outcome_fd,
         &state->exec_descriptor_socket, &state->directory_commit_socket,
         &state->directory_commit_fd,
@@ -3184,16 +2911,16 @@ static void reap_children(shell_state *state)
                                  : gsh_async_repl_cell_for_pid(
                                        state->async_repl, pid);
 
-            if (pid == state->prompt_worker_pid) {
-                bool unexpected = state->prompt_worker_alive;
-                bool command = state->mode == MODE_ASYNC_WORKER;
-                bool restart = state->prompt_worker_restart_pending;
+            if (pid == state->redirection_worker_pid) {
+                bool unexpected = state->redirection_worker_alive;
+                bool command = state->mode == MODE_ASYNC_REDIRECTION;
+                bool restart = state->redirection_worker_restart_pending;
 
-                disable_prompt_worker(state, false);
-                state->prompt_worker_pid = -1;
-                state->prompt_worker_restart_pending = false;
+                disable_redirection_worker(state, false);
+                state->redirection_worker_pid = -1;
+                state->redirection_worker_restart_pending = false;
                 if (unexpected) {
-                    state->prompt_worker_failures++;
+                    state->redirection_worker_failures++;
                 }
                 if (command) {
                     output_text(
@@ -3204,8 +2931,8 @@ static void reap_children(shell_state *state)
                     queue_prompt(state);
                 }
                 if (restart && state->running &&
-                    start_prompt_worker(state) == -1) {
-                    state->prompt_worker_failures++;
+                    start_redirection_worker(state) == -1) {
+                    state->redirection_worker_failures++;
                 }
             } else if (state->current_job.active &&
                        find_job_member(&state->current_job, pid) !=
@@ -3605,12 +3332,12 @@ static void process_pending_signals(shell_state *state)
         state->mode = MODE_EDITOR;
         state->pending_line[0] = '\0';
         cancel_editor_line(state);
-    } else if (interrupt && state->mode == MODE_ASYNC_WORKER) {
-        disable_prompt_worker(state, true);
-        state->prompt_worker_restart_pending = true;
+    } else if (interrupt && state->mode == MODE_ASYNC_REDIRECTION) {
+        disable_redirection_worker(state, true);
+        state->redirection_worker_restart_pending = true;
         state->last_status = 130;
         state->mode = MODE_EDITOR;
-        state->worker_redirection_target[0] = '\0';
+        state->redirection_target[0] = '\0';
         abandon_pending_list(state);
         cancel_editor_line(state);
     } else if (interrupt && state->mode == MODE_WAIT) {
@@ -6457,8 +6184,8 @@ static void start_native_pipeline(shell_state *state,
             close(state->tty_fd);
             close(state->signal_pipe[0]);
             close(state->signal_pipe[1]);
-            if (state->prompt_worker_fd >= 0) {
-                close(state->prompt_worker_fd);
+            if (state->redirection_worker_fd >= 0) {
+                close(state->redirection_worker_fd);
             }
             if (fault_should_fail("exec", EIO)) {
                 child_exec_error(pipeline->commands[index].argv[0], errno);
@@ -6659,8 +6386,8 @@ static void start_native_pipeline(shell_state *state,
             close(state->tty_fd);
             close(state->signal_pipe[0]);
             close(state->signal_pipe[1]);
-            if (state->prompt_worker_fd >= 0) {
-                close(state->prompt_worker_fd);
+            if (state->redirection_worker_fd >= 0) {
+                close(state->redirection_worker_fd);
             }
             child_write_heredoc(pipeline, index, heredoc_pipes);
         }
@@ -6784,8 +6511,8 @@ static void close_child_reactor_descriptors(shell_state *state,
     }
     (void)close(state->signal_pipe[0]);
     (void)close(state->signal_pipe[1]);
-    if (state->prompt_worker_fd >= 0) {
-        (void)close(state->prompt_worker_fd);
+    if (state->redirection_worker_fd >= 0) {
+        (void)close(state->redirection_worker_fd);
     }
     if (state->async_repl == NULL) {
         return;
@@ -7051,8 +6778,8 @@ static void start_external(shell_state *state, simple_command *direct)
         close(state->tty_fd);
         close(state->signal_pipe[0]);
         close(state->signal_pipe[1]);
-        if (state->prompt_worker_fd >= 0) {
-            close(state->prompt_worker_fd);
+        if (state->redirection_worker_fd >= 0) {
+            close(state->redirection_worker_fd);
         }
         if (direct != NULL) {
             if (fault_should_fail("exec", EIO)) {
@@ -7444,13 +7171,13 @@ static bool start_async_stateless_redirection(
     const gsh_native_command *command)
 {
     const gsh_native_redirect *redirect;
-    prompt_request request;
+    redirection_request request;
     mode_t mask;
     int builtin_status;
     int length;
     ssize_t sent;
 
-    if (!state->prompt_worker_alive || state->prompt_worker_busy ||
+    if (!state->redirection_worker_alive || state->redirection_worker_busy ||
         fault_injection_active() || command->assignment_count != 0 ||
         command->redirect_count != 1U ||
         !native_stateless_builtin(command, &builtin_status)) {
@@ -7478,33 +7205,31 @@ static bool start_async_stateless_redirection(
     }
     mask = umask(0);
     (void)umask(mask);
-    request.version = PROMPT_PROTOCOL_VERSION;
-    request.type = PROMPT_REQUEST_REDIRECTION;
-    request.request_id = state->prompt_next_request_id++;
+    request.version = REDIRECTION_WORKER_PROTOCOL_VERSION;
+    request.request_id = state->redirection_next_request_id++;
     request.operator_kind = (uint32_t)redirect->operator_kind;
     request.option_bits = state->options.enabled;
     request.creation_mode = (uint32_t)(0666 & ~mask);
     request.builtin_status = builtin_status;
     do {
-        sent = send(state->prompt_worker_fd, &request, sizeof(request), 0);
+        sent = send(state->redirection_worker_fd, &request,
+                    sizeof(request), 0);
     } while (sent == -1 && errno == EINTR);
     if (sent != (ssize_t)sizeof(request)) {
         if (sent == -1 && (errno == EAGAIN || errno == EWOULDBLOCK ||
                            errno == ENOBUFS)) {
             return false;
         }
-        state->prompt_worker_failures++;
-        disable_prompt_worker(state, true);
+        state->redirection_worker_failures++;
+        disable_redirection_worker(state, true);
         return false;
     }
-    state->prompt_worker_busy = true;
-    state->prompt_active_request_id = request.request_id;
-    state->prompt_active_request_type = request.type;
-    state->prompt_worker_deadline_ns = 0;
-    state->worker_pipeline_negated = pipeline->negated;
-    memcpy(state->worker_redirection_target, request.directory,
+    state->redirection_worker_busy = true;
+    state->redirection_active_request_id = request.request_id;
+    state->redirection_pipeline_negated = pipeline->negated;
+    memcpy(state->redirection_target, request.directory,
            (size_t)length + 1U);
-    state->mode = MODE_ASYNC_WORKER;
+    state->mode = MODE_ASYNC_REDIRECTION;
     return true;
 }
 
@@ -7873,9 +7598,6 @@ static bool run_planned_main_builtin(shell_state *state,
             command, lookup_variables, state->variables, NULL,
             &state->options, &io, state->current_directory,
             sizeof(state->current_directory));
-        if (state->last_status == 0) {
-            schedule_prompt_refresh(state);
-        }
         state->mode = MODE_EDITOR;
         queue_prompt(state);
         return true;
@@ -8496,7 +8218,7 @@ static void dispatch_pending(shell_state *state)
                       "native=%llu "
                       "shell=%llu "
                       "parsed=%llu parse_failures=%llu job=%s worker=%s "
-                      "busy=%u timeouts=%llu failures=%llu stale=%llu "
+                      "busy=%u failures=%llu "
                       "async_jobs=%zu focus=%s protected_bridge=%llu\r\n",
                       (unsigned long long)state->reactor_cycles,
                       (double)state->reactor_max_ns / 1000000.0,
@@ -8511,11 +8233,9 @@ static void dispatch_pending(shell_state *state)
                       (unsigned long long)state->parsed_dispatches,
                       (unsigned long long)state->parse_failures,
                       state->current_job.active ? "active" : "idle",
-                      state->prompt_worker_alive ? "on" : "off",
-                      state->prompt_worker_busy ? 1U : 0U,
-                      (unsigned long long)state->prompt_worker_timeouts,
-                      (unsigned long long)state->prompt_worker_failures,
-                      (unsigned long long)state->prompt_stale_results,
+                      state->redirection_worker_alive ? "on" : "off",
+                      state->redirection_worker_busy ? 1U : 0U,
+                      (unsigned long long)state->redirection_worker_failures,
                       gsh_async_repl_job_count(state->async_repl),
                       gsh_async_repl_focused_job(state->async_repl) >= 0
                           ? "job"
@@ -9468,7 +9188,7 @@ static int load_managed_submission(shell_state *state, int cell_index)
 static bool managed_state_lane_busy(const shell_state *state)
 {
     return state->async_state_cell >= 0 || state->current_job.active ||
-           state->mode == MODE_ASYNC_WORKER || state->mode == MODE_WAIT ||
+           state->mode == MODE_ASYNC_REDIRECTION || state->mode == MODE_WAIT ||
            state->pending_list_active || state->pending_and_or_active;
 }
 
@@ -9477,7 +9197,7 @@ static void finish_managed_state_cell(shell_state *state)
     int cell_index = state->async_state_cell;
 
     if (cell_index < 0 || state->mode != MODE_EDITOR ||
-        state->current_job.active || state->mode == MODE_ASYNC_WORKER ||
+        state->current_job.active ||
         state->mode == MODE_WAIT || state->pending_list_active ||
         state->pending_and_or_active) {
         return;
@@ -10263,10 +9983,10 @@ static int run_reactor(shell_state *state)
             descriptors[1].events |= POLLOUT;
         }
 
-        descriptors[2].fd = state->prompt_worker_alive
-                                ? state->prompt_worker_fd
+        descriptors[2].fd = state->redirection_worker_alive
+                                ? state->redirection_worker_fd
                                 : -1;
-        descriptors[2].events = state->prompt_worker_alive ? POLLIN : 0;
+        descriptors[2].events = state->redirection_worker_alive ? POLLIN : 0;
         descriptors[2].revents = 0;
         descriptors[3].fd = state->variable_commit_active
                                 ? state->variable_commit_fd
@@ -10281,7 +10001,7 @@ static int run_reactor(shell_state *state)
         result = fault_should_fail("poll", EIO)
                      ? -1
                      : poll(descriptors, descriptor_count,
-                            prompt_poll_timeout(state));
+                            history_poll_timeout(state));
         if (result == -1) {
             if (errno == EINTR) {
                 continue;
@@ -10318,16 +10038,16 @@ static int run_reactor(shell_state *state)
             state->running = false;
         }
         process_managed_descriptors(state, descriptors, descriptor_count);
-        if (state->prompt_worker_alive &&
+        if (state->redirection_worker_alive &&
             (descriptors[2].revents & POLLIN) != 0) {
-            receive_prompt_result(state);
+            receive_redirection_result(state);
         }
-        if (state->prompt_worker_alive &&
+        if (state->redirection_worker_alive &&
             (descriptors[2].revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
-            bool command = state->mode == MODE_ASYNC_WORKER;
+            bool command = state->mode == MODE_ASYNC_REDIRECTION;
 
-            state->prompt_worker_failures++;
-            disable_prompt_worker(state, true);
+            state->redirection_worker_failures++;
+            disable_redirection_worker(state, true);
             if (command) {
                 output_text(state,
                             "gsh: asynchronous redirection failed\r\n");
@@ -10336,7 +10056,6 @@ static int run_reactor(shell_state *state)
                 queue_prompt(state);
             }
         }
-        enforce_prompt_deadline(state);
         schedule_managed_submissions(state);
         apply_async_transition(state);
         prepare_classic_redraw(state);
@@ -10344,7 +10063,6 @@ static int run_reactor(shell_state *state)
         if (state->output_len > 0) {
             flush_output(state);
         }
-        send_prompt_request(state);
 
         service_end = monotonic_ns();
         service_duration = service_end >= service_start
@@ -10443,7 +10161,7 @@ static void terminate_managed_children(
 
 static void cleanup(shell_state *state)
 {
-    pid_t worker_pid = state->prompt_worker_pid;
+    pid_t worker_pid = state->redirection_worker_pid;
     pid_t managed_pids[GSH_ASYNC_CELL_CAP] = {0};
     pid_t managed_groups[GSH_ASYNC_CELL_CAP] = {0};
     pid_t managed_terminal_groups[GSH_ASYNC_CELL_CAP] = {0};
@@ -10478,15 +10196,15 @@ static void cleanup(shell_state *state)
         (void)kill(-background_pids[background], SIGCONT);
         (void)kill(background_pids[background], SIGCONT);
     }
-    state->prompt_worker_restart_pending = false;
-    disable_prompt_worker(state, true);
+    state->redirection_worker_restart_pending = false;
+    disable_redirection_worker(state, true);
     close_variable_commit(state);
     terminate_managed_children(managed_pids, managed_groups,
                                managed_terminal_groups);
     if (worker_pid > 0) {
         while (waitpid(worker_pid, NULL, 0) == -1 && errno == EINTR) {
         }
-        state->prompt_worker_pid = -1;
+        state->redirection_worker_pid = -1;
     }
     leave_managed_screen(state);
     restore_terminal(state);
@@ -15553,8 +15271,8 @@ static bool start_background_node(shell_state *state, size_t node_index)
         close(state->tty_fd);
         close(state->signal_pipe[0]);
         close(state->signal_pipe[1]);
-        if (state->prompt_worker_fd >= 0) {
-            close(state->prompt_worker_fd);
+        if (state->redirection_worker_fd >= 0) {
+            close(state->redirection_worker_fd);
         }
         if (state->variable_commit_fd >= 0) {
             close(state->variable_commit_fd);
@@ -17783,8 +17501,8 @@ int main(int argc, char **argv)
         return 1;
     }
     initialize_history(&state);
-    if (start_prompt_worker(&state) == -1) {
-        state.prompt_worker_failures++;
+    if (start_redirection_worker(&state) == -1) {
+        state.redirection_worker_failures++;
     }
 
     status = run_reactor(&state);

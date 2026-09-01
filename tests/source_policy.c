@@ -137,11 +137,11 @@ static int binary_excludes_fault_injection(const char *path)
         BINARY_OVERLAP_SIZE = 128,
     };
     static const char *const forbidden[] = {
-        "GSH_FAULT", "worker-malformed", "worker-stall", "job-fork",
+        "GSH_FAULT", "job-fork",
         "terminal-handoff", "pipeline-pipe", "pipeline-fork",
         "descriptor-dup", "redirect-open", "evaluator-gate",
-        "evaluator-fork", "subshell-fork", "worker-close",
-        "worker-stale", "time-source-failure", "heredoc-pipe",
+        "evaluator-fork", "subshell-fork", "time-source-failure",
+        "heredoc-pipe",
         "heredoc-fork", "heredoc-write", "substitution-pipe",
         "substitution-fork", "substitution-read",
         "source-workspace-exhaustion", "state-commit-pipe",

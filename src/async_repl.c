@@ -14,12 +14,12 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-enum { GSH_ASYNC_INITIAL_OUTPUT_ROWS = 1 };
-
 /* ── Cells Separate Output From Editor Ownership ─────────────────
  * Direct terminal output made the next prompt depend on job completion.
  * A cell now owns the immutable command, lifecycle, PTY, and captured bytes.
  * The editor is separate state and can therefore become active at Enter.
+ * Captured output adds rows only when bytes arrive, so silent commands do not
+ * reserve an empty row between their command and the next active editor.
  * Fixed cell, job, output, viewport, and render capacities bound every turn.
  * Reuse is allowed only after both the process and its output source settle.
  * ─────────────────────────────────────────────────────────────── */
@@ -1247,33 +1247,28 @@ static void push_prefixed_row(gsh_async_repl *repl, const char *prefix,
     push_view_row(repl, row, prefix_length + length);
 }
 
-static size_t push_output_rows(gsh_async_repl *repl,
-                               const gsh_async_cell *cell)
+static void push_output_rows(gsh_async_repl *repl,
+                             const gsh_async_cell *cell)
 {
     size_t start = 0;
-    size_t rows = 0;
     size_t offset;
 
     for (offset = 0; offset < cell->output_length; offset++) {
         if (cell->output[offset] == '\n') {
             push_view_row(repl, cell->output + start, offset - start);
-            rows++;
             start = offset + 1U;
         }
     }
     if (start < cell->output_length) {
         push_view_row(repl, cell->output + start,
                       cell->output_length - start);
-        rows++;
     }
-    return rows;
 }
 
 static void push_cell(gsh_async_repl *repl, const gsh_async_cell *cell)
 {
     char command_row[GSH_ASYNC_PROMPT_CAP + GSH_ASYNC_COMMAND_CAP] = {0};
     size_t command_length = cell->prompt_length + cell->command_length;
-    size_t output_rows;
 
     if (command_length > sizeof(command_row) - 1U) {
         command_length = sizeof(command_row) - 1U;
@@ -1286,11 +1281,7 @@ static void push_cell(gsh_async_repl *repl, const gsh_async_cell *cell)
                command_length - cell->prompt_length);
     }
     push_view_row(repl, command_row, command_length);
-    output_rows = push_output_rows(repl, cell);
-    while (output_rows < GSH_ASYNC_INITIAL_OUTPUT_ROWS) {
-        push_view_row(repl, "", 0);
-        output_rows++;
-    }
+    push_output_rows(repl, cell);
     if (cell->output_truncated) {
         push_view_row(repl, "[output truncated]", 18);
     }
