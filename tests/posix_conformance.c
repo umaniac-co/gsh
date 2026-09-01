@@ -156,6 +156,42 @@ static bool bytes_contain(const char *data, size_t length, const char *needle)
     return false;
 }
 
+static bool valid_hexadecimal_float_output(const char *data, size_t length)
+{
+    char copy[128];
+    char *separator;
+    char *end;
+    double lower_value;
+    double upper_value;
+
+    if (length < 8U || length >= sizeof(copy) || data[length - 1U] != '\n') {
+        return false;
+    }
+    memcpy(copy, data, length);
+    copy[length - 1U] = '\0';
+    separator = strchr(copy, ':');
+    if (separator == NULL || strchr(separator + 1, ':') != NULL) {
+        return false;
+    }
+    *separator = '\0';
+    if (strncmp(copy, "0x", 2U) != 0 || strchr(copy, 'p') == NULL ||
+        strchr(copy, 'P') != NULL ||
+        strncmp(separator + 1, "0X", 2U) != 0 ||
+        strchr(separator + 1, 'P') == NULL ||
+        strchr(separator + 1, 'p') != NULL) {
+        return false;
+    }
+
+    errno = 0;
+    lower_value = strtod(copy, &end);
+    if (errno != 0 || *end != '\0' || lower_value != 1.0) {
+        return false;
+    }
+    errno = 0;
+    upper_value = strtod(separator + 1, &end);
+    return errno == 0 && *end == '\0' && upper_value == 2.0;
+}
+
 static int run_case_arguments(
     const char *executable, const syntax_case *test, bool syntax_only,
     const char *parameter_zero, const char *const *positionals,
@@ -279,12 +315,24 @@ static int run_case_arguments(
     }
     close(descriptors[0]);
 
-    if (!((test->status >= 0 && WIFEXITED(status) &&
-           WEXITSTATUS(status) == test->status) ||
-          (test->status < 0 && WIFSIGNALED(status) &&
-           WTERMSIG(status) == -test->status)) ||
-        (test->diagnostic != NULL &&
-         !bytes_contain(diagnostic, diagnostic_length, test->diagnostic))) {
+    {
+        bool status_matches =
+            (test->status >= 0 && WIFEXITED(status) &&
+             WEXITSTATUS(status) == test->status) ||
+            (test->status < 0 && WIFSIGNALED(status) &&
+             WTERMSIG(status) == -test->status);
+        bool diagnostic_matches =
+            test->diagnostic == NULL ||
+            (strcmp(test->name, "printf hexadecimal floating conversions") ==
+                 0
+                 ? valid_hexadecimal_float_output(diagnostic,
+                                                  diagnostic_length)
+                 : bytes_contain(diagnostic, diagnostic_length,
+                                 test->diagnostic));
+
+        if (status_matches && diagnostic_matches) {
+            return 0;
+        }
         fprintf(stderr,
                 "conformance: %s (%s): expected status %d and diagnostic "
                 "%s\n",
@@ -299,7 +347,6 @@ static int run_case_arguments(
         }
         return 1;
     }
-    return 0;
 }
 
 static int run_case(const char *executable, const syntax_case *test,
