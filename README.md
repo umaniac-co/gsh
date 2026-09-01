@@ -92,6 +92,9 @@ and assign/error operators, parameter character length, and bounded
 transactional shell variables are implemented natively. Mutating expansions in
 a multi-command pipeline use one fixed-size scoped journal: effects are visible
 later in the same command but neither to sibling stages nor to the parent shell.
+An assignment-only simple command takes the status of its last `$()` or
+backquote substitution directly from the expansion pass, including negation;
+no output rescan or additional process is needed.
 Command substitution and pathname enumeration execute only in isolated
 evaluator processes; neither can block the interactive reactor. Nested source
 evaluation uses an eight-slot LIFO arena allocated once at startup. Each slot
@@ -617,7 +620,7 @@ This is soft real-time engineering, not hard real-time or mission-grade status.
 The repository has executable conformance tranches, bounded fuzz/property
 checks, sanitizer builds, 83 deterministic fault cases, resource-pressure
 scenarios, and a configurable soak runner. The current native tranche contains
-515 execution cases, 30 syntax cases, and 17 deterministic limit cases with
+519 execution cases, 30 syntax cases, and 17 deterministic limit cases with
 one explicitly unsupported case and no delegated cases. The current same-source
 tranche passes the local macOS matrix, but does not gain same-revision remote
 evidence until the macOS arm64 and Ubuntu x86-64 GCC/Clang jobs run after

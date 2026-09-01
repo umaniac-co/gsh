@@ -70,6 +70,8 @@ typedef struct {
     void *command_opaque;
     gsh_native_command_substitute_fn command_substitute;
     void *command_substitute_opaque;
+    bool *command_substitution_performed;
+    int *command_substitution_status;
     gsh_native_pathname_mode pathname_mode;
     bool defer_complex_patterns;
     bool *deferred_work;
@@ -102,6 +104,8 @@ typedef struct {
     bool command_suppresses_functions;
     bool command_uses_default_path;
     bool command_regular_context;
+    bool command_substitution_performed;
+    int command_substitution_status;
 } gsh_native_command;
 
 typedef struct {

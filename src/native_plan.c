@@ -2075,12 +2075,16 @@ static gsh_native_plan_status expand_command_substitution(
         context->command_substitute_opaque, input + *offset + 1U,
         commands_end - *offset - 1U, output + *output_used,
         output_capacity - *output_used, &produced, &exit_status);
-    (void)exit_status;
     if (status != GSH_NATIVE_PLAN_OK) {
         return status;
     }
     if (produced > output_capacity - *output_used) {
         return GSH_NATIVE_PLAN_LIMIT;
+    }
+    if (context->command_substitution_performed != NULL &&
+        context->command_substitution_status != NULL) {
+        *context->command_substitution_performed = true;
+        *context->command_substitution_status = exit_status;
     }
     *output_used += produced;
     *offset = after;
@@ -2110,12 +2114,16 @@ static gsh_native_plan_status expand_backquote_substitution(
                 context->command_substitute_opaque, commands, command_used,
                 output + *output_used, output_capacity - *output_used,
                 &produced, &exit_status);
-            (void)exit_status;
             if (status != GSH_NATIVE_PLAN_OK) {
                 return status;
             }
             if (produced > output_capacity - *output_used) {
                 return GSH_NATIVE_PLAN_LIMIT;
+            }
+            if (context->command_substitution_performed != NULL &&
+                context->command_substitution_status != NULL) {
+                *context->command_substitution_performed = true;
+                *context->command_substitution_status = exit_status;
             }
             *output_used += produced;
             *offset = cursor;
@@ -4156,6 +4164,8 @@ plan_command(const char *input, const gsh_parse_storage *storage,
              gsh_native_pipeline *pipeline,
              gsh_native_command *command)
 {
+    gsh_native_expansion_context command_context;
+    const gsh_native_expansion_context *active_context = context;
     size_t index;
 
     if (node->kind != GSH_AST_SIMPLE ||
@@ -4168,6 +4178,14 @@ plan_command(const char *input, const gsh_parse_storage *storage,
         return GSH_NATIVE_PLAN_LIMIT;
     }
     memset(command, 0, sizeof(*command));
+    if (context != NULL) {
+        command_context = *context;
+        command_context.command_substitution_performed =
+            &command->command_substitution_performed;
+        command_context.command_substitution_status =
+            &command->command_substitution_status;
+        active_context = &command_context;
+    }
     for (index = 0; index < node->word_count; index++) {
         gsh_word_ref word = storage->words[node->first_word + index];
         bool declaration = planned_declaration_utility(command);
@@ -4182,7 +4200,7 @@ plan_command(const char *input, const gsh_parse_storage *storage,
                 return GSH_NATIVE_PLAN_LIMIT;
             }
             status = plan_assignment(
-                input, word, assignment_length, context, pipeline,
+                input, word, assignment_length, active_context, pipeline,
                 &command->assignments[command->assignment_count]);
             if (status != GSH_NATIVE_PLAN_OK) {
                 return status;
@@ -4195,7 +4213,7 @@ plan_command(const char *input, const gsh_parse_storage *storage,
                 return GSH_NATIVE_PLAN_LIMIT;
             }
             status = plan_assignment(
-                input, word, assignment_length, context, pipeline,
+                input, word, assignment_length, active_context, pipeline,
                 &command->argv[command->argc]);
             if (status != GSH_NATIVE_PLAN_OK) {
                 return status;
@@ -4203,7 +4221,7 @@ plan_command(const char *input, const gsh_parse_storage *storage,
             command->argc++;
             continue;
         }
-        status = append_expanded_word(input, word, context, pipeline,
+        status = append_expanded_word(input, word, active_context, pipeline,
                                       command->argv, &command->argc);
         if (status != GSH_NATIVE_PLAN_OK) {
             return status;
@@ -4215,8 +4233,8 @@ plan_command(const char *input, const gsh_parse_storage *storage,
     command->argv[command->argc] = NULL;
     for (index = 0; index < node->redirect_count; index++) {
         gsh_native_plan_status status = plan_redirect(
-            input, &storage->redirects[node->first_redirect + index], context,
-            pipeline, &command->redirects[index]);
+            input, &storage->redirects[node->first_redirect + index],
+            active_context, pipeline, &command->redirects[index]);
 
         if (status != GSH_NATIVE_PLAN_OK) {
             return status;

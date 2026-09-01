@@ -6993,7 +6993,14 @@ static bool run_planned_main_builtin(shell_state *state,
                           strerror(errno));
             state->last_status = 1;
         } else {
-            state->last_status = 0;
+            int assignment_status =
+                command->command_substitution_performed
+                    ? command->command_substitution_status
+                    : 0;
+
+            state->last_status = pipeline->negated
+                                     ? (assignment_status == 0 ? 1 : 0)
+                                     : assignment_status;
         }
         state->variable_generation++;
         state->mode = MODE_EDITOR;
@@ -9410,7 +9417,15 @@ static int run_native_noninteractive_pipeline(
             return assignment_status == GSH_ASSIGNMENT_JOURNAL_ERROR ? 125
                                                                      : 1;
         }
-        return pipeline->negated ? 1 : 0;
+        {
+            int status = pipeline->commands[0]
+                                 .command_substitution_performed
+                             ? pipeline->commands[0]
+                                   .command_substitution_status
+                             : 0;
+
+            return pipeline->negated ? (status == 0 ? 1 : 0) : status;
+        }
     }
     if (pipeline->command_count == 1U && evaluator != NULL &&
         native_loop_control_builtin(&pipeline->commands[0])) {
