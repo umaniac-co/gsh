@@ -42,6 +42,7 @@
 enum {
     CAPTURE_CAP = 65536,
     TEST_TIMEOUT_MS = 3000,
+    JOB_TRANSITION_TIMEOUT_MS = 10000,
     BENCH_SHELLS = 3,
     BENCH_STARTUP_SAMPLES = 120,
     BENCH_KEY_SAMPLES = 500,
@@ -51,13 +52,17 @@ enum {
     BENCH_LATENCY_WORKLOADS = 36,
 };
 
-_Static_assert(BENCH_STARTUP_SAMPLES <= BENCHMARK_REPORT_SAMPLE_CAP,
+_Static_assert((size_t)BENCH_STARTUP_SAMPLES <=
+                   (size_t)BENCHMARK_REPORT_SAMPLE_CAP,
                "startup samples must fit the CSV schema");
-_Static_assert(BENCH_KEY_SAMPLES <= BENCHMARK_REPORT_SAMPLE_CAP,
+_Static_assert((size_t)BENCH_KEY_SAMPLES <=
+                   (size_t)BENCHMARK_REPORT_SAMPLE_CAP,
                "key samples must fit the CSV schema");
-_Static_assert(BENCH_EXEC_SAMPLES <= BENCHMARK_REPORT_SAMPLE_CAP,
+_Static_assert((size_t)BENCH_EXEC_SAMPLES <=
+                   (size_t)BENCHMARK_REPORT_SAMPLE_CAP,
                "command samples must fit the CSV schema");
-_Static_assert(BENCH_MEMORY_SAMPLES <= BENCHMARK_REPORT_SAMPLE_CAP,
+_Static_assert((size_t)BENCH_MEMORY_SAMPLES <=
+                   (size_t)BENCHMARK_REPORT_SAMPLE_CAP,
                "memory samples must fit the CSV schema");
 
 static int configure_utf8_locale(void)
@@ -1364,6 +1369,110 @@ static int ordinary_flow(const char *executable)
     return failed;
 }
 
+static int job_flow_failure(pty_session *session, const char *stage)
+{
+    int saved_errno = errno;
+
+    fprintf(stderr, "pty jobs: %s: %s\n", stage, strerror(saved_errno));
+    dump_capture(session);
+    errno = saved_errno;
+    return -1;
+}
+
+static int job_expect(pty_session *session, const char *marker,
+                      const char *stage)
+{
+    if (consume_through(session, marker, JOB_TRANSITION_TIMEOUT_MS) == -1) {
+        return job_flow_failure(session, stage);
+    }
+    return 0;
+}
+
+static int job_observe(pty_session *session, const char *marker,
+                       const char *stage)
+{
+    if (wait_for_output(session, marker, JOB_TRANSITION_TIMEOUT_MS) == -1) {
+        return job_flow_failure(session, stage);
+    }
+    return 0;
+}
+
+static int job_send(pty_session *session, const char *command,
+                    const char *stage)
+{
+    if (send_text(session, command) == -1) {
+        return job_flow_failure(session, stage);
+    }
+    return 0;
+}
+
+static int job_start_stopped(pty_session *session, const char *command,
+                             const char *job_marker)
+{
+    return job_send(session, command, "launch stopped probe") == -1 ||
+                   job_expect(session, job_marker, "observe job id") == -1 ||
+                   job_expect(session, "GSH_PROBE_READY",
+                              "observe probe readiness") == -1 ||
+                   job_expect(session, "]+ Stopped ",
+                              "observe stopped notification") == -1 ||
+                   job_expect(session, "$gsh> ",
+                              "observe prompt after stop") == -1
+               ? -1
+               : 0;
+}
+
+/* ── Job Markers And Prompts Synchronize Independently ───────────
+ * Sanitized macOS runs exposed that resumed output can trail the prompt.
+ * Consuming those events in one fixed order made a healthy shell time out.
+ * The harness now observes both markers without assigning them an order.
+ * Clearing the captured pair prevents that prompt from satisfying a later step.
+ * A dedicated bounded deadline still turns a lost transition into a failure.
+ * ─────────────────────────────────────────────────────────────── */
+static int job_resume_background(pty_session *session)
+{
+    if (job_send(session, "jobs %1 | /bin/cat\r", "send jobs pipeline") ==
+            -1 ||
+        job_expect(session, "Stopped ", "observe jobs state") == -1 ||
+        job_expect(session, "$gsh> ", "observe prompt after jobs") == -1 ||
+        job_send(session, "bg %1\r", "resume background job") == -1 ||
+        job_expect(session, "[continued ", "observe continued notice") == -1 ||
+        job_observe(session, "GSH_PROBE_CONTINUED",
+                    "observe resumed probe") == -1 ||
+        job_observe(session, "$gsh> ", "observe prompt after bg") == -1) {
+        return -1;
+    }
+    session->capture_length = 0;
+    return 0;
+}
+
+static int job_foreground_second(pty_session *session, const char *command)
+{
+    if (job_start_stopped(session, command, "[2] ") == -1 ||
+        job_send(session, "fg %2\r", "foreground second job") == -1 ||
+        job_expect(session, "GSH_PROBE_CONTINUED",
+                   "observe foreground resume") == -1) {
+        return -1;
+    }
+    if (send_bytes(session, "\003", 1U) == -1) {
+        return job_flow_failure(session, "interrupt foreground job");
+    }
+    return job_expect(session, "$gsh> ", "observe prompt after interrupt");
+}
+
+static int job_finish_background(pty_session *session)
+{
+    return job_send(
+               session,
+               "kill %1; wait %1; printf 'GSH_WAIT=%s\\n' \"$?\"\r",
+               "terminate background job") == -1 ||
+                   job_expect(session, "GSH_WAIT=143",
+                              "observe wait status") == -1 ||
+                   job_expect(session, "$gsh> ",
+                              "observe final prompt") == -1
+               ? -1
+               : 0;
+}
+
 static int job_service_control_flow(const char *executable)
 {
     char fixture[] = "/tmp/gsh-job-service-XXXXXX";
@@ -1397,36 +1506,11 @@ static int job_service_control_flow(const char *executable)
         (void)rmdir(fixture);
         return 1;
     }
-    if (consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
-        send_text(&session, command) == -1 ||
-        consume_through(&session, "[1] ", TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "GSH_PROBE_READY", TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "]+ Stopped ", TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
-        send_text(&session, "jobs %1 | /bin/cat\r") == -1 ||
-        consume_through(&session, "Stopped ", TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
-        send_text(&session, "bg %1\r") == -1 ||
-        consume_through(&session, "[continued ", TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "GSH_PROBE_CONTINUED",
-                        TEST_TIMEOUT_MS) == -1 ||
-        send_text(&session, command) == -1 ||
-        consume_through(&session, "[2] ", TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "GSH_PROBE_READY", TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "]+ Stopped ", TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
-        send_text(&session, "fg %2\r") == -1 ||
-        consume_through(&session, "GSH_PROBE_CONTINUED",
-                        TEST_TIMEOUT_MS) == -1 ||
-        send_bytes(&session, "\003", 1U) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1 ||
-        send_text(&session,
-                  "kill %1; wait %1; printf 'GSH_WAIT=%s\\n' \"$?\"\r") ==
-            -1 ||
-        consume_through(&session, "GSH_WAIT=143", TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "$gsh> ", TEST_TIMEOUT_MS) == -1) {
-        perror("pty jobs: explicit fg/bg jobspec flow");
-        dump_capture(&session);
+    if (job_expect(&session, "$gsh> ", "observe initial prompt") == -1 ||
+        job_start_stopped(&session, command, "[1] ") == -1 ||
+        job_resume_background(&session) == -1 ||
+        job_foreground_second(&session, command) == -1 ||
+        job_finish_background(&session) == -1) {
         failed = 1;
     }
     if (!failed && process_child_count(session.pid) != 1) {
@@ -5759,13 +5843,13 @@ static const char *benchmark_shell_version(const shell_spec *spec)
 
 static int write_latency_report(
     benchmark_report *report, const shell_spec specs[BENCH_SHELLS],
-    const benchmark_latency_metric metrics[BENCH_LATENCY_WORKLOADS],
+    const benchmark_latency_metric *metrics,
     size_t metric_count)
 {
     size_t metric;
     size_t shell;
 
-    if (report == NULL || metric_count == 0 ||
+    if (report == NULL || metrics == NULL || metric_count == 0 ||
         metric_count > BENCH_LATENCY_WORKLOADS) {
         errno = EINVAL;
         return -1;
