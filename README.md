@@ -37,6 +37,8 @@ POSIX-compatible only through another shell. Until the evidence above exists,
 the corresponding performance, conformance, or mission-grade statement remains
 an objective rather than a product claim.
 
+Every POSIX shell builtin is completed as a native C implementation inside gsh; delegation is never an accepted final state.
+
 The mandatory code-writing policy for human contributors and AI agents is
 [`CODE.md`](CODE.md). It adopts JPL's Power of Ten rules and gsh's Literate Code
 discipline; new and materially changed code must follow it, while legacy
@@ -53,8 +55,9 @@ The MVP already follows the central shape described by
   each command job its own PTY and cell, and exposes the next editor
   immediately; classic mode retains direct foreground terminal handoff;
 - child transitions are collected with nonblocking `waitpid()` calls;
-- asynchronous AND-OR lists use a bounded direct-child registry; `$!` and
-  reactor-driven `wait` stay with the process that actually owns those PIDs;
+- classic and managed jobs share one bounded reactor-owned service; `$!`,
+  `jobs`, `kill`, `fg`, `bg`, and `wait` use the process that owns the live
+  PID/PGID state;
 - shell output uses a fixed-size nonblocking queue;
 - the base prompt is immediate and independent from optional integrations;
 - a persistent process computes Git prompt enrichment and services eligible
@@ -135,8 +138,10 @@ directory descriptor for rollback, so a failed compound commit can restore the
 previous directory even if its pathname was renamed; directory state crosses
 the evaluator boundary through a bounded `SCM_RIGHTS` transaction rather than
 path reconstruction.
-Asynchronous AND-OR lists, `$!`, and `wait` are native. The interactive shell
-tracks at most 128 direct background children without allocation. Sequential
+Asynchronous AND-OR lists, `$!`, and `wait` are native. A unified bounded
+service tracks at most 128 user jobs across classic and managed modes, retaining
+stable job IDs, PGIDs, members, commands, running/stopped/done state,
+current/previous selection, notification, and consumption state. Sequential
 and `&&`/`||` continuations keep `wait` in the owning reactor, Ctrl-C cancels
 the wait without killing the job, and a simple external background command
 tail-`exec`s in its direct child rather than retaining an evaluator wrapper.
@@ -220,7 +225,7 @@ successful `PATH` assignment invalidates it, stale executable locations fall
 back to a fresh search, and compound mutations commit atomically while
 pipelines and subshells remain isolated. Command-local `PATH` and `command -p`
 do not pollute the owning shell's cache. Command execution remains incomplete
-for target builtins not implemented yet.
+for POSIX features outside the documented native subset.
 Function definition, deferred expansion, positional invocation scope,
 environment mutation, `return`, redefinition, and `unset -f` have native
 bounded implementations. Definition/call redirections and function execution
@@ -228,20 +233,30 @@ inside pipelines, subshells, command substitutions, and asynchronous lists are
 also native and bounded. The complete Issue 8 error/search semantics,
 performance gate, and platform evidence remain incomplete. The remaining
 `set` options beyond
-`a`/`C`/`f`/`u`, full monitor-mode job control, and the remaining nested
-expansion forms are still
-incomplete. The interactive unsupported-syntax bridge must disappear from
+`a`/`C`/`f`/`u`, monitor-mode terminal/notification edge cases, and the
+remaining nested expansion forms are still incomplete. The interactive
+unsupported-syntax bridge must disappear from
 normal shell-language execution before `gsh` can claim POSIX.1-2024
 shell-language conformance.
 
-The builtins implemented in `gsh` itself include `.`, `cd`, `command` within the
-target set described above, `eval`, `exec`, `exit`, `hash`, `pwd`, `export`,
-`readonly`, `unset`, `ulimit`, `umask`, `times`, `trap`, `:`, `true`, `false`,
-`fg`, `bg`,
-`set`, `shift`, `type`, `wait`, `break`, `continue`, `alias`, `unalias`,
-`help`, and `rt` within their currently documented contexts. The exact standalone
-interactive control submission `/async` toggles the managed REPL for the
-current session.
+The builtins implemented in `gsh` itself include `.`, `:`, `[`, `alias`, `bg`,
+`break`, `cd`, `command`, `continue`, `echo`, `eval`, `exec`, `exit`, `export`,
+`false`, `fc`, `fg`, `getopts`, `hash`, `help`, `jobs`, `kill`, `printf`, `pwd`,
+`read`, `readonly`, `return`, `rt`, `set`, `shift`, `test`, `times`, `trap`,
+`true`, `type`, `ulimit`, `umask`, `unalias`, `unset`, and `wait` within their
+documented native contexts. The exact standalone interactive control submission
+`/async` toggles the managed REPL for the current session.
+
+The protected POSIX tranche—`echo`, `printf`, `test`, `[`, `read`, `getopts`,
+`fc`, `jobs`, and `kill`—cannot reach the compatibility bridge in any command
+context. One fixed registry supplies builtin identity and execution class.
+Pure callbacks are shared by direct, redirected, pipeline, subshell,
+asynchronous, and compound execution. Stateful commits remain parent-only:
+for example, `read value < file` updates the current shell while a pipeline
+stage is isolated. `fc` launches an external editor directly when requested,
+then parses and runs the edited text with gsh. `jobs`, `kill`, `fg`, `bg`, and
+`wait` share the live reactor-owned job service; evaluator contexts reach it
+through bounded descriptor-carrying requests rather than a shell delegation.
 `ulimit` implements the POSIX.1-2024 `-H`,
 `-S`, `-a`, `-c`, `-d`, `-f`, `-n`, `-s`, `-t`, and `-v` resource interface.
 `umask` implements octal masks, `-S`, and POSIX symbolic masks including
@@ -263,7 +278,8 @@ as `htop`, editors, pagers, and terminal coding agents without command-specific
 rules. `fg` focuses the newest live job when a program has no detectable
 terminal transition, and `Ctrl-]` remains an explicit emergency return to the
 editor.
-The separate POSIX asynchronous-list registry holds 128 direct children.
+The unified job service holds at most 128 user-visible jobs and never exposes
+internal workers as jobs.
 
 ## Requirements
 
@@ -626,8 +642,8 @@ assignments use an atomic fixed-store overlay: they are visible during the
 source and exported to nested utilities, their names are restored afterward
 even if made readonly, and all other source mutations still commit.
 Function command-search and error semantics, attached redirections on the
-remaining compound commands, the remaining required builtins, monitor-mode
-job selection/notification, and dynamic
+remaining compound commands, required builtin utility pages outside the
+protected tranche, monitor-mode terminal/notification edge cases, and dynamic
 command-name or command-substitution forms of parent-owned `wait` are also
 incomplete. The 30 atomic alias requirements are verified on macOS; native
 Linux x86-64 release evidence is still required. Command
@@ -653,7 +669,7 @@ This is soft real-time engineering, not hard real-time or mission-grade status.
 The repository has executable conformance tranches, bounded fuzz/property
 checks, sanitizer builds, 94 deterministic fault cases, resource-pressure
 scenarios, and a configurable soak runner. The current native tranche contains
-563 execution cases, 30 syntax cases, and 17 deterministic limit cases with
+612 execution cases, 30 syntax cases, and 18 deterministic limit cases with
 one explicitly unsupported case and no delegated cases. The current same-source
 tranche passes the local macOS matrix, but does not gain same-revision remote
 evidence until the macOS arm64 and Ubuntu x86-64 GCC/Clang jobs run after
@@ -663,7 +679,6 @@ The normative checklist and evidence-state rules live in
 [`specs/0007.verification.md`](specs/0007.verification.md). CI defines macOS Clang
 and Linux Clang/GCC jobs, but a matrix is considered verified only after those
 jobs have actually run for the same revision; the workflow file alone is not
-evidence of a passing platform. The latest same-source local gate record is
-`dev/status/2026-08-27-alias-matrix.md` when that ignored evidence is present;
-its ARM64 Linux rows are portability evidence, not `verified-linux` release
-evidence.
+evidence of a passing platform. The current ignored suspension record is
+`dev/status/posix-2024-notes.md` when present; its global percentage remains a
+planning estimate, not a conformance or release score.
