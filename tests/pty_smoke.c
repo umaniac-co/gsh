@@ -384,6 +384,13 @@ static int start_session(pty_session *session, const char *executable,
                 }
             }
         }
+        /* ── Internal-Descriptor Tests Need a Stable First Slot ──
+         * CI launchers may leak an unrelated descriptor 3 without CLOEXEC.
+         * The exec-protection test deliberately targets the shell's first
+         * internal descriptor, so make that slot deterministic immediately
+         * before overlaying the child. Standard descriptors remain intact.
+         * ─────────────────────────────────────────────────────── */
+        (void)close(STDERR_FILENO + 1);
         if (kind == SHELL_BASH) {
             execl(executable, executable, "--noprofile", "--norc", "-i",
                   (char *)NULL);
