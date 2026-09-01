@@ -22,7 +22,9 @@ static int exercise_workspace_stack(void)
         return 1;
     }
     gsh_source_workspaces_initialize(stack);
-    if (gsh_source_workspaces_depth(stack) != 0U) {
+    if (gsh_source_workspaces_depth(stack) != 0U ||
+        gsh_aliases_count(&stack->root_aliases) != 0U ||
+        gsh_functions_count(&stack->root_functions) != 0U) {
         failed = 1;
     }
     for (index = 0; index < GSH_SOURCE_DEPTH_CAP; index++) {

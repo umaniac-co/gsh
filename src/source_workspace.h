@@ -31,6 +31,12 @@ typedef struct {
 typedef struct {
     uint32_t version;
     uint32_t depth;
+    gsh_alias_store root_aliases;
+    gsh_alias_store root_alias_scratch;
+    gsh_alias_journal root_alias_commit;
+    gsh_function_store root_functions;
+    gsh_function_store root_function_scratch;
+    char root_alias_expansion[GSH_ALIAS_EXPANSION_CAP];
     gsh_source_workspace workspaces[GSH_SOURCE_DEPTH_CAP];
 } gsh_source_workspace_stack;
 

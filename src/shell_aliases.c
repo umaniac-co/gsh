@@ -45,7 +45,15 @@ static uint32_t alias_hash(const char *name, size_t length)
 
 void gsh_aliases_initialize(gsh_alias_store *store)
 {
-    memset(store, 0, sizeof(*store));
+    /* ── Empty Metadata Leaves the Alias Arena Cold ──────────────
+     * Whole-store clearing made an empty shell fault in every text-arena page.
+     * No entry or text byte is observable while count and text_used are zero.
+     * Only the hash table must start cleared before the first insertion.
+     * Initializing metadata alone preserves semantics and demand paging.
+     * ─────────────────────────────────────────────── */
+    memset(store->hash_slots, 0, sizeof(store->hash_slots));
+    store->count = 0;
+    store->text_used = 0;
 }
 
 static bool entry_matches(const gsh_alias_store *store,

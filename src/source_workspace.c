@@ -13,10 +13,10 @@
  * Command substitution once allocated up to nine large objects per entry,
  * making latency and failure depend on allocator state after initialization.
  * Eval, dot, trap actions, and executable fallback need the same parse state.
- * One initialization-time arena now gives each active source a complete slot.
- * Strict LIFO ownership makes nesting deterministic and stale reuse detectable.
- * The fixed depth bounds address space while untouched pages stay uncommitted
- * on the supported demand-paged platforms.
+ * One initialization-time arena now owns persistent alias/function stores and
+ * gives each active source a complete slot. Strict LIFO ownership makes
+ * nesting deterministic and stale reuse detectable. The fixed depth bounds
+ * address space while untouched pages stay uncommitted on supported platforms.
  * ─────────────────────────────────────────────── */
 void gsh_source_workspaces_initialize(gsh_source_workspace_stack *stack)
 {
@@ -25,6 +25,10 @@ void gsh_source_workspaces_initialize(gsh_source_workspace_stack *stack)
     }
     stack->version = GSH_SOURCE_STACK_VERSION;
     stack->depth = 0;
+    gsh_aliases_initialize(&stack->root_aliases);
+    gsh_aliases_initialize(&stack->root_alias_scratch);
+    gsh_functions_initialize(&stack->root_functions);
+    gsh_functions_initialize(&stack->root_function_scratch);
 }
 
 gsh_source_workspace *gsh_source_workspace_acquire(

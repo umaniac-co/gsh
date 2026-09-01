@@ -97,8 +97,10 @@ evaluator processes; neither can block the interactive reactor. Nested source
 evaluation uses an eight-slot LIFO arena allocated once at startup. Each slot
 owns parser, planner, transactional, function, alias, and 1 MiB source storage,
 so entering a command substitution performs no heap allocation and depth
-exhaustion is deterministic. `-c` maps its command name and arguments to `$0`
-and the positional parameters, with native
+exhaustion is deterministic. The same allocation owns the persistent root
+alias and function stores, removing their former first-use allocations without
+faulting in their unused text and parser arenas. `-c` maps its command name and
+arguments to `$0` and the positional parameters, with native
 `$#`, numbered parameters, `$@`, `$*`, and `$-`; quoted `$@` retains its
 multi-field semantics. `set --` and operand forms replace or clear positional
 parameters in a bounded zero-fill arena; `shift` validates an unsigned decimal

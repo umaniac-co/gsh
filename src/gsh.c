@@ -425,68 +425,34 @@ static bool fault_injection_active(void)
 
 static int ensure_alias_state(shell_state *state, bool transaction)
 {
-    if (state->aliases == NULL) {
-        state->aliases = fault_should_fail("alias-allocation", ENOMEM)
-                             ? NULL
-                             : malloc(sizeof(*state->aliases));
-        if (state->aliases == NULL) {
-            return -1;
-        }
-        gsh_aliases_initialize(state->aliases);
-    }
-    if (state->alias_expansion == NULL) {
-        state->alias_expansion =
-            fault_should_fail("alias-allocation", ENOMEM)
-                ? NULL
-                : malloc(GSH_ALIAS_EXPANSION_CAP);
-        if (state->alias_expansion == NULL) {
-            return -1;
-        }
+    if (fault_should_fail("alias-allocation", ENOMEM) ||
+        state->aliases == NULL || state->alias_expansion == NULL) {
+        errno = ENOMEM;
+        return -1;
     }
     if (!transaction) {
         return 0;
     }
-    if (state->alias_scratch == NULL) {
-        state->alias_scratch =
-            fault_should_fail("alias-transaction-allocation", ENOMEM)
-                ? NULL
-                : malloc(sizeof(*state->alias_scratch));
-        if (state->alias_scratch == NULL) {
-            return -1;
-        }
-    }
-    if (state->alias_commit == NULL) {
-        state->alias_commit =
-            fault_should_fail("alias-transaction-allocation", ENOMEM)
-                ? NULL
-                : malloc(sizeof(*state->alias_commit));
-        if (state->alias_commit == NULL) {
-            return -1;
-        }
+    if (fault_should_fail("alias-transaction-allocation", ENOMEM) ||
+        state->alias_scratch == NULL || state->alias_commit == NULL) {
+        errno = ENOMEM;
+        return -1;
     }
     return 0;
 }
 
 static int ensure_function_state(shell_state *state, bool scratch)
 {
-    if (state->functions == NULL) {
-        state->functions = fault_should_fail("function-allocation", ENOMEM)
-                               ? NULL
-                               : malloc(sizeof(*state->functions));
-        if (state->functions == NULL) {
-            return -1;
-        }
-        gsh_functions_initialize(state->functions);
+    if (fault_should_fail("function-allocation", ENOMEM) ||
+        state->functions == NULL) {
+        errno = ENOMEM;
+        return -1;
     }
-    if (scratch && state->function_scratch == NULL) {
-        state->function_scratch =
-            fault_should_fail("function-compact-allocation", ENOMEM)
-                ? NULL
-                : malloc(sizeof(*state->function_scratch));
-        if (state->function_scratch == NULL) {
-            return -1;
-        }
-        gsh_functions_initialize(state->function_scratch);
+    if (scratch &&
+        (fault_should_fail("function-compact-allocation", ENOMEM) ||
+         state->function_scratch == NULL)) {
+        errno = ENOMEM;
+        return -1;
     }
     return 0;
 }
@@ -1301,6 +1267,15 @@ static int initialize_interactive(shell_state *state,
         return -1;
     }
     gsh_source_workspaces_initialize(state->source_workspaces);
+    state->aliases = &state->source_workspaces->root_aliases;
+    state->alias_expansion =
+        state->source_workspaces->root_alias_expansion;
+    state->alias_scratch =
+        &state->source_workspaces->root_alias_scratch;
+    state->alias_commit = &state->source_workspaces->root_alias_commit;
+    state->functions = &state->source_workspaces->root_functions;
+    state->function_scratch =
+        &state->source_workspaces->root_function_scratch;
     gsh_command_cache_initialize(
         state->command_cache,
         gsh_variables_path_generation(state->variables));
@@ -8355,22 +8330,16 @@ static void cleanup(shell_state *state)
     state->variable_commit = NULL;
     free(state->pipeline_changes);
     state->pipeline_changes = NULL;
-    free(state->source_workspaces);
-    state->source_workspaces = NULL;
     free(state->async_repl);
     state->async_repl = NULL;
-    free(state->alias_expansion);
     state->alias_expansion = NULL;
-    free(state->aliases);
     state->aliases = NULL;
-    free(state->alias_scratch);
     state->alias_scratch = NULL;
-    free(state->alias_commit);
     state->alias_commit = NULL;
-    free(state->functions);
     state->functions = NULL;
-    free(state->function_scratch);
     state->function_scratch = NULL;
+    free(state->source_workspaces);
+    state->source_workspaces = NULL;
     if (state->positionals != &g_interactive_positionals) {
         free(state->positionals);
     }
@@ -8426,53 +8395,6 @@ static bool storage_has_function(const gsh_parse_storage *storage)
     for (index = 0; index < storage->node_count; index++) {
         if (storage->nodes[index].kind == GSH_AST_FUNCTION) {
             return true;
-        }
-    }
-    return false;
-}
-
-static bool storage_requires_alias_state(
-    const char *input, size_t input_length,
-    const gsh_parse_storage *storage)
-{
-    size_t node_index;
-
-    if (input == NULL || storage == NULL ||
-        storage->node_count > GSH_PARSE_NODE_CAP ||
-        storage->word_count > GSH_PARSE_WORD_CAP) {
-        return false;
-    }
-    /* Alias lookup happens before expansion, but the alias builtin itself can
-     * be named by expansion. Inspect only command positions: proven literal
-     * non-aliases stay on the zero-allocation path; dynamic names enable state
-     * conservatively before planning and execution. */
-    for (node_index = 0; node_index < storage->node_count; node_index++) {
-        const gsh_ast_node *node = &storage->nodes[node_index];
-        size_t word_index;
-
-        if (node->kind != GSH_AST_SIMPLE) {
-            continue;
-        }
-        if (node->first_word > storage->word_count ||
-            node->word_count > storage->word_count - node->first_word) {
-            return false;
-        }
-        for (word_index = 0; word_index < node->word_count; word_index++) {
-            gsh_word_ref word =
-                storage->words[node->first_word + word_index];
-
-            if (word.begin > word.end || word.end > input_length) {
-                return false;
-            }
-            if (managed_assignment_name_length(input, word) != 0) {
-                continue;
-            }
-            if (literal_command_word_is(input, word, "alias") ||
-                literal_command_word_is(input, word, "unalias") ||
-                !reactor_literal_word(input, word)) {
-                return true;
-            }
-            break;
         }
     }
     return false;
@@ -12382,6 +12304,10 @@ static int execute_native_script(
         errno = EINVAL;
         return 125;
     }
+    aliases = &source_workspaces->root_aliases;
+    functions = &source_workspaces->root_functions;
+    function_scratch = &source_workspaces->root_function_scratch;
+    expanded = source_workspaces->root_alias_expansion;
     memset(&evaluator, 0, sizeof(evaluator));
     evaluator.storage = storage;
     evaluator.pipeline = pipeline;
@@ -12392,7 +12318,9 @@ static int execute_native_script(
     evaluator.command_cache = command_cache;
     evaluator.command_cache_base_generation = 1;
     gsh_options_initialize(&evaluator.options, false);
-    evaluator.aliases = NULL;
+    evaluator.aliases = aliases;
+    evaluator.functions = functions;
+    evaluator.function_scratch = function_scratch;
     evaluator.scope_base = scope_base;
     evaluator.scope_changes = scope_changes;
     evaluator.source_workspaces = source_workspaces;
@@ -12424,7 +12352,7 @@ static int execute_native_script(
 
             end = newline == NULL ? input_length
                                   : (size_t)(newline - input) + 1U;
-            if (aliases == NULL) {
+            if (gsh_aliases_count(aliases) == 0U) {
                 parsed_length = end - offset;
                 parsed = gsh_parse(input + offset, parsed_length, storage);
             } else {
@@ -12445,50 +12373,6 @@ static int execute_native_script(
             status = 2;
             break;
         }
-        if (aliases == NULL &&
-            storage_requires_alias_state(parsed_input, parsed_length,
-                                         storage)) {
-            aliases = fault_should_fail("alias-allocation", ENOMEM)
-                          ? NULL
-                          : malloc(sizeof(*aliases));
-            if (aliases == NULL) {
-                perror("gsh: alias allocation");
-                status = 125;
-                break;
-            }
-            expanded = fault_should_fail("alias-allocation", ENOMEM)
-                           ? NULL
-                           : malloc(GSH_ALIAS_EXPANSION_CAP);
-            if (expanded == NULL) {
-                perror("gsh: alias allocation");
-                status = 125;
-                break;
-            }
-            gsh_aliases_initialize(aliases);
-            evaluator.aliases = aliases;
-        }
-        if (storage_has_function(storage) && functions == NULL) {
-            functions = fault_should_fail("function-allocation", ENOMEM)
-                            ? NULL
-                            : malloc(sizeof(*functions));
-            if (functions == NULL) {
-                perror("gsh: function allocation");
-                status = 125;
-                break;
-            }
-            function_scratch =
-                fault_should_fail("function-allocation", ENOMEM)
-                    ? NULL
-                    : malloc(sizeof(*function_scratch));
-            if (function_scratch == NULL) {
-                perror("gsh: function allocation");
-                status = 125;
-                break;
-            }
-            gsh_functions_initialize(functions);
-            gsh_functions_initialize(function_scratch);
-        }
-
         memcpy(scratch, variables, sizeof(*scratch));
         evaluator.input = parsed_input;
         evaluator.input_length = parsed_length;
@@ -12524,10 +12408,6 @@ static int execute_native_script(
         }
         offset = end;
     }
-    free(aliases);
-    free(expanded);
-    free(functions);
-    free(function_scratch);
     return status;
 }
 

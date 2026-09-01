@@ -156,9 +156,11 @@ $(CONFIG_TEST_TARGET): tests/shell_config_test.c src/shell_config.c | build
 		src/shell_config.c $(LDFLAGS) -o $@
 
 $(SOURCE_WORKSPACE_TEST_TARGET): tests/source_workspace_test.c \
-		src/source_workspace.c | build
+		src/source_workspace.c src/shell_aliases.c \
+		src/shell_functions.c | build
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/source_workspace_test.c \
-		src/source_workspace.c $(LDFLAGS) -o $@
+		src/source_workspace.c src/shell_aliases.c \
+		src/shell_functions.c $(LDFLAGS) -o $@
 
 check: $(TARGET) $(HISTORY_AGENT_TARGET) $(TEST_TARGET) $(PROBE_TARGET)
 	./$(TEST_TARGET) $(abspath $(TARGET))
