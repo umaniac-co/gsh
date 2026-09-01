@@ -1422,8 +1422,8 @@ static int job_start_stopped(pty_session *session, const char *command,
 }
 
 /* ── Job Markers And Prompts Synchronize Independently ───────────
- * Sanitized macOS runs exposed that resumed output can trail the prompt.
- * Consuming those events in one fixed order made a healthy shell time out.
+ * Sanitized macOS runs exposed that resumed output can lead or trail notices.
+ * Consuming any event first could discard another one already in the capture.
  * The harness now observes both markers without assigning them an order.
  * Clearing the captured pair prevents that prompt from satisfying a later step.
  * A dedicated bounded deadline still turns a lost transition into a failure.
@@ -1435,7 +1435,7 @@ static int job_resume_background(pty_session *session)
         job_expect(session, "Stopped ", "observe jobs state") == -1 ||
         job_expect(session, "$gsh> ", "observe prompt after jobs") == -1 ||
         job_send(session, "bg %1\r", "resume background job") == -1 ||
-        job_expect(session, "[continued ", "observe continued notice") == -1 ||
+        job_observe(session, "[continued ", "observe continued notice") == -1 ||
         job_observe(session, "GSH_PROBE_CONTINUED",
                     "observe resumed probe") == -1 ||
         job_observe(session, "$gsh> ", "observe prompt after bg") == -1) {
