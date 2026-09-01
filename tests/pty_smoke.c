@@ -12,6 +12,7 @@
 #endif
 
 #include "../src/source_workspace.h"
+#include "benchmark_report.h"
 
 #include <errno.h>
 #include <dirent.h>
@@ -29,7 +30,6 @@
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/types.h>
-#include <sys/utsname.h>
 #include <sys/wait.h>
 #include <termios.h>
 #include <time.h>
@@ -48,7 +48,17 @@ enum {
     BENCH_EXEC_SAMPLES = 300,
     BENCH_MEMORY_SAMPLES = 20,
     BENCH_MEMORY_WORKLOADS = 26,
+    BENCH_LATENCY_WORKLOADS = 36,
 };
+
+_Static_assert(BENCH_STARTUP_SAMPLES <= BENCHMARK_REPORT_SAMPLE_CAP,
+               "startup samples must fit the CSV schema");
+_Static_assert(BENCH_KEY_SAMPLES <= BENCHMARK_REPORT_SAMPLE_CAP,
+               "key samples must fit the CSV schema");
+_Static_assert(BENCH_EXEC_SAMPLES <= BENCHMARK_REPORT_SAMPLE_CAP,
+               "command samples must fit the CSV schema");
+_Static_assert(BENCH_MEMORY_SAMPLES <= BENCHMARK_REPORT_SAMPLE_CAP,
+               "memory samples must fit the CSV schema");
 
 static int configure_utf8_locale(void)
 {
@@ -5286,45 +5296,6 @@ static int stabilize_gsh(pty_session *session)
     return -1;
 }
 
-static int compare_u64(const void *left, const void *right)
-{
-    uint64_t first = *(const uint64_t *)left;
-    uint64_t second = *(const uint64_t *)right;
-
-    return first < second ? -1 : first > second ? 1 : 0;
-}
-
-static double percentile_ms(const uint64_t *samples, size_t count,
-                            size_t numerator, size_t denominator)
-{
-    size_t rank = (count * numerator + denominator - 1U) / denominator;
-
-    if (rank == 0) {
-        rank = 1;
-    }
-    return (double)samples[rank - 1U] / 1000000.0;
-}
-
-static void print_metric(const char *label, uint64_t *samples, size_t count,
-                         uint64_t deadline_ns)
-{
-    size_t misses = 0;
-    size_t index;
-
-    for (index = 0; index < count; index++) {
-        if (samples[index] > deadline_ns) {
-            misses++;
-        }
-    }
-    qsort(samples, count, sizeof(samples[0]), compare_u64);
-    printf("  %-23s n=%zu p50=%7.3f p95=%7.3f p99=%7.3f max=%7.3f "
-           ">5ms=%zu\n",
-           label, count, percentile_ms(samples, count, 50, 100),
-           percentile_ms(samples, count, 95, 100),
-           percentile_ms(samples, count, 99, 100),
-           (double)samples[count - 1U] / 1000000.0, misses);
-}
-
 static int start_benchmark_session(pty_session *session,
                                    const shell_spec *spec,
                                    const char *directory, bool stabilize)
@@ -5419,18 +5390,6 @@ static int benchmark_synchronized_prompt_command(
     return 0;
 }
 
-static void print_raw_samples(const char *shell, const char *metric,
-                              const uint64_t *samples, size_t count)
-{
-    size_t index;
-
-    printf("raw-ns,%s,%s", shell, metric);
-    for (index = 0; index < count; index++) {
-        printf(",%llu", (unsigned long long)samples[index]);
-    }
-    putchar('\n');
-}
-
 static size_t paired_win_count(const uint64_t *candidate,
                                const uint64_t *peer, size_t count)
 {
@@ -5446,7 +5405,8 @@ static size_t paired_win_count(const uint64_t *candidate,
 static int direct_builtin_performance_gate(
     uint64_t echo_samples[BENCH_SHELLS][BENCH_EXEC_SAMPLES],
     uint64_t printf_samples[BENCH_SHELLS][BENCH_EXEC_SAMPLES],
-    uint64_t test_samples[BENCH_SHELLS][BENCH_EXEC_SAMPLES])
+    uint64_t test_samples[BENCH_SHELLS][BENCH_EXEC_SAMPLES],
+    size_t *bash_wins_result, size_t *zsh_wins_result)
 {
     size_t bash_wins =
         paired_win_count(echo_samples[0], echo_samples[1],
@@ -5464,8 +5424,12 @@ static int direct_builtin_performance_gate(
                          BENCH_EXEC_SAMPLES);
     size_t total = 3U * BENCH_EXEC_SAMPLES;
 
-    printf("direct-builtin paired wins: bash=%zu/%zu zsh=%zu/%zu\n",
-           bash_wins, total, zsh_wins, total);
+    if (bash_wins_result == NULL || zsh_wins_result == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+    *bash_wins_result = bash_wins;
+    *zsh_wins_result = zsh_wins;
     if (bash_wins * 2U <= total || zsh_wins * 2U <= total) {
         fprintf(stderr,
                 "pty benchmark: direct builtins did not clear the >50%% "
@@ -5473,18 +5437,6 @@ static int direct_builtin_performance_gate(
         return -1;
     }
     return 0;
-}
-
-static void print_raw_memory(const char *shell, const char *metric,
-                             const uint64_t *samples, size_t count)
-{
-    size_t index;
-
-    printf("raw-bytes,%s,%s", shell, metric);
-    for (index = 0; index < count; index++) {
-        printf(",%llu", (unsigned long long)samples[index]);
-    }
-    putchar('\n');
 }
 
 typedef struct {
@@ -5508,6 +5460,52 @@ typedef struct {
     uint64_t tree_delta[BENCH_MEMORY_WORKLOADS][BENCH_SHELLS]
                        [BENCH_MEMORY_SAMPLES];
 } benchmark_memory;
+
+static const memory_workload
+    benchmark_memory_workloads[BENCH_MEMORY_WORKLOADS] = {
+        {"external-true", NULL, "/usr/bin/true\r", "/bin/sleep 0.02\r"},
+        {"variable-lookup", "GSH_BENCH_VALUE=value\r",
+         ": \"${GSH_BENCH_VALUE}\"\r", NULL},
+        {"variable-assignment", NULL, "GSH_BENCH_ASSIGN=value\r", NULL},
+        {"parameter-assign-default", "GSH_BENCH_DEFAULT=\r",
+         ": \"${GSH_BENCH_DEFAULT:=value}\"\r", NULL},
+        {"arithmetic-assignment", "GSH_BENCH_ARITH=1\r",
+         ": \"$((GSH_BENCH_ARITH += 1))\"\r", NULL},
+        {"pipeline-scoped-assignment", "GSH_BENCH_PIPE=\r",
+         ": \"${GSH_BENCH_PIPE:=value}\" | /usr/bin/true\r",
+         ": \"${GSH_BENCH_PIPE:=value}\" | /bin/sleep 0.02\r"},
+        {"ulimit-soft-nofile", NULL, "ulimit -S -n\r", NULL},
+        {"umask-report", NULL, "umask\r", NULL},
+        {"export-assignment", NULL, "export GSH_BENCH_EXPORT=value\r", NULL},
+        {"unset-variable", "GSH_BENCH_UNSET=value\r",
+         "unset GSH_BENCH_UNSET\r", NULL},
+        {"readonly-existing", "readonly GSH_BENCH_READONLY\r",
+         "readonly GSH_BENCH_READONLY\r", NULL},
+        {"for-explicit", NULL,
+         "for GSH_BENCH_ITEM in a b c; do :; done\r", NULL},
+        {"set-positionals", NULL, "set -- a b c\r", NULL},
+        {"shift-positionals", "set -- a b c\r", "shift\r", NULL},
+        {"set-options", "set +aCfu\r", "set -aCfu\r", NULL},
+        {"allexport-assignment", "set +Cfu -a\r",
+         "GSH_BENCH_ASSIGN=value\r", NULL},
+        {"nounset-defined-lookup", "set +aCf -u\r",
+         ": \"${GSH_BENCH_VALUE}\"\r", NULL},
+        {"parameter-pattern-removal", NULL,
+         ": \"${GSH_BENCH_PATTERN##*b}\"\r", NULL},
+        {"parameter-pattern-multistar", NULL,
+         ": \"${GSH_BENCH_PATTERN_MULTI#*a*d}\"\r", NULL},
+        {"noglob-expansion", "set +aCu -f\r",
+         "/usr/bin/printf '' /dev/n[uo]ll\r", NULL},
+        {"noclobber-nonregular-redirection", "set +afu -C\r",
+         ": >/dev/null\r", NULL},
+        {"async-external-held", NULL, "/bin/sleep 0.05 &\r", "wait\r"},
+        {"wait-completed", "/usr/bin/true &\r", "wait\r", NULL},
+        {"alias-definition", NULL, "alias GSH_BENCH_ALIAS=:\r", NULL},
+        {"alias-expansion", "alias GSH_BENCH_ALIAS=:\r",
+         "GSH_BENCH_ALIAS\r", NULL},
+        {"unalias", "alias GSH_BENCH_ALIAS=:\r",
+         "unalias GSH_BENCH_ALIAS\r", NULL},
+};
 
 static int wait_for_output_sampling_tree(pty_session *session,
                                          const char *marker,
@@ -5533,235 +5531,329 @@ static int wait_for_output_sampling_tree(pty_session *session,
     return -1;
 }
 
-static void print_memory_metric(const char *label, uint64_t *samples,
-                                size_t count)
+static int measure_idle_memory_sample(const shell_spec *spec,
+                                      const char *directory,
+                                      uint64_t *shell_current,
+                                      uint64_t *tree_current)
 {
-    qsort(samples, count, sizeof(samples[0]), compare_u64);
-    printf("  %-32s n=%zu p50=%7.3f p95=%7.3f p99=%7.3f "
-           "max=%7.3f MiB\n",
-           label, count,
-           (double)samples[(count * 50U + 99U) / 100U - 1U] /
-               (1024.0 * 1024.0),
-           (double)samples[(count * 95U + 99U) / 100U - 1U] /
-               (1024.0 * 1024.0),
-           (double)samples[(count * 99U + 99U) / 100U - 1U] /
-               (1024.0 * 1024.0),
-           (double)samples[count - 1U] / (1024.0 * 1024.0));
+    pty_session session;
+    process_memory memory;
+    int64_t tree;
+    bool failed = false;
+
+    if (spec == NULL || directory == NULL || shell_current == NULL ||
+        tree_current == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (start_benchmark_session(&session, spec, directory, true) == -1) {
+        return -1;
+    }
+    if (process_memory_bytes(session.pid, &memory) == -1) {
+        failed = true;
+    }
+    tree = failed ? -1 : process_tree_memory_bytes(session.pid);
+    if (tree < 0) {
+        failed = true;
+    } else {
+        *shell_current = memory.current;
+        *tree_current = (uint64_t)tree;
+    }
+    if (stop_session(&session) == -1) {
+        failed = true;
+    }
+    return failed ? -1 : 0;
+}
+
+static int prepare_memory_sample(pty_session *session,
+                                 const shell_spec *spec,
+                                 const char *directory, size_t workload,
+                                 process_memory *before,
+                                 int64_t *before_tree)
+{
+    const memory_workload *definition;
+
+    if (session == NULL || spec == NULL || directory == NULL ||
+        before == NULL || before_tree == NULL ||
+        workload >= BENCH_MEMORY_WORKLOADS) {
+        errno = EINVAL;
+        return -1;
+    }
+    definition = &benchmark_memory_workloads[workload];
+    if (start_benchmark_session(session, spec, directory, true) == -1) {
+        return -1;
+    }
+    if (definition->setup != NULL &&
+        (send_text(session, definition->setup) == -1 ||
+         consume_through(session, spec->prompt, TEST_TIMEOUT_MS) == -1)) {
+        (void)stop_session(session);
+        return -1;
+    }
+    discard_ready_output(session);
+    if (process_memory_bytes(session->pid, before) == -1 ||
+        (*before_tree = process_tree_memory_bytes(session->pid)) < 0) {
+        (void)stop_session(session);
+        return -1;
+    }
+    return 0;
+}
+
+static int execute_memory_sample(pty_session *session,
+                                 const shell_spec *spec, size_t workload,
+                                 uint64_t *tree_peak)
+{
+    const memory_workload *definition;
+
+    if (session == NULL || spec == NULL || tree_peak == NULL ||
+        workload >= BENCH_MEMORY_WORKLOADS) {
+        errno = EINVAL;
+        return -1;
+    }
+    definition = &benchmark_memory_workloads[workload];
+    if (send_text(session, definition->command) == -1 ||
+        consume_through(session, spec->prompt, TEST_TIMEOUT_MS) == -1) {
+        return -1;
+    }
+    if (definition->held_command == NULL) {
+        return 0;
+    }
+    discard_ready_output(session);
+    return send_text(session, definition->held_command) == -1 ||
+                   wait_for_output_sampling_tree(session, spec->prompt,
+                                                 tree_peak) == -1
+               ? -1
+               : 0;
+}
+
+static int store_memory_sample(benchmark_memory *results, size_t workload,
+                               size_t shell, size_t sample,
+                               const process_memory *before,
+                               const process_memory *after,
+                               int64_t before_tree, uint64_t tree_peak)
+{
+    if (results == NULL || before == NULL || after == NULL ||
+        workload >= BENCH_MEMORY_WORKLOADS || shell >= BENCH_SHELLS ||
+        sample >= BENCH_MEMORY_SAMPLES || before_tree < 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    results->shell_peak[workload][shell][sample] = after->peak;
+    results->shell_delta[workload][shell][sample] =
+        after->peak > before->current ? after->peak - before->current : 0;
+    results->shell_growth[workload][shell][sample] =
+        after->peak > before->peak ? after->peak - before->peak : 0;
+    results->tree_peak[workload][shell][sample] = tree_peak;
+    results->tree_delta[workload][shell][sample] =
+        tree_peak > (uint64_t)before_tree
+            ? tree_peak - (uint64_t)before_tree
+            : 0;
+    return 0;
+}
+
+static int measure_workload_memory_sample(
+    const shell_spec *spec, const char *directory, size_t workload,
+    size_t shell, size_t sample, benchmark_memory *results)
+{
+    pty_session session;
+    process_memory before;
+    process_memory after;
+    int64_t before_tree;
+    int64_t tree;
+    uint64_t tree_peak;
+    bool failed = false;
+
+    if (prepare_memory_sample(&session, spec, directory, workload, &before,
+                              &before_tree) == -1) {
+        return -1;
+    }
+    tree_peak = (uint64_t)before_tree;
+    if (execute_memory_sample(&session, spec, workload, &tree_peak) == -1 ||
+        process_memory_bytes(session.pid, &after) == -1) {
+        failed = true;
+    }
+    tree = failed ? -1 : process_tree_memory_bytes(session.pid);
+    if (!failed && tree >= 0 && (uint64_t)tree > tree_peak) {
+        tree_peak = (uint64_t)tree;
+    }
+    if (!failed &&
+        store_memory_sample(results, workload, shell, sample, &before, &after,
+                            before_tree, tree_peak) == -1) {
+        failed = true;
+    }
+    if (stop_session(&session) == -1) {
+        failed = true;
+    }
+    return failed ? -1 : 0;
 }
 
 static int memory_benchmark(const shell_spec specs[BENCH_SHELLS],
                             const char *directory, size_t workload_begin,
-                            size_t workload_count)
+                            size_t workload_count,
+                            benchmark_memory *results)
 {
-    static const memory_workload workloads[BENCH_MEMORY_WORKLOADS] = {
-        {"external-true", NULL, "/usr/bin/true\r", "/bin/sleep 0.02\r"},
-        {"variable-lookup", "GSH_BENCH_VALUE=value\r",
-         ": \"${GSH_BENCH_VALUE}\"\r", NULL},
-        {"variable-assignment", NULL, "GSH_BENCH_ASSIGN=value\r", NULL},
-        {"parameter-assign-default", "GSH_BENCH_DEFAULT=\r",
-         ": \"${GSH_BENCH_DEFAULT:=value}\"\r", NULL},
-        {"arithmetic-assignment", "GSH_BENCH_ARITH=1\r",
-         ": \"$((GSH_BENCH_ARITH += 1))\"\r", NULL},
-        {"pipeline-scoped-assignment", "GSH_BENCH_PIPE=\r",
-         ": \"${GSH_BENCH_PIPE:=value}\" | /usr/bin/true\r",
-         ": \"${GSH_BENCH_PIPE:=value}\" | /bin/sleep 0.02\r"},
-        {"ulimit-soft-nofile", NULL, "ulimit -S -n\r", NULL},
-        {"umask-report", NULL, "umask\r", NULL},
-        {"export-assignment", NULL,
-         "export GSH_BENCH_EXPORT=value\r", NULL},
-        {"unset-variable", "GSH_BENCH_UNSET=value\r",
-         "unset GSH_BENCH_UNSET\r", NULL},
-        {"readonly-existing", "readonly GSH_BENCH_READONLY\r",
-         "readonly GSH_BENCH_READONLY\r", NULL},
-        {"for-explicit", NULL,
-         "for GSH_BENCH_ITEM in a b c; do :; done\r", NULL},
-        {"set-positionals", NULL, "set -- a b c\r", NULL},
-        {"shift-positionals", "set -- a b c\r", "shift\r", NULL},
-        {"set-options", "set +aCfu\r", "set -aCfu\r", NULL},
-        {"allexport-assignment",
-         "set +Cfu -a\r",
-         "GSH_BENCH_ASSIGN=value\r", NULL},
-        {"nounset-defined-lookup",
-         "set +aCf -u\r",
-         ": \"${GSH_BENCH_VALUE}\"\r", NULL},
-        {"parameter-pattern-removal",
-         NULL,
-         ": \"${GSH_BENCH_PATTERN##*b}\"\r", NULL},
-        {"parameter-pattern-multistar",
-         NULL,
-         ": \"${GSH_BENCH_PATTERN_MULTI#*a*d}\"\r", NULL},
-        {"noglob-expansion", "set +aCu -f\r",
-         "/usr/bin/printf '' /dev/n[uo]ll\r", NULL},
-        {"noclobber-nonregular-redirection", "set +afu -C\r",
-         ": >/dev/null\r", NULL},
-        {"async-external-held", NULL, "/bin/sleep 0.05 &\r", "wait\r"},
-        {"wait-completed", "/usr/bin/true &\r", "wait\r", NULL},
-        {"alias-definition", NULL,
-         "alias GSH_BENCH_ALIAS=:\r", NULL},
-        {"alias-expansion", "alias GSH_BENCH_ALIAS=:\r",
-         "GSH_BENCH_ALIAS\r", NULL},
-        {"unalias", "alias GSH_BENCH_ALIAS=:\r",
-         "unalias GSH_BENCH_ALIAS\r", NULL},
-    };
-    benchmark_memory results;
     size_t workload;
     size_t sample;
     size_t offset;
-    size_t workload_end = workload_begin + workload_count;
+    size_t workload_end;
 
-    if (workload_begin > BENCH_MEMORY_WORKLOADS ||
+    if (results == NULL || workload_begin > BENCH_MEMORY_WORKLOADS ||
         workload_count > BENCH_MEMORY_WORKLOADS - workload_begin) {
         return -1;
     }
-    memset(&results, 0, sizeof(results));
+    workload_end = workload_begin + workload_count;
+    memset(results, 0, sizeof(*results));
     for (sample = 0; sample < BENCH_MEMORY_SAMPLES; sample++) {
         for (offset = 0; offset < BENCH_SHELLS; offset++) {
             size_t shell = (sample + offset) % BENCH_SHELLS;
-            pty_session session;
-            process_memory memory;
-            int64_t tree;
 
-            if (start_benchmark_session(&session, &specs[shell], directory,
-                                        true) == -1 ||
-                process_memory_bytes(session.pid, &memory) == -1) {
+            if (measure_idle_memory_sample(
+                    &specs[shell], directory, &results->idle[shell][sample],
+                    &results->idle_tree[shell][sample]) == -1) {
                 fprintf(stderr, "pty benchmark: %s idle memory failed\n",
                         specs[shell].name);
                 return -1;
             }
-            tree = process_tree_memory_bytes(session.pid);
-            if (tree < 0) {
-                (void)stop_session(&session);
-                return -1;
-            }
-            results.idle[shell][sample] = memory.current;
-            results.idle_tree[shell][sample] = (uint64_t)tree;
-            if (stop_session(&session) == -1) {
-                return -1;
-            }
         }
     }
-    for (workload = workload_begin; workload < workload_end; workload++) {
+    for (workload = workload_begin; workload < BENCH_MEMORY_WORKLOADS &&
+                                    workload < workload_end;
+         workload++) {
         for (sample = 0; sample < BENCH_MEMORY_SAMPLES; sample++) {
             for (offset = 0; offset < BENCH_SHELLS; offset++) {
                 size_t shell = (sample + offset) % BENCH_SHELLS;
-                pty_session session;
-                process_memory before;
-                process_memory after;
-                int64_t before_tree;
-                int64_t tree;
-                uint64_t tree_peak;
 
-                if (start_benchmark_session(&session, &specs[shell],
-                                            directory, true) == -1) {
-                    return -1;
-                }
-                if (workloads[workload].setup != NULL &&
-                    (send_text(&session, workloads[workload].setup) == -1 ||
-                     consume_through(&session, specs[shell].prompt,
-                                     TEST_TIMEOUT_MS) == -1)) {
-                    (void)stop_session(&session);
-                    return -1;
-                }
-                discard_ready_output(&session);
-                if (process_memory_bytes(session.pid, &before) == -1) {
-                    (void)stop_session(&session);
-                    return -1;
-                }
-                before_tree = process_tree_memory_bytes(session.pid);
-                if (before_tree < 0) {
-                    (void)stop_session(&session);
-                    return -1;
-                }
-                tree_peak = (uint64_t)before_tree;
-                if (send_text(&session, workloads[workload].command) == -1 ||
-                    consume_through(&session, specs[shell].prompt,
-                                    TEST_TIMEOUT_MS) == -1) {
-                    (void)stop_session(&session);
-                    return -1;
-                }
-                if (workloads[workload].held_command != NULL) {
-                    discard_ready_output(&session);
-                    if (send_text(&session,
-                                  workloads[workload].held_command) == -1 ||
-                        wait_for_output_sampling_tree(
-                            &session, specs[shell].prompt, &tree_peak) == -1) {
-                        (void)stop_session(&session);
-                        return -1;
-                    }
-                }
-                if (process_memory_bytes(session.pid, &after) == -1) {
-                    (void)stop_session(&session);
-                    return -1;
-                }
-                tree = process_tree_memory_bytes(session.pid);
-                if (tree >= 0 && (uint64_t)tree > tree_peak) {
-                    tree_peak = (uint64_t)tree;
-                }
-                results.shell_peak[workload][shell][sample] = after.peak;
-                results.shell_delta[workload][shell][sample] =
-                    after.peak > before.current
-                        ? after.peak - before.current
-                        : 0;
-                results.shell_growth[workload][shell][sample] =
-                    after.peak > before.peak ? after.peak - before.peak : 0;
-                results.tree_peak[workload][shell][sample] = tree_peak;
-                results.tree_delta[workload][shell][sample] =
-                    tree_peak > (uint64_t)before_tree
-                        ? tree_peak - (uint64_t)before_tree
-                        : 0;
-                if (stop_session(&session) == -1) {
+                if (measure_workload_memory_sample(
+                        &specs[shell], directory, workload, shell, sample,
+                        results) == -1) {
                     return -1;
                 }
             }
         }
     }
 
-#if defined(__APPLE__)
-    puts("memory units: bytes raw, MiB summary; macOS physical footprint "
-         "and lifetime maximum");
-#elif defined(__linux__)
-    puts("memory units: bytes raw, MiB summary; Linux VmRSS and VmHWM");
-#else
-    puts("memory units: bytes raw, MiB summary; current RSS only");
-#endif
-    puts("memory tree peak: aggregate current memory sampled every 1 ms; "
-         "external and pipeline children are held for 20 ms");
-    for (offset = 0; offset < BENCH_SHELLS; offset++) {
-        printf("memory %s:\n", specs[offset].name);
-        print_raw_memory(specs[offset].name, "startup-idle",
-                         results.idle[offset], BENCH_MEMORY_SAMPLES);
-        print_memory_metric("startup-idle", results.idle[offset],
-                            BENCH_MEMORY_SAMPLES);
-        print_raw_memory(specs[offset].name, "startup-idle-tree",
-                         results.idle_tree[offset], BENCH_MEMORY_SAMPLES);
-        print_memory_metric("startup-idle-tree", results.idle_tree[offset],
-                            BENCH_MEMORY_SAMPLES);
-        for (workload = workload_begin; workload < workload_end; workload++) {
-            char label[96];
+    return 0;
+}
 
-#define PRINT_MEMORY_FIELD(field, suffix)                                  \
-    do {                                                                    \
-        (void)snprintf(label, sizeof(label), "%s-%s",                    \
-                       workloads[workload].label, suffix);                  \
-        print_raw_memory(specs[offset].name, label,                         \
-                         results.field[workload][offset],                   \
-                         BENCH_MEMORY_SAMPLES);                             \
-        print_memory_metric(label, results.field[workload][offset],         \
-                            BENCH_MEMORY_SAMPLES);                          \
-    } while (0)
-            PRINT_MEMORY_FIELD(shell_peak, "shell-peak");
-            PRINT_MEMORY_FIELD(shell_delta, "shell-delta-over-idle");
-            PRINT_MEMORY_FIELD(shell_growth, "shell-peak-growth");
-            PRINT_MEMORY_FIELD(tree_peak, "tree-peak");
-            PRINT_MEMORY_FIELD(tree_delta, "tree-delta-over-idle");
-#undef PRINT_MEMORY_FIELD
+typedef struct {
+    const char *test;
+    const uint64_t *samples;
+    size_t sample_count;
+} benchmark_latency_metric;
+
+static const char *benchmark_shell_version(const shell_spec *spec)
+{
+    const char *version;
+
+    if (spec == NULL) {
+        return "unknown";
+    }
+    if (spec->kind == SHELL_BASH) {
+        version = getenv("GSH_BENCH_BASH_VERSION");
+    } else if (spec->kind == SHELL_ZSH) {
+        version = getenv("GSH_BENCH_ZSH_VERSION");
+    } else {
+        version = getenv("GSH_BENCH_REVISION");
+    }
+    return version == NULL ? "unknown" : version;
+}
+
+static int write_latency_report(
+    benchmark_report *report, const shell_spec specs[BENCH_SHELLS],
+    const benchmark_latency_metric metrics[BENCH_LATENCY_WORKLOADS],
+    size_t metric_count)
+{
+    size_t metric;
+    size_t shell;
+
+    if (report == NULL || metric_count == 0 ||
+        metric_count > BENCH_LATENCY_WORKLOADS) {
+        errno = EINVAL;
+        return -1;
+    }
+    for (metric = 0; metric < BENCH_LATENCY_WORKLOADS &&
+                     metric < metric_count;
+         metric++) {
+        for (shell = 0; shell < BENCH_SHELLS; shell++) {
+            const uint64_t *samples =
+                metrics[metric].samples + shell * metrics[metric].sample_count;
+
+            if (benchmark_report_write_metric(
+                    report, "latency", metrics[metric].test,
+                    specs[shell].name, benchmark_shell_version(&specs[shell]),
+                    specs[shell].executable, "duration", "ns", samples,
+                    metrics[metric].sample_count, 5000000ULL) == -1) {
+                return -1;
+            }
+        }
+    }
+    return 0;
+}
+
+static int write_memory_metric(benchmark_report *report,
+                               const shell_spec *spec, const char *test,
+                               const char *measurement,
+                               const uint64_t samples[BENCH_MEMORY_SAMPLES])
+{
+    if (report == NULL || spec == NULL || samples == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+    return benchmark_report_write_metric(
+        report, "memory", test, spec->name, benchmark_shell_version(spec),
+        spec->executable, measurement, "bytes", samples,
+        BENCH_MEMORY_SAMPLES, 0);
+}
+
+static int write_memory_report(benchmark_report *report,
+                               const shell_spec specs[BENCH_SHELLS],
+                               const benchmark_memory *results,
+                               size_t workload_begin, size_t workload_count)
+{
+    size_t workload_end;
+    size_t shell;
+    size_t workload;
+
+    if (report == NULL || results == NULL ||
+        workload_begin > BENCH_MEMORY_WORKLOADS ||
+        workload_count > BENCH_MEMORY_WORKLOADS - workload_begin) {
+        errno = EINVAL;
+        return -1;
+    }
+    workload_end = workload_begin + workload_count;
+    for (shell = 0; shell < BENCH_SHELLS; shell++) {
+        if (write_memory_metric(report, &specs[shell], "startup-idle",
+                                "shell-current", results->idle[shell]) == -1 ||
+            write_memory_metric(report, &specs[shell], "startup-idle",
+                                "tree-current",
+                                results->idle_tree[shell]) == -1) {
+            return -1;
+        }
+        for (workload = workload_begin; workload < workload_end; workload++) {
+            const char *test = benchmark_memory_workloads[workload].label;
+
+            if (write_memory_metric(report, &specs[shell], test, "shell-peak",
+                                    results->shell_peak[workload][shell]) ==
+                    -1 ||
+                write_memory_metric(
+                    report, &specs[shell], test, "shell-delta-over-idle",
+                    results->shell_delta[workload][shell]) == -1 ||
+                write_memory_metric(
+                    report, &specs[shell], test, "shell-peak-growth",
+                    results->shell_growth[workload][shell]) == -1 ||
+                write_memory_metric(report, &specs[shell], test, "tree-peak",
+                                    results->tree_peak[workload][shell]) == -1 ||
+                write_memory_metric(
+                    report, &specs[shell], test, "tree-delta-over-idle",
+                    results->tree_delta[workload][shell]) == -1) {
+                return -1;
+            }
         }
     }
     return 0;
 }
 
 static int latency_benchmark(const char *gsh, const char *bash,
-                             const char *zsh)
+                             const char *zsh, const char *output_path)
 {
     shell_spec specs[BENCH_SHELLS] = {
         {"gsh", gsh, "$gsh> ", SHELL_GSH},
@@ -5806,8 +5898,11 @@ static int latency_benchmark(const char *gsh, const char *bash,
     uint64_t unalias_command[BENCH_SHELLS][BENCH_EXEC_SAMPLES];
     pty_session sessions[BENCH_SHELLS];
     bool started[BENCH_SHELLS] = {false, false, false};
+    benchmark_memory memory_results;
+    benchmark_report report;
     char directory[4096];
-    struct utsname platform;
+    size_t bash_wins;
+    size_t zsh_wins;
     size_t sample;
     size_t offset;
     int failed = 0;
@@ -6079,180 +6174,105 @@ done:
         return 1;
     }
     if (direct_builtin_performance_gate(
-            direct_echo, direct_printf, direct_test) == -1) return 1;
+            direct_echo, direct_printf, direct_test, &bash_wins,
+            &zsh_wins) == -1 ||
+        memory_benchmark(specs, directory, 0, BENCH_MEMORY_WORKLOADS,
+                         &memory_results) == -1) {
+        return 1;
+    }
+    {
+        const benchmark_latency_metric metrics[BENCH_LATENCY_WORKLOADS] = {
+            {"startup-to-base-prompt", &startup[0][0],
+             BENCH_STARTUP_SAMPLES},
+            {"idle-key-to-output", &key[0][0], BENCH_KEY_SAMPLES},
+            {"true-enter-to-prompt", &execution[0][0], BENCH_EXEC_SAMPLES},
+            {"direct-echo", &direct_echo[0][0], BENCH_EXEC_SAMPLES},
+            {"direct-printf", &direct_printf[0][0], BENCH_EXEC_SAMPLES},
+            {"direct-test", &direct_test[0][0], BENCH_EXEC_SAMPLES},
+            {"variable-lookup", &lookup[0][0], BENCH_EXEC_SAMPLES},
+            {"command-lookup", &command_lookup[0][0], BENCH_EXEC_SAMPLES},
+            {"command-path-cache", &command_path_cache[0][0],
+             BENCH_EXEC_SAMPLES},
+            {"variable-assignment", &assignment[0][0], BENCH_EXEC_SAMPLES},
+            {"parameter-assign-default", &assign_default[0][0],
+             BENCH_EXEC_SAMPLES},
+            {"arithmetic-assignment", &arithmetic_assignment[0][0],
+             BENCH_EXEC_SAMPLES},
+            {"pipeline-scoped-assignment", &pipeline_assignment[0][0],
+             BENCH_EXEC_SAMPLES},
+            {"ulimit-soft-nofile", &resource_limit[0][0],
+             BENCH_EXEC_SAMPLES},
+            {"umask-report", &creation_mask[0][0], BENCH_EXEC_SAMPLES},
+            {"process-times", &process_times[0][0], BENCH_EXEC_SAMPLES},
+            {"exec-descriptor-commit", &exec_descriptor[0][0],
+             BENCH_EXEC_SAMPLES},
+            {"export-assignment", &export_assignment[0][0],
+             BENCH_EXEC_SAMPLES},
+            {"unset-variable", &unset_variable[0][0], BENCH_EXEC_SAMPLES},
+            {"readonly-existing", &readonly_existing[0][0],
+             BENCH_EXEC_SAMPLES},
+            {"for-explicit", &for_explicit[0][0], BENCH_EXEC_SAMPLES},
+            {"set-positionals", &set_positionals[0][0], BENCH_EXEC_SAMPLES},
+            {"shift-positionals", &shift_positionals[0][0],
+             BENCH_EXEC_SAMPLES},
+            {"set-options", &set_options[0][0], BENCH_EXEC_SAMPLES},
+            {"allexport-assignment", &allexport_assignment[0][0],
+             BENCH_EXEC_SAMPLES},
+            {"nounset-defined-lookup", &nounset_lookup[0][0],
+             BENCH_EXEC_SAMPLES},
+            {"parameter-pattern-removal", &pattern_removal[0][0],
+             BENCH_EXEC_SAMPLES},
+            {"parameter-pattern-multistar", &pattern_multistar[0][0],
+             BENCH_EXEC_SAMPLES},
+            {"noglob-expansion", &noglob_expansion[0][0],
+             BENCH_EXEC_SAMPLES},
+            {"noclobber-redirection", &noclobber_redirection[0][0],
+             BENCH_EXEC_SAMPLES},
+            {"async-builtin-launch", &async_launch[0][0],
+             BENCH_EXEC_SAMPLES},
+            {"async-external-held-launch", &async_external_launch[0][0],
+             BENCH_EXEC_SAMPLES},
+            {"wait-completed", &wait_completed[0][0], BENCH_EXEC_SAMPLES},
+            {"alias-definition-update", &alias_definition[0][0],
+             BENCH_EXEC_SAMPLES},
+            {"alias-lookup-expansion", &alias_expansion[0][0],
+             BENCH_EXEC_SAMPLES},
+            {"unalias-definition", &unalias_command[0][0],
+             BENCH_EXEC_SAMPLES},
+        };
 
-    if (uname(&platform) == 0) {
-        printf("platform: %s %s %s, cpus=%ld, terminal=80x24, "
-               "TERM=xterm-256color\n",
-               platform.sysname, platform.release, platform.machine,
-               sysconf(_SC_NPROCESSORS_ONLN));
+        if (benchmark_report_open(&report, output_path) == -1 ||
+            write_latency_report(&report, specs, metrics,
+                                 BENCH_LATENCY_WORKLOADS) == -1 ||
+            benchmark_report_write_gate(
+                &report, "direct-builtins", specs[0].name,
+                benchmark_shell_version(&specs[0]), specs[0].executable,
+                specs[1].name, bash_wins, 3U * BENCH_EXEC_SAMPLES) == -1 ||
+            benchmark_report_write_gate(
+                &report, "direct-builtins", specs[0].name,
+                benchmark_shell_version(&specs[0]), specs[0].executable,
+                specs[2].name, zsh_wins, 3U * BENCH_EXEC_SAMPLES) == -1 ||
+            write_memory_report(&report, specs, &memory_results, 0,
+                                BENCH_MEMORY_WORKLOADS) == -1 ||
+            benchmark_report_commit(&report) == -1) {
+            perror("pty benchmark: CSV report");
+            benchmark_report_abort(&report);
+            return 1;
+        }
     }
-    puts("metric units: milliseconds; deadline column counts samples > 5 ms");
-    for (offset = 0; offset < BENCH_SHELLS; offset++) {
-        printf("%s: %s\n", specs[offset].name, specs[offset].executable);
-        print_raw_samples(specs[offset].name, "startup-to-base-prompt",
-                          startup[offset], BENCH_STARTUP_SAMPLES);
-        print_raw_samples(specs[offset].name, "idle-key-to-output",
-                          key[offset], BENCH_KEY_SAMPLES);
-        print_raw_samples(specs[offset].name, "true-enter-to-prompt",
-                          execution[offset], BENCH_EXEC_SAMPLES);
-        print_raw_samples(specs[offset].name, "direct-echo",
-                          direct_echo[offset], BENCH_EXEC_SAMPLES);
-        print_raw_samples(specs[offset].name, "direct-printf",
-                          direct_printf[offset], BENCH_EXEC_SAMPLES);
-        print_raw_samples(specs[offset].name, "direct-test",
-                          direct_test[offset], BENCH_EXEC_SAMPLES);
-        print_raw_samples(specs[offset].name, "variable-lookup",
-                          lookup[offset], BENCH_EXEC_SAMPLES);
-        print_raw_samples(specs[offset].name, "command-lookup",
-                          command_lookup[offset], BENCH_EXEC_SAMPLES);
-        print_raw_samples(specs[offset].name, "command-path-cache",
-                          command_path_cache[offset], BENCH_EXEC_SAMPLES);
-        print_raw_samples(specs[offset].name, "variable-assignment",
-                          assignment[offset], BENCH_EXEC_SAMPLES);
-        print_raw_samples(specs[offset].name, "parameter-assign-default",
-                          assign_default[offset], BENCH_EXEC_SAMPLES);
-        print_raw_samples(specs[offset].name, "arithmetic-assignment",
-                          arithmetic_assignment[offset],
-                          BENCH_EXEC_SAMPLES);
-        print_raw_samples(specs[offset].name,
-                          "pipeline-scoped-assignment",
-                          pipeline_assignment[offset],
-                          BENCH_EXEC_SAMPLES);
-        print_raw_samples(specs[offset].name, "ulimit-soft-nofile",
-                          resource_limit[offset], BENCH_EXEC_SAMPLES);
-        print_raw_samples(specs[offset].name, "umask-report",
-                          creation_mask[offset], BENCH_EXEC_SAMPLES);
-        print_raw_samples(specs[offset].name, "process-times",
-                          process_times[offset], BENCH_EXEC_SAMPLES);
-        print_raw_samples(specs[offset].name, "exec-descriptor-commit",
-                          exec_descriptor[offset], BENCH_EXEC_SAMPLES);
-        print_raw_samples(specs[offset].name, "export-assignment",
-                          export_assignment[offset], BENCH_EXEC_SAMPLES);
-        print_raw_samples(specs[offset].name, "unset-variable",
-                          unset_variable[offset], BENCH_EXEC_SAMPLES);
-        print_raw_samples(specs[offset].name, "readonly-existing",
-                          readonly_existing[offset], BENCH_EXEC_SAMPLES);
-        print_raw_samples(specs[offset].name, "for-explicit",
-                          for_explicit[offset], BENCH_EXEC_SAMPLES);
-        print_raw_samples(specs[offset].name, "set-positionals",
-                          set_positionals[offset], BENCH_EXEC_SAMPLES);
-        print_raw_samples(specs[offset].name, "shift-positionals",
-                          shift_positionals[offset], BENCH_EXEC_SAMPLES);
-        print_raw_samples(specs[offset].name, "set-options",
-                          set_options[offset], BENCH_EXEC_SAMPLES);
-        print_raw_samples(specs[offset].name, "allexport-assignment",
-                          allexport_assignment[offset],
-                          BENCH_EXEC_SAMPLES);
-        print_raw_samples(specs[offset].name, "nounset-defined-lookup",
-                          nounset_lookup[offset], BENCH_EXEC_SAMPLES);
-        print_raw_samples(specs[offset].name, "parameter-pattern-removal",
-                          pattern_removal[offset], BENCH_EXEC_SAMPLES);
-        print_raw_samples(specs[offset].name,
-                          "parameter-pattern-multistar",
-                          pattern_multistar[offset], BENCH_EXEC_SAMPLES);
-        print_raw_samples(specs[offset].name, "noglob-expansion",
-                          noglob_expansion[offset], BENCH_EXEC_SAMPLES);
-        print_raw_samples(specs[offset].name, "noclobber-redirection",
-                          noclobber_redirection[offset],
-                          BENCH_EXEC_SAMPLES);
-        print_raw_samples(specs[offset].name, "async-builtin-launch",
-                          async_launch[offset], BENCH_EXEC_SAMPLES);
-        print_raw_samples(specs[offset].name, "async-external-held-launch",
-                          async_external_launch[offset],
-                          BENCH_EXEC_SAMPLES);
-        print_raw_samples(specs[offset].name, "wait-completed",
-                          wait_completed[offset], BENCH_EXEC_SAMPLES);
-        print_raw_samples(specs[offset].name, "alias-definition-update",
-                          alias_definition[offset], BENCH_EXEC_SAMPLES);
-        print_raw_samples(specs[offset].name, "alias-lookup-expansion",
-                          alias_expansion[offset], BENCH_EXEC_SAMPLES);
-        print_raw_samples(specs[offset].name, "unalias-definition",
-                          unalias_command[offset], BENCH_EXEC_SAMPLES);
-        print_metric("startup-to-base-prompt", startup[offset],
-                     BENCH_STARTUP_SAMPLES, 5000000ULL);
-        print_metric("idle-key-to-output", key[offset], BENCH_KEY_SAMPLES,
-                     5000000ULL);
-        print_metric("true-enter-to-prompt", execution[offset],
-                     BENCH_EXEC_SAMPLES, 5000000ULL);
-        print_metric("direct-echo", direct_echo[offset],
-                     BENCH_EXEC_SAMPLES, 5000000ULL);
-        print_metric("direct-printf", direct_printf[offset],
-                     BENCH_EXEC_SAMPLES, 5000000ULL);
-        print_metric("direct-test", direct_test[offset],
-                     BENCH_EXEC_SAMPLES, 5000000ULL);
-        print_metric("variable-lookup", lookup[offset],
-                     BENCH_EXEC_SAMPLES, 5000000ULL);
-        print_metric("command-lookup", command_lookup[offset],
-                     BENCH_EXEC_SAMPLES, 5000000ULL);
-        print_metric("command-path-cache", command_path_cache[offset],
-                     BENCH_EXEC_SAMPLES, 5000000ULL);
-        print_metric("variable-assignment", assignment[offset],
-                     BENCH_EXEC_SAMPLES, 5000000ULL);
-        print_metric("parameter-assign-default", assign_default[offset],
-                     BENCH_EXEC_SAMPLES, 5000000ULL);
-        print_metric("arithmetic-assignment", arithmetic_assignment[offset],
-                     BENCH_EXEC_SAMPLES, 5000000ULL);
-        print_metric("pipeline-scoped-assignment",
-                     pipeline_assignment[offset], BENCH_EXEC_SAMPLES,
-                     5000000ULL);
-        print_metric("ulimit-soft-nofile", resource_limit[offset],
-                     BENCH_EXEC_SAMPLES, 5000000ULL);
-        print_metric("umask-report", creation_mask[offset],
-                     BENCH_EXEC_SAMPLES, 5000000ULL);
-        print_metric("process-times", process_times[offset],
-                     BENCH_EXEC_SAMPLES, 5000000ULL);
-        print_metric("exec-descriptor-commit", exec_descriptor[offset],
-                     BENCH_EXEC_SAMPLES, 5000000ULL);
-        print_metric("export-assignment", export_assignment[offset],
-                     BENCH_EXEC_SAMPLES, 5000000ULL);
-        print_metric("unset-variable", unset_variable[offset],
-                     BENCH_EXEC_SAMPLES, 5000000ULL);
-        print_metric("readonly-existing", readonly_existing[offset],
-                     BENCH_EXEC_SAMPLES, 5000000ULL);
-        print_metric("for-explicit", for_explicit[offset],
-                     BENCH_EXEC_SAMPLES, 5000000ULL);
-        print_metric("set-positionals", set_positionals[offset],
-                     BENCH_EXEC_SAMPLES, 5000000ULL);
-        print_metric("shift-positionals", shift_positionals[offset],
-                     BENCH_EXEC_SAMPLES, 5000000ULL);
-        print_metric("set-options", set_options[offset],
-                     BENCH_EXEC_SAMPLES, 5000000ULL);
-        print_metric("allexport-assignment", allexport_assignment[offset],
-                     BENCH_EXEC_SAMPLES, 5000000ULL);
-        print_metric("nounset-defined-lookup", nounset_lookup[offset],
-                     BENCH_EXEC_SAMPLES, 5000000ULL);
-        print_metric("parameter-pattern-removal", pattern_removal[offset],
-                     BENCH_EXEC_SAMPLES, 5000000ULL);
-        print_metric("parameter-pattern-multistar",
-                     pattern_multistar[offset], BENCH_EXEC_SAMPLES,
-                     5000000ULL);
-        print_metric("noglob-expansion", noglob_expansion[offset],
-                     BENCH_EXEC_SAMPLES, 5000000ULL);
-        print_metric("noclobber-redirection", noclobber_redirection[offset],
-                     BENCH_EXEC_SAMPLES, 5000000ULL);
-        print_metric("async-builtin-launch", async_launch[offset],
-                     BENCH_EXEC_SAMPLES, 5000000ULL);
-        print_metric("async-external-held-launch",
-                     async_external_launch[offset],
-                     BENCH_EXEC_SAMPLES, 5000000ULL);
-        print_metric("wait-completed", wait_completed[offset],
-                     BENCH_EXEC_SAMPLES, 5000000ULL);
-        print_metric("alias-definition-update", alias_definition[offset],
-                     BENCH_EXEC_SAMPLES, 5000000ULL);
-        print_metric("alias-lookup-expansion", alias_expansion[offset],
-                     BENCH_EXEC_SAMPLES, 5000000ULL);
-        print_metric("unalias-definition", unalias_command[offset],
-                     BENCH_EXEC_SAMPLES, 5000000ULL);
-    }
-    return memory_benchmark(specs, directory, 0,
-                            BENCH_MEMORY_WORKLOADS) == 0
-               ? 0
-               : 1;
+    printf("benchmark: pass | latency=%d | memory=%d+startup | rows=%zu\n",
+           BENCH_LATENCY_WORKLOADS, BENCH_MEMORY_WORKLOADS,
+           (size_t)BENCH_LATENCY_WORKLOADS * BENCH_SHELLS +
+               (2U + 5U * BENCH_MEMORY_WORKLOADS) * BENCH_SHELLS + 2U);
+    printf("direct-builtins: pass | bash=%zu/%u | zsh=%zu/%u\n",
+           bash_wins, 3U * BENCH_EXEC_SAMPLES, zsh_wins,
+           3U * BENCH_EXEC_SAMPLES);
+    printf("csv: %s\n", output_path);
+    return 0;
 }
 
 static int alias_benchmark(const char *gsh, const char *bash,
-                           const char *zsh)
+                           const char *zsh, const char *output_path)
 {
     shell_spec specs[BENCH_SHELLS] = {
         {"gsh", gsh, "$gsh> ", SHELL_GSH},
@@ -6264,8 +6284,9 @@ static int alias_benchmark(const char *gsh, const char *bash,
     uint64_t removal[BENCH_SHELLS][BENCH_EXEC_SAMPLES];
     pty_session sessions[BENCH_SHELLS];
     bool started[BENCH_SHELLS] = {false, false, false};
+    benchmark_memory memory_results;
+    benchmark_report report;
     char directory[4096];
-    struct utsname platform;
     size_t shell;
     int failed = 0;
 
@@ -6302,32 +6323,33 @@ done:
     if (failed) {
         return 1;
     }
-    if (uname(&platform) == 0) {
-        printf("platform: %s %s %s, cpus=%ld, terminal=80x24, "
-               "TERM=xterm-256color\n",
-               platform.sysname, platform.release, platform.machine,
-               sysconf(_SC_NPROCESSORS_ONLN));
+    if (memory_benchmark(specs, directory, BENCH_MEMORY_WORKLOADS - 3U, 3U,
+                         &memory_results) == -1) {
+        return 1;
     }
-    puts("metric units: milliseconds; deadline column counts samples > 5 ms");
-    for (shell = 0; shell < BENCH_SHELLS; shell++) {
-        printf("%s: %s\n", specs[shell].name, specs[shell].executable);
-        print_raw_samples(specs[shell].name, "alias-definition-update",
-                          definition[shell], BENCH_EXEC_SAMPLES);
-        print_raw_samples(specs[shell].name, "alias-lookup-expansion",
-                          expansion[shell], BENCH_EXEC_SAMPLES);
-        print_raw_samples(specs[shell].name, "unalias-definition",
-                          removal[shell], BENCH_EXEC_SAMPLES);
-        print_metric("alias-definition-update", definition[shell],
-                     BENCH_EXEC_SAMPLES, 5000000ULL);
-        print_metric("alias-lookup-expansion", expansion[shell],
-                     BENCH_EXEC_SAMPLES, 5000000ULL);
-        print_metric("unalias-definition", removal[shell],
-                     BENCH_EXEC_SAMPLES, 5000000ULL);
+    {
+        const benchmark_latency_metric metrics[3] = {
+            {"alias-definition-update", &definition[0][0],
+             BENCH_EXEC_SAMPLES},
+            {"alias-lookup-expansion", &expansion[0][0],
+             BENCH_EXEC_SAMPLES},
+            {"unalias-definition", &removal[0][0], BENCH_EXEC_SAMPLES},
+        };
+
+        if (benchmark_report_open(&report, output_path) == -1 ||
+            write_latency_report(&report, specs, metrics, 3U) == -1 ||
+            write_memory_report(&report, specs, &memory_results,
+                                BENCH_MEMORY_WORKLOADS - 3U, 3U) == -1 ||
+            benchmark_report_commit(&report) == -1) {
+            perror("pty alias benchmark: CSV report");
+            benchmark_report_abort(&report);
+            return 1;
+        }
     }
-    return memory_benchmark(specs, directory,
-                            BENCH_MEMORY_WORKLOADS - 3U, 3U) == 0
-               ? 0
-               : 1;
+    printf("alias benchmark: pass | latency=3 | memory=3+startup | rows=%u\n",
+           3U * BENCH_SHELLS + (2U + 5U * 3U) * BENCH_SHELLS);
+    printf("csv: %s\n", output_path);
+    return 0;
 }
 
 static uint64_t pty_fuzz_next(uint64_t *state)
@@ -6520,11 +6542,11 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    if (argc == 5 && strcmp(argv[1], "--benchmark") == 0) {
-        return latency_benchmark(argv[2], argv[3], argv[4]);
+    if (argc == 6 && strcmp(argv[1], "--benchmark") == 0) {
+        return latency_benchmark(argv[2], argv[3], argv[4], argv[5]);
     }
-    if (argc == 5 && strcmp(argv[1], "--benchmark-alias") == 0) {
-        return alias_benchmark(argv[2], argv[3], argv[4]);
+    if (argc == 6 && strcmp(argv[1], "--benchmark-alias") == 0) {
+        return alias_benchmark(argv[2], argv[3], argv[4], argv[5]);
     }
     if (argc == 3 && strcmp(argv[1], "--fault") == 0) {
         return fault_injection_flow(argv[2]);
@@ -6559,8 +6581,9 @@ int main(int argc, char **argv)
                 "       pty-harness --resource /absolute/path/to/gsh\n"
                 "       pty-harness --soak /absolute/path/to/gsh seconds\n"
                 "       pty-harness --fuzz-pty /absolute/path/to/gsh cases\n"
-                "       pty-harness --benchmark gsh bash zsh\n"
-                "       pty-harness --benchmark-alias gsh bash zsh\n");
+                "       pty-harness --benchmark gsh bash zsh report.csv\n"
+                "       pty-harness --benchmark-alias gsh bash zsh "
+                "report.csv\n");
         return 2;
     }
     if (argv[1][0] == '/') {

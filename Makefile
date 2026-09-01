@@ -21,7 +21,8 @@ SOURCES := src/gsh.c src/async_repl.c src/posix_lexer.c \
 	src/positional_parameters.c src/shell_options.c src/builtin_set.c \
 	src/builtin_shift.c src/background_jobs.c
 TEST_TARGET := build/pty-harness
-TEST_SOURCE := tests/pty_smoke.c
+TEST_SOURCES := tests/pty_smoke.c tests/benchmark_report.c
+BENCHMARK_REPORT_TEST_TARGET := build/benchmark-report-test
 PROBE_TARGET := build/job-probe
 PROBE_SOURCE := tests/job_probe.c
 FAULT_TARGET := build/gsh-fault
@@ -53,8 +54,13 @@ ANALYZE_CC ?= clang
 FUZZ_SEED_CORPUS ?= tests/corpus/lexer
 FUZZ_WORK_CORPUS ?= dev/fuzz/lexer
 PERFORMANCE_DIR ?= dev/performance
-BENCH_OUTPUT ?= $(PERFORMANCE_DIR)/current.raw.txt
-ALIAS_BENCH_OUTPUT ?= $(PERFORMANCE_DIR)/current-alias.raw.txt
+BENCH_OUTPUT ?= $(PERFORMANCE_DIR)/current.csv
+ALIAS_BENCH_OUTPUT ?= $(PERFORMANCE_DIR)/current-alias.csv
+BENCH_REVISION := $(shell revision=$$(git rev-parse --short=12 HEAD \
+	2>/dev/null || echo unknown); if test -n "$$(git status --porcelain \
+	--untracked-files=normal -- Makefile README.md CODE.md src tests \
+	2>/dev/null)"; then printf '%s-dirty' "$$revision"; else \
+	printf '%s' "$$revision"; fi)
 SODIUM_PREFIX := $(shell if command -v brew >/dev/null 2>&1; then \
 	brew --prefix libsodium 2>/dev/null; fi)
 SODIUM_CFLAGS := $(shell if command -v pkg-config >/dev/null 2>&1; then \
@@ -64,7 +70,7 @@ SODIUM_LIBS := $(shell if command -v pkg-config >/dev/null 2>&1; then \
 	pkg-config --libs libsodium 2>/dev/null; elif test -n "$(SODIUM_PREFIX)"; \
 	then echo -L$(SODIUM_PREFIX)/lib -lsodium; else echo -lsodium; fi)
 
-.PHONY: all analyze bench bench-record bench-alias bench-alias-record check check-fault check-resource check-sanitize clean
+.PHONY: all analyze bench bench-record bench-alias bench-alias-record check check-benchmark-report check-fault check-resource check-sanitize clean
 .PHONY: check-aliases check-background check-command-cache check-config check-functions check-positionals check-source-workspaces check-traps check-variables conformance fuzz-libfuzzer fuzz-pty fuzz-pty-sanitize fuzz-sanitize
 .PHONY: fuzz-smoke policy soak
 .PHONY: verify-fast
@@ -79,8 +85,13 @@ $(HISTORY_AGENT_TARGET): src/history_agent.c src/history_store.c | build
 		src/history_agent.c src/history_store.c $(LDFLAGS) \
 		$(SODIUM_LIBS) -o $@
 
-$(TEST_TARGET): $(TEST_SOURCE) | build
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(TEST_SOURCE) $(LDFLAGS) -o $@
+$(TEST_TARGET): $(TEST_SOURCES) tests/benchmark_report.h | build
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(TEST_SOURCES) $(LDFLAGS) -o $@
+
+$(BENCHMARK_REPORT_TEST_TARGET): tests/benchmark_report_test.c \
+		tests/benchmark_report.c tests/benchmark_report.h | build
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/benchmark_report_test.c \
+		tests/benchmark_report.c $(LDFLAGS) -o $@
 
 $(PROBE_TARGET): $(PROBE_SOURCE) | build
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(PROBE_SOURCE) $(LDFLAGS) -o $@
@@ -271,6 +282,9 @@ check-source-workspaces: $(SOURCE_WORKSPACE_TEST_TARGET)
 check-traps: $(SHELL_TRAPS_TEST_TARGET)
 	./$(SHELL_TRAPS_TEST_TARGET)
 
+check-benchmark-report: $(BENCHMARK_REPORT_TEST_TARGET)
+	./$(BENCHMARK_REPORT_TEST_TARGET)
+
 soak: $(TARGET) $(TEST_TARGET)
 	./$(TEST_TARGET) --soak $(abspath $(TARGET)) $(SOAK_SECONDS)
 
@@ -286,6 +300,7 @@ verify-fast:
 	$(MAKE) -j1 check-config
 	$(MAKE) -j1 check-source-workspaces
 	$(MAKE) -j1 check-traps
+	$(MAKE) -j1 check-benchmark-report
 	$(MAKE) -j1 check-aliases
 	$(MAKE) -j1 check-functions
 	$(MAKE) -j1 check-fault
@@ -295,23 +310,25 @@ verify-fast:
 	$(MAKE) -j1 fuzz-pty
 	$(MAKE) -j1 check-sanitize
 
-bench: $(TARGET) $(TEST_TARGET)
-	@$(CC) --version | sed -n '1{s/^/compiler: /;p;}'
-	@$(BASH_BIN) --version | sed -n '1{s/^/bash-version: /;p;}'
-	@$(ZSH_BIN) --version | sed -n '1{s/^/zsh-version: /;p;}'
-	./$(TEST_TARGET) --benchmark $(abspath $(TARGET)) $(BASH_BIN) $(ZSH_BIN)
+bench: $(TARGET) $(TEST_TARGET) | $(PERFORMANCE_DIR)
+	@GSH_BENCH_REVISION="$(BENCH_REVISION)" \
+	GSH_BENCH_COMPILER="$$($(CC) --version | sed -n '1p')" \
+	GSH_BENCH_BASH_VERSION="$$($(BASH_BIN) --version | sed -n '1p')" \
+	GSH_BENCH_ZSH_VERSION="$$($(ZSH_BIN) --version | sed -n '1p')" \
+	./$(TEST_TARGET) --benchmark $(abspath $(TARGET)) $(BASH_BIN) $(ZSH_BIN) \
+		$(abspath $(BENCH_OUTPUT))
 
-bench-record: $(TARGET) $(TEST_TARGET) | $(PERFORMANCE_DIR)
-	$(MAKE) --no-print-directory bench > $(BENCH_OUTPUT)
+bench-record: bench
 
-bench-alias: $(TARGET) $(TEST_TARGET)
-	@$(CC) --version | sed -n '1{s/^/compiler: /;p;}'
-	@$(BASH_BIN) --version | sed -n '1{s/^/bash-version: /;p;}'
-	@$(ZSH_BIN) --version | sed -n '1{s/^/zsh-version: /;p;}'
-	./$(TEST_TARGET) --benchmark-alias $(abspath $(TARGET)) $(BASH_BIN) $(ZSH_BIN)
+bench-alias: $(TARGET) $(TEST_TARGET) | $(PERFORMANCE_DIR)
+	@GSH_BENCH_REVISION="$(BENCH_REVISION)" \
+	GSH_BENCH_COMPILER="$$($(CC) --version | sed -n '1p')" \
+	GSH_BENCH_BASH_VERSION="$$($(BASH_BIN) --version | sed -n '1p')" \
+	GSH_BENCH_ZSH_VERSION="$$($(ZSH_BIN) --version | sed -n '1p')" \
+	./$(TEST_TARGET) --benchmark-alias $(abspath $(TARGET)) $(BASH_BIN) \
+		$(ZSH_BIN) $(abspath $(ALIAS_BENCH_OUTPUT))
 
-bench-alias-record: $(TARGET) $(TEST_TARGET) | $(PERFORMANCE_DIR)
-	$(MAKE) --no-print-directory bench-alias > $(ALIAS_BENCH_OUTPUT)
+bench-alias-record: bench-alias
 
 $(PERFORMANCE_DIR):
 	mkdir -p $@
@@ -324,6 +341,7 @@ clean:
 	rm -f $(SANITIZE_TARGET) $(FUZZ_SMOKE_TARGET) $(FUZZ_TARGET) $(POLICY_TARGET)
 	rm -f $(CONFORMANCE_TARGET)
 	rm -f $(VARIABLE_TEST_TARGET)
+	rm -f $(BENCHMARK_REPORT_TEST_TARGET)
 	rm -f $(COMMAND_CACHE_TEST_TARGET)
 	rm -f $(COMMAND_CACHE_SANITIZE_TEST_TARGET)
 	rm -f $(POSITIONAL_TEST_TARGET)

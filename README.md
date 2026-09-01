@@ -394,9 +394,25 @@ Run the reproducible clean-shell latency comparison with:
 make bench
 ```
 
-It alternates `gsh`, Bash without startup files, and Zsh with `-f`, reporting
-the tool versions, every ordered raw nanosecond sample, p50, p95, p99, maximum,
-and samples over 5 ms. All three shells emit the same-length base prompt.
+It alternates `gsh`, Bash without startup files, and Zsh with `-f`. The command
+writes the complete result to the ignored local file
+`dev/performance/current.csv` and prints only a three-line summary containing
+the gate result, matrix size, and report path. Override the destination with
+`BENCH_OUTPUT=/path/report.csv`; `make bench-record` remains an alias for the
+same recording run. The default directory is created automatically; an
+overridden destination must already have a parent directory.
+
+The CSV has one row per test, shell, and measurement. Its leading columns hold
+the revision, UTC timestamp, platform, tool versions, exact integer
+p50/p95/p99/max values, the 5 ms deadline count, and paired-win gates. The
+bounded `sample_001` through `sample_500` columns preserve every raw sample in
+measurement order; unused cells remain empty. Latency is stored in nanoseconds
+and memory in bytes so consumers never need to reverse formatted units. The
+temporary report is written only after all measurements finish, synchronized,
+and atomically renamed, so report I/O cannot enter a timed interval and a
+failed run cannot replace the previous complete CSV.
+
+All three shells emit the same-length base prompt.
 Workloads currently cover startup, idle key echo,
 `/usr/bin/true`, variable, builtin-command, and cached `PATH` lookup, assignment,
 `${parameter:=word}`, arithmetic
@@ -429,29 +445,29 @@ the ignored local `dev/performance/` directory, separately from `build/`.
 The current local worktree snapshot below is evidence for this machine, not a
 release or cross-platform performance claim. It was measured on 2026-09-01 with
 Darwin 25.5.0 arm64 (18 CPUs), Apple Clang 21.0.0, Bash 5.3.3, and Zsh 5.9.
-The complete record contains 33 latency and 26 command-memory workloads; this
+The complete record contains 36 latency and 26 command-memory workloads; this
 compact view shows startup, idle input, `exec`, and the alias paths. Cells are
 p50 / p99 milliseconds over 120 startup, 500 key, or 300 command samples:
 
 | Workload | `gsh` | Bash | Zsh |
 | --- | ---: | ---: | ---: |
-| startup | 3.199 / 3.658 | 5.411 / 6.207 | 5.919 / 6.815 |
-| idle key | 0.011 / 0.014 | 0.011 / 0.014 | 0.011 / 0.013 |
-| `exec` descriptor commit | 0.053 / 0.102 | 0.093 / 0.140 | 0.104 / 0.160 |
-| alias define/update | 0.024 / 0.029 | 0.063 / 0.077 | 0.082 / 0.097 |
-| alias lookup/expand | 0.018 / 0.026 | 0.052 / 0.060 | 0.064 / 0.074 |
-| `unalias` | 0.023 / 0.027 | 0.060 / 0.068 | 0.075 / 0.089 |
+| startup | 3.582 / 4.540 | 6.356 / 7.215 | 6.644 / 7.516 |
+| idle key | 0.011 / 0.014 | 0.011 / 0.015 | 0.010 / 0.015 |
+| `exec` descriptor commit | 0.054 / 0.106 | 0.096 / 0.145 | 0.108 / 0.149 |
+| alias define/update | 0.023 / 0.030 | 0.072 / 0.084 | 0.087 / 0.105 |
+| alias lookup/expand | 0.020 / 0.028 | 0.058 / 0.070 | 0.067 / 0.083 |
+| `unalias` | 0.022 / 0.032 | 0.066 / 0.079 | 0.080 / 0.097 |
 
 The current full repeat puts gsh below both comparison shells at p50 and p99
-for the displayed command workloads. Its main process uses 2.500 MiB at idle,
-versus 2.360 MiB for Bash and 1.875 MiB for Zsh. Its complete 3.391 MiB process
-tree is still 1.031 MiB and 1.516 MiB larger respectively because of the
+for the displayed command workloads. Its main process uses 3.094 MiB at idle,
+versus 2.344 MiB for Bash and 1.875 MiB for Zsh. Its complete 3.969 MiB process
+tree is still 1.625 MiB and 2.094 MiB larger respectively because of the
 persistent worker and preallocated language workspaces; that fixed cost remains
 an explicit optimization target. Re-run `make bench` after every affected
 implementation change; never carry a result across revisions as if it were
 fresh evidence. The full methodology, ordered raw values, percentiles, and
 first-use memory growth are in the ignored local file
-`dev/performance/current.raw.txt` when that evidence is present.
+`dev/performance/current.csv` when that evidence is present.
 
 ## Run
 
