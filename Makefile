@@ -32,6 +32,9 @@ CORE_SOURCES := src/gsh.c src/async_repl.c src/posix_lexer.c \
 	src/history_client.c src/history_store.c src/shell_config.c \
 	src/shell_variables.c src/builtin_common.c src/builtin_registry.c \
 	src/builtin_pure.c src/builtin_stateful.c src/builtin_fc.c \
+	src/builtin_files.c \
+	src/native_viewer.c \
+	src/resource_actions.c \
 	src/builtin_job_control.c src/command_cache.c \
 	src/builtin_command.c \
 	src/builtin_cd.c src/builtin_times.c src/builtin_ulimit.c \
@@ -65,6 +68,10 @@ ALIAS_TEST_TARGET := $(BUILD_DIR)/shell-aliases-test
 FUNCTION_TEST_TARGET := $(BUILD_DIR)/shell-functions-test
 FUNCTION_SANITIZE_TEST_TARGET := $(BUILD_DIR)/shell-functions-test-sanitize
 CONFIG_TEST_TARGET := $(BUILD_DIR)/shell-config-test
+FILE_BUILTINS_TEST_TARGET := $(BUILD_DIR)/file-builtins-test
+FILE_BUILTINS_SANITIZE_TEST_TARGET := $(BUILD_DIR)/file-builtins-test-sanitize
+RESOURCE_ACTIONS_TEST_TARGET := $(BUILD_DIR)/resource-actions-test
+RESOURCE_ACTIONS_SANITIZE_TEST_TARGET := $(BUILD_DIR)/resource-actions-test-sanitize
 SOURCE_WORKSPACE_TEST_TARGET := $(BUILD_DIR)/source-workspace-test
 SHELL_TRAPS_TEST_TARGET := $(BUILD_DIR)/shell-traps-test
 SHELL_TRAPS_SANITIZE_TEST_TARGET := $(BUILD_DIR)/shell-traps-test-sanitize
@@ -74,11 +81,14 @@ QUALITY_TARGETS := $(TARGET) $(HISTORY_AGENT_TARGET) $(TEST_TARGET) \
 	$(VARIABLE_TEST_TARGET) $(COMMAND_CACHE_TEST_TARGET) \
 	$(POSITIONAL_TEST_TARGET) $(BACKGROUND_TEST_TARGET) \
 	$(ALIAS_TEST_TARGET) $(FUNCTION_TEST_TARGET) $(CONFIG_TEST_TARGET) \
+	$(FILE_BUILTINS_TEST_TARGET) $(RESOURCE_ACTIONS_TEST_TARGET) \
 	$(SOURCE_WORKSPACE_TEST_TARGET) $(SHELL_TRAPS_TEST_TARGET)
 QUALITY_MAPS := $(addsuffix .map,$(QUALITY_TARGETS))
 DEPENDENCY_TARGETS := $(QUALITY_TARGETS) $(SANITIZE_TARGET) $(FUZZ_TARGET) \
 	$(COMMAND_CACHE_SANITIZE_TEST_TARGET) \
-	$(FUNCTION_SANITIZE_TEST_TARGET) $(SHELL_TRAPS_SANITIZE_TEST_TARGET)
+	$(FUNCTION_SANITIZE_TEST_TARGET) $(SHELL_TRAPS_SANITIZE_TEST_TARGET) \
+	$(FILE_BUILTINS_SANITIZE_TEST_TARGET) \
+	$(RESOURCE_ACTIONS_SANITIZE_TEST_TARGET)
 DEPENDENCY_FILES := $(addsuffix .d,$(DEPENDENCY_TARGETS))
 BASH_BIN ?= $(shell command -v bash)
 ZSH_BIN ?= $(shell command -v zsh)
@@ -111,7 +121,7 @@ SODIUM_LIBS := $(shell if command -v pkg-config >/dev/null 2>&1; then \
 	then echo -L$(SODIUM_PREFIX)/lib -lsodium; else echo -lsodium; fi)
 
 .PHONY: all analyze bench bench-record bench-alias bench-alias-record check check-benchmark-report check-fault check-resource check-sanitize clean
-.PHONY: check-aliases check-background check-command-cache check-config check-functions check-positionals check-source-workspaces check-traps check-variables conformance fuzz-libfuzzer fuzz-pty fuzz-pty-sanitize fuzz-sanitize
+.PHONY: check-aliases check-background check-command-cache check-config check-file-builtins check-functions check-positionals check-resource-actions check-source-workspaces check-traps check-variables conformance fuzz-libfuzzer fuzz-pty fuzz-pty-sanitize fuzz-sanitize
 .PHONY: fuzz-smoke fuzz-libfuzzer-linux policy quality quality-callgraph quality-compilers quality-dependencies quality-includes quality-linux quality-maps soak
 .PHONY: verify-fast
 
@@ -132,9 +142,45 @@ $(TARGET) $(HISTORY_AGENT_TARGET) $(TEST_TARGET) \
 	$(COMMAND_CACHE_TEST_TARGET) $(COMMAND_CACHE_SANITIZE_TEST_TARGET) \
 	$(POSITIONAL_TEST_TARGET) $(BACKGROUND_TEST_TARGET) \
 	$(ALIAS_TEST_TARGET) $(FUNCTION_TEST_TARGET) \
-	$(FUNCTION_SANITIZE_TEST_TARGET) $(CONFIG_TEST_TARGET) \
-	$(SOURCE_WORKSPACE_TEST_TARGET) $(SHELL_TRAPS_TEST_TARGET) \
+		$(FUNCTION_SANITIZE_TEST_TARGET) $(CONFIG_TEST_TARGET) \
+		$(FILE_BUILTINS_TEST_TARGET) $(RESOURCE_ACTIONS_TEST_TARGET) \
+		$(FILE_BUILTINS_SANITIZE_TEST_TARGET) \
+		$(RESOURCE_ACTIONS_SANITIZE_TEST_TARGET) \
+		$(SOURCE_WORKSPACE_TEST_TARGET) $(SHELL_TRAPS_TEST_TARGET) \
 	$(SHELL_TRAPS_SANITIZE_TEST_TARGET): Makefile
+
+$(FILE_BUILTINS_TEST_TARGET): tests/file_builtins_test.c \
+		src/builtin_files.c src/native_viewer.c src/shell_config.c \
+		src/builtin_common.c src/async_repl.c src/resource_actions.c | $(BUILD_DIR)
+	$(call generate_dependencies,tests/file_builtins_test.c src/builtin_files.c src/native_viewer.c src/shell_config.c src/builtin_common.c src/async_repl.c src/resource_actions.c)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/file_builtins_test.c \
+		src/builtin_files.c src/native_viewer.c src/shell_config.c \
+		src/builtin_common.c src/async_repl.c src/resource_actions.c \
+		$(LDFLAGS) $(AUDIT_LDFLAGS) -o $@
+
+$(RESOURCE_ACTIONS_TEST_TARGET): tests/resource_actions_test.c \
+		src/async_repl.c src/resource_actions.c | $(BUILD_DIR)
+	$(call generate_dependencies,tests/resource_actions_test.c src/async_repl.c src/resource_actions.c)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/resource_actions_test.c \
+		src/async_repl.c src/resource_actions.c $(LDFLAGS) \
+		$(AUDIT_LDFLAGS) -o $@
+
+$(FILE_BUILTINS_SANITIZE_TEST_TARGET): tests/file_builtins_test.c \
+		src/builtin_files.c src/native_viewer.c src/shell_config.c \
+		src/builtin_common.c src/async_repl.c src/resource_actions.c | $(BUILD_DIR)
+	$(call generate_dependencies,tests/file_builtins_test.c src/builtin_files.c src/native_viewer.c src/shell_config.c src/builtin_common.c src/async_repl.c src/resource_actions.c)
+	clang $(CPPFLAGS) -O1 -g -std=c17 -Wall -Wextra -Wpedantic \
+		-Werror -fsanitize=address,undefined tests/file_builtins_test.c \
+		src/builtin_files.c src/native_viewer.c src/shell_config.c \
+		src/builtin_common.c src/async_repl.c src/resource_actions.c \
+		$(LDFLAGS) -o $@
+
+$(RESOURCE_ACTIONS_SANITIZE_TEST_TARGET): tests/resource_actions_test.c \
+		src/async_repl.c src/resource_actions.c | $(BUILD_DIR)
+	$(call generate_dependencies,tests/resource_actions_test.c src/async_repl.c src/resource_actions.c)
+	clang $(CPPFLAGS) -O1 -g -std=c17 -Wall -Wextra -Wpedantic \
+		-Werror -fsanitize=address,undefined tests/resource_actions_test.c \
+		src/async_repl.c src/resource_actions.c $(LDFLAGS) -o $@
 
 $(TARGET): $(SOURCES) | $(BUILD_DIR)
 	$(call generate_dependencies,$(SOURCES))
@@ -173,23 +219,23 @@ $(SANITIZE_TARGET): $(SOURCES) | $(BUILD_DIR)
 	clang $(CPPFLAGS) -O1 -g -std=c17 -Wall -Wextra -Wpedantic -Werror \
 		-fsanitize=address,undefined $(SOURCES) $(LDFLAGS) -o $@
 
-$(FUZZ_SMOKE_TARGET): tests/lexer_fuzz.c src/posix_lexer.c src/posix_parser.c src/native_plan.c src/shell_aliases.c src/alias_expansion.c src/shell_functions.c src/shell_variables.c src/builtin_common.c src/async_repl.c | $(BUILD_DIR)
-	$(call generate_dependencies,tests/lexer_fuzz.c src/posix_lexer.c src/posix_parser.c src/native_plan.c src/shell_aliases.c src/alias_expansion.c src/shell_functions.c src/shell_variables.c src/builtin_common.c src/async_repl.c,-DGSH_FUZZ_STANDALONE)
+$(FUZZ_SMOKE_TARGET): tests/lexer_fuzz.c src/posix_lexer.c src/posix_parser.c src/native_plan.c src/shell_aliases.c src/alias_expansion.c src/shell_functions.c src/shell_variables.c src/builtin_common.c src/async_repl.c src/resource_actions.c | $(BUILD_DIR)
+	$(call generate_dependencies,tests/lexer_fuzz.c src/posix_lexer.c src/posix_parser.c src/native_plan.c src/shell_aliases.c src/alias_expansion.c src/shell_functions.c src/shell_variables.c src/builtin_common.c src/async_repl.c src/resource_actions.c,-DGSH_FUZZ_STANDALONE)
 	$(CC) $(CPPFLAGS) -DGSH_FUZZ_STANDALONE $(CFLAGS) \
 		tests/lexer_fuzz.c src/posix_lexer.c src/posix_parser.c \
 		src/native_plan.c src/shell_aliases.c src/alias_expansion.c \
 		src/shell_functions.c src/shell_variables.c \
-		src/builtin_common.c src/async_repl.c \
+		src/builtin_common.c src/async_repl.c src/resource_actions.c \
 		$(LDFLAGS) $(AUDIT_LDFLAGS) -o $@
 
-$(FUZZ_TARGET): tests/lexer_fuzz.c src/posix_lexer.c src/posix_parser.c src/native_plan.c src/shell_aliases.c src/alias_expansion.c src/shell_functions.c src/shell_variables.c src/builtin_common.c src/async_repl.c | $(BUILD_DIR)
-	$(call generate_dependencies,tests/lexer_fuzz.c src/posix_lexer.c src/posix_parser.c src/native_plan.c src/shell_aliases.c src/alias_expansion.c src/shell_functions.c src/shell_variables.c src/builtin_common.c src/async_repl.c)
+$(FUZZ_TARGET): tests/lexer_fuzz.c src/posix_lexer.c src/posix_parser.c src/native_plan.c src/shell_aliases.c src/alias_expansion.c src/shell_functions.c src/shell_variables.c src/builtin_common.c src/async_repl.c src/resource_actions.c | $(BUILD_DIR)
+	$(call generate_dependencies,tests/lexer_fuzz.c src/posix_lexer.c src/posix_parser.c src/native_plan.c src/shell_aliases.c src/alias_expansion.c src/shell_functions.c src/shell_variables.c src/builtin_common.c src/async_repl.c src/resource_actions.c)
 	$(FUZZ_CC) $(CPPFLAGS) -O1 -g -std=c17 -Wall -Wextra -Wpedantic \
 		-Werror -fsanitize=fuzzer,address,undefined \
 		tests/lexer_fuzz.c src/posix_lexer.c src/posix_parser.c \
 		src/native_plan.c src/shell_aliases.c src/alias_expansion.c \
 		src/shell_functions.c src/shell_variables.c \
-		src/builtin_common.c src/async_repl.c \
+		src/builtin_common.c src/async_repl.c src/resource_actions.c \
 		$(LDFLAGS) -o $@
 
 $(POLICY_TARGET): tests/source_policy.c tests/canon_call_graph.c \
@@ -283,8 +329,11 @@ $(SHELL_TRAPS_SANITIZE_TEST_TARGET): tests/shell_traps_test.c \
 		-Werror -fsanitize=address,undefined \
 		tests/shell_traps_test.c src/shell_traps.c $(LDFLAGS) -o $@
 
-check: $(TARGET) $(HISTORY_AGENT_TARGET) $(TEST_TARGET) $(PROBE_TARGET)
+check: $(TARGET) $(HISTORY_AGENT_TARGET) $(TEST_TARGET) $(PROBE_TARGET) \
+		$(FILE_BUILTINS_TEST_TARGET) $(RESOURCE_ACTIONS_TEST_TARGET)
 	$(abspath $(TEST_TARGET)) $(abspath $(TARGET))
+	$(abspath $(FILE_BUILTINS_TEST_TARGET))
+	$(abspath $(RESOURCE_ACTIONS_TEST_TARGET))
 
 check-fault: $(FAULT_TARGET) $(TEST_TARGET)
 	$(abspath $(TEST_TARGET)) --fault $(abspath $(FAULT_TARGET))
@@ -296,6 +345,8 @@ check-sanitize: $(SANITIZE_TARGET) $(HISTORY_AGENT_TARGET) \
 		$(FUNCTION_SANITIZE_TEST_TARGET) \
 		$(COMMAND_CACHE_SANITIZE_TEST_TARGET) \
 		$(SHELL_TRAPS_SANITIZE_TEST_TARGET) \
+		$(FILE_BUILTINS_SANITIZE_TEST_TARGET) \
+		$(RESOURCE_ACTIONS_SANITIZE_TEST_TARGET) \
 		$(TEST_TARGET) $(PROBE_TARGET)
 	ASAN_OPTIONS=abort_on_error=1 UBSAN_OPTIONS=halt_on_error=1 \
 		$(abspath $(TEST_TARGET)) $(abspath $(SANITIZE_TARGET))
@@ -305,6 +356,10 @@ check-sanitize: $(SANITIZE_TARGET) $(HISTORY_AGENT_TARGET) \
 		$(abspath $(COMMAND_CACHE_SANITIZE_TEST_TARGET))
 	ASAN_OPTIONS=abort_on_error=1 UBSAN_OPTIONS=halt_on_error=1 \
 		$(abspath $(SHELL_TRAPS_SANITIZE_TEST_TARGET))
+	ASAN_OPTIONS=abort_on_error=1 UBSAN_OPTIONS=halt_on_error=1 \
+		$(abspath $(FILE_BUILTINS_SANITIZE_TEST_TARGET))
+	ASAN_OPTIONS=abort_on_error=1 UBSAN_OPTIONS=halt_on_error=1 \
+		$(abspath $(RESOURCE_ACTIONS_SANITIZE_TEST_TARGET))
 
 fuzz-smoke: $(FUZZ_SMOKE_TARGET)
 	$(abspath $(FUZZ_SMOKE_TARGET)) $(FUZZ_CASES)
@@ -315,7 +370,7 @@ fuzz-sanitize: | $(BUILD_DIR)
 		tests/lexer_fuzz.c src/posix_lexer.c src/posix_parser.c \
 		src/native_plan.c src/shell_aliases.c src/alias_expansion.c \
 		src/shell_functions.c src/shell_variables.c \
-		src/builtin_common.c src/async_repl.c \
+		src/builtin_common.c src/async_repl.c src/resource_actions.c \
 		-o $(FUZZ_SMOKE_TARGET)-sanitize
 	ASAN_OPTIONS=abort_on_error=1 UBSAN_OPTIONS=halt_on_error=1 \
 		$(abspath $(FUZZ_SMOKE_TARGET))-sanitize $(FUZZ_CASES)
@@ -496,6 +551,12 @@ check-functions: $(FUNCTION_TEST_TARGET)
 
 check-config: $(CONFIG_TEST_TARGET)
 	$(abspath $(CONFIG_TEST_TARGET))
+
+check-file-builtins: $(FILE_BUILTINS_TEST_TARGET)
+	$(abspath $(FILE_BUILTINS_TEST_TARGET))
+
+check-resource-actions: $(RESOURCE_ACTIONS_TEST_TARGET)
+	$(abspath $(RESOURCE_ACTIONS_TEST_TARGET))
 
 check-source-workspaces: $(SOURCE_WORKSPACE_TEST_TARGET)
 	$(abspath $(SOURCE_WORKSPACE_TEST_TARGET))

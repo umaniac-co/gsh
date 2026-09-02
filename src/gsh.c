@@ -37,6 +37,7 @@
 #include "builtin_alias.h"
 #include "builtin_command.h"
 #include "builtin_fc.h"
+#include "builtin_files.h"
 #include "builtin_job_control.h"
 #include "builtin_pure.h"
 #include "builtin_stateful.h"
@@ -51,7 +52,7 @@
 #include "fault_injection.h"
 #include "history_client.h"
 #include "history_protocol.h"
-#include "shell_config.h"
+#include "resource_protocol.h"
 #include "source_workspace.h"
 
 #define require(condition) (condition)
@@ -229,6 +230,12 @@ typedef struct {
     char line[LINE_CAP];
     size_t line_len;
     unsigned int escape_state;
+    char mouse_sequence[64];
+    size_t mouse_sequence_length;
+    int focus_escape_cell;
+    unsigned int focus_escape_state;
+    uint64_t focus_escape_deadline_ns;
+    uint64_t editor_escape_deadline_ns;
     gsh_history_store *history;
     unsigned char *history_snapshot;
     gsh_history_client history_client;
@@ -461,6 +468,7 @@ static void start_async_external(shell_state *state, simple_command *direct);
 static void start_async_native_pipeline(
     shell_state *state, const gsh_native_pipeline *pipeline,
     const pipeline_expansion_scope *scope);
+static int create_resource_socket(int descriptors[2]);
 static bool command_uses_persistent_path(
     const gsh_native_command *command);
 static uint64_t command_cache_path_generation(
@@ -489,6 +497,7 @@ static void abandon_pending_list(shell_state *state);
 static void queue_redraw(shell_state *state);
 static bool async_transition_can_start_now(const shell_state *state);
 static void leave_managed_fullscreen(shell_state *state, int cell_index);
+static void handle_mouse_event(shell_state *state, unsigned char final);
 static const char *store_path_value(const gsh_variable_store *variables,
                                     const char *default_path);
 static int open_redirect_path(const char *target,
@@ -1032,7 +1041,7 @@ static size_t primary_prompt_text(const shell_state *state, char *prompt,
     size_t length;
 
     if (include_async_state &&
-        !gsh_async_repl_all_settled(state->async_repl)) {
+        !gsh_async_repl_prompt_settled(state->async_repl)) {
         text = ASYNC_PENDING_PROMPT;
     }
     length = strlen(text);
@@ -1302,6 +1311,18 @@ static bool managed_repl_requested(const gsh_shell_config *config)
     return config->async_repl_enabled;
 }
 
+static bool terminal_actions_requested(const gsh_shell_config *config,
+                                       bool managed)
+{
+    const char *terminal;
+    if (config == NULL || !managed) return false;
+    if (config->terminal_actions == GSH_TERMINAL_ACTIONS_OFF) return false;
+    if (config->terminal_actions == GSH_TERMINAL_ACTIONS_ON) return true;
+    terminal = getenv("TERM");
+    return terminal != NULL && terminal[0] != '\0' &&
+           strcmp(terminal, "dumb") != 0;
+}
+
 static void initialize_repl_size(shell_state *state)
 {
     if (state == NULL) return;
@@ -1385,6 +1406,7 @@ static void initialize_shell_state(shell_state *state,
     state->async_capture_cell = -1;
     state->async_state_cell = -1;
     state->async_dispatch_cell = -1;
+    state->focus_escape_cell = -1;
     state->history_client.descriptor = -1;
     state->running = true;
 }
@@ -1440,6 +1462,10 @@ static int initialize_interactive_stores(shell_state *state,
     state->command_cache_generation = 1;
     state->async_desired = managed_repl_requested(&state->config);
     gsh_async_repl_initialize(state->async_repl, state->async_desired);
+    gsh_async_repl_configure_actions(
+        state->async_repl,
+        terminal_actions_requested(&state->config, state->async_desired),
+        state->config.path_detection);
     state->variable_generation = 1;
     state->alias_generation = 1;
     state->function_generation = 1;
@@ -1765,6 +1791,32 @@ static int history_poll_timeout(const shell_state *state)
     remaining = state->history_reminder_deadline_ns - now;
     milliseconds = (remaining + 999999U) / 1000000U;
     return milliseconds > (uint64_t)INT_MAX ? INT_MAX : (int)milliseconds;
+}
+
+static int bounded_deadline_timeout(uint64_t deadline, int current)
+{
+    uint64_t now;
+    uint64_t remaining;
+    uint64_t milliseconds;
+    int timeout;
+    if (deadline == 0U) return current;
+    now = monotonic_ns();
+    if (now >= deadline) return 0;
+    remaining = deadline - now;
+    milliseconds = (remaining + 999999U) / 1000000U;
+    timeout = milliseconds > (uint64_t)INT_MAX ? INT_MAX : (int)milliseconds;
+    return current < 0 || timeout < current ? timeout : current;
+}
+
+static int reactor_poll_timeout(const shell_state *state)
+{
+    int timeout;
+    if (state == NULL) return -1;
+    timeout = history_poll_timeout(state);
+    timeout = bounded_deadline_timeout(state->focus_escape_deadline_ns,
+                                       timeout);
+    return bounded_deadline_timeout(state->editor_escape_deadline_ns,
+                                    timeout);
 }
 
 static void reclaim_terminal(shell_state *state, bool save_job_modes)
@@ -2705,7 +2757,10 @@ static int protect_exec_owner_descriptors(
                     index < GSH_ASYNC_CELL_CAP; index++) {
         if (relocate_exec_owner_fd(
                 targets, count, minimum,
-                &state_async_repl(state)->cells[index].pty_fd) == -1) {
+                &state_async_repl(state)->cells[index].pty_fd) == -1 ||
+            relocate_exec_owner_fd(
+                targets, count, minimum,
+                &state_async_repl(state)->cells[index].resource_fd) == -1) {
             return -1;
         }
     }
@@ -3676,11 +3731,12 @@ static bool is_native_command_name(const char *name)
         "exec",   "exit",    "export",   "false",    "fc",
         "fg",
         "getopts", "hash",   "help",     "history",  "jobs",
-        "kill",
+        "kill",   "ll",     "ls",
         "printf", "pwd",     "read",     "readonly", "return",
         "rt",     "set",     "shift",    "test",     "times",
         "trap",   "true",    "type",
-        "ulimit", "umask",   "unalias",  "unset",    "wait",
+        "ulimit", "umask",   "unalias",  "unset",    "view",
+        "wait",
         "case",   "do",      "done",     "elif",     "else",
         "esac",   "fi",      "for",      "function", "if",
         "in",     "select",  "then",     "time",     "until",
@@ -4326,6 +4382,29 @@ static bool native_fc_builtin(const gsh_native_command *command)
         return false;
     }
     return command->argc > 0 && strcmp(command->argv[0], "fc") == 0;
+}
+
+static gsh_file_builtin_kind native_file_builtin_kind(
+    const gsh_native_command *command)
+{
+    if (command == NULL || command->argc == 0U) return 0;
+    if (strcmp(command->argv[0], "ls") == 0) return GSH_FILE_BUILTIN_LS;
+    if (strcmp(command->argv[0], "ll") == 0) return GSH_FILE_BUILTIN_LL;
+    if (strcmp(command->argv[0], "view") == 0) return GSH_FILE_BUILTIN_VIEW;
+    return 0;
+}
+
+static bool native_file_builtin(const gsh_native_command *command)
+{
+    return native_file_builtin_kind(command) != 0;
+}
+
+static int run_native_file_builtin(const gsh_native_command *command,
+                                   const gsh_builtin_io *io)
+{
+    if (command == NULL || io == NULL) return 1;
+    return gsh_builtin_run_files(native_file_builtin_kind(command),
+                                 command->argc, command->argv, io);
 }
 
 static bool native_jobs_builtin(const gsh_native_command *command)
@@ -5163,7 +5242,7 @@ static bool native_planned_command_is_supported(
     if (native_posix_stateful_builtin(native)) {
         return true;
     }
-    if (native_fc_builtin(native)) {
+    if (native_fc_builtin(native) || native_file_builtin(native)) {
         return true;
     }
     if (native_job_control_builtin(native)) {
@@ -6821,6 +6900,10 @@ static bool primary_pipeline_builtin_status(
         *status = run_native_pure_builtin(command, &descriptor_builtin_io);
         return true;
     }
+    if (native_file_builtin(command)) {
+        *status = run_native_file_builtin(command, &descriptor_builtin_io);
+        return true;
+    }
     if (native_posix_stateful_builtin(command)) {
         *status = child_run_posix_stateful_builtin(
             command, state->variables, state->pipeline_variables,
@@ -7328,9 +7411,14 @@ static void close_child_reactor_descriptors(shell_state *state,
     }
     for (index = 0; index < GSH_ASYNC_CELL_CAP; index++) {
         int descriptor = state_async_repl(state)->cells[index].pty_fd;
+        int resource_descriptor =
+            state_async_repl(state)->cells[index].resource_fd;
 
         if (descriptor >= 0 && descriptor != retained) {
             (void)close(descriptor);
+        }
+        if (resource_descriptor >= 0 && resource_descriptor != retained) {
+            (void)close(resource_descriptor);
         }
     }
 }
@@ -7499,7 +7587,7 @@ static void start_async_external(shell_state *state, simple_command *direct)
     (void)close(gate[0]);
     if (pid == -1 || gsh_async_repl_attach(
                          state->async_repl, state->async_dispatch_cell, pid,
-                         pid, pty.master) == -1 ||
+                         pid, pty.master, -1) == -1 ||
         register_managed_job(state, state->async_dispatch_cell,
                              pid, pid) == -1) {
         int saved_errno = errno;
@@ -9728,6 +9816,7 @@ static int accept_managed_submission(shell_state *state,
     blocks_independent = barrier && command_blocks_independent(state);
     cell_index = gsh_async_repl_accept(
         state->async_repl, prompt, state->pending_line, command_length,
+        state->current_directory,
         barrier, blocks_independent, status_dependency, control);
     if (cell_index < 0) {
         state->overloads++;
@@ -9894,6 +9983,66 @@ static void erase_last_character(shell_state *state)
     queue_redraw(state);
 }
 
+static void clear_focused_escape(shell_state *state)
+{
+    if (state == NULL) return;
+    state->focus_escape_cell = -1;
+    state->focus_escape_state = 0U;
+    state->focus_escape_deadline_ns = 0U;
+    state->mouse_sequence_length = 0U;
+}
+
+static int queue_focused_escape(shell_state *state, int focused,
+                                unsigned char byte, bool include_byte)
+{
+    char sequence[4U + sizeof(state->mouse_sequence)];
+    size_t length = 0U;
+    if (state == NULL) return -1;
+    sequence[length++] = '\033';
+    if (state->focus_escape_state >= 1U) sequence[length++] = '[';
+    if (state->focus_escape_state >= 2U) {
+        sequence[length++] = '<';
+        (void)memcpy(sequence + length, state->mouse_sequence,
+                     state->mouse_sequence_length);
+        length += state->mouse_sequence_length;
+    }
+    if (include_byte) sequence[length++] = (char)byte;
+    clear_focused_escape(state);
+    return gsh_async_repl_queue_input(state->async_repl, focused,
+                                      sequence, length);
+}
+
+static bool consume_focused_escape(shell_state *state, int focused,
+                                   unsigned char byte)
+{
+    if (state == NULL || state->focus_escape_cell != focused) return false;
+    state->focus_escape_deadline_ns = monotonic_ns() + 30000000ULL;
+    if (state->focus_escape_state == 0U && byte == '[') {
+        state->focus_escape_state = 1U;
+        return true;
+    }
+    if (state->focus_escape_state == 1U && byte == '<') {
+        state->focus_escape_state = 2U;
+        state->mouse_sequence_length = 0U;
+        return true;
+    }
+    if (state->focus_escape_state == 2U &&
+        ((byte >= '0' && byte <= '9') || byte == ';')) {
+        if (state->mouse_sequence_length < sizeof(state->mouse_sequence)) {
+            state->mouse_sequence[state->mouse_sequence_length++] = (char)byte;
+            return true;
+        }
+    } else if (state->focus_escape_state == 2U &&
+               (byte == 'M' || byte == 'm')) {
+        handle_mouse_event(state, byte);
+        clear_focused_escape(state);
+        return true;
+    }
+    if (queue_focused_escape(state, focused, byte, true) == -1)
+        gsh_async_repl_unfocus(state->async_repl);
+    return true;
+}
+
 static bool route_focused_input(shell_state *state, unsigned char byte)
 {
     if (state == NULL) {
@@ -9906,7 +10055,13 @@ static bool route_focused_input(shell_state *state, unsigned char byte)
     if (focused < 0) {
         return false;
     }
-    if (byte == 0x1dU) {
+    if (consume_focused_escape(state, focused, byte)) return true;
+    if (byte == 0x1bU &&
+        state_async_repl(state)->cells[focused].fullscreen) {
+        state->focus_escape_cell = focused;
+        state->focus_escape_state = 0U;
+        state->focus_escape_deadline_ns = monotonic_ns() + 30000000ULL;
+    } else if (byte == 0x1dU) {
         leave_managed_fullscreen(state, focused);
         gsh_async_repl_unfocus(state->async_repl);
         queue_redraw(state);
@@ -9922,6 +10077,248 @@ static bool route_focused_input(shell_state *state, unsigned char byte)
         (void)raw_output_push(state, "\a", 1);
     }
     return true;
+}
+
+static void complete_pending_escapes(shell_state *state)
+{
+    uint64_t now;
+    if (state == NULL) return;
+    if (state->focus_escape_deadline_ns == 0U &&
+        state->editor_escape_deadline_ns == 0U) return;
+    now = monotonic_ns();
+    if (state->focus_escape_deadline_ns != 0U &&
+        now >= state->focus_escape_deadline_ns) {
+        int focused = gsh_async_repl_focused_job(state->async_repl);
+        if (focused == state->focus_escape_cell) {
+            if (state->focus_escape_state == 0U) {
+                leave_managed_fullscreen(state, focused);
+                gsh_async_repl_unfocus(state->async_repl);
+                queue_redraw(state);
+            } else if (queue_focused_escape(state, focused, 0U, false) == -1) {
+                gsh_async_repl_unfocus(state->async_repl);
+            }
+        }
+        clear_focused_escape(state);
+    }
+    if (state->editor_escape_deadline_ns != 0U &&
+        now >= state->editor_escape_deadline_ns) {
+        int suspended;
+        state->editor_escape_deadline_ns = 0U;
+        if (state->escape_state != 1U || state->async_repl == NULL) return;
+        state->escape_state = 0U;
+        suspended = gsh_async_repl_suspended_fullscreen(state->async_repl);
+        if (suspended >= 0 &&
+            gsh_async_repl_focus(state->async_repl, suspended) == 0) {
+            static const char redraw = '\f';
+            (void)gsh_async_repl_queue_input(state->async_repl, suspended,
+                                             &redraw, 1U);
+        } else if (state->history_search) cancel_history_search(state);
+    }
+}
+
+static void resource_notice(shell_state *state, const char *message)
+{
+    static const char command[] = "[resource action]";
+    char prompt[GSH_ASYNC_PROMPT_CAP];
+    int cell;
+    if (state == NULL || message == NULL || state->async_repl == NULL) return;
+    (void)active_prompt_text(state, prompt);
+    cell = gsh_async_repl_accept(state->async_repl, prompt, command,
+                                 sizeof(command) - 1U,
+                                 state->current_directory, false, false,
+                                 false, true);
+    if (cell < 0) { (void)raw_output_push(state, "\a", 1U); return; }
+    gsh_async_repl_starting(state->async_repl, cell);
+    (void)gsh_async_repl_append(state->async_repl, cell, message,
+                                strlen(message));
+    (void)gsh_async_repl_append(state->async_repl, cell, "\n", 1U);
+    gsh_async_repl_finish(state->async_repl, cell, 0, true);
+}
+
+static int absolute_resource_path(const gsh_async_resource_action *action,
+                                  const char *relative,
+                                  char output[PATH_MAX])
+{
+    const char *home;
+    int length;
+    if (action == NULL || relative == NULL || output == NULL) return -1;
+    if (relative[0] == '/') length = snprintf(output, PATH_MAX, "%s", relative);
+    else if (relative[0] == '~' && relative[1] == '/') {
+        home = getenv("HOME");
+        if (home == NULL || home[0] != '/') { errno = ENOENT; return -1; }
+        length = snprintf(output, PATH_MAX, "%s/%s", home, relative + 2U);
+    } else length = snprintf(output, PATH_MAX, "%s/%s",
+                             action->launch_directory, relative);
+    if (length < 0 || length >= PATH_MAX) { errno = ENAMETOOLONG; return -1; }
+    return 0;
+}
+
+static int shell_quote_resource(const char *path, char *output,
+                                size_t capacity)
+{
+    size_t source;
+    size_t used = 0U;
+    if (path == NULL || output == NULL || capacity < 3U) return -1;
+    output[used++] = '\'';
+    for (source = 0U; path[source] != '\0'; source++) {
+        static const char quote[] = "'\\''";
+        if (path[source] == '\'') {
+            if (sizeof(quote) - 1U > capacity - used) return -1;
+            (void)memcpy(output + used, quote, sizeof(quote) - 1U);
+            used += sizeof(quote) - 1U;
+        } else {
+            if (used + 1U >= capacity) return -1;
+            output[used++] = path[source];
+        }
+    }
+    if (used + 2U > capacity) return -1;
+    output[used++] = '\'';
+    output[used] = '\0';
+    return 0;
+}
+
+static int build_resource_command(gsh_resource_type type,
+                                  const char *path, const char *located,
+                                  char command[LINE_CAP])
+{
+    char quoted_path[LINE_CAP];
+    char quoted_location[LINE_CAP];
+    int length;
+    if (path == NULL || located == NULL || command == NULL ||
+        shell_quote_resource(path, quoted_path, sizeof(quoted_path)) == -1 ||
+        shell_quote_resource(located, quoted_location,
+                             sizeof(quoted_location)) == -1) return -1;
+    if (type == GSH_RESOURCE_REGULAR) {
+        length = snprintf(command, LINE_CAP, "view -- %s", quoted_location);
+    } else if (type == GSH_RESOURCE_DIRECTORY) {
+        length = snprintf(command, LINE_CAP, "cd -- %s && ll", quoted_path);
+    } else {
+        length = snprintf(command, LINE_CAP,
+                          "if test -d %s; then cd -- %s && ll; "
+                          "else view -- %s; fi",
+                          quoted_path, quoted_path, quoted_location);
+    }
+    if (length < 0 || (size_t)length >= LINE_CAP) {
+        errno = EOVERFLOW;
+        return -1;
+    }
+    return 0;
+}
+
+static int submit_resource_command(shell_state *state, const char *command,
+                                   bool directory)
+{
+    char prompt[GSH_ASYNC_PROMPT_CAP];
+    size_t length;
+    int cell;
+    if (state == NULL || command == NULL || state->async_repl == NULL) return -1;
+    length = strlen(command);
+    (void)active_prompt_text(state, prompt);
+    cell = gsh_async_repl_accept(state->async_repl, prompt, command, length,
+                                 state->current_directory, directory,
+                                 directory, false, false);
+    if (cell < 0) return -1;
+    state_async_repl(state)->scroll_offset = 0U;
+    state_async_repl(state)->render_pending = true;
+    return 0;
+}
+
+static void perform_resource_action(shell_state *state,
+                                    const gsh_async_resource_action *action)
+{
+    char path[PATH_MAX];
+    char located[PATH_MAX + 64U];
+    char command[LINE_CAP];
+    int length;
+    if (state == NULL || action == NULL) return;
+    errno = 0;
+    if (absolute_resource_path(action, action->path, path) == -1) {
+        char message[PATH_MAX + 128U];
+        (void)snprintf(message, sizeof(message), "resource unavailable: %s: %s",
+                       action->path, strerror(errno));
+        resource_notice(state, message);
+        return;
+    }
+    if (action->type != GSH_RESOURCE_DIRECTORY && action->line != 0U) {
+        length = snprintf(located, sizeof(located), "%s:%zu:%zu", path,
+                          action->line, action->column == 0U ? 1U : action->column);
+        if (length < 0 || (size_t)length >= sizeof(located)) return;
+    } else (void)snprintf(located, sizeof(located), "%s", path);
+    if (build_resource_command(action->type, path, located, command) == -1 ||
+        submit_resource_command(state, command,
+                                action->type != GSH_RESOURCE_REGULAR) == -1) {
+        resource_notice(state, "cannot queue resource action");
+    }
+}
+
+static bool parse_mouse_numbers(const char *text, size_t length,
+                                size_t values[3])
+{
+    size_t part = 0U;
+    size_t index;
+    if (text == NULL || values == NULL) return false;
+    (void)memset(values, 0, 3U * sizeof(values[0]));
+    for (index = 0U; index < length; index++) {
+        if (text[index] == ';') { if (++part >= 3U) return false; continue; }
+        if (text[index] < '0' || text[index] > '9' ||
+            values[part] > (SIZE_MAX - (size_t)(text[index] - '0')) / 10U) return false;
+        values[part] = values[part] * 10U + (size_t)(text[index] - '0');
+    }
+    return part == 2U;
+}
+
+static void handle_mouse_event(shell_state *state, unsigned char final)
+{
+    size_t values[3];
+    size_t separator_column = 0U;
+    gsh_async_resource_action action;
+    int focused;
+    int preview;
+    if (state == NULL ||
+        !parse_mouse_numbers(state->mouse_sequence,
+                             state->mouse_sequence_length, values) ||
+        state->async_repl == NULL) return;
+    preview = gsh_async_repl_split_preview(state->async_repl,
+                                           &separator_column);
+    focused = gsh_async_repl_focused_job(state->async_repl);
+    if (final == 'M' && (values[0] & 64U) != 0U) {
+        if (preview >= 0 && focused == preview &&
+            values[1] > separator_column) {
+            static const char up[] = "kkk";
+            static const char down[] = "jjj";
+            const char *motion = (values[0] & 1U) == 0U ? up : down;
+            (void)gsh_async_repl_queue_input(state->async_repl, preview,
+                                             motion, sizeof(up) - 1U);
+        } else {
+            gsh_async_repl_scroll(state->async_repl,
+                                  (values[0] & 1U) == 0U ? 3L : -3L);
+        }
+        return;
+    }
+    if (final != 'M' || (values[0] & 32U) != 0U ||
+        (values[0] & 3U) != 0U) return;
+    if (preview >= 0 && values[1] > separator_column &&
+        focused != preview &&
+        gsh_async_repl_focus(state->async_repl, preview) == 0) {
+        static const char redraw = '\f';
+        (void)gsh_async_repl_queue_input(state->async_repl, preview,
+                                         &redraw, 1U);
+        return;
+    }
+    if (gsh_async_repl_resource_at(state->async_repl, values[2], values[1],
+                                   &action) == 0) {
+        if (preview >= 0 && focused == preview) {
+            static const char close = 'q';
+            if (gsh_async_repl_queue_input(state->async_repl, preview,
+                                           &close, 1U) == -1) {
+                (void)raw_output_push(state, "\a", 1U);
+                return;
+            }
+            leave_managed_fullscreen(state, preview);
+            gsh_async_repl_unfocus(state->async_repl);
+        }
+        perform_resource_action(state, &action);
+    }
 }
 
 static bool process_managed_editor_signal(shell_state *state,
@@ -9946,6 +10343,7 @@ static bool process_escape_input(shell_state *state, unsigned char byte)
 {
     if (state == NULL) return false;
     if (state->escape_state == 1) {
+        state->editor_escape_deadline_ns = 0U;
         if (byte == '[' || byte == 'O') {
             state->escape_state = 2U;
         } else {
@@ -9957,6 +10355,11 @@ static bool process_escape_input(shell_state *state, unsigned char byte)
         return true;
     }
     if (state->escape_state == 2) {
+        if (byte == '<') {
+            state->escape_state = 3U;
+            state->mouse_sequence_length = 0U;
+            return true;
+        }
         if (byte >= 0x40U && byte <= 0x7eU) {
             state->escape_state = 0;
             if (byte == 'A') {
@@ -9975,6 +10378,18 @@ static bool process_escape_input(shell_state *state, unsigned char byte)
                 accept_history_search(state);
             }
         }
+        return true;
+    }
+    if (state->escape_state == 3U) {
+        if (byte == 'M' || byte == 'm') {
+            handle_mouse_event(state, byte);
+            state->escape_state = 0U;
+            state->mouse_sequence_length = 0U;
+        } else if ((byte >= '0' && byte <= '9') || byte == ';') {
+            if (state->mouse_sequence_length < sizeof(state->mouse_sequence))
+                state->mouse_sequence[state->mouse_sequence_length++] = (char)byte;
+            else state->escape_state = 0U;
+        } else state->escape_state = 0U;
         return true;
     }
     return false;
@@ -10045,6 +10460,7 @@ static bool process_editor_control(shell_state *state, unsigned char byte)
     }
     if (byte == 0x1bU) {
         state->escape_state = 1;
+        state->editor_escape_deadline_ns = monotonic_ns() + 30000000ULL;
         return true;
     }
     if (byte == '\r' || byte == '\n') {
@@ -10091,6 +10507,7 @@ static void insert_editor_byte(shell_state *state, unsigned char byte)
         state->line[state->line_len++] = (char)byte;
         state->line[state->line_len] = '\0';
         if (state->async_repl != NULL && state_async_repl(state)->enabled) {
+            state_async_repl(state)->scroll_offset = 0U;
             state_async_repl(state)->render_pending = true;
         } else {
             (void)output_push(state, (const char *)&byte, 1);
@@ -10570,7 +10987,8 @@ enum { GSH_REACTOR_BASE_FDS = 5 };
 
 static size_t add_managed_poll_descriptors(
     shell_state *state,
-    struct pollfd descriptors[GSH_REACTOR_BASE_FDS + GSH_ASYNC_CELL_CAP])
+    struct pollfd descriptors[
+        GSH_REACTOR_BASE_FDS + 2U * GSH_ASYNC_CELL_CAP])
 {
     if (state == NULL) return 0U;
     if (descriptors == NULL) {
@@ -10583,18 +11001,22 @@ static size_t add_managed_poll_descriptors(
         return count;
     }
     for (index = 0; index < GSH_ASYNC_CELL_CAP; index++) {
-        int descriptor = state_async_repl(state)->cells[index].pty_fd;
+        int descriptor = state_async_repl(state)->cells[index].resource_fd;
 
-        if (descriptor < 0) {
-            continue;
+        if (descriptor >= 0) {
+            descriptors[count] = (struct pollfd){descriptor, POLLIN, 0};
+            count++;
         }
-        descriptors[count].fd = descriptor;
-        descriptors[count].events = POLLIN;
-        if (gsh_async_repl_input_pending(state->async_repl, index)) {
-            descriptors[count].events |= POLLOUT;
+        descriptor = state_async_repl(state)->cells[index].pty_fd;
+        if (descriptor >= 0) {
+            descriptors[count].fd = descriptor;
+            descriptors[count].events = POLLIN;
+            if (gsh_async_repl_input_pending(state->async_repl, index)) {
+                descriptors[count].events |= POLLOUT;
+            }
+            descriptors[count].revents = 0;
+            count++;
         }
-        descriptors[count].revents = 0;
-        count++;
     }
     return count;
 }
@@ -10644,13 +11066,49 @@ static void note_managed_private_input(shell_state *state, int cell_index)
     }
 }
 
+static bool output_requests_fullscreen(const char *bytes, size_t length)
+{
+    static const char *const requests[] = {
+        "\033[?47h", "\033[?1047h", "\033[?1049h"};
+    size_t request;
+    if (bytes == NULL) return false;
+    for (request = 0U;
+         request < sizeof(requests) / sizeof(requests[0]); request++) {
+        size_t wanted = strlen(requests[request]);
+        size_t offset;
+        for (offset = 0U; offset + wanted <= length; offset++) {
+            if (memcmp(bytes + offset, requests[request], wanted) == 0)
+                return true;
+        }
+    }
+    return false;
+}
+
+static bool push_managed_preview_base(shell_state *state)
+{
+    char prompt[GSH_ASYNC_PROMPT_CAP];
+    const char *render;
+    size_t length;
+    if (state == NULL || state->async_repl == NULL) return false;
+    (void)active_prompt_text(state, prompt);
+    if (gsh_async_repl_prepare_render(state->async_repl, prompt,
+                                      state->line, state->line_len) == -1)
+        return false;
+    render = gsh_async_repl_render_data(state->async_repl);
+    length = gsh_async_repl_render_length(state->async_repl);
+    if (!raw_output_push(state, render, length)) return false;
+    gsh_async_repl_rendered(state->async_repl);
+    return true;
+}
+
 static void leave_managed_fullscreen(shell_state *state, int cell_index)
 {
     if (state == NULL) return;
     static const char restore[] =
         "\033[0m\033[?25h\033[?1000l\033[?1002l\033[?1003l"
         "\033[?1004l\033[?1006l\033[?1015l\033[?2004l\033[?2026l"
-        "\033[>4;0m\033[<u\033>\033[H\033[2J";
+        "\033[>4;0m\033[<u\033>\033[H\033[2J\033[3J";
+    static const char split_restore[] = "\033[0m\033[?25h";
     gsh_async_cell *cell;
 
     if (state->async_repl == NULL || cell_index < 0 ||
@@ -10661,7 +11119,10 @@ static void leave_managed_fullscreen(shell_state *state, int cell_index)
     if (!cell->fullscreen_presented) {
         return;
     }
-    (void)raw_output_push(state, restore, sizeof(restore) - 1U);
+    if (cell->preview_split)
+        (void)raw_output_push(state, split_restore,
+                              sizeof(split_restore) - 1U);
+    else (void)raw_output_push(state, restore, sizeof(restore) - 1U);
     cell->fullscreen_presented = false;
     cell->passthrough_state = 0;
     cell->passthrough_utf8_length = 0;
@@ -10677,17 +11138,22 @@ static void present_managed_fullscreen(shell_state *state, int cell_index,
         return;
     }
     static const char begin[] = "\033[0m\033[H\033[2J";
+    static const char split_begin[] =
+        "\033[0m\033[?25l\033[?1000h\033[?1006h";
     char filtered[4096 + GSH_ASYNC_PASSTHROUGH_SEQUENCE_CAP];
     gsh_async_cell *cell = &state_async_repl(state)->cells[cell_index];
     size_t filtered_length = 0;
 
-    if (!cell->focused || !cell->fullscreen) {
-        return;
-    }
+    if (!cell->focused || !cell->fullscreen) return;
     if (!cell->fullscreen_presented) {
-        if (!raw_output_push(state, begin, sizeof(begin) - 1U)) {
+        if (cell->preview_split && !push_managed_preview_base(state)) return;
+        if (!raw_output_push(state,
+                             cell->preview_split ? split_begin : begin,
+                             cell->preview_split ? sizeof(split_begin) - 1U
+                                                 : sizeof(begin) - 1U)) {
             return;
         }
+        if (cell->preview_split) state_async_repl(state)->mouse_enabled = true;
         cell->fullscreen_presented = true;
     }
     if (gsh_async_repl_filter_fullscreen(
@@ -10700,7 +11166,8 @@ static void present_managed_fullscreen(shell_state *state, int cell_index,
 
 static void preflight_managed_input_focus(
     shell_state *state,
-    struct pollfd descriptors[GSH_REACTOR_BASE_FDS + GSH_ASYNC_CELL_CAP],
+    struct pollfd descriptors[
+        GSH_REACTOR_BASE_FDS + 2U * GSH_ASYNC_CELL_CAP],
     size_t count)
 {
     if (state == NULL) return;
@@ -10747,6 +11214,12 @@ static void read_managed_output(shell_state *state, struct pollfd *descriptor)
         ssize_t count = read(descriptor->fd, bytes, sizeof(bytes));
 
         if (count > 0) {
+            cell = &state_async_repl(state)->cells[cell_index];
+            if (!cell->fullscreen &&
+                output_requests_fullscreen(bytes, (size_t)count)) {
+                (void)gsh_async_repl_request_input(
+                    state->async_repl, cell_index, true);
+            }
             note_managed_private_input(state, cell_index);
             (void)gsh_async_repl_autofocus(state->async_repl);
             cell = &state_async_repl(state)->cells[cell_index];
@@ -10779,9 +11252,104 @@ static void read_managed_output(shell_state *state, struct pollfd *descriptor)
     }
 }
 
+static bool accept_view_datagram(shell_state *state, int cell_index,
+                                 const char *message, size_t length)
+{
+    static const char clear_editor_screen[] = "\033[H\033[2J\033[3J";
+    gsh_resource_view_record view;
+    gsh_async_cell *cell;
+    bool returning_from_editor;
+    if (state == NULL || message == NULL ||
+        length != sizeof(view) || cell_index < 0) return false;
+    (void)memcpy(&view, message, sizeof(view));
+    if (view.version == GSH_RESOURCE_PROTOCOL_VERSION &&
+        view.size == sizeof(view) &&
+        ((view.event == GSH_RESOURCE_PROTOCOL_VIEW_FULL &&
+          view.separator_column == 0U) ||
+         (view.event == GSH_RESOURCE_PROTOCOL_VIEW_SPLIT &&
+          view.separator_column > 1U))) {
+        cell = &state_async_repl(state)->cells[cell_index];
+        returning_from_editor = cell->native_preview &&
+                                !cell->preview_split &&
+                                view.event == GSH_RESOURCE_PROTOCOL_VIEW_SPLIT;
+        if (returning_from_editor)
+            (void)raw_output_push(state, clear_editor_screen,
+                                  sizeof(clear_editor_screen) - 1U);
+        (void)gsh_async_repl_set_preview_layout(
+            state->async_repl, cell_index, (size_t)view.separator_column);
+    }
+    return true;
+}
+
+static void accept_resource_datagram(shell_state *state, int cell_index,
+                                     const char *message, size_t length)
+{
+    gsh_resource_record_header header;
+    const char *path;
+    const char *label;
+    if (accept_view_datagram(state, cell_index, message, length)) return;
+    if (state == NULL || message == NULL ||
+        length < sizeof(header) || cell_index < 0) return;
+    (void)memcpy(&header, message, sizeof(header));
+    if (header.version != GSH_RESOURCE_PROTOCOL_VERSION ||
+        header.size != length ||
+        header.path_length == 0U ||
+        header.path_length >= GSH_RESOURCE_PROTOCOL_PATH_CAP ||
+        header.label_length == 0U ||
+        header.label_length >= GSH_RESOURCE_PROTOCOL_LABEL_CAP ||
+        sizeof(header) + (size_t)header.path_length +
+                (size_t)header.label_length != length ||
+        header.byte_begin >= header.byte_end ||
+        header.byte_end - header.byte_begin != header.label_length ||
+        header.column_begin >= header.column_end ||
+        header.type < GSH_RESOURCE_REGULAR ||
+        header.type > GSH_RESOURCE_SYMLINK ||
+        (header.flags & ~GSH_RESOURCE_PROTOCOL_NAVIGABLE) != 0U) return;
+    path = message + sizeof(header);
+    label = path + header.path_length;
+    if (memchr(path, '\0', header.path_length) != NULL ||
+        memchr(label, '\0', header.label_length) != NULL) return;
+    (void)gsh_async_repl_add_native_resource(
+        state->async_repl, cell_index, header.row, header.byte_begin,
+        header.byte_end, header.column_begin, header.column_end,
+        label, header.label_length, path,
+        header.path_length, (gsh_resource_type)header.type,
+        (header.flags & GSH_RESOURCE_PROTOCOL_NAVIGABLE) != 0U);
+}
+
+static void read_managed_resources(shell_state *state,
+                                   const struct pollfd *descriptor,
+                                   int cell_index)
+{
+    char message[sizeof(gsh_resource_record_header) +
+                 GSH_RESOURCE_PROTOCOL_PATH_CAP +
+                 GSH_RESOURCE_PROTOCOL_LABEL_CAP];
+    unsigned int reads;
+    bool close_channel = false;
+    if (state == NULL || descriptor == NULL || cell_index < 0) return;
+    for (reads = 0U; reads < 16U; reads++) {
+        ssize_t count = recv(descriptor->fd, message, sizeof(message),
+                             MSG_DONTWAIT);
+        if (count > 0) {
+            accept_resource_datagram(state, cell_index, message,
+                                     (size_t)count);
+            continue;
+        }
+        if (count == -1 && errno == EINTR) continue;
+        if (count == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
+        close_channel = true;
+        break;
+    }
+    if ((descriptor->revents & (POLLERR | POLLHUP | POLLNVAL)) != 0)
+        close_channel = true;
+    if (close_channel)
+        gsh_async_repl_close_resource(state->async_repl, cell_index);
+}
+
 static void process_managed_descriptors(
     shell_state *state,
-    struct pollfd descriptors[GSH_REACTOR_BASE_FDS + GSH_ASYNC_CELL_CAP],
+    struct pollfd descriptors[
+        GSH_REACTOR_BASE_FDS + 2U * GSH_ASYNC_CELL_CAP],
     size_t count)
 {
     if (state == NULL) return;
@@ -10795,6 +11363,15 @@ static void process_managed_descriptors(
     }
     for (index = GSH_REACTOR_BASE_FDS; index < count; index++) {
         short events = descriptors[index].revents;
+        int resource_cell = gsh_async_repl_cell_for_resource_fd(
+            state->async_repl, descriptors[index].fd);
+
+        if (resource_cell >= 0) {
+            if ((events & (POLLIN | POLLERR | POLLHUP | POLLNVAL)) != 0)
+                read_managed_resources(state, &descriptors[index],
+                                       resource_cell);
+            continue;
+        }
 
         if ((events & (POLLIN | POLLERR | POLLHUP | POLLNVAL)) != 0) {
             read_managed_output(state, &descriptors[index]);
@@ -10905,6 +11482,7 @@ static int seed_async_enabled_notice(shell_state *state)
     (void)active_prompt_text(state, prompt);
     cell_index = gsh_async_repl_accept(
         state->async_repl, prompt, command, sizeof(command) - 1U,
+        state->current_directory,
         false, false, false, true);
     if (cell_index < 0) {
         return -1;
@@ -10947,6 +11525,9 @@ static void apply_async_transition(shell_state *state)
     }
 
     gsh_async_repl_initialize(state->async_repl, true);
+    gsh_async_repl_configure_actions(
+        state->async_repl, terminal_actions_requested(&state->config, true),
+        state->config.path_detection);
     initialize_repl_size(state);
     make_editor_modes(state);
     if (enter_editor(state) == -1 || seed_async_enabled_notice(state) == -1) {
@@ -11007,7 +11588,8 @@ static bool dispatch_classic_pending(shell_state *state)
 
 static size_t prepare_reactor_descriptors(
     shell_state *state,
-    struct pollfd descriptors[GSH_REACTOR_BASE_FDS + GSH_ASYNC_CELL_CAP])
+    struct pollfd descriptors[
+        GSH_REACTOR_BASE_FDS + 2U * GSH_ASYNC_CELL_CAP])
 {
     if (!require(state != NULL)) return 0U;
     if (!require(descriptors != NULL)) return 0U;
@@ -11101,12 +11683,13 @@ static int run_reactor(shell_state *state)
 
     while (state->running) {
         struct pollfd descriptors[
-            GSH_REACTOR_BASE_FDS + GSH_ASYNC_CELL_CAP];
+            GSH_REACTOR_BASE_FDS + 2U * GSH_ASYNC_CELL_CAP];
         size_t descriptor_count;
         int result;
         uint64_t service_start;
 
         maybe_verify_history(state);
+        complete_pending_escapes(state);
         schedule_managed_submissions(state);
         apply_async_transition(state);
         prepare_classic_redraw(state);
@@ -11118,7 +11701,7 @@ static int run_reactor(shell_state *state)
         result = gsh_fault_should_fail(GSH_FAULT_POLL, EIO)
                      ? -1
                      : poll(descriptors, descriptor_count,
-                            history_poll_timeout(state));
+                            reactor_poll_timeout(state));
         if (result == -1) {
             if (errno == EINTR) {
                 continue;
@@ -11128,6 +11711,7 @@ static int run_reactor(shell_state *state)
             break;
         }
 
+        complete_pending_escapes(state);
         service_start = monotonic_ns();
         service_reactor_descriptors(state, descriptors, descriptor_count);
         record_reactor_duration(state, service_start, monotonic_ns());
@@ -11138,7 +11722,10 @@ static int run_reactor(shell_state *state)
 static void leave_managed_screen(shell_state *state)
 {
     if (state == NULL) return;
-    static const char sequence[] = "\033[?1049l";
+    static const char sequence[] =
+        "\033[0m\033[?25h\033[?1000l\033[?1002l\033[?1003l"
+        "\033[?1004l\033[?1006l\033[?1015l\033[?2004l\033[?2026l"
+        "\033[>4;0m\033[<u\033>\033[?1049l";
     unsigned int attempts;
 
     if (state->async_repl == NULL ||
@@ -11380,6 +11967,9 @@ static int native_wait_status_value(int status, bool negated)
 }
 
 typedef struct native_evaluator native_evaluator;
+
+static const gsh_builtin_io *evaluator_file_builtin_io(
+    native_evaluator *evaluator);
 static void close_evaluator_exec_transaction(native_evaluator *evaluator);
 static gsh_command_cache *evaluator_command_cache(
     native_evaluator *evaluator);
@@ -11806,6 +12396,9 @@ static bool noninteractive_child_primary_status(
     if (!require(options != NULL && status != NULL)) return false;
     if (native_pure_builtin(command)) {
         *status = run_native_pure_builtin(command, &descriptor_builtin_io);
+    } else if (native_file_builtin(command)) {
+        *status = run_native_file_builtin(
+            command, evaluator_file_builtin_io(evaluator));
     } else if (native_posix_stateful_builtin(command)) {
         if (positionals == NULL || scratch == NULL) {
             *status = 125;
@@ -12323,7 +12916,18 @@ struct native_evaluator {
     void *trap_request;
     int pipeline_exit_status;
     bool suppress_async_once;
+    bool file_resources_enabled;
+    gsh_builtin_resource_sink file_resource_sink;
+    gsh_builtin_io file_builtin_io;
 };
+
+static const gsh_builtin_io *evaluator_file_builtin_io(
+    native_evaluator *evaluator)
+{
+    if (evaluator == NULL || !evaluator->file_resources_enabled)
+        return &descriptor_builtin_io;
+    return &evaluator->file_builtin_io;
+}
 
 static const gsh_parse_storage *evaluator_storage(
     const native_evaluator *evaluator)
@@ -15215,6 +15819,7 @@ static bool evaluator_tail_is_external(
     if (!require(command != NULL)) return false;
     if (!require(command->argc <= GSH_NATIVE_ARGUMENT_CAP)) return false;
     return command->argc != 0 && !native_pure_builtin(command) &&
+           !native_file_builtin(command) &&
            !native_pwd_builtin(command) && !native_cd_builtin(command) &&
            !native_environment_builtin(command) &&
            !native_variable_builtin(command) &&
@@ -18568,6 +19173,7 @@ static void initialize_interactive_evaluator(native_evaluator *evaluator,
 
 static void managed_pipeline_child(
     shell_state *state, managed_pty *pty, int gate_read, int gate_write,
+    int resource_read, int resource_write,
     const sigset_t *previous, const gsh_native_pipeline *pipeline,
     const pipeline_expansion_scope *scope)
 {
@@ -18581,6 +19187,7 @@ static void managed_pipeline_child(
     int status;
 
     (void)close(gate_write);
+    if (resource_read >= 0) (void)close(resource_read);
     (void)close(pty->master);
     reset_child_signals();
     if (attach_child_pty(state, pty) == -1) {
@@ -18593,6 +19200,13 @@ static void managed_pipeline_child(
     }
     (void)close(gate_read);
     initialize_interactive_evaluator(&evaluator, state, state->variables);
+    if (resource_write >= 0) {
+        evaluator.file_resource_sink.descriptor = resource_write;
+        evaluator.file_builtin_io = descriptor_builtin_io;
+        evaluator.file_builtin_io.resources =
+            &evaluator.file_resource_sink;
+        evaluator.file_resources_enabled = true;
+    }
     backgrounds = allocate_isolated_job_table();
     if (backgrounds == NULL) child_exec_error("managed job state", errno);
     evaluator.backgrounds = backgrounds;
@@ -18604,18 +19218,30 @@ static void managed_pipeline_child(
     _exit(status & 255);
 }
 
+static bool managed_pipeline_opens_viewer(
+    const gsh_native_pipeline *pipeline)
+{
+    const gsh_native_command *command;
+    if (pipeline == NULL || pipeline->command_count != 1U) return false;
+    command = &pipeline->commands[0];
+    return command->redirect_count == 0U &&
+           native_file_builtin_kind(command) == GSH_FILE_BUILTIN_VIEW;
+}
+
 static void managed_pipeline_parent(shell_state *state, managed_pty *pty,
-                                    int gate_write, pid_t pid,
+                                    int gate_write, int resource_read,
+                                    int resource_write, pid_t pid, bool viewer,
                                     const sigset_t *previous)
 {
     if (state == NULL || pty == NULL) return;
     if (previous == NULL) {
         return;
     }
+    if (resource_write >= 0) (void)close(resource_write);
     if (pid == -1 ||
         gsh_async_repl_attach(state->async_repl,
                               state->async_dispatch_cell, pid, pid,
-                              pty->master) == -1 ||
+                              pty->master, resource_read) == -1 ||
         register_managed_job(state, state->async_dispatch_cell,
                              pid, pid) == -1) {
         int saved_errno = errno;
@@ -18624,10 +19250,15 @@ static void managed_pipeline_parent(shell_state *state, managed_pty *pty,
             (void)kill(pid, SIGKILL);
         }
         (void)close(pty->master);
+        if (resource_read >= 0) (void)close(resource_read);
         output_format(state, "gsh: managed pipeline fork: %s\r\n",
                       strerror(saved_errno));
         gsh_async_repl_finish(state->async_repl,
                               state->async_dispatch_cell, 125 << 8, false);
+    } else if (viewer) {
+        (void)gsh_async_repl_request_input(
+            state->async_repl, state->async_dispatch_cell, true);
+        (void)gsh_async_repl_autofocus(state->async_repl);
     }
     (void)close(gate_write);
     (void)sigprocmask(SIG_SETMASK, previous, NULL);
@@ -18644,8 +19275,10 @@ static void start_async_native_pipeline(
     }
     managed_pty pty = {.master = -1, .slave_hold = -1};
     int gate[2] = {-1, -1};
+    int resource[2] = {-1, -1};
     sigset_t blocked;
     sigset_t previous;
+    bool viewer;
     pid_t pid;
 
     if (!gsh_background_has_capacity(&state->background_jobs)) {
@@ -18653,8 +19286,11 @@ static void start_async_native_pipeline(
         state->mode = MODE_EDITOR;
         return;
     }
+    viewer = managed_pipeline_opens_viewer(pipeline);
     if (open_managed_pty(&pty) == -1 ||
-        make_pipe(gate, false, GSH_FAULT_JOB_PIPE) == -1) {
+        make_pipe(gate, false, GSH_FAULT_JOB_PIPE) == -1 ||
+        ((state_async_repl(state)->actions_enabled || viewer) &&
+         create_resource_socket(resource) == -1)) {
         output_format(state, "gsh: managed pipeline: %s\r\n",
                       strerror(errno));
         if (pty.master >= 0) {
@@ -18663,6 +19299,10 @@ static void start_async_native_pipeline(
         if (pty.slave_hold >= 0) {
             (void)close(pty.slave_hold);
         }
+        if (gate[0] >= 0) (void)close(gate[0]);
+        if (gate[1] >= 0) (void)close(gate[1]);
+        if (resource[0] >= 0) (void)close(resource[0]);
+        if (resource[1] >= 0) (void)close(resource[1]);
         state->mode = MODE_EDITOR;
         return;
     }
@@ -18675,19 +19315,22 @@ static void start_async_native_pipeline(
         (void)close(pty.slave_hold);
         (void)close(gate[0]);
         (void)close(gate[1]);
+        if (resource[0] >= 0) (void)close(resource[0]);
+        if (resource[1] >= 0) (void)close(resource[1]);
         state->mode = MODE_EDITOR;
         return;
     }
     pid = fork();
     if (pid == 0) {
-        managed_pipeline_child(state, &pty, gate[0], gate[1], &previous,
-                               pipeline, scope);
+        managed_pipeline_child(state, &pty, gate[0], gate[1], resource[0],
+                               resource[1], &previous, pipeline, scope);
         _exit(125);
     }
     (void)close(pty.slave_hold);
     pty.slave_hold = -1;
     (void)close(gate[0]);
-    managed_pipeline_parent(state, &pty, gate[1], pid, &previous);
+    managed_pipeline_parent(state, &pty, gate[1], resource[0], resource[1],
+                            pid, viewer, &previous);
 }
 
 static bool native_pipeline_node_is_wait(const shell_state *state,
@@ -19460,14 +20103,16 @@ static bool pending_exec_protects_descriptor(const shell_state *state,
 
 static int protect_exec_transaction_descriptors(
     const shell_state *state, int gate[2], int commit[2], int directory[2],
-    int outcome[2], int descriptors[2], int job_service[2])
+    int outcome[2], int descriptors[2], int job_service[2], int resource[2])
 {
-    if (commit == NULL || descriptors == NULL || directory == NULL || gate == NULL || job_service == NULL || outcome == NULL) {
+    if (commit == NULL || descriptors == NULL || directory == NULL ||
+        gate == NULL || job_service == NULL || outcome == NULL ||
+        resource == NULL) {
         return -1;
     }
     int *child_descriptors[] = {
         &gate[0], &commit[1], &directory[1], &outcome[1], &descriptors[1],
-        &job_service[1]};
+        &job_service[1], &resource[1]};
     int reservations[GSH_EXEC_DESCRIPTOR_COMMIT_CAP];
     size_t reservation_count = 0;
     size_t index;
@@ -19527,6 +20172,7 @@ typedef struct {
     int exec_outcome[2];
     int exec_descriptors[2];
     int job_service[2];
+    int resource[2];
     managed_pty pty;
     bool managed;
     bool signals_blocked;
@@ -19547,6 +20193,7 @@ static void initialize_compound_launch(compound_launch *launch,
     launch->exec_outcome[0] = launch->exec_outcome[1] = -1;
     launch->exec_descriptors[0] = launch->exec_descriptors[1] = -1;
     launch->job_service[0] = launch->job_service[1] = -1;
+    launch->resource[0] = launch->resource[1] = -1;
     launch->pty.master = -1;
     launch->pty.slave_hold = -1;
     launch->managed = managed;
@@ -19573,6 +20220,7 @@ static void close_compound_channels(compound_launch *launch)
     close_compound_pair(launch->exec_outcome);
     close_compound_pair(launch->exec_descriptors);
     close_compound_pair(launch->job_service);
+    close_compound_pair(launch->resource);
     if (launch->pty.master >= 0) (void)close(launch->pty.master);
     if (launch->pty.slave_hold >= 0) (void)close(launch->pty.slave_hold);
     launch->pty.master = -1;
@@ -19663,6 +20311,18 @@ static int create_compound_socket(int descriptors[2],
     return 0;
 }
 
+static int create_resource_socket(int descriptors[2])
+{
+    if (!require(descriptors != NULL)) return -1;
+    if (gsh_fault_should_fail(GSH_FAULT_RESOURCE_ACTION_SOCKET, EMFILE) ||
+        socketpair(AF_UNIX, SOCK_DGRAM, 0, descriptors) == -1 ||
+        set_fd_flags(descriptors[0], F_GETFL, O_NONBLOCK) == -1 ||
+        set_fd_flags(descriptors[1], F_GETFL, O_NONBLOCK) == -1 ||
+        set_fd_flags(descriptors[0], F_GETFD, FD_CLOEXEC) == -1 ||
+        set_fd_flags(descriptors[1], F_GETFD, FD_CLOEXEC) == -1) return -1;
+    return 0;
+}
+
 static bool create_compound_channels(shell_state *state,
                                      compound_launch *launch)
 {
@@ -19705,11 +20365,16 @@ static bool create_compound_channels(shell_state *state,
         reject_compound_start(state, launch, "job service socket", errno);
         return false;
     }
+    if (launch->managed && state_async_repl(state)->actions_enabled &&
+        create_resource_socket(launch->resource) == -1) {
+        reject_compound_start(state, launch, "resource action socket", errno);
+        return false;
+    }
     if (state->pending_exec_possible &&
         protect_exec_transaction_descriptors(
             state, launch->gate, launch->commit, launch->directory,
             launch->exec_outcome, launch->exec_descriptors,
-            launch->job_service) == -1) {
+            launch->job_service, launch->resource) == -1) {
         reject_compound_start(state, launch,
                               "exec descriptor protection", errno);
         return false;
@@ -19782,12 +20447,14 @@ static void close_compound_parent_ends(compound_launch *launch)
     }
     if (launch->directory[0] >= 0) (void)close(launch->directory[0]);
     if (launch->job_service[0] >= 0) (void)close(launch->job_service[0]);
+    if (launch->resource[0] >= 0) (void)close(launch->resource[0]);
     launch->gate[1] = -1;
     launch->commit[0] = -1;
     launch->exec_outcome[0] = -1;
     launch->exec_descriptors[0] = -1;
     launch->directory[0] = -1;
     launch->job_service[0] = -1;
+    launch->resource[0] = -1;
 }
 
 static void prepare_compound_child(shell_state *state,
@@ -19868,6 +20535,13 @@ static void initialize_compound_evaluator(
     (void)memcpy(evaluator->exec_descriptors, state->pending_exec_descriptors,
            evaluator->exec_descriptor_count *
                sizeof(evaluator->exec_descriptors[0]));
+    evaluator->file_resource_sink.descriptor = launch->resource[1];
+    evaluator->file_builtin_io = descriptor_builtin_io;
+    if (launch->resource[1] >= 0) {
+        evaluator->file_resources_enabled = true;
+        evaluator->file_builtin_io.resources =
+            &evaluator->file_resource_sink;
+    }
 }
 
 static int commit_compound_evaluator(shell_state *state,
@@ -19933,6 +20607,7 @@ _Noreturn static void run_compound_child(shell_state *state,
         (void)close(launch->exec_descriptors[1]);
     }
     if (launch->job_service[1] >= 0) (void)close(launch->job_service[1]);
+    if (launch->resource[1] >= 0) (void)close(launch->resource[1]);
     _exit(status & 255);
 }
 
@@ -19948,12 +20623,14 @@ static void close_compound_child_ends(compound_launch *launch)
     }
     if (launch->directory[1] >= 0) (void)close(launch->directory[1]);
     if (launch->job_service[1] >= 0) (void)close(launch->job_service[1]);
+    if (launch->resource[1] >= 0) (void)close(launch->resource[1]);
     launch->gate[0] = -1;
     launch->commit[1] = -1;
     launch->exec_outcome[1] = -1;
     launch->exec_descriptors[1] = -1;
     launch->directory[1] = -1;
     launch->job_service[1] = -1;
+    launch->resource[1] = -1;
 }
 
 static void initialize_compound_parent_commit(shell_state *state,
@@ -20017,7 +20694,8 @@ static bool handoff_managed_compound(shell_state *state,
     state->current_job.silent = true;
     if (gsh_async_repl_attach(state->async_repl, state->async_dispatch_cell,
                               launch->pid, launch->pid,
-                              launch->pty.master) == -1 ||
+                              launch->pty.master,
+                              launch->resource[0]) == -1 ||
         register_managed_job(state, state->async_dispatch_cell,
                              launch->pid, launch->pid) == -1) {
         error = errno;
@@ -20034,6 +20712,7 @@ static bool handoff_managed_compound(shell_state *state,
         return false;
     }
     launch->pty.master = -1;
+    launch->resource[0] = -1;
     state->mode = MODE_EDITOR;
     release_compound_launch(launch);
     queue_prompt(state);

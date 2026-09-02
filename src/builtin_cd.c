@@ -75,20 +75,23 @@ int gsh_builtin_cd(size_t argc, char *const argv[],
                    const gsh_builtin_io *io, char *directory,
                    size_t directory_capacity)
 {
-    if (argv == NULL || io == NULL || lookup_variables == NULL) {
+    if (argc == 0U || argv == NULL || io == NULL ||
+        lookup_variables == NULL) {
         return -1;
     }
     const char *argument;
     const char *destination;
     char old_directory[PATH_MAX];
     char new_directory[PATH_MAX];
+    size_t index = 1U;
     bool found;
     int previous_directory;
 
-    if (argc > 2U) {
+    if (index < argc && strcmp(argv[index], "--") == 0) index++;
+    if (argc - index > 1U) {
         return cd_error(io, NULL, "too many operands");
     }
-    argument = argc == 1U ? "" : argv[1];
+    argument = index == argc ? "" : argv[index];
     destination = argument;
     if (*destination == '\0' || strcmp(destination, "~") == 0) {
         destination = gsh_variables_lookup(lookup_variables, "HOME", 4,

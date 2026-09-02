@@ -86,6 +86,7 @@ static const char *const FAULT_NAMES[GSH_FAULT_COUNT] = {
     [GSH_FAULT_POSITIONAL_COMMIT_ALLOCATION] = "positional-commit-allocation",
     [GSH_FAULT_POSITIONAL_COMMIT_MALFORMED] = "positional-commit-malformed",
     [GSH_FAULT_REDIRECT_OPEN] = "redirect-open",
+    [GSH_FAULT_RESOURCE_ACTION_SOCKET] = "resource-action-socket",
     [GSH_FAULT_SHELL_EXECUTABLE_RESOLUTION] = "shell-executable-resolution",
     [GSH_FAULT_SIGNAL_PIPE] = "signal-pipe",
     [GSH_FAULT_SOURCE_WORKSPACE_EXHAUSTION] = "source-workspace-exhaustion",

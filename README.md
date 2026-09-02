@@ -239,9 +239,10 @@ shell-language conformance.
 
 The builtins implemented in `gsh` itself include `.`, `:`, `[`, `alias`, `bg`,
 `break`, `cd`, `command`, `continue`, `echo`, `eval`, `exec`, `exit`, `export`,
-`false`, `fc`, `fg`, `getopts`, `hash`, `help`, `jobs`, `kill`, `printf`, `pwd`,
-`read`, `readonly`, `return`, `rt`, `set`, `shift`, `test`, `times`, `trap`,
-`true`, `type`, `ulimit`, `umask`, `unalias`, `unset`, and `wait` within their
+`false`, `fc`, `fg`, `getopts`, `hash`, `help`, `jobs`, `kill`, `ll`, `ls`,
+`printf`, `pwd`, `read`, `readonly`, `return`, `rt`, `set`, `shift`, `test`,
+`times`, `trap`, `true`, `type`, `ulimit`, `umask`, `unalias`, `unset`, `view`,
+and `wait` within their
 documented native contexts. The exact standalone interactive control submission
 `/async` toggles the managed REPL for the current session.
 
@@ -329,6 +330,8 @@ Additional reliability gates are:
 ```sh
 make check-fault
 make check-resource
+make check-file-builtins
+make check-resource-actions
 make check-positionals
 make check-background
 make check-functions
@@ -406,7 +409,7 @@ read-only and all Linux build products stay in the disposable container.
 
 `policy` has no accepted debt baseline: every violation count must remain
 zero. Source ownership lives in `dev/target-manifest.tsv`: every C source must
-belong to one or more of the 18
+belong to one or more of the 20
 closed, supported targets, and every target must have an explicit `main` or
 fuzzer root. Unknown targets, unknown roles, duplicate sources, unowned files,
 and dependency-only targets fail `policy`; embedded positive and negative
@@ -415,7 +418,7 @@ The manifest is an enforcement input rather than an exception to the Code
 Canon. As with the normal build, an isolated artifact directory can be selected with, for
 example, `make BUILD_DIR=/tmp/gsh-quality quality`.
 
-`check-fault` uses a separate test-only binary and exercises 88 deterministic
+`check-fault` uses a separate test-only binary and exercises 89 deterministic
 failure points. The production build contains neither the injection
 configuration nor its fault names. `check-resource` covers runtime descriptor
 and process exhaustion, data-limit capability, bounded single-line and
@@ -610,6 +613,70 @@ modifying `~/.gshrc`. If jobs, PTYs, input, state commits, or classic background
 processes are still live, the requested transition remains pending; entering
 `/async` again cancels it.
 
+### Clickable files and native preview
+
+The managed REPL recognizes file and directory references without inserting
+terminal hyperlinks into command output. Native `ls` and `ll` send typed
+metadata over a private close-on-exec channel; adapters recognize the output of
+`/bin/ls`, `find`, `tree`, `fd`, `rg --files`, `git status`, `grep`, and `rg`;
+the conservative fallback recognizes path-shaped tokens but excludes URLs and
+bare words. Pathname cells are styled and clickable; in `ll`, the underline
+and hitbox extend through the complete left-hand name field, including its
+alignment padding. Output-carried
+OSC, DCS, CSI, SOS, PM, and APC sequences cannot manufacture an action.
+Because the managed REPL owns an alternate screen, mouse-wheel events scroll
+its 10,240-line bounded viewport directly, including when the active prompt is
+on the last terminal row. This also handles SGR wheel reports emitted by
+iTerm2.
+
+Clicking a regular file opens the native `view` builtin. At 100 columns or
+more it opens beside a 45-percent REPL pane whose minimum width is 48 columns;
+on narrower terminals it uses a contained full-screen panel. It uses bounded
+`pread()` windows, syntax colors for Python,
+shell, C/C++, JavaScript/TypeScript, Rust, Go, JSON, TOML/YAML, and Markdown,
+and switches to a hex view when a NUL byte is present. `q` closes the viewer,
+`/` searches, `n` and `N` move among results, `r` reloads, and `e` launches the
+configured editor. A `file:line[:column]` reference opens at that location.
+While the side viewer has focus, clicking another file in the left REPL pane
+replaces the current preview in place. Returning from an external editor
+clears its physical terminal frames before gsh redraws its own logical
+scrollback, so editor contents do not reappear when scrolling upward.
+Clicking a directory queues the equivalent of `cd -- PATH && ll` as a normal
+ordered shell operation. Resource clicks do not enter command history, and
+preview navigation does not change `$?`.
+
+`ls` is a first-party C implementation of the POSIX Issue 8 option set:
+
+```text
+-A -C -F -H -L -R -S -a -c -d -f -g -i -k -l
+-m -n -o -p -q -r -s -t -u -x -1
+```
+
+Its non-terminal output contains no colors, escape sequences, or visible
+metadata. `ll [-a] [--] [PATH]` displays the filename at the left and responsive
+metadata columns at the right, while `view [--] FILE` copies bytes unchanged
+when its output is redirected or piped. Interactive managed `ll` listings begin
+with a clickable `<-` row that navigates to the parent listing; at the
+filesystem root the row is omitted. The directory change uses the same transactional path as
+`cd`, so `PWD`, `OLDPWD`, and `$?` remain coherent.
+
+The corresponding optional schema-version-1 settings are:
+
+```text
+terminal.actions = auto
+terminal.actions.path_detection = safe
+shell.preview.editor = auto
+
+# Exact override; one element must be {file}.
+shell.preview.editor = ["nvim", "--", "{file}"]
+```
+
+`terminal.actions` accepts `auto`, `on`, or `off`. Path detection accepts
+`off` (only native structured references), `known` (plus adapters), or `safe`
+(plus conservative universal detection). Editor auto-discovery tries `nvim`,
+then `vim`, then `nano`; automatic Vim/Neovim sessions show absolute line
+numbers, while an explicit vector is never overridden and has no fallback.
+
 The future `?` steering and `??` AI queue described by specification 0008 are
 not implemented yet; ordinary shell operation does not depend on an LLM.
 
@@ -640,9 +707,11 @@ for the passphrase before decrypting the existing vault.
 deadline applies only to work performed by the interactive core after `poll()`
 wakes; it is not a guarantee about external commands or the host OS. `gsh$`
 means every prior command is terminal and its output source is closed. `gsh*`
-means at least one command is queued, running, stopped, has pending input or
-output, or still owns a PTY. The prompt changes automatically from `gsh*` to
-`gsh$` when the session settles. Progress output that uses carriage return,
+means at least one ordinary command is queued, running, stopped, has pending
+input or output, or still owns a PTY. A suspended native preview is excluded:
+it remains available to refocus but leaves the editable prompt as `gsh$`. The
+prompt changes automatically from `gsh*` to `gsh$` when the session settles.
+Progress output that uses carriage return,
 including Git's compression and object-writing counters, rewrites one retained
 row instead of turning every intermediate percentage into scrollback.
 
@@ -758,9 +827,9 @@ replaces the worker.
 
 This is soft real-time engineering, not hard real-time or mission-grade status.
 The repository has executable conformance tranches, bounded fuzz/property
-checks, sanitizer builds, 88 deterministic fault cases, resource-pressure
+checks, sanitizer builds, 89 deterministic fault cases, resource-pressure
 scenarios, and a configurable soak runner. The current native tranche contains
-612 execution cases, 30 syntax cases, and 18 deterministic limit cases with
+616 execution cases, 30 syntax cases, and 18 deterministic limit cases with
 one explicitly unsupported case and no delegated cases. The current same-source
 tranche passes the local macOS matrix, but does not gain same-revision remote
 evidence until the macOS arm64 and Ubuntu x86-64 GCC/Clang jobs run after

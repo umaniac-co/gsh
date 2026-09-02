@@ -18,6 +18,9 @@ typedef enum {
     GSH_BUILTIN_FC,
     GSH_BUILTIN_JOBS,
     GSH_BUILTIN_KILL,
+    GSH_BUILTIN_LS,
+    GSH_BUILTIN_LL,
+    GSH_BUILTIN_VIEW,
     GSH_BUILTIN_OTHER,
 } gsh_builtin_kind;
 

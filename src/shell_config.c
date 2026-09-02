@@ -32,6 +32,9 @@ static const char initial_config[] =
     "config.version = 1\n"
     "\n"
     "shell.async_repl.enabled = true\n"
+    "terminal.actions = auto\n"
+    "terminal.actions.path_detection = safe\n"
+    "shell.preview.editor = auto\n"
     "shell.history.enabled = true\n"
     "shell.history.max_entries = 1024\n"
     "shell.history.deduplicate = false\n"
@@ -46,7 +49,7 @@ typedef struct {
     size_t length;
     size_t line;
     bool version_seen;
-    bool seen[9];
+    bool seen[12];
 } config_parser;
 
 /* ── Configuration Is Parsed Before It Can Mutate State ───────
@@ -84,6 +87,9 @@ void gsh_config_defaults(gsh_shell_config *config)
     config->history_unlock_infinite = true;
     config->history_reminder_min_ns = GSH_HISTORY_REMINDER_MIN_NS;
     config->history_reminder_max_ns = GSH_HISTORY_REMINDER_MAX_NS;
+    config->terminal_actions = GSH_TERMINAL_ACTIONS_AUTO;
+    config->path_detection = GSH_PATH_DETECTION_SAFE;
+    config->preview_editor_auto = true;
 }
 
 static int write_all(int descriptor, const char *text, size_t length)
@@ -283,6 +289,9 @@ static int field_index(const char *key)
         "shell.history.ignore_space",  "shell.history.unlock_ttl",
         "shell.history.reminder_min",  "shell.history.reminder_max",
         "shell.async_repl.enabled",
+        "terminal.actions",
+        "terminal.actions.path_detection",
+        "shell.preview.editor",
     };
     size_t index;
 
@@ -292,6 +301,104 @@ static int field_index(const char *key)
         }
     }
     return -1;
+}
+
+static int parse_actions_mode(const char *value,
+                              gsh_terminal_actions_mode *mode)
+{
+    if (value == NULL || mode == NULL) return -1;
+    if (strcmp(value, "auto") == 0) *mode = GSH_TERMINAL_ACTIONS_AUTO;
+    else if (strcmp(value, "on") == 0) *mode = GSH_TERMINAL_ACTIONS_ON;
+    else if (strcmp(value, "off") == 0) *mode = GSH_TERMINAL_ACTIONS_OFF;
+    else { errno = EINVAL; return -1; }
+    return 0;
+}
+
+static int parse_detection_mode(const char *value,
+                                gsh_path_detection_mode *mode)
+{
+    if (value == NULL || mode == NULL) return -1;
+    if (strcmp(value, "off") == 0) *mode = GSH_PATH_DETECTION_OFF;
+    else if (strcmp(value, "known") == 0) *mode = GSH_PATH_DETECTION_KNOWN;
+    else if (strcmp(value, "safe") == 0) *mode = GSH_PATH_DETECTION_SAFE;
+    else { errno = EINVAL; return -1; }
+    return 0;
+}
+
+static int parse_editor_string(const char **cursor, char *storage,
+                               size_t capacity, size_t *used)
+{
+    const char *text;
+
+    if (cursor == NULL || *cursor == NULL || storage == NULL || used == NULL ||
+        **cursor != '"') return -1;
+    text = ++*cursor;
+    (void)text;
+    while (**cursor != '\0' && **cursor != '"') {
+        char byte = **cursor;
+        if (byte == '\\') {
+            (*cursor)++;
+            byte = **cursor;
+            if (byte != '\\' && byte != '"') return -1;
+        }
+        if (*used + 1U >= capacity) { errno = E2BIG; return -1; }
+        storage[(*used)++] = byte;
+        (*cursor)++;
+    }
+    if (**cursor != '"' || *used + 1U > capacity) return -1;
+    storage[(*used)++] = '\0';
+    (*cursor)++;
+    return 0;
+}
+
+static void skip_editor_space(const char **cursor)
+{
+    if (cursor == NULL || *cursor == NULL) return;
+    while (**cursor == ' ' || **cursor == '\t') (*cursor)++;
+}
+
+static int parse_editor_argv(const char *value, gsh_shell_config *config)
+{
+    const char *cursor = value;
+    size_t used = 0U;
+    size_t placeholders = 0U;
+
+    if (value == NULL || config == NULL) return -1;
+    if (strcmp(value, "auto") == 0) {
+        config->preview_editor_auto = true;
+        config->preview_editor_argc = 0U;
+        return 0;
+    }
+    config->preview_editor_auto = false;
+    config->preview_editor_argc = 0U;
+    skip_editor_space(&cursor);
+    if (*cursor++ != '[') return -1;
+    for (size_t item = 0U; item <= GSH_CONFIG_EDITOR_ARG_CAP; item++) {
+        size_t offset;
+        skip_editor_space(&cursor);
+        if (*cursor == ']') { cursor++; break; }
+        if (config->preview_editor_argc >= GSH_CONFIG_EDITOR_ARG_CAP) {
+            errno = E2BIG;
+            return -1;
+        }
+        offset = used;
+        if (parse_editor_string(&cursor, config->preview_editor_storage,
+                                sizeof(config->preview_editor_storage),
+                                &used) == -1) return -1;
+        config->preview_editor_offsets[config->preview_editor_argc++] = offset;
+        if (strcmp(config->preview_editor_storage + offset, "{file}") == 0) placeholders++;
+        skip_editor_space(&cursor);
+        if (*cursor == ',') { cursor++; continue; }
+        if (*cursor == ']') { cursor++; break; }
+        return -1;
+    }
+    skip_editor_space(&cursor);
+    if (*cursor != '\0' || config->preview_editor_argc == 0U ||
+        placeholders != 1U || used > GSH_CONFIG_EDITOR_STORAGE_CAP) {
+        errno = EINVAL;
+        return -1;
+    }
+    return 0;
 }
 
 static int apply_history_field(gsh_shell_config *config, int field,
@@ -320,10 +427,27 @@ static int apply_history_field(gsh_shell_config *config, int field,
         return parse_duration(value, &config->history_reminder_max_ns);
     case 8:
         return parse_boolean(value, &config->async_repl_enabled);
+    case 9:
+        return parse_actions_mode(value, &config->terminal_actions);
+    case 10:
+        return parse_detection_mode(value, &config->path_detection);
+    case 11:
+        return parse_editor_argv(value, config);
     default:
         errno = EINVAL;
         return -1;
     }
+}
+
+const char *gsh_config_editor_argument(const gsh_shell_config *config,
+                                       size_t index)
+{
+    size_t offset;
+
+    if (config == NULL || index >= config->preview_editor_argc) return NULL;
+    offset = config->preview_editor_offsets[index];
+    return offset < sizeof(config->preview_editor_storage)
+               ? config->preview_editor_storage + offset : NULL;
 }
 
 static int parse_assignment(config_parser *parser,

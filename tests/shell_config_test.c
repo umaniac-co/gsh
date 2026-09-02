@@ -73,6 +73,52 @@ static bool initial_file_has_async_default(const char *home)
     return strstr(contents, expected) != NULL;
 }
 
+static bool initial_file_has_action_defaults(const char *home)
+{
+    static const char actions[] = "terminal.actions = auto";
+    static const char detection[] = "terminal.actions.path_detection = safe";
+    static const char editor[] = "shell.preview.editor = auto";
+    char path[4096];
+    char contents[4096];
+    ssize_t count;
+    int descriptor;
+    if (home == NULL || snprintf(path, sizeof(path), "%s/.gshrc", home) >=
+                            (int)sizeof(path)) return false;
+    descriptor = open(path, O_RDONLY);
+    if (descriptor < 0) return false;
+    count = read(descriptor, contents, sizeof(contents) - 1U);
+    (void)close(descriptor);
+    if (count < 0) return false;
+    contents[(size_t)count] = '\0';
+    return strstr(contents, actions) != NULL &&
+           strstr(contents, detection) != NULL &&
+           strstr(contents, editor) != NULL;
+}
+
+static int action_configuration_cases(const char *home,
+                                      gsh_shell_config *config)
+{
+    static const char explicit[] =
+        "config.version = 1\n"
+        "terminal.actions = off\n"
+        "terminal.actions.path_detection = known\n"
+        "shell.preview.editor = [\"nvim\", \"--\", \"{file}\"]\n";
+    static const char invalid[] =
+        "config.version = 1\n"
+        "shell.preview.editor = [\"vim\", \"--\"]\n";
+    if (home == NULL || config == NULL) return 1;
+    if (write_configuration(home, explicit) == -1 ||
+        gsh_config_load(config, home, false) == -1 ||
+        config->terminal_actions != GSH_TERMINAL_ACTIONS_OFF ||
+        config->path_detection != GSH_PATH_DETECTION_KNOWN ||
+        config->preview_editor_auto || config->preview_editor_argc != 3U ||
+        strcmp(gsh_config_editor_argument(config, 0U), "nvim") != 0 ||
+        strcmp(gsh_config_editor_argument(config, 2U), "{file}") != 0) return 1;
+    if (write_configuration(home, invalid) == -1 ||
+        gsh_config_load(config, home, false) != -1) return 1;
+    return 0;
+}
+
 int main(void)
 {
     static const char absent[] =
@@ -103,7 +149,11 @@ int main(void)
     if (!config.async_repl_enabled ||
         gsh_config_load(&config, home, true) == -1 ||
         !config.async_repl_enabled ||
-        !initial_file_has_async_default(home)) {
+        config.terminal_actions != GSH_TERMINAL_ACTIONS_AUTO ||
+        config.path_detection != GSH_PATH_DETECTION_SAFE ||
+        !config.preview_editor_auto ||
+        !initial_file_has_async_default(home) ||
+        !initial_file_has_action_defaults(home)) {
         failed = 1;
     }
     if (!failed &&
@@ -132,6 +182,7 @@ int main(void)
          strstr(config.diagnostic, "invalid configuration") == NULL)) {
         failed = 1;
     }
+    if (!failed && action_configuration_cases(home, &config) != 0) failed = 1;
     if (snprintf(path, sizeof(path), "%s/.gshrc", home) <
         (int)sizeof(path)) {
         (void)unlink(path);

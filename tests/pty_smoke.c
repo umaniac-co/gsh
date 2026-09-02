@@ -329,12 +329,13 @@ static void configure_child_environment(shell_kind kind)
 {
     const char *managed;
     const char *history;
+    const char *path = getenv("GSH_HARNESS_PATH");
     const char *repl;
 
     if (!require(kind >= SHELL_GSH) || !require(kind <= SHELL_ZSH)) {
         return;
     }
-    (void)setenv("PATH", "/usr/bin:/bin", 1);
+    (void)setenv("PATH", path == NULL ? "/usr/bin:/bin" : path, 1);
     (void)setenv("TERM", "xterm-256color", 1);
     (void)setenv("PS1", "gsh$ ", 1);
     (void)setenv("PS2", "GSH_MORE> ", 1);
@@ -1861,12 +1862,345 @@ static int managed_repl_launch_state_fence(pty_session *session)
     }
     start = monotonic_ns();
     if (send_text(session, "/bin/pwd\r") == -1 ||
-        consume_through(session, "/bin/pwd\r\n/", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(session, "gsh-pty-managed-", TEST_TIMEOUT_MS) == -1 ||
         monotonic_ns() - start < 700000000ULL) {
         errno = ETIMEDOUT;
         return -1;
     }
     return 0;
+}
+
+static int managed_repl_native_resources(pty_session *session)
+{
+    static const char styled[] =
+        "\033[4;38;5;81mname with space.py\033[0m";
+    if (session == NULL) return -1;
+    session->capture_length = 0U;
+    if (send_text(session, "ls -1\r") == -1 ||
+        wait_for_output(session, styled, TEST_TIMEOUT_MS) == -1 ||
+        wait_for_output(session, "gsh$ ", TEST_TIMEOUT_MS) == -1) return -1;
+    return 0;
+}
+
+typedef struct {
+    char directory[PATH_MAX];
+    char first[PATH_MAX];
+    char second[PATH_MAX];
+    char tools[PATH_MAX];
+    char editor[PATH_MAX];
+    pty_session session;
+} resource_action_fixture;
+
+static void cleanup_resource_action_fixture(resource_action_fixture *fixture)
+{
+    if (fixture == NULL) return;
+    if (fixture->first[0] != '\0') (void)unlink(fixture->first);
+    if (fixture->second[0] != '\0') (void)unlink(fixture->second);
+    if (fixture->editor[0] != '\0') (void)unlink(fixture->editor);
+    if (fixture->tools[0] != '\0') (void)rmdir(fixture->tools);
+    if (fixture->directory[0] != '\0') (void)rmdir(fixture->directory);
+}
+
+static int setup_resource_action_fixture(resource_action_fixture *fixture,
+                                         const char *executable)
+{
+    char test_path[PATH_MAX * 2U];
+    if (fixture == NULL || executable == NULL) return -1;
+    (void)memset(fixture, 0, sizeof(*fixture));
+    (void)snprintf(fixture->directory, sizeof(fixture->directory),
+                   "/tmp/gsh-resource-action-XXXXXX");
+    if (mkdtemp(fixture->directory) == NULL ||
+        snprintf(fixture->first, sizeof(fixture->first), "%s/%s",
+                 fixture->directory, "name with space.py") >=
+            (int)sizeof(fixture->first) ||
+        write_text_file(fixture->first, "print('resource')\n", 0600) == -1 ||
+        snprintf(fixture->second, sizeof(fixture->second), "%s/%s",
+                 fixture->directory, "second.py") >=
+            (int)sizeof(fixture->second) ||
+        write_text_file(fixture->second, "SECOND_PREVIEW = True\n", 0600) == -1 ||
+        snprintf(fixture->tools, sizeof(fixture->tools), "%s/.tools",
+                 fixture->directory) >= (int)sizeof(fixture->tools) ||
+        mkdir(fixture->tools, 0700) == -1 ||
+        snprintf(fixture->editor, sizeof(fixture->editor), "%s/nvim",
+                 fixture->tools) >= (int)sizeof(fixture->editor) ||
+        write_text_file(fixture->editor,
+                        "#!/bin/sh\nprintf 'FAKE_EDITOR_FRAME:%s\\n' \"$*\"\n",
+                        0700) == -1 ||
+        snprintf(test_path, sizeof(test_path), "%s:/usr/bin:/bin",
+                 fixture->tools) >= (int)sizeof(test_path) ||
+        setenv("GSH_HARNESS_PATH", test_path, 1) == -1 ||
+        start_managed_session(&fixture->session, executable,
+                              fixture->directory) == -1) {
+        (void)unsetenv("GSH_HARNESS_PATH");
+        return -1;
+    }
+    (void)unsetenv("GSH_HARNESS_PATH");
+    return 0;
+}
+
+static int open_and_replace_resource_preview(pty_session *session, int *stage)
+{
+    static const char styled[] =
+        "\033[4;38;5;81mname with space.py\033[0m";
+    static const char click[] = "\033[<0;2;2M";
+    static const char replacement_click[] = "\033[<0;2;3M";
+    static const char split_origin[] = "\033[1;50H";
+    if (session == NULL || stage == NULL) return -1;
+    if (resize_session(session, 24U, 110U) == -1 ||
+        consume_through(session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
+        send_text(session, "ls -1\r") == -1 ||
+        wait_for_output(session, styled, TEST_TIMEOUT_MS) == -1) return -1;
+    *stage = 1;
+    if (send_text(session, click) == -1 ||
+        wait_for_output(session, split_origin, TEST_TIMEOUT_MS) == -1 ||
+        wait_for_output(session, "Esc: panel", TEST_TIMEOUT_MS) == -1 ||
+        wait_for_output(session, "print", TEST_TIMEOUT_MS) == -1 ||
+        wait_for_output(session, "\033[38;5;114m", TEST_TIMEOUT_MS) == -1 ||
+        wait_for_output(session, "-rw-------", TEST_TIMEOUT_MS) == -1)
+        return -1;
+    *stage = 6;
+    session->capture_length = 0U;
+    if (send_text(session, replacement_click) == -1 ||
+        wait_for_output(session, "SECOND_PREVIEW", TEST_TIMEOUT_MS) == -1)
+        return -1;
+    *stage = 7;
+    return 0;
+}
+
+static int exercise_resource_editor(pty_session *session, int *stage)
+{
+    static const char scrollback_purge[] = "\033[H\033[2J\033[3J";
+    if (session == NULL || stage == NULL) return -1;
+    (void)poll(NULL, 0U, 100);
+    session->capture_length = 0U;
+    if (send_text(session, "e") == -1 ||
+        consume_through(session, "FAKE_EDITOR_FRAME", TEST_TIMEOUT_MS) == -1)
+        return -1;
+    *stage = 71;
+    if (wait_for_output(session, "+1 -c set number norelativenumber --",
+                        TEST_TIMEOUT_MS) == -1 ||
+        wait_for_output(session, scrollback_purge, TEST_TIMEOUT_MS) == -1)
+        return -1;
+    *stage = 72;
+    if (wait_for_output(session, "SECOND_PREVIEW", TEST_TIMEOUT_MS) == -1)
+        return -1;
+    *stage = 8;
+    return 0;
+}
+
+static int exercise_resource_focus(pty_session *session, int *stage)
+{
+    static const char right_panel_click[] = "\033[<0;80;2M";
+    static const char split_origin[] = "\033[1;50H";
+    if (session == NULL || stage == NULL) return -1;
+    session->capture_length = 0U;
+    if (send_text(session, "\033") == -1 ||
+        wait_for_output(session, "gsh$ ", TEST_TIMEOUT_MS) == -1) return -1;
+    *stage = 9;
+    if (send_text(session, "q") == -1 ||
+        wait_for_output(session, "gsh$ q", TEST_TIMEOUT_MS) == -1) return -1;
+    *stage = 10;
+    if (send_bytes(session, "\025", 1U) == -1) return -1;
+    *stage = 11;
+    (void)poll(NULL, 0U, 40);
+    session->capture_length = 0U;
+    if (send_text(session, right_panel_click) == -1 ||
+        wait_for_output(session, split_origin, TEST_TIMEOUT_MS) == -1)
+        return -1;
+    *stage = 12;
+    if (send_text(session, "q") == -1 ||
+        wait_for_output(session, "gsh$ ", TEST_TIMEOUT_MS) == -1) return -1;
+    *stage = 13;
+    return 0;
+}
+
+static int managed_resource_action_flow(const char *executable)
+{
+    resource_action_fixture fixture = {0};
+    int failed;
+    int stage = 0;
+    if (setup_resource_action_fixture(&fixture, executable) == -1) {
+        perror("pty resource action: setup");
+        cleanup_resource_action_fixture(&fixture);
+        return 1;
+    }
+    failed = open_and_replace_resource_preview(&fixture.session, &stage) == -1 ||
+             exercise_resource_editor(&fixture.session, &stage) == -1 ||
+             exercise_resource_focus(&fixture.session, &stage) == -1;
+    (void)poll(NULL, 0U, 100);
+    if (failed) {
+        (void)fprintf(stderr, "pty resource action: stage %d: %s\n", stage,
+                      strerror(errno));
+        dump_capture(&fixture.session);
+    }
+    if (stop_session(&fixture.session) == -1) failed = 1;
+    cleanup_resource_action_fixture(&fixture);
+    return failed;
+}
+
+static int managed_directory_action_flow(const char *executable)
+{
+    static const char styled[] = "\033[4;38;5;75mchild\033[0m";
+    static const char back_styled[] =
+        "\033[4;38;5;75m<-   \033[0m";
+    static const char nested_styled[] =
+        "\033[4;38;5;75mperformance\033[0m";
+    static const char nested_back_styled[] =
+        "\033[4;38;5;75m<-  \033[0m";
+    static const char first_click[] = "\033[<0;2;3M";
+    static const char second_click[] = "\033[<0;2;6M";
+    static const char back_click[] = "\033[<0;2;8M";
+    char fixture[] = "/tmp/gsh-directory-action-XXXXXX";
+    char child[PATH_MAX] = {0};
+    char nested[PATH_MAX] = {0};
+    char canonical[PATH_MAX];
+    char committed[PATH_MAX] = {0};
+    char probe[PATH_MAX * 2U + 256U];
+    pty_session session;
+    int failed = 0;
+
+    if (executable == NULL || mkdtemp(fixture) == NULL ||
+        snprintf(child, sizeof(child), "%s/child", fixture) >=
+            (int)sizeof(child) ||
+        mkdir(child, 0700) == -1 ||
+        snprintf(nested, sizeof(nested), "%s/performance", child) >=
+            (int)sizeof(nested) ||
+        mkdir(nested, 0700) == -1 ||
+        realpath(fixture, canonical) == NULL ||
+        snprintf(committed, sizeof(committed), "%s/committed", child) >=
+            (int)sizeof(committed) ||
+        snprintf(probe, sizeof(probe),
+                 "status=$?; /bin/test \"$status\" -eq 0 && "
+                 "/bin/test \"$PWD\" = '%s/child' && "
+                 "/bin/test \"$OLDPWD\" = '%s/child/performance' && "
+                 "/usr/bin/touch committed && "
+                 "/usr/bin/printf '%%s%%s\\n' GSH_DIRECTORY_ACTION_ OK\r",
+                 canonical, canonical) >= (int)sizeof(probe) ||
+        start_managed_session(&session, executable, fixture) == -1) {
+        perror("pty directory action: setup");
+        if (nested[0] != '\0') (void)rmdir(nested);
+        if (child[0] != '\0') (void)rmdir(child);
+        (void)rmdir(fixture);
+        return 1;
+    }
+    if (consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
+        send_text(&session, "ll\r") == -1 ||
+        wait_for_output(&session, back_styled, TEST_TIMEOUT_MS) == -1 ||
+        wait_for_output(&session, styled, TEST_TIMEOUT_MS) == -1 ||
+        send_text(&session, first_click) == -1 ||
+        wait_for_output(&session, nested_styled, TEST_TIMEOUT_MS) == -1 ||
+        send_text(&session, second_click) == -1 ||
+        wait_for_output(&session, "/child/performance",
+                        TEST_TIMEOUT_MS) == -1 ||
+        wait_for_output(&session, nested_back_styled,
+                        TEST_TIMEOUT_MS) == -1 ||
+        send_text(&session, back_click) == -1 ||
+        wait_for_output(&session, "/child' && ll",
+                        TEST_TIMEOUT_MS) == -1 ||
+        send_text(&session, probe) == -1 ||
+        wait_for_output(&session, "GSH_DIRECTORY_ACTION_OK",
+                        TEST_TIMEOUT_MS) == -1) {
+        perror("pty directory action: flow");
+        dump_capture(&session);
+        failed = 1;
+    }
+    if (stop_session(&session) == -1 || access(committed, F_OK) == -1)
+        failed = 1;
+    (void)unlink(committed);
+    (void)rmdir(nested);
+    (void)rmdir(child);
+    (void)rmdir(fixture);
+    return failed;
+}
+
+static int managed_scroll_flow(const char *executable)
+{
+    static const char output[] =
+        "/usr/bin/printf 'SCROLL_01\\nSCROLL_02\\nSCROLL_03\\n"
+        "SCROLL_04\\nSCROLL_05\\nSCROLL_06\\nSCROLL_07\\n"
+        "SCROLL_08\\nSCROLL_09\\nSCROLL_10\\n'\r";
+    static const char wheel_up[] = "\033[<64;1;1M";
+    static const char wheel_down[] = "\033[<65;1;1M";
+    char fixture[] = "/tmp/gsh-scroll-action-XXXXXX";
+    pty_session session;
+    int failed = 0;
+
+    if (executable == NULL || mkdtemp(fixture) == NULL ||
+        start_managed_session(&session, executable, fixture) == -1) {
+        perror("pty managed scroll: setup");
+        (void)rmdir(fixture);
+        return 1;
+    }
+    if (resize_session(&session, 6U, 80U) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
+        send_text(&session, output) == -1 ||
+        wait_for_output(&session, "SCROLL_10", TEST_TIMEOUT_MS) == -1) {
+        failed = 1;
+    }
+    session.capture_length = 0U;
+    if (!failed &&
+        (send_text(&session, wheel_up) == -1 ||
+         wait_for_output(&session, "SCROLL_03", TEST_TIMEOUT_MS) == -1 ||
+         capture_contains(&session, "SCROLL_10"))) failed = 1;
+    session.capture_length = 0U;
+    if (!failed &&
+        (send_text(&session, wheel_down) == -1 ||
+         wait_for_output(&session, "SCROLL_10", TEST_TIMEOUT_MS) == -1))
+        failed = 1;
+    if (failed) {
+        perror("pty managed scroll: flow");
+        dump_capture(&session);
+    }
+    if (stop_session(&session) == -1) failed = 1;
+    (void)rmdir(fixture);
+    return failed;
+}
+
+static int managed_detected_action_flow(const char *executable)
+{
+    static const char styled[] =
+        "\033[4;38;5;81m./detected.py\033[0m:2:3";
+    static const char click[] = "\033[<0;2;2M";
+    char fixture[] = "/tmp/gsh-detected-action-XXXXXX";
+    char path[PATH_MAX] = {0};
+    pty_session session;
+    int failed = 0;
+
+    if (executable == NULL || mkdtemp(fixture) == NULL ||
+        snprintf(path, sizeof(path), "%s/detected.py", fixture) >=
+            (int)sizeof(path) ||
+        write_text_file(path, "first\nprint('detected')", 0600) == -1 ||
+        start_managed_session(&session, executable, fixture) == -1) {
+        perror("pty detected action: setup");
+        if (path[0] != '\0') (void)unlink(path);
+        (void)rmdir(fixture);
+        return 1;
+    }
+    if (consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
+        send_text(&session,
+                  "/usr/bin/printf './detected.py:2:3\\n'\r") == -1 ||
+        wait_for_output(&session, styled, TEST_TIMEOUT_MS) == -1 ||
+        send_text(&session, click) == -1 ||
+        wait_for_output(&session, "Esc: switch panel", TEST_TIMEOUT_MS) == -1 ||
+        wait_for_output(&session, "print", TEST_TIMEOUT_MS) == -1 ||
+        wait_for_output(&session, "2/2", TEST_TIMEOUT_MS) == -1) {
+        perror("pty detected action: flow");
+        dump_capture(&session);
+        failed = 1;
+    }
+    (void)poll(NULL, 0U, 100);
+    session.capture_length = 0U;
+    if (!failed &&
+        (send_text(&session, "q") == -1 ||
+         wait_for_output(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1)) {
+        perror("pty detected action: flow");
+        dump_capture(&session);
+        failed = 1;
+    }
+    if (stop_session(&session) == -1) failed = 1;
+    (void)unlink(path);
+    (void)rmdir(fixture);
+    return failed;
 }
 
 static int managed_repl_preserves_edit(pty_session *session)
@@ -2028,7 +2362,9 @@ static int managed_repl_ordering(pty_session *session)
                   "/usr/bin/printf 'ORDER_STATE=%s' \"$PWD\"\r") == -1 ||
         consume_through(session, "\r\nORDER_FIRST", TEST_TIMEOUT_MS) ==
             -1 ||
-        consume_through(session, "\r\nORDER_STATE=/",
+        consume_through(session, "\r\nORDER_STATE=",
+                        TEST_TIMEOUT_MS) == -1 ||
+        consume_through(session, "/",
                         TEST_TIMEOUT_MS) == -1 ||
         send_text(session, "/usr/bin/false\r") == -1 ||
         send_text(session,
@@ -2192,10 +2528,14 @@ static int managed_repl_toggle(pty_session *session)
 static int managed_async_repl_flow(const char *executable)
 {
     char fixture[] = "/tmp/gsh-pty-managed-XXXXXX";
+    char resource_path[PATH_MAX];
     pty_session session;
     int failed = 0;
 
     if (mkdtemp(fixture) == NULL ||
+        snprintf(resource_path, sizeof(resource_path), "%s/%s", fixture,
+                 "name with space.py") >= (int)sizeof(resource_path) ||
+        write_text_file(resource_path, "print('resource')\n", 0600) == -1 ||
         start_managed_session(&session, executable, fixture) == -1) {
         perror("pty managed: setup");
         (void)rmdir(fixture);
@@ -2203,6 +2543,7 @@ static int managed_async_repl_flow(const char *executable)
     }
     if (consume_through(&session, "gsh$ ",
                         TEST_TIMEOUT_MS) == -1 ||
+        managed_repl_native_resources(&session) == -1 ||
         managed_repl_prompt_state(&session) == -1 ||
         managed_repl_terminal_outcomes(&session) == -1 ||
         managed_repl_concurrency(&session) == -1 ||
@@ -2237,6 +2578,7 @@ static int managed_async_repl_flow(const char *executable)
             failed = 1;
         }
     }
+    (void)unlink(resource_path);
     (void)rmdir(fixture);
     return failed;
 }
@@ -3549,21 +3891,25 @@ static int worker_surviving_fault_case(const char *executable,
 }
 
 static int command_fault_case(const char *executable, const char *fault,
-                              const char *command, const char *diagnostic)
+                              const char *command, const char *diagnostic,
+                              bool managed)
 {
     char fixture[] = "/tmp/gsh-fault-command-XXXXXX";
     pty_session session;
     int failed = 0;
 
     if (mkdtemp(fixture) == NULL || setenv("GSH_FAULT", fault, 1) == -1 ||
-        start_session(&session, executable, fixture, SHELL_GSH) == -1) {
+        (managed ? start_managed_session(&session, executable, fixture)
+                 : start_session(&session, executable, fixture, SHELL_GSH)) ==
+            -1) {
         perror("pty fault: command setup");
         (void)unsetenv("GSH_FAULT");
         (void)rmdir(fixture);
         return 1;
     }
     (void)unsetenv("GSH_FAULT");
-    if (consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
+    if ((managed && resize_session(&session, 24U, 512U) == -1) ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, command) == -1 ||
         consume_through(&session, diagnostic, TEST_TIMEOUT_MS) == -1 ||
         consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
@@ -3795,7 +4141,7 @@ static int heredoc_fault_case(const char *executable, const char *fault,
     }
     return command_fault_case(executable, fault,
                               "/bin/cat <<EOF\rvalue\rEOF\r",
-                              diagnostic);
+                              diagnostic, false);
 }
 
 static int fatal_fault_case(const char *executable, const char *fault)
@@ -4067,6 +4413,7 @@ static int fault_injection_flow(const char *executable)
         const char *command;
         const char *diagnostic;
     } command_cases[] = {
+        {"resource-action-socket", "ls -1\r", "gsh: managed pipeline:"},
         {"job-pipe", "/usr/bin/true\r", "gsh: pipe:"},
         {"job-fork", "/usr/bin/true\r", "gsh: fork:"},
         {"terminal-handoff", "/usr/bin/true\r",
@@ -4215,7 +4562,9 @@ static int fault_injection_flow(const char *executable)
          index++) {
         failed |= command_fault_case(executable, command_cases[index].name,
                                      command_cases[index].command,
-                                     command_cases[index].diagnostic);
+                                     command_cases[index].diagnostic,
+                                     strcmp(command_cases[index].name,
+                                            "resource-action-socket") == 0);
     }
     failed |= worker_surviving_fault_case(executable, "time-source-failure",
                                           "misses=1");
@@ -4296,7 +4645,7 @@ static int fault_injection_flow(const char *executable)
         failed |= fatal_fault_case(executable, fatal_cases[index]);
     }
     if (!failed) {
-        (void)puts("pty fault: 88 deterministic boundary failures passed");
+        (void)puts("pty fault: 89 deterministic boundary failures passed");
     }
     return failed;
 }
@@ -7081,6 +7430,18 @@ static int run_primary_smoke_flows(const char *executable)
     }
     if (managed_async_repl_flow(executable) != 0) {
         return smoke_flow_failure("managed async REPL");
+    }
+    if (managed_resource_action_flow(executable) != 0) {
+        return smoke_flow_failure("managed resource action");
+    }
+    if (managed_directory_action_flow(executable) != 0) {
+        return smoke_flow_failure("managed directory action");
+    }
+    if (managed_detected_action_flow(executable) != 0) {
+        return smoke_flow_failure("managed detected action");
+    }
+    if (managed_scroll_flow(executable) != 0) {
+        return smoke_flow_failure("managed wheel scrolling");
     }
     return 0;
 }

@@ -2765,6 +2765,8 @@ static int native_set_option_cases(const char *executable)
         {"cd", "command assignment supplies local HOME",
          "HOME=/ cd; /bin/test \"$PWD\" = /; "
          "/bin/test \"$HOME\" = /tmp/gsh-conformance-home", 0, NULL},
+        {"cd", "end-of-options marker precedes the directory operand",
+         "cd -- /; /bin/test \"$PWD\" = /", 0, NULL},
         {"set -a", "allexport cd command environment remains local",
          "unset GSH_OPTION_CD_LOCAL; set -a; "
          "GSH_OPTION_CD_LOCAL=value cd .; set +a; "
@@ -3257,7 +3259,7 @@ static int run_native_builtin_groups(const char *executable,
     if (native_positional_cases(executable) != 0) return 1;
     *execution_passed += 26U;
     if (native_set_option_cases(executable) != 0) return 1;
-    *execution_passed += 50U;
+    *execution_passed += 51U;
     if (native_pwd_cases(executable) != 0) return 1;
     *execution_passed += 5U;
     if (native_umask_creation_case(executable) != 0) return 1;
@@ -4056,6 +4058,13 @@ int main(int argc, char **argv)
          "command -v true", 0, "true\n"},
         {"command", "command -V describes regular builtin",
          "command -V true", 0, "true is a regular builtin\n"},
+        {"command", "command -v identifies native ls",
+         "command -v ls", 0, "ls\n"},
+        {"command", "command -V describes native ls",
+         "command -V ls", 0, "ls is a regular builtin\n"},
+        {"command", "type describes native file utilities",
+         "type ll; type view", 0,
+         "ll is a regular builtin\nview is a regular builtin\n"},
         {"command", "command -V identifies reserved word",
          "command -V if", 0, "if is a shell reserved word\n"},
         {"command", "command inspection finds shell function",

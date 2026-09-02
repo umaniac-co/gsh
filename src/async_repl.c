@@ -9,6 +9,7 @@
 
 #include <errno.h>
 #include <signal.h> /* CANON-INCLUDE: macos */
+#include <stdio.h>
 #include <string.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -79,13 +80,17 @@ static void reset_cell(gsh_async_cell *cell)
         return;
     }
     int descriptor;
+    int resource_descriptor;
 
     descriptor = cell->pty_fd;
+    resource_descriptor = cell->resource_fd;
     (void)memset(cell, 0, sizeof(*cell));
     cell->pty_fd = -1;
+    cell->resource_fd = -1;
     if (descriptor >= 0) {
         (void)close(descriptor);
     }
+    if (resource_descriptor >= 0) (void)close(resource_descriptor);
 }
 
 void gsh_async_repl_initialize(gsh_async_repl *repl, bool enabled)
@@ -100,10 +105,21 @@ void gsh_async_repl_initialize(gsh_async_repl *repl, bool enabled)
     repl->next_id = 1;
     repl->terminal_rows = 24;
     repl->terminal_columns = 80;
+    repl->view_columns = 80;
     repl->render_pending = enabled;
     for (index = 0; index < GSH_ASYNC_CELL_CAP; index++) {
         repl->cells[index].pty_fd = -1;
+        repl->cells[index].resource_fd = -1;
     }
+}
+
+void gsh_async_repl_configure_actions(gsh_async_repl *repl, bool enabled,
+                                      gsh_path_detection_mode detection)
+{
+    if (repl == NULL) return;
+    repl->actions_enabled = enabled;
+    repl->path_detection = detection;
+    repl->render_pending = repl->enabled;
 }
 
 void gsh_async_repl_resize(gsh_async_repl *repl, size_t rows,
@@ -114,8 +130,8 @@ void gsh_async_repl_resize(gsh_async_repl *repl, size_t rows,
     }
     repl->terminal_rows = rows == 0 ? 1 : rows;
     repl->terminal_columns = columns == 0 ? 1 : columns;
-    if (repl->terminal_rows > GSH_ASYNC_VIEW_ROWS) {
-        repl->terminal_rows = GSH_ASYNC_VIEW_ROWS;
+    if (repl->terminal_rows > GSH_ASYNC_TERMINAL_ROW_CAP) {
+        repl->terminal_rows = GSH_ASYNC_TERMINAL_ROW_CAP;
     }
     if (repl->terminal_columns > GSH_ASYNC_VIEW_COLUMNS) {
         repl->terminal_columns = GSH_ASYNC_VIEW_COLUMNS;
@@ -123,12 +139,36 @@ void gsh_async_repl_resize(gsh_async_repl *repl, size_t rows,
     repl->render_pending = true;
 }
 
+void gsh_async_repl_scroll(gsh_async_repl *repl, long rows)
+{
+    size_t visible;
+    size_t maximum;
+    if (repl == NULL || rows == 0) return;
+    visible = repl->terminal_rows < repl->view_count
+                  ? repl->terminal_rows : repl->view_count;
+    maximum = repl->view_count - visible;
+    if (repl->scroll_offset > maximum) repl->scroll_offset = maximum;
+    if (rows > 0) {
+        size_t amount = (size_t)rows;
+        repl->scroll_offset = amount > maximum - repl->scroll_offset
+                                  ? maximum
+                                  : repl->scroll_offset + amount;
+    } else {
+        size_t amount = (size_t)(-(rows + 1L)) + 1U;
+        repl->scroll_offset = amount > repl->scroll_offset
+                                  ? 0U : repl->scroll_offset - amount;
+    }
+    repl->render_pending = repl->enabled;
+}
+
 static int copy_cell_text(gsh_async_cell *cell, const char *prompt,
-                          const char *command, size_t command_length)
+                          const char *command, size_t command_length,
+                          const char *launch_directory)
 {
     size_t prompt_length;
 
     if (cell == NULL || prompt == NULL || command == NULL ||
+        launch_directory == NULL ||
         command_length >= sizeof(cell->command)) {
         errno = EINVAL;
         return -1;
@@ -143,11 +183,18 @@ static int copy_cell_text(gsh_async_cell *cell, const char *prompt,
     cell->command[command_length] = '\0';
     cell->prompt_length = prompt_length;
     cell->command_length = command_length;
+    if (strlen(launch_directory) >= sizeof(cell->launch_directory)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    (void)memcpy(cell->launch_directory, launch_directory,
+                 strlen(launch_directory) + 1U);
     return 0;
 }
 
 int gsh_async_repl_accept(gsh_async_repl *repl, const char *prompt,
                           const char *command, size_t command_length,
+                          const char *launch_directory,
                           bool barrier, bool blocks_independent,
                           bool status_dependency, bool control)
 {
@@ -163,7 +210,8 @@ int gsh_async_repl_accept(gsh_async_repl *repl, const char *prompt,
     }
     cell = &repl->cells[cell_index];
     reset_cell(cell);
-    if (copy_cell_text(cell, prompt, command, command_length) == -1) {
+    if (copy_cell_text(cell, prompt, command, command_length,
+                       launch_directory) == -1) {
         return -1;
     }
     cell->occupied = true;
@@ -172,6 +220,7 @@ int gsh_async_repl_accept(gsh_async_repl *repl, const char *prompt,
     cell->status_dependency = status_dependency;
     cell->control = control;
     cell->id = repl->next_id++;
+    cell->output_generation = 1U;
     cell->state = GSH_ASYNC_QUEUED;
     repl->render_pending = true;
     return cell_index;
@@ -295,6 +344,25 @@ bool gsh_async_repl_all_settled(const gsh_async_repl *repl)
     return gsh_async_repl_all_settled_except(repl, -1);
 }
 
+bool gsh_async_repl_prompt_settled(const gsh_async_repl *repl)
+{
+    int index;
+    if (repl == NULL) return false;
+    for (index = 0; index < GSH_ASYNC_CELL_CAP; index++) {
+        const gsh_async_cell *cell = &repl->cells[index];
+        bool suspended_preview = cell->native_preview && cell->fullscreen &&
+                                 !cell->focused &&
+                                 cell->state == GSH_ASYNC_RUNNING;
+        if (cell->occupied && !suspended_preview &&
+            (!cell_terminal(cell) || !cell->output_closed ||
+             cell->pty_fd >= 0 || cell->input_offset < cell->input_length ||
+             cell->input_requested || cell->input_probe_pending)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 int gsh_async_repl_next(gsh_async_repl *repl, bool state_lane_busy)
 {
     uint64_t selected_id = UINT64_MAX;
@@ -335,12 +403,12 @@ void gsh_async_repl_starting(gsh_async_repl *repl, int cell_index)
 }
 
 int gsh_async_repl_attach(gsh_async_repl *repl, int cell_index, pid_t pid,
-                          pid_t pgid, int pty_fd)
+                          pid_t pgid, int pty_fd, int resource_fd)
 {
     gsh_async_cell *cell;
 
     if (repl == NULL || !cell_index_valid(cell_index) || pid <= 0 ||
-        pgid <= 0 || pty_fd < 0) {
+        pgid <= 0 || pty_fd < 0 || resource_fd < -1) {
         errno = EINVAL;
         return -1;
     }
@@ -352,6 +420,7 @@ int gsh_async_repl_attach(gsh_async_repl *repl, int cell_index, pid_t pid,
     cell->pid = pid;
     cell->pgid = pgid;
     cell->pty_fd = pty_fd;
+    cell->resource_fd = resource_fd;
     cell->state = GSH_ASYNC_RUNNING;
     repl->render_pending = true;
     return 0;
@@ -409,6 +478,120 @@ int gsh_async_repl_cell_for_fd(const gsh_async_repl *repl, int descriptor)
     return -1;
 }
 
+int gsh_async_repl_cell_for_resource_fd(const gsh_async_repl *repl,
+                                        int descriptor)
+{
+    int index;
+    if (repl == NULL || descriptor < 0) return -1;
+    for (index = 0; index < GSH_ASYNC_CELL_CAP; index++) {
+        if (repl->cells[index].occupied &&
+            repl->cells[index].resource_fd == descriptor) return index;
+    }
+    return -1;
+}
+
+void gsh_async_repl_close_resource(gsh_async_repl *repl, int cell_index)
+{
+    if (repl == NULL || !cell_index_valid(cell_index)) return;
+    if (repl->cells[cell_index].resource_fd >= 0)
+        (void)close(repl->cells[cell_index].resource_fd);
+    repl->cells[cell_index].resource_fd = -1;
+}
+
+int gsh_async_repl_set_preview_layout(gsh_async_repl *repl, int cell_index,
+                                      size_t separator_column)
+{
+    gsh_async_cell *cell;
+    bool split;
+    if (repl == NULL || !cell_index_valid(cell_index)) return -1;
+    cell = &repl->cells[cell_index];
+    split = separator_column > 1U &&
+            separator_column < repl->terminal_columns;
+    if (!cell->occupied || cell_terminal(cell) ||
+        (separator_column != 0U && !split)) return -1;
+    if (!cell->native_preview || cell->preview_split != split ||
+        cell->preview_separator_column != separator_column) {
+        cell->fullscreen_presented = false;
+        repl->render_pending = true;
+    }
+    cell->native_preview = true;
+    cell->preview_split = split;
+    cell->preview_separator_column = split ? separator_column : 0U;
+    return 0;
+}
+
+int gsh_async_repl_split_preview(const gsh_async_repl *repl,
+                                 size_t *separator_column)
+{
+    uint64_t newest = 0U;
+    int selected = -1;
+    int index;
+    if (repl == NULL || separator_column == NULL) return -1;
+    for (index = 0; index < GSH_ASYNC_CELL_CAP; index++) {
+        const gsh_async_cell *cell = &repl->cells[index];
+        if (cell->occupied && cell->native_preview && cell->preview_split &&
+            cell->fullscreen && !cell_terminal(cell) &&
+            cell->preview_separator_column < repl->terminal_columns &&
+            cell->id > newest) {
+            newest = cell->id;
+            selected = index;
+        }
+    }
+    if (selected < 0) return -1;
+    *separator_column = repl->cells[selected].preview_separator_column;
+    return selected;
+}
+
+int gsh_async_repl_add_native_resource(
+    gsh_async_repl *repl, int cell_index, size_t output_row,
+    size_t byte_begin, size_t byte_end, size_t column_begin,
+    size_t column_end, const char *label,
+    size_t label_length, const char *path, size_t path_length,
+    gsh_resource_type type, bool navigable_root)
+{
+    size_t index;
+    gsh_async_native_resource *resource = NULL;
+    const gsh_async_cell *cell;
+    if (repl == NULL || !cell_index_valid(cell_index) || label == NULL ||
+        path == NULL || label_length == 0U ||
+        label_length >= sizeof(repl->native_resources[0].label) ||
+        path_length == 0U ||
+        path_length >= sizeof(repl->native_resources[0].path) ||
+        byte_begin >= byte_end || byte_end - byte_begin != label_length ||
+        column_begin >= column_end ||
+        type < GSH_RESOURCE_REGULAR || type > GSH_RESOURCE_SYMLINK) return -1;
+    cell = &repl->cells[cell_index];
+    if (!cell->occupied) return -1;
+    for (index = 0U; index < GSH_ASYNC_NATIVE_RESOURCE_CAP; index++) {
+        gsh_async_native_resource *candidate = &repl->native_resources[index];
+        if (!candidate->occupied || !cell_index_valid(candidate->cell_index) ||
+            !repl->cells[candidate->cell_index].occupied ||
+            repl->cells[candidate->cell_index].id != candidate->cell_id) {
+            resource = candidate;
+            break;
+        }
+    }
+    if (resource == NULL) { errno = ENOBUFS; return -1; }
+    (void)memset(resource, 0, sizeof(*resource));
+    resource->occupied = true;
+    resource->cell_index = cell_index;
+    resource->cell_id = cell->id;
+    resource->output_row = output_row;
+    resource->byte_begin = byte_begin;
+    resource->byte_end = byte_end;
+    resource->column_begin = column_begin;
+    resource->column_end = column_end;
+    resource->label_length = label_length;
+    (void)memcpy(resource->label, label, label_length);
+    resource->label[label_length] = '\0';
+    (void)memcpy(resource->path, path, path_length);
+    resource->path[path_length] = '\0';
+    resource->type = type;
+    resource->navigable_root = navigable_root;
+    repl->render_pending = true;
+    return 0;
+}
+
 int gsh_async_repl_reap(gsh_async_repl *repl, pid_t pid, int wait_status)
 {
     if (repl == NULL) {
@@ -429,6 +612,9 @@ int gsh_async_repl_reap(gsh_async_repl *repl, pid_t pid, int wait_status)
     cell->input_requested = false;
     cell->input_probe_pending = false;
     cell->fullscreen_presented = false;
+    cell->native_preview = false;
+    cell->preview_split = false;
+    cell->preview_separator_column = 0U;
     cell->passthrough_state = 0;
     cell->passthrough_utf8_length = 0;
     cell->passthrough_utf8_expected = 0;
@@ -507,7 +693,11 @@ static void append_terminal_byte(gsh_async_cell *cell, unsigned char byte)
 {
     if (cell == NULL) return;
     if (cell->escape_state == 1U) {
-        cell->escape_state = byte == '[' ? 2U : (byte == ']' ? 3U : 0U);
+        if (byte == '[') cell->escape_state = 2U;
+        else if (byte == ']') cell->escape_state = 3U;
+        else if (byte == 'P' || byte == 'X' || byte == '^' || byte == '_')
+            cell->escape_state = 5U;
+        else cell->escape_state = 0U;
         return;
     }
     if (cell->escape_state == 2U) {
@@ -517,15 +707,32 @@ static void append_terminal_byte(gsh_async_cell *cell, unsigned char byte)
         return;
     }
     if (cell->escape_state == 3U || cell->escape_state == 4U) {
-        if (byte == 0x07U || (cell->escape_state == 4U && byte == '\\')) {
+        if (byte == 0x07U || byte == 0x9cU ||
+            (cell->escape_state == 4U && byte == '\\')) {
             cell->escape_state = 0;
         } else {
             cell->escape_state = byte == 0x1bU ? 4U : 3U;
         }
         return;
     }
+    if (cell->escape_state == 5U || cell->escape_state == 6U) {
+        if (byte == 0x9cU ||
+            (cell->escape_state == 6U && byte == '\\')) {
+            cell->escape_state = 0U;
+        } else {
+            cell->escape_state = byte == 0x1bU ? 6U : 5U;
+        }
+        return;
+    }
     if (byte == 0x1bU) {
         cell->escape_state = 1U;
+    } else if (byte == 0x9bU) {
+        cell->escape_state = 2U;
+    } else if (byte == 0x9dU) {
+        cell->escape_state = 3U;
+    } else if (byte == 0x90U || byte == 0x98U || byte == 0x9eU ||
+               byte == 0x9fU) {
+        cell->escape_state = 5U;
     } else if (byte == '\r') {
         recover_output_cursor(cell);
         cell->output_cursor = cell->output_line_start;
@@ -557,6 +764,7 @@ int gsh_async_repl_append(gsh_async_repl *repl, int cell_index,
     for (offset = 0; offset < length; offset++) {
         append_terminal_byte(cell, (unsigned char)bytes[offset]);
     }
+    if (cell->output_generation != UINT64_MAX) cell->output_generation++;
     repl->render_pending = true;
     return cell->output_truncated ? 1 : 0;
 }
@@ -1165,6 +1373,10 @@ static void clear_view(gsh_async_repl *repl)
     repl->view_start = 0;
     repl->view_count = 0;
     (void)memset(repl->view_lengths, 0, sizeof(repl->view_lengths));
+    (void)memset(repl->screen_row_by_view, 0,
+                 sizeof(repl->screen_row_by_view));
+    repl->resource_count = 0U;
+    (void)memset(repl->resources, 0, sizeof(repl->resources));
 }
 
 static size_t ansi_token_length(const char *text, size_t length,
@@ -1228,12 +1440,27 @@ static size_t utf8_token_length(const char *text, size_t length,
     return wanted;
 }
 
-static void push_view_row(gsh_async_repl *repl, const char *text,
-                          size_t length)
+static void discard_row_resources(gsh_async_repl *repl, size_t row)
 {
+    size_t source;
+    size_t used = 0U;
     if (repl == NULL) return;
+    for (source = 0U; source < repl->resource_count; source++) {
+        if (repl->resources[source].occupied &&
+            repl->resources[source].view_row != row) {
+            if (used != source) repl->resources[used] = repl->resources[source];
+            used++;
+        }
+    }
+    repl->resource_count = used;
+}
+
+static size_t push_view_row(gsh_async_repl *repl, const char *text,
+                            size_t length)
+{
+    if (repl == NULL) return SIZE_MAX;
     if (text == NULL) {
-        return;
+        return SIZE_MAX;
     }
     static const char reset_style[] = "\033[0m";
     char clipped[GSH_ASYNC_VIEW_BYTES];
@@ -1257,7 +1484,7 @@ static void push_view_row(gsh_async_repl *repl, const char *text,
                 break;
             }
             width = 1;
-            if (columns + width > repl->terminal_columns) {
+            if (columns + width > repl->view_columns) {
                 break;
             }
         }
@@ -1282,11 +1509,177 @@ static void push_view_row(gsh_async_repl *repl, const char *text,
         row = repl->view_start;
         repl->view_start = (repl->view_start + 1U) % GSH_ASYNC_VIEW_ROWS;
     }
+    discard_row_resources(repl, row);
     if (used != 0) {
         (void)memcpy(repl->view[row], clipped, used);
     }
     repl->view[row][used] = '\0';
     repl->view_lengths[row] = used;
+    return row;
+}
+
+static const char *resource_style(gsh_resource_type type)
+{
+    if (type == GSH_RESOURCE_DIRECTORY) return "\033[4;38;5;75m";
+    if (type == GSH_RESOURCE_SYMLINK) return "\033[4;38;5;176m";
+    return "\033[4;38;5;81m";
+}
+
+static size_t native_row_candidates(
+    const gsh_async_repl *repl, int cell_index, size_t output_row,
+    const char *text, size_t length, gsh_resource_candidate *candidates,
+    size_t capacity)
+{
+    size_t resource_index;
+    size_t count = 0U;
+    if (repl == NULL || text == NULL || candidates == NULL ||
+        !cell_index_valid(cell_index)) return 0U;
+    for (resource_index = 0U;
+         resource_index < GSH_ASYNC_NATIVE_RESOURCE_CAP && count < capacity;
+         resource_index++) {
+        const gsh_async_native_resource *native =
+            &repl->native_resources[resource_index];
+        size_t position;
+        if (!native->occupied || native->cell_index != cell_index ||
+            native->cell_id != repl->cells[cell_index].id ||
+            native->output_row != output_row ||
+            native->byte_end > length ||
+            native->byte_end - native->byte_begin != native->label_length ||
+            memcmp(text + native->byte_begin, native->label,
+                   native->label_length) != 0) continue;
+        position = count;
+        while (position > 0U &&
+               candidates[position - 1U].begin > native->byte_begin) {
+            candidates[position] = candidates[position - 1U];
+            position--;
+        }
+        (void)memset(&candidates[position], 0, sizeof(candidates[position]));
+        candidates[position].begin = native->byte_begin;
+        candidates[position].end = native->byte_end;
+        candidates[position].column_begin = native->column_begin;
+        candidates[position].column_end = native->column_end;
+        (void)memcpy(candidates[position].path, native->path,
+                     strlen(native->path) + 1U);
+        candidates[position].provenance = GSH_RESOURCE_NATIVE;
+        candidates[position].type = native->type;
+        candidates[position].navigable_root = native->navigable_root;
+        count++;
+    }
+    return count;
+}
+
+static int register_resource(gsh_async_repl *repl, int cell_index,
+                             size_t view_row,
+                             const gsh_resource_candidate *candidate)
+{
+    gsh_async_resource_action *action;
+    const gsh_async_cell *cell;
+
+    if (repl == NULL || candidate == NULL ||
+        !cell_index_valid(cell_index) ||
+        repl->resource_count >= GSH_ASYNC_RESOURCE_CAP) return -1;
+    cell = &repl->cells[cell_index];
+    action = &repl->resources[repl->resource_count++];
+    (void)memset(action, 0, sizeof(*action));
+    action->occupied = true;
+    action->cell_index = cell_index;
+    action->cell_id = cell->id;
+    action->generation = cell->output_generation;
+    action->view_row = view_row;
+    action->column_begin = candidate->column_begin + 1U;
+    action->column_end = candidate->column_end;
+    (void)memcpy(action->path, candidate->path,
+                 strlen(candidate->path) + 1U);
+    (void)memcpy(action->launch_directory, cell->launch_directory,
+                 strlen(cell->launch_directory) + 1U);
+    action->line = candidate->line;
+    action->column = candidate->column;
+    action->provenance = candidate->provenance;
+    action->type = candidate->type;
+    action->stderr_stream = false;
+    action->navigable_root = candidate->navigable_root;
+    return 0;
+}
+
+static size_t style_resource_row(gsh_async_repl *repl, int cell_index,
+                                 size_t output_row, const char *text,
+                                 size_t length,
+                                 char *styled, size_t capacity,
+                                 gsh_resource_candidate *candidates,
+                                 size_t *candidate_count)
+{
+    size_t count;
+    size_t source = 0U;
+    size_t used = 0U;
+    size_t index;
+    const gsh_async_cell *cell;
+
+    if (repl == NULL || text == NULL || styled == NULL ||
+        candidates == NULL || candidate_count == NULL ||
+        !cell_index_valid(cell_index)) return 0U;
+    cell = &repl->cells[cell_index];
+    count = native_row_candidates(repl, cell_index, output_row, text, length,
+                                  candidates, 16U);
+    if (count == 0U)
+        count = gsh_resource_detect(cell->command, cell->launch_directory,
+                                    text, length, repl->path_detection,
+                                    candidates, 16U);
+    for (index = 0U; index < count; index++) {
+        const char *style = resource_style(candidates[index].type);
+        size_t style_length = strlen(style);
+        size_t plain = candidates[index].begin >= source
+                           ? candidates[index].begin - source : 0U;
+        size_t marked = candidates[index].end - candidates[index].begin;
+        if (plain + style_length + marked + 4U > capacity - used) break;
+        (void)memcpy(styled + used, text + source, plain);
+        used += plain;
+        (void)memcpy(styled + used, style, style_length);
+        used += style_length;
+        (void)memcpy(styled + used, text + candidates[index].begin, marked);
+        used += marked;
+        (void)memcpy(styled + used, "\033[0m", 4U);
+        used += 4U;
+        source = candidates[index].end;
+    }
+    if (length - source <= capacity - used) {
+        (void)memcpy(styled + used, text + source, length - source);
+        used += length - source;
+    }
+    *candidate_count = index;
+    return used;
+}
+
+static void push_resource_row(gsh_async_repl *repl, int cell_index,
+                              size_t output_row, const char *text,
+                              size_t length)
+{
+    char styled[GSH_ASYNC_VIEW_BYTES * 4U];
+    gsh_resource_candidate candidates[16];
+    size_t count = 0U;
+    size_t styled_length;
+    size_t row;
+    size_t index;
+
+    if (repl == NULL || text == NULL) return;
+    if (!repl->actions_enabled) {
+        (void)push_view_row(repl, text, length);
+        return;
+    }
+    styled_length = style_resource_row(repl, cell_index, output_row,
+                                       text, length,
+                                       styled, sizeof(styled), candidates,
+                                       &count);
+    row = push_view_row(repl, count == 0U ? text : styled,
+                        count == 0U ? length : styled_length);
+    if (row == SIZE_MAX) return;
+    for (index = 0U; index < count; index++) {
+        if (candidates[index].begin < repl->view_columns) {
+            if (candidates[index].end > repl->view_columns)
+                candidates[index].end = repl->view_columns;
+            (void)register_resource(repl, cell_index, row,
+                                    &candidates[index]);
+        }
+    }
 }
 
 static void push_prefixed_row(gsh_async_repl *repl, const char *prefix,
@@ -1308,31 +1701,37 @@ static void push_prefixed_row(gsh_async_repl *repl, const char *prefix,
     if (length != 0) {
         (void)memcpy(row + prefix_length, text, length);
     }
-    push_view_row(repl, row, prefix_length + length);
+    (void)push_view_row(repl, row, prefix_length + length);
 }
 
 static void push_output_rows(gsh_async_repl *repl,
-                             const gsh_async_cell *cell)
+                             const gsh_async_cell *cell, int cell_index)
 {
     if (cell == NULL || repl == NULL) {
         return;
     }
     size_t start = 0;
     size_t offset;
+    size_t output_row = 0U;
 
     for (offset = 0; offset < cell->output_length; offset++) {
         if (cell->output[offset] == '\n') {
-            push_view_row(repl, cell->output + start, offset - start);
+            push_resource_row(repl, cell_index, output_row,
+                              cell->output + start,
+                              offset - start);
             start = offset + 1U;
+            output_row++;
         }
     }
     if (start < cell->output_length) {
-        push_view_row(repl, cell->output + start,
-                      cell->output_length - start);
+        push_resource_row(repl, cell_index, output_row,
+                          cell->output + start,
+                          cell->output_length - start);
     }
 }
 
-static void push_cell(gsh_async_repl *repl, const gsh_async_cell *cell)
+static void push_cell(gsh_async_repl *repl, const gsh_async_cell *cell,
+                      int cell_index)
 {
     if (cell == NULL || repl == NULL) {
         return;
@@ -1350,10 +1749,10 @@ static void push_cell(gsh_async_repl *repl, const gsh_async_cell *cell)
         (void)memcpy(command_row + cell->prompt_length, cell->command,
                command_length - cell->prompt_length);
     }
-    push_view_row(repl, command_row, command_length);
-    push_output_rows(repl, cell);
+    (void)push_view_row(repl, command_row, command_length);
+    push_output_rows(repl, cell, cell_index);
     if (cell->output_truncated) {
-        push_view_row(repl, "[output truncated]", 18);
+        (void)push_view_row(repl, "[output truncated]", 18);
     }
 }
 
@@ -1401,14 +1800,63 @@ static int render_append(gsh_async_repl *repl, const char *text,
     return 0;
 }
 
+static int render_cursor(gsh_async_repl *repl, size_t row, size_t column)
+{
+    char sequence[64];
+    int length;
+    if (repl == NULL || row == 0U || column == 0U) return -1;
+    length = snprintf(sequence, sizeof(sequence), "\033[%zu;%zuH", row,
+                      column);
+    if (length < 0 || (size_t)length >= sizeof(sequence)) return -1;
+    return render_append(repl, sequence, (size_t)length);
+}
+
+static int render_clear_split(gsh_async_repl *repl,
+                              size_t separator_column)
+{
+    size_t row;
+    char erase[64];
+    int length;
+    if (repl == NULL || separator_column <= 1U) return -1;
+    length = snprintf(erase, sizeof(erase), "\033[%zuX",
+                      separator_column - 1U);
+    if (length < 0 || (size_t)length >= sizeof(erase)) return -1;
+    for (row = 1U; row <= repl->terminal_rows; row++) {
+        if (render_cursor(repl, row, 1U) == -1 ||
+            render_append(repl, erase, (size_t)length) == -1) return -1;
+    }
+    return 0;
+}
+
+static bool visible_resource_exists(const gsh_async_repl *repl, size_t skip,
+                                    size_t visible)
+{
+    size_t index;
+    if (repl == NULL) return false;
+    for (index = 0U; index < repl->resource_count; index++) {
+        const gsh_async_resource_action *resource = &repl->resources[index];
+        size_t position;
+        if (!resource->occupied ||
+            resource->view_row >= GSH_ASYNC_VIEW_ROWS) continue;
+        position = (resource->view_row + GSH_ASYNC_VIEW_ROWS -
+                    repl->view_start) % GSH_ASYNC_VIEW_ROWS;
+        if (position >= skip && position < skip + visible) return true;
+    }
+    return false;
+}
+
 static int compose_render(gsh_async_repl *repl)
 {
     if (repl == NULL) {
         return -1;
     }
     size_t visible = repl->terminal_rows;
+    size_t maximum_offset;
     size_t skip;
     size_t row_index;
+    size_t separator_column = 0U;
+    bool split;
+    bool have_visible_resource;
 
     /* ── One Compositor Owns the Physical Terminal ───────────────
      * Per-job PTYs prevent a child from moving or erasing the real editor.
@@ -1422,19 +1870,37 @@ static int compose_render(gsh_async_repl *repl)
         render_append(repl, "\033[?1049h", 8) == -1) {
         return -1;
     }
-    if (render_append(repl, "\033[H\033[2J", 7) == -1) {
-        return -1;
-    }
+    split = gsh_async_repl_split_preview(repl, &separator_column) >= 0;
+    if ((!repl->alternate_screen_entered || !split) &&
+        render_append(repl, "\033[H\033[2J", 7) == -1) return -1;
+    if (repl->alternate_screen_entered && split &&
+        render_clear_split(repl, separator_column) == -1) return -1;
     if (visible > repl->view_count) {
         visible = repl->view_count;
     }
-    skip = repl->view_count - visible;
-    for (row_index = skip; row_index < repl->view_count; row_index++) {
+    maximum_offset = repl->view_count - visible;
+    if (repl->scroll_offset > maximum_offset)
+        repl->scroll_offset = maximum_offset;
+    skip = maximum_offset - repl->scroll_offset;
+    have_visible_resource = visible_resource_exists(repl, skip, visible);
+    if (have_visible_resource || maximum_offset != 0U || split) {
+        if (render_append(repl, "\033[?1000h\033[?1006h", 16U) == -1)
+            return -1;
+        repl->mouse_enabled = true;
+    } else if (repl->mouse_enabled) {
+        if (render_append(repl, "\033[?1000l\033[?1006l", 16U) == -1)
+            return -1;
+        repl->mouse_enabled = false;
+    }
+    for (row_index = skip; row_index < skip + visible; row_index++) {
         size_t row = (repl->view_start + row_index) % GSH_ASYNC_VIEW_ROWS;
 
-        if (render_append(repl, repl->view[row], repl->view_lengths[row]) ==
+        repl->screen_row_by_view[row] = row_index - skip + 1U;
+
+        if ((split && render_cursor(repl, row_index - skip + 1U, 1U) == -1) ||
+            render_append(repl, repl->view[row], repl->view_lengths[row]) ==
                 -1 ||
-            (row_index + 1U < repl->view_count &&
+            (!split && row_index + 1U < skip + visible &&
              render_append(repl, "\n", 1) == -1)) {
             return -1;
         }
@@ -1449,16 +1915,20 @@ int gsh_async_repl_prepare_render(gsh_async_repl *repl,
     int ordered[GSH_ASYNC_CELL_CAP];
     size_t count;
     size_t index;
+    size_t separator_column = 0U;
 
     if (repl == NULL || active_prompt == NULL || editor == NULL ||
         editor_length >= GSH_ASYNC_COMMAND_CAP || !repl->enabled) {
         errno = EINVAL;
         return -1;
     }
+    repl->view_columns =
+        gsh_async_repl_split_preview(repl, &separator_column) >= 0
+            ? separator_column - 1U : repl->terminal_columns;
     clear_view(repl);
     count = ordered_cells(repl, ordered);
     for (index = 0; index < count; index++) {
-        push_cell(repl, &repl->cells[ordered[index]]);
+        push_cell(repl, &repl->cells[ordered[index]], ordered[index]);
     }
     push_prefixed_row(repl, active_prompt, editor, editor_length);
     if (compose_render(repl) == -1) {
@@ -1533,5 +2003,54 @@ void gsh_async_repl_close(gsh_async_repl *repl)
             (void)close(cell->pty_fd);
             cell->pty_fd = -1;
         }
+        if (cell->resource_fd >= 0) {
+            (void)close(cell->resource_fd);
+            cell->resource_fd = -1;
+        }
     }
+}
+
+int gsh_async_repl_resource_at(const gsh_async_repl *repl, size_t row,
+                               size_t column,
+                               gsh_async_resource_action *action)
+{
+    size_t index;
+    if (repl == NULL || action == NULL || row == 0U || column == 0U) {
+        errno = EINVAL;
+        return -1;
+    }
+    for (index = 0U; index < repl->resource_count; index++) {
+        const gsh_async_resource_action *candidate = &repl->resources[index];
+        const gsh_async_cell *cell;
+        if (!candidate->occupied ||
+            candidate->view_row >= GSH_ASYNC_VIEW_ROWS ||
+            repl->screen_row_by_view[candidate->view_row] != row ||
+            column < candidate->column_begin ||
+            column > candidate->column_end ||
+            !cell_index_valid(candidate->cell_index)) continue;
+        cell = &repl->cells[candidate->cell_index];
+        if (!cell->occupied || cell->id != candidate->cell_id ||
+            cell->output_generation != candidate->generation) continue;
+        *action = *candidate;
+        return 0;
+    }
+    errno = ENOENT;
+    return -1;
+}
+
+int gsh_async_repl_suspended_fullscreen(const gsh_async_repl *repl)
+{
+    uint64_t newest = 0U;
+    int selected = -1;
+    int index;
+    if (repl == NULL) return -1;
+    for (index = 0; index < GSH_ASYNC_CELL_CAP; index++) {
+        const gsh_async_cell *cell = &repl->cells[index];
+        if (cell->occupied && cell->fullscreen && !cell->focused &&
+            cell->state == GSH_ASYNC_RUNNING && cell->id > newest) {
+            newest = cell->id;
+            selected = index;
+        }
+    }
+    return selected;
 }

@@ -46,8 +46,9 @@ static const char *const FORBIDDEN_CALLS[] = {
 static const char *const MANIFEST_TARGETS[] = {
     "alias-test", "background-test", "benchmark-report-test",
     "command-cache-test", "config-test", "conformance", "fault", "function-test",
-    "fuzz", "gsh", "history-agent", "job-probe", "positional-test", "pty",
-    "source-policy", "source-workspace-test", "trap-test", "variable-test",
+    "file-builtins-test", "fuzz", "gsh", "history-agent", "job-probe",
+    "positional-test", "pty", "resource-actions-test", "source-policy",
+    "source-workspace-test", "trap-test", "variable-test",
 };
 
 typedef struct {

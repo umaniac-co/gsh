@@ -1,13 +1,14 @@
 # source target root-or-role
 src/gsh.c gsh,fault main
 src/alias_expansion.c gsh,fault,fuzz dependency
-src/async_repl.c gsh,fault,fuzz dependency
+src/async_repl.c gsh,fault,fuzz,file-builtins-test,resource-actions-test dependency
 src/background_jobs.c gsh,fault dependency
 src/builtin_alias.c gsh,fault dependency
 src/builtin_cd.c gsh,fault dependency
 src/builtin_command.c gsh,fault dependency
-src/builtin_common.c gsh,fault,fuzz dependency
+src/builtin_common.c gsh,fault,fuzz,file-builtins-test dependency
 src/builtin_fc.c gsh,fault dependency
+src/builtin_files.c gsh,fault,file-builtins-test dependency
 src/builtin_job_control.c gsh,fault dependency
 src/builtin_pure.c gsh,fault dependency
 src/builtin_registry.c gsh,fault dependency
@@ -27,11 +28,13 @@ src/history_agent.c history-agent main
 src/history_client.c gsh,fault dependency
 src/history_store.c gsh,fault,history-agent dependency
 src/native_plan.c gsh,fault,fuzz dependency
+src/native_viewer.c gsh,fault,file-builtins-test dependency
 src/positional_parameters.c gsh,fault,positional-test dependency
 src/posix_lexer.c gsh,fault,fuzz dependency
 src/posix_parser.c gsh,fault,fuzz dependency
+src/resource_actions.c gsh,fault,fuzz,file-builtins-test,resource-actions-test dependency
 src/shell_aliases.c gsh,fault,fuzz,alias-test dependency
-src/shell_config.c gsh,fault,config-test dependency
+src/shell_config.c gsh,fault,config-test,file-builtins-test dependency
 src/shell_functions.c gsh,fault,fuzz,function-test dependency
 src/shell_options.c gsh,fault dependency
 src/shell_traps.c gsh,fault,trap-test dependency
@@ -48,7 +51,9 @@ tests/job_probe.c job-probe main
 tests/lexer_fuzz.c fuzz LLVMFuzzerTestOneInput,main
 tests/positional_parameters_test.c positional-test main
 tests/posix_conformance.c conformance main
+tests/file_builtins_test.c file-builtins-test main
 tests/pty_smoke.c pty main
+tests/resource_actions_test.c resource-actions-test main
 tests/shell_aliases_test.c alias-test main
 tests/shell_config_test.c config-test main
 tests/shell_functions_test.c function-test main

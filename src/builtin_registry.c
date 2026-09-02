@@ -42,6 +42,8 @@ static const gsh_builtin_descriptor builtin_table[] = {
     BUILTIN("help", GSH_BUILTIN_OTHER, GSH_BUILTIN_PURE, false),
     BUILTIN("jobs", GSH_BUILTIN_JOBS, GSH_BUILTIN_JOB_CONTROL, false),
     BUILTIN("kill", GSH_BUILTIN_KILL, GSH_BUILTIN_JOB_CONTROL, false),
+    BUILTIN("ll", GSH_BUILTIN_LL, GSH_BUILTIN_BLOCKING, false),
+    BUILTIN("ls", GSH_BUILTIN_LS, GSH_BUILTIN_BLOCKING, false),
     BUILTIN("printf", GSH_BUILTIN_PRINTF, GSH_BUILTIN_PURE, false),
     BUILTIN("pwd", GSH_BUILTIN_OTHER, GSH_BUILTIN_PURE, false),
     BUILTIN("read", GSH_BUILTIN_READ, GSH_BUILTIN_BLOCKING, false),
@@ -59,6 +61,7 @@ static const gsh_builtin_descriptor builtin_table[] = {
     BUILTIN("umask", GSH_BUILTIN_OTHER, GSH_BUILTIN_STATEFUL, false),
     BUILTIN("unalias", GSH_BUILTIN_OTHER, GSH_BUILTIN_STATEFUL, false),
     BUILTIN("unset", GSH_BUILTIN_OTHER, GSH_BUILTIN_STATEFUL, true),
+    BUILTIN("view", GSH_BUILTIN_VIEW, GSH_BUILTIN_BLOCKING, false),
     BUILTIN("wait", GSH_BUILTIN_OTHER, GSH_BUILTIN_JOB_CONTROL, false),
 };
 

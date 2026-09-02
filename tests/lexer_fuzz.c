@@ -65,6 +65,7 @@ typedef struct {
     gsh_function_store functions;
     gsh_function_store function_scratch;
     gsh_function_store function_snapshot;
+    gsh_async_repl repl;
 } fuzz_workspace;
 
 _Static_assert(sizeof(((fuzz_workspace *)0)->alias_expansion) ==
@@ -505,6 +506,66 @@ static bool fuzz_alias_parse(const uint8_t *data, size_t size)
     return true;
 }
 
+static bool fuzz_resource_candidate(const gsh_resource_candidate *candidate,
+                                    size_t length)
+{
+    if (candidate == NULL) return false;
+    require(candidate->begin <= candidate->end);
+    require(candidate->end <= length);
+    require(candidate->column_begin < candidate->column_end);
+    require(memchr(candidate->path, '\0', sizeof(candidate->path)) != NULL);
+    require(candidate->provenance == GSH_RESOURCE_ADAPTER ||
+            candidate->provenance == GSH_RESOURCE_DETECTED);
+    require(candidate->type <= GSH_RESOURCE_SYMLINK);
+    return true;
+}
+
+static bool fuzz_resource_actions(const uint8_t *data, size_t size)
+{
+    static const char *const commands[] = {
+        "/bin/ls -1", "find .", "tree", "fd", "rg --files",
+        "git status", "grep -n value", "printf output"};
+    fuzz_workspace *workspace = fuzz_storage();
+    gsh_resource_candidate candidates[16];
+    const char *command;
+    size_t length;
+    size_t count;
+    size_t index;
+    int cell;
+    if (data == NULL || workspace == NULL) return false;
+    if (size != 0U && (data[0] & 31U) != 0U) return true;
+    command = commands[size == 0U ? 0U : data[0] >> 5U];
+    if (size != 0U) { data++; size--; }
+    length = size < GSH_ASYNC_CELL_OUTPUT_CAP
+                 ? size : GSH_ASYNC_CELL_OUTPUT_CAP;
+    count = gsh_resource_detect(command, "/", (const char *)data, length,
+                                GSH_PATH_DETECTION_SAFE, candidates,
+                                sizeof(candidates) / sizeof(candidates[0]));
+    require(count <= sizeof(candidates) / sizeof(candidates[0]));
+    for (index = 0U; index < count; index++)
+        require(fuzz_resource_candidate(&candidates[index], length));
+    gsh_async_repl_initialize(&workspace->repl, true);
+    gsh_async_repl_configure_actions(&workspace->repl, true,
+                                     GSH_PATH_DETECTION_SAFE);
+    gsh_async_repl_resize(&workspace->repl, 24U, 80U);
+    cell = gsh_async_repl_accept(&workspace->repl, "gsh$ ", command,
+                                 strlen(command), "/", false, false,
+                                 false, false);
+    require(cell >= 0);
+    gsh_async_repl_starting(&workspace->repl, cell);
+    if (length != 0U)
+        require(gsh_async_repl_append(&workspace->repl, cell,
+                                      (const char *)data, length) == 0);
+    gsh_async_repl_finish(&workspace->repl, cell, 0, true);
+    require(gsh_async_repl_prepare_render(&workspace->repl, "gsh$ ",
+                                          "", 0U) == 0);
+    require(gsh_async_repl_render_length(&workspace->repl) <=
+            GSH_ASYNC_RENDER_CAP);
+    require(workspace->repl.resource_count <= GSH_ASYNC_RESOURCE_CAP);
+    gsh_async_repl_close(&workspace->repl);
+    return true;
+}
+
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 {
     if (data == NULL) {
@@ -513,7 +574,8 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     if (size > 1024U * 1024U) return 0;
     if (!fuzz_lexer_determinism(data, size) ||
         !fuzz_parse_and_plan(data, size) ||
-        !fuzz_alias_parse(data, size)) return -1;
+        !fuzz_alias_parse(data, size) ||
+        !fuzz_resource_actions(data, size)) return -1;
     return 0;
 }
 
@@ -736,7 +798,7 @@ int main(int argc, char **argv)
 
     passed &= random_fuzz_cases(cases);
     if (!passed) return 1;
-    (void)printf("lexer/parser/planner/alias/function fuzz smoke: cases=%lu "
+    (void)printf("lexer/parser/planner/alias/function/resource fuzz smoke: cases=%lu "
            "seed=0x%llx passed\n",
            cases,
            (unsigned long long)UINT64_C(0x6a09e667f3bcc909));
