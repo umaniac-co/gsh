@@ -2,6 +2,8 @@
 #define GSH_NATIVE_PLAN_H
 
 #include "posix_parser.h"
+#include "builtin_common.h"
+#include "shell_variables.h"
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -22,29 +24,54 @@ typedef enum {
     GSH_NATIVE_PLAN_UNSUPPORTED,
     GSH_NATIVE_PLAN_LIMIT,
     GSH_NATIVE_PLAN_ERROR,
+    GSH_NATIVE_PLAN_DEFERRED,
 } gsh_native_plan_status;
 
-typedef gsh_native_plan_status (*gsh_native_command_substitute_fn)(
-    void *opaque, const char *commands, size_t command_length,
-    char *output, size_t output_capacity, size_t *output_length,
-    int *exit_status);
+enum { GSH_NATIVE_SUBSTITUTION_CAP = 32 };
 
-typedef const char *(*gsh_native_variable_lookup_fn)(
-    void *opaque, const char *name, size_t name_length, bool *found);
+typedef struct {
+    uint32_t offset;
+    uint32_t length;
+    int32_t exit_status;
+} gsh_native_substitution_result;
 
-typedef gsh_native_plan_status (*gsh_native_variable_assign_fn)(
-    void *opaque, const char *name, size_t name_length, const char *value,
-    size_t value_length);
+typedef struct {
+    gsh_native_substitution_result results[GSH_NATIVE_SUBSTITUTION_CAP];
+    size_t count;
+    size_t cursor;
+    size_t text_used;
+    char text[GSH_NATIVE_HEREDOC_TEXT_CAP];
+    char request[GSH_NATIVE_TEXT_CAP];
+    size_t request_length;
+    bool execute;
+    bool pending;
+} gsh_native_substitution_state;
 
-typedef gsh_native_plan_status (*gsh_native_parameter_error_fn)(
-    void *opaque, const char *name, size_t name_length, const char *message,
-    size_t message_length, bool default_message);
+typedef enum {
+    GSH_NATIVE_VARIABLE_OVERLAY,
+    GSH_NATIVE_VARIABLE_LIVE,
+} gsh_native_variable_mode;
 
-typedef gsh_native_plan_status (*gsh_native_expansion_error_fn)(
-    void *opaque, const char *message, size_t message_length);
-
-typedef gsh_native_plan_status (*gsh_native_command_begin_fn)(
-    void *opaque, size_t command_index, size_t command_count);
+typedef struct {
+    gsh_native_variable_mode mode;
+    gsh_variable_store *variables;
+    gsh_variable_journal *journal;
+    uint64_t journal_generation;
+    const gsh_variable_store *scope_base;
+    gsh_variable_journal *scope_changes;
+    size_t command_count;
+    size_t current_scope;
+    unsigned int attributes;
+    bool isolated;
+    bool mutated;
+    bool preflight;
+    bool assignment_fault_enabled;
+    unsigned long assignment_fault_trigger;
+    unsigned long *assignment_fault_calls;
+    bool *fatal_error;
+    const gsh_builtin_io *diagnostic_io;
+    bool carriage_return;
+} gsh_native_variable_state;
 
 typedef enum {
     GSH_NATIVE_PATHNAME_REJECT = 0,
@@ -61,15 +88,8 @@ typedef struct {
     size_t positional_count;
     const char *option_flags;
     char *const *environment;
-    gsh_native_variable_lookup_fn variable_lookup;
-    gsh_native_variable_assign_fn variable_assign;
-    gsh_native_parameter_error_fn parameter_error;
-    gsh_native_expansion_error_fn expansion_error;
-    void *variable_opaque;
-    gsh_native_command_begin_fn command_begin;
-    void *command_opaque;
-    gsh_native_command_substitute_fn command_substitute;
-    void *command_substitute_opaque;
+    gsh_native_variable_state *variable_state;
+    gsh_native_substitution_state *substitutions;
     bool *command_substitution_performed;
     int *command_substitution_status;
     gsh_native_pathname_mode pathname_mode;
@@ -121,15 +141,6 @@ typedef struct {
     size_t heredoc_text_used;
 } gsh_native_pipeline;
 
-gsh_native_plan_status
-gsh_native_plan_pipeline(const char *input,
-                         const gsh_parse_storage *storage, size_t root,
-                         gsh_native_pipeline *pipeline);
-gsh_native_plan_status
-gsh_native_plan_pipeline_node(const char *input,
-                              const gsh_parse_storage *storage,
-                              size_t pipeline_node,
-                              gsh_native_pipeline *pipeline);
 gsh_native_plan_status gsh_native_plan_pipeline_with_context(
     const char *input, const gsh_parse_storage *storage, size_t root,
     const gsh_native_expansion_context *context,
@@ -151,6 +162,14 @@ gsh_native_plan_status gsh_native_plan_redirects_with_context(
     const char *input, const gsh_parse_storage *storage, size_t node_index,
     const gsh_native_expansion_context *context,
     gsh_native_pipeline *pipeline);
-const char *gsh_native_plan_status_name(gsh_native_plan_status status);
+void gsh_native_substitutions_initialize(
+    gsh_native_substitution_state *state, bool execute);
+void gsh_native_substitutions_rewind(gsh_native_substitution_state *state);
+const char *gsh_native_substitution_request(
+    const gsh_native_substitution_state *state, size_t *length);
+char *gsh_native_substitution_output(gsh_native_substitution_state *state,
+                                     size_t *capacity);
+gsh_native_plan_status gsh_native_substitution_complete(
+    gsh_native_substitution_state *state, size_t length, int exit_status);
 
 #endif

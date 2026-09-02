@@ -8,7 +8,8 @@
 #include "benchmark_report.h"
 
 #include <errno.h>
-#include <fcntl.h>
+#include <stdarg.h> /* CANON-INCLUDE: macos */
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/utsname.h>
@@ -17,8 +18,70 @@
 
 enum {
     BENCHMARK_REPORT_FIELD_CAP = 4096,
+    BENCHMARK_REPORT_FORMAT_CAP = 8192,
     BENCHMARK_REPORT_SCHEMA_VERSION = 1,
 };
+
+static int write_all(int descriptor, const char *data, size_t length)
+{
+    size_t written = 0;
+    size_t attempts;
+
+    if (descriptor < 0 || (length > 0U && data == NULL)) {
+        errno = EINVAL;
+        return -1;
+    }
+    for (attempts = 0; written < length && attempts <= length; attempts++) {
+        ssize_t count = write(descriptor, data + written, length - written);
+
+        if (count > 0) {
+            written += (size_t)count;
+        } else if (count != -1 || errno != EINTR) {
+            return -1;
+        }
+    }
+    if (written != length) {
+        errno = EIO;
+        return -1;
+    }
+    return 0;
+}
+
+static int write_text(int descriptor, const char *text)
+{
+    size_t length;
+
+    if (text == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+    length = strnlen(text, BENCHMARK_REPORT_FORMAT_CAP);
+    if (length == BENCHMARK_REPORT_FORMAT_CAP) {
+        errno = EOVERFLOW;
+        return -1;
+    }
+    return write_all(descriptor, text, length);
+}
+
+static int write_format(int descriptor, const char *format, ...)
+{
+    char buffer[BENCHMARK_REPORT_FORMAT_CAP];
+    va_list arguments;
+    int length;
+
+    if (format == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+    va_start(arguments, format);
+    length = vsnprintf(buffer, sizeof(buffer), format, arguments);
+    va_end(arguments);
+    if (length < 0 || (size_t)length >= sizeof(buffer)) {
+        errno = EOVERFLOW;
+        return -1;
+    }
+    return write_all(descriptor, buffer, (size_t)length);
+}
 
 static int copy_field(char *destination, size_t capacity,
                       const char *source)
@@ -34,17 +97,17 @@ static int copy_field(char *destination, size_t capacity,
         errno = ENAMETOOLONG;
         return -1;
     }
-    memcpy(destination, source, length + 1U);
+    (void)memcpy(destination, source, length + 1U);
     return 0;
 }
 
-static int write_csv_string(FILE *stream, const char *value)
+static int write_csv_string(int descriptor, const char *value)
 {
     size_t length;
     size_t index;
     bool formula_like;
 
-    if (stream == NULL || value == NULL) {
+    if (descriptor < 0 || value == NULL) {
         errno = EINVAL;
         return -1;
     }
@@ -52,8 +115,9 @@ static int write_csv_string(FILE *stream, const char *value)
     formula_like = length > 0 &&
                    (value[0] == '=' || value[0] == '+' || value[0] == '-' ||
                     value[0] == '@');
-    if (length > BENCHMARK_REPORT_FIELD_CAP || fputc('"', stream) == EOF ||
-        (formula_like && fputc('\'', stream) == EOF)) {
+    if (length > BENCHMARK_REPORT_FIELD_CAP ||
+        write_all(descriptor, "\"", 1U) == -1 ||
+        (formula_like && write_all(descriptor, "'", 1U) == -1)) {
         errno = length > BENCHMARK_REPORT_FIELD_CAP ? EOVERFLOW : errno;
         return -1;
     }
@@ -65,19 +129,23 @@ static int write_csv_string(FILE *stream, const char *value)
                           : value[index] == '\n' ? 'n'
                                                  : 't';
 
-            if (fputc('\\', stream) == EOF || fputc(escaped, stream) == EOF) {
+            char escaped_text[2] = {'\\', (char)escaped};
+
+            if (write_all(descriptor, escaped_text,
+                          sizeof(escaped_text)) == -1) {
                 return -1;
             }
-        } else if (value[index] == '"' && fputc('"', stream) == EOF) {
+        } else if (value[index] == '"' &&
+                   write_all(descriptor, "\"", 1U) == -1) {
             return -1;
-        } else if (fputc((unsigned char)value[index], stream) == EOF) {
+        } else if (write_all(descriptor, &value[index], 1U) == -1) {
             return -1;
         }
     }
-    return fputc('"', stream) == EOF ? -1 : 0;
+    return write_all(descriptor, "\"", 1U);
 }
 
-static int write_header(FILE *stream)
+static int write_header(int descriptor)
 {
     static const char prefix[] =
         "schema_version,recorded_at_utc,revision,platform,cpu_count,compiler,"
@@ -86,19 +154,19 @@ static int write_header(FILE *stream)
         "total,status";
     size_t index;
 
-    if (stream == NULL) {
+    if (descriptor < 0) {
         errno = EINVAL;
         return -1;
     }
-    if (fputs(prefix, stream) == EOF) {
+    if (write_text(descriptor, prefix) == -1) {
         return -1;
     }
     for (index = 0; index < BENCHMARK_REPORT_SAMPLE_CAP; index++) {
-        if (fprintf(stream, ",sample_%03zu", index + 1U) < 0) {
+        if (write_format(descriptor, ",sample_%03zu", index + 1U) == -1) {
             return -1;
         }
     }
-    return fputc('\n', stream) == EOF ? -1 : 0;
+    return write_all(descriptor, "\n", 1U);
 }
 
 static int format_metadata(benchmark_report *report)
@@ -147,7 +215,7 @@ int benchmark_report_open(benchmark_report *report, const char *path)
         errno = EINVAL;
         return -1;
     }
-    memset(report, 0, sizeof(*report));
+    (void)memset(report, 0, sizeof(*report));
     if (copy_field(report->final_path, sizeof(report->final_path), path) ==
             -1 ||
         format_metadata(report) == -1) {
@@ -163,34 +231,40 @@ int benchmark_report_open(benchmark_report *report, const char *path)
     if (descriptor == -1) {
         return -1;
     }
-    report->stream = fdopen(descriptor, "w");
-    if (report->stream == NULL) {
-        int saved = errno;
-
-        (void)close(descriptor);
-        (void)unlink(report->temporary_path);
-        errno = saved;
-        return -1;
-    }
+    report->descriptor = descriptor;
     report->active = true;
-    if (write_header(report->stream) == -1) {
+    if (write_header(report->descriptor) == -1) {
         benchmark_report_abort(report);
         return -1;
     }
     return 0;
 }
 
-static int compare_u64_report(const void *left, const void *right)
+static void sort_u64_report(uint64_t *values, size_t count)
 {
-    uint64_t first = *(const uint64_t *)left;
-    uint64_t second = *(const uint64_t *)right;
+    if (values == NULL) {
+        return;
+    }
+    size_t index;
 
-    return first < second ? -1 : first > second ? 1 : 0;
+    for (index = 1U; index < count; index++) {
+        uint64_t value = values[index];
+        size_t position = index;
+
+        while (position > 0U && values[position - 1U] > value) {
+            values[position] = values[position - 1U];
+            position--;
+        }
+        values[position] = value;
+    }
 }
 
 static uint64_t percentile(const uint64_t *samples, size_t count,
                            size_t numerator)
 {
+    if (samples == NULL) {
+        return 0U;
+    }
     size_t rank = (count * numerator + 99U) / 100U;
 
     return samples[rank == 0 ? 0 : rank - 1U];
@@ -202,52 +276,60 @@ static int write_common_prefix(benchmark_report *report, const char *suite,
                                const char *executable,
                                const char *measurement, const char *unit)
 {
-    FILE *stream = report->stream;
+    if (report == NULL) {
+        return -1;
+    }
+    int descriptor = report->descriptor;
 
-    if (fprintf(stream, "%d,", BENCHMARK_REPORT_SCHEMA_VERSION) < 0 ||
-        write_csv_string(stream, report->recorded_at_utc) == -1 ||
-        fputc(',', stream) == EOF ||
-        write_csv_string(stream, report->revision) == -1 ||
-        fputc(',', stream) == EOF ||
-        write_csv_string(stream, report->platform) == -1 ||
-        fprintf(stream, ",%ld,", report->cpu_count) < 0 ||
-        write_csv_string(stream, report->compiler) == -1 ||
-        fputc(',', stream) == EOF || write_csv_string(stream, suite) == -1 ||
-        fputc(',', stream) == EOF || write_csv_string(stream, test) == -1 ||
-        fputc(',', stream) == EOF || write_csv_string(stream, shell) == -1 ||
-        fputc(',', stream) == EOF ||
-        write_csv_string(stream, shell_version) == -1 ||
-        fputc(',', stream) == EOF ||
-        write_csv_string(stream, executable) == -1 ||
-        fputc(',', stream) == EOF ||
-        write_csv_string(stream, measurement) == -1 ||
-        fputc(',', stream) == EOF || write_csv_string(stream, unit) == -1) {
+    if (write_format(descriptor, "%d,", BENCHMARK_REPORT_SCHEMA_VERSION) ==
+            -1 ||
+        write_csv_string(descriptor, report->recorded_at_utc) == -1 ||
+        write_all(descriptor, ",", 1U) == -1 ||
+        write_csv_string(descriptor, report->revision) == -1 ||
+        write_all(descriptor, ",", 1U) == -1 ||
+        write_csv_string(descriptor, report->platform) == -1 ||
+        write_format(descriptor, ",%ld,", report->cpu_count) == -1 ||
+        write_csv_string(descriptor, report->compiler) == -1 ||
+        write_all(descriptor, ",", 1U) == -1 ||
+        write_csv_string(descriptor, suite) == -1 ||
+        write_all(descriptor, ",", 1U) == -1 ||
+        write_csv_string(descriptor, test) == -1 ||
+        write_all(descriptor, ",", 1U) == -1 ||
+        write_csv_string(descriptor, shell) == -1 ||
+        write_all(descriptor, ",", 1U) == -1 ||
+        write_csv_string(descriptor, shell_version) == -1 ||
+        write_all(descriptor, ",", 1U) == -1 ||
+        write_csv_string(descriptor, executable) == -1 ||
+        write_all(descriptor, ",", 1U) == -1 ||
+        write_csv_string(descriptor, measurement) == -1 ||
+        write_all(descriptor, ",", 1U) == -1 ||
+        write_csv_string(descriptor, unit) == -1) {
         return -1;
     }
     return 0;
 }
 
-static int write_sample_columns(FILE *stream, const uint64_t *samples,
+static int write_sample_columns(int descriptor, const uint64_t *samples,
                                 size_t count)
 {
     size_t index;
 
-    if (stream == NULL || count > BENCHMARK_REPORT_SAMPLE_CAP ||
+    if (descriptor < 0 || count > BENCHMARK_REPORT_SAMPLE_CAP ||
         (count > 0 && samples == NULL)) {
         errno = EINVAL;
         return -1;
     }
     for (index = 0; index < BENCHMARK_REPORT_SAMPLE_CAP; index++) {
         if (index < count) {
-            if (fprintf(stream, ",%llu",
-                        (unsigned long long)samples[index]) < 0) {
+            if (write_format(descriptor, ",%llu",
+                             (unsigned long long)samples[index]) == -1) {
                 return -1;
             }
-        } else if (fputc(',', stream) == EOF) {
+        } else if (write_all(descriptor, ",", 1U) == -1) {
             return -1;
         }
     }
-    return fputc('\n', stream) == EOF ? -1 : 0;
+    return write_all(descriptor, "\n", 1U);
 }
 
 /* ── One Row Preserves One Comparable Measurement ────────────────
@@ -286,22 +368,22 @@ int benchmark_report_write_metric(benchmark_report *report,
             misses++;
         }
     }
-    qsort(sorted, sample_count, sizeof(sorted[0]), compare_u64_report);
+    sort_u64_report(sorted, sample_count);
     if (write_common_prefix(report, suite, test, shell, shell_version,
                             executable, measurement, unit) == -1 ||
-        fprintf(report->stream,
-                ",%zu,%llu,%llu,%llu,%llu,",
-                sample_count,
-                (unsigned long long)percentile(sorted, sample_count, 50),
-                (unsigned long long)percentile(sorted, sample_count, 95),
-                (unsigned long long)percentile(sorted, sample_count, 99),
-                (unsigned long long)sorted[sample_count - 1U]) < 0 ||
+        write_format(report->descriptor, ",%zu,%llu,%llu,%llu,%llu,",
+                     sample_count,
+                     (unsigned long long)percentile(sorted, sample_count, 50),
+                     (unsigned long long)percentile(sorted, sample_count, 95),
+                     (unsigned long long)percentile(sorted, sample_count, 99),
+                     (unsigned long long)sorted[sample_count - 1U]) == -1 ||
         (threshold > 0 &&
-         fprintf(report->stream, "%llu,%zu",
-                 (unsigned long long)threshold, misses) < 0) ||
-        (threshold == 0 && fputs(",", report->stream) == EOF) ||
-        fputs(",,,,", report->stream) == EOF ||
-        write_sample_columns(report->stream, samples, sample_count) == -1) {
+         write_format(report->descriptor, "%llu,%zu",
+                      (unsigned long long)threshold, misses) == -1) ||
+        (threshold == 0 && write_all(report->descriptor, ",", 1U) == -1) ||
+        write_text(report->descriptor, ",,,,") == -1 ||
+        write_sample_columns(report->descriptor, samples, sample_count) ==
+            -1) {
         report->failed = true;
         return -1;
     }
@@ -325,11 +407,11 @@ int benchmark_report_write_gate(benchmark_report *report,
     }
     if (write_common_prefix(report, "gate", test, shell, shell_version,
                             executable, "paired-wins", "count") == -1 ||
-        fprintf(report->stream, ",,,,,,%zu,,", minimum) < 0 ||
-        write_csv_string(report->stream, peer) == -1 ||
-        fprintf(report->stream, ",%zu,%zu,", wins, total) < 0 ||
-        write_csv_string(report->stream, status) == -1 ||
-        write_sample_columns(report->stream, NULL, 0) == -1) {
+        write_format(report->descriptor, ",,,,,,%zu,,", minimum) == -1 ||
+        write_csv_string(report->descriptor, peer) == -1 ||
+        write_format(report->descriptor, ",%zu,%zu,", wins, total) == -1 ||
+        write_csv_string(report->descriptor, status) == -1 ||
+        write_sample_columns(report->descriptor, NULL, 0) == -1) {
         report->failed = true;
         return -1;
     }
@@ -338,29 +420,27 @@ int benchmark_report_write_gate(benchmark_report *report,
 
 int benchmark_report_commit(benchmark_report *report)
 {
-    int descriptor;
     int saved;
 
     if (report == NULL || !report->active || report->failed) {
         errno = EINVAL;
         return -1;
     }
-    descriptor = fileno(report->stream);
-    if (fflush(report->stream) == EOF || fsync(descriptor) == -1) {
+    if (fsync(report->descriptor) == -1) {
         saved = errno;
         benchmark_report_abort(report);
         errno = saved;
         return -1;
     }
-    if (fclose(report->stream) == EOF) {
+    if (close(report->descriptor) == -1) {
         saved = errno;
-        report->stream = NULL;
+        report->descriptor = -1;
         (void)unlink(report->temporary_path);
         report->active = false;
         errno = saved;
         return -1;
     }
-    report->stream = NULL;
+    report->descriptor = -1;
     if (rename(report->temporary_path, report->final_path) == -1) {
         saved = errno;
         (void)unlink(report->temporary_path);
@@ -377,9 +457,9 @@ void benchmark_report_abort(benchmark_report *report)
     if (report == NULL || !report->active) {
         return;
     }
-    if (report->stream != NULL) {
-        (void)fclose(report->stream);
-        report->stream = NULL;
+    if (report->descriptor >= 0) {
+        (void)close(report->descriptor);
+        report->descriptor = -1;
     }
     (void)unlink(report->temporary_path);
     report->active = false;

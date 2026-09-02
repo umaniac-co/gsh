@@ -10,9 +10,7 @@
 #include <errno.h>
 #include <inttypes.h>
 #include <limits.h>
-#include <stdbool.h>
-#include <stdint.h>
-#include <stdio.h>
+#include <stdio.h> /* CANON-INCLUDE: linux */
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -54,12 +52,12 @@ typedef enum {
 static int emit_bytes(const gsh_builtin_io *io, int descriptor,
                       const void *bytes, size_t length)
 {
-    if (io == NULL || io->output == NULL ||
+    if (!gsh_builtin_io_valid(io) ||
         (bytes == NULL && length != 0)) {
         errno = EINVAL;
         return 1;
     }
-    return io->output(io->opaque, descriptor, bytes, length) == 0 ? 0 : 1;
+    return gsh_builtin_output(io, descriptor, bytes, length) == 0 ? 0 : 1;
 }
 
 static int hex_digit(unsigned char byte)
@@ -79,6 +77,9 @@ static int hex_digit(unsigned char byte)
 static size_t encode_utf8(uint32_t value,
                           unsigned char output[GSH_ESCAPE_BYTE_CAP])
 {
+    if (output == NULL) {
+        return 0U;
+    }
     if (value <= 0x7fU) {
         output[0] = (unsigned char)value;
         return 1;
@@ -109,6 +110,9 @@ static size_t encode_utf8(uint32_t value,
 
 static void simple_escape(unsigned char byte, escape_result *result)
 {
+    if (result == NULL) {
+        return;
+    }
     switch (byte) {
     case 'a': result->bytes[0] = '\a'; break;
     case 'b': result->bytes[0] = '\b'; break;
@@ -133,6 +137,9 @@ static void numeric_escape(const char *text, size_t available,
                            size_t digits, unsigned int base,
                            escape_result *result)
 {
+    if (result == NULL || text == NULL) {
+        return;
+    }
     uint32_t value = 0;
     size_t index;
 
@@ -156,6 +163,9 @@ static void numeric_escape(const char *text, size_t available,
 static void unicode_escape(const char *text, size_t available,
                            size_t digits, escape_result *result)
 {
+    if (result == NULL || text == NULL) {
+        return;
+    }
     uint32_t value = 0;
     size_t index;
 
@@ -184,6 +194,9 @@ typedef enum {
 static escape_result decode_escape(const char *text, size_t available,
                                    escape_mode mode)
 {
+    if (text == NULL) {
+        return (escape_result){0};
+    }
     escape_result result = {{0}, 0, 1, false};
     unsigned char kind;
 
@@ -222,6 +235,10 @@ static escape_result decode_escape(const char *text, size_t available,
 static bool echo_option(const char *argument, bool *newline,
                         bool *escapes)
 {
+    if (argument == NULL) return false;
+    if (escapes == NULL || newline == NULL) {
+        return false;
+    }
     size_t index;
 
     if (argument[0] != '-' || argument[1] == '\0') {
@@ -246,6 +263,9 @@ static bool echo_option(const char *argument, bool *newline,
 static int echo_escaped_operand(const gsh_builtin_io *io,
                                 const char *operand, bool *stopped)
 {
+    if (operand == NULL || stopped == NULL) {
+        return -1;
+    }
     size_t length = strlen(operand);
     size_t offset = 0;
 
@@ -283,6 +303,9 @@ static int echo_escaped_operand(const gsh_builtin_io *io,
 static int builtin_echo(size_t argc, char *const argv[],
                         const gsh_builtin_io *io)
 {
+    if (argv == NULL) {
+        return -1;
+    }
     size_t index = 1;
     size_t operand_index;
     bool newline = true;
@@ -314,6 +337,9 @@ static int builtin_echo(size_t argc, char *const argv[],
 
 static int parse_decimal_field(const char *text, size_t *offset, int *value)
 {
+    if (offset == NULL || text == NULL || value == NULL) {
+        return -1;
+    }
     unsigned int parsed = 0;
     size_t consumed = 0;
 
@@ -335,6 +361,10 @@ static int parse_decimal_field(const char *text, size_t *offset, int *value)
 static int parse_star_value(size_t argc, char *const argv[], size_t *argument,
                             int *value)
 {
+    if (argument == NULL) return -1;
+    if (argv == NULL || value == NULL) {
+        return -1;
+    }
     char *end;
     long parsed;
 
@@ -357,9 +387,12 @@ static int parse_printf_conversion(const char *format, size_t available,
                                    size_t *argument,
                                    printf_conversion *conversion)
 {
+    if (argument == NULL || argv == NULL || conversion == NULL || format == NULL) {
+        return -1;
+    }
     size_t offset = 1;
 
-    memset(conversion, 0, sizeof(*conversion));
+    (void)memset(conversion, 0, sizeof(*conversion));
     conversion->precision = -1;
     while (offset < available && strchr("-+ #0'", format[offset]) != NULL &&
            conversion->flag_count < sizeof(conversion->flags)) {
@@ -406,12 +439,16 @@ static int build_printf_spec(const printf_conversion *conversion,
                              char result[GSH_PRINTF_SPEC_CAP],
                              char final_conversion)
 {
+    if (conversion == NULL) return -1;
+    if (result == NULL) {
+        return -1;
+    }
     size_t used = 0;
     int count;
 
     result[used++] = '%';
     if (conversion->flag_count != 0) {
-        memcpy(result + used, conversion->flags, conversion->flag_count);
+        (void)memcpy(result + used, conversion->flags, conversion->flag_count);
         used += conversion->flag_count;
     }
     if (conversion->width_set) {
@@ -446,6 +483,9 @@ static int build_printf_spec(const printf_conversion *conversion,
 static uintmax_t printf_quoted_operand(const char *text, bool *valid,
                                       bool *quoted)
 {
+    if (quoted == NULL || text == NULL || valid == NULL) {
+        return 0U;
+    }
     mbstate_t state;
     wchar_t value;
     size_t length;
@@ -453,7 +493,7 @@ static uintmax_t printf_quoted_operand(const char *text, bool *valid,
     *quoted = text[0] == '\'' || text[0] == '"';
     if (!*quoted) return 0;
     if (text[1] == '\0') return 0;
-    memset(&state, 0, sizeof(state));
+    (void)memset(&state, 0, sizeof(state));
     length = mbrtowc(&value, text + 1U, strlen(text + 1U), &state);
     if (length == (size_t)-1 || length == (size_t)-2) {
         *valid = false;
@@ -464,6 +504,9 @@ static uintmax_t printf_quoted_operand(const char *text, bool *valid,
 
 static intmax_t printf_signed_operand(const char *text, bool *valid)
 {
+    if (text == NULL || valid == NULL) {
+        return -1;
+    }
     char *end;
     intmax_t value;
     bool quoted;
@@ -480,6 +523,9 @@ static intmax_t printf_signed_operand(const char *text, bool *valid)
 
 static uintmax_t printf_unsigned_operand(const char *text, bool *valid)
 {
+    if (text == NULL || valid == NULL) {
+        return 0U;
+    }
     char *end;
     uintmax_t value;
     bool quoted;
@@ -496,6 +542,9 @@ static uintmax_t printf_unsigned_operand(const char *text, bool *valid)
 
 static long double printf_float_operand(const char *text, bool *valid)
 {
+    if (text == NULL || valid == NULL) {
+        return 0.0;
+    }
     char *end;
     long double value;
     bool quoted;
@@ -514,6 +563,9 @@ static int emit_printf_field(const gsh_builtin_io *io, const char *spec,
                              char conversion, const char *operand,
                              bool *valid)
 {
+    if (io == NULL || operand == NULL || spec == NULL || valid == NULL) {
+        return -1;
+    }
     char output[GSH_PRINTF_FIELD_CAP + 1U];
     int length;
 
@@ -542,6 +594,9 @@ static int emit_printf_field(const gsh_builtin_io *io, const char *spec,
 static int decode_printf_b(const char *operand, unsigned char *output,
                            size_t capacity, size_t *length, bool *stop)
 {
+    if (operand == NULL || output == NULL) {
+        return -1;
+    }
     size_t input_length = strlen(operand);
     size_t input = 0;
     size_t used = 0;
@@ -563,7 +618,7 @@ static int decode_printf_b(const char *operand, unsigned char *output,
             if (result.length > capacity - used) {
                 return -1;
             }
-            memcpy(output + used, result.bytes, result.length);
+            (void)memcpy(output + used, result.bytes, result.length);
             used += result.length;
             input += result.consumed;
         }
@@ -593,6 +648,7 @@ static int emit_padding(const gsh_builtin_io *io, size_t count)
 
 static bool printf_left_adjusted(const printf_conversion *conversion)
 {
+    if (conversion == NULL) return false;
     size_t index;
 
     if (conversion->width < 0) {
@@ -610,6 +666,9 @@ static int emit_printf_b(const gsh_builtin_io *io,
                          const printf_conversion *conversion,
                          const char *operand, bool *stop)
 {
+    if (conversion == NULL) {
+        return -1;
+    }
     unsigned char decoded[GSH_PRINTF_FIELD_CAP];
     size_t length;
     size_t visible;
@@ -641,6 +700,9 @@ static int emit_printf_b(const gsh_builtin_io *io,
 static int emit_format_escape(const gsh_builtin_io *io, const char *format,
                               size_t available, size_t *consumed)
 {
+    if (consumed == NULL || format == NULL || io == NULL) {
+        return -1;
+    }
     escape_result result = decode_escape(format, available,
                                          ESCAPE_PRINTF_FORMAT);
 
@@ -653,6 +715,10 @@ static int run_printf_conversion(const gsh_builtin_io *io,
                                  size_t argc, char *const argv[],
                                  size_t *argument, bool *valid, bool *stop)
 {
+    if (conversion == NULL) return -1;
+    if (argument == NULL || argv == NULL || io == NULL || stop == NULL || valid == NULL) {
+        return -1;
+    }
     const char *operand;
     bool missing;
     char spec[GSH_PRINTF_SPEC_CAP];
@@ -680,6 +746,9 @@ static int run_printf_format(const gsh_builtin_io *io, const char *format,
                              size_t *argument, bool *valid, bool *stop,
                              bool *used_operand)
 {
+    if (argument == NULL || format == NULL || io == NULL || stop == NULL || used_operand == NULL) {
+        return -1;
+    }
     size_t length = strlen(format);
     size_t offset = 0;
 
@@ -722,6 +791,9 @@ static int run_printf_format(const gsh_builtin_io *io, const char *format,
 static int builtin_printf(size_t argc, char *const argv[],
                           const gsh_builtin_io *io)
 {
+    if (argv == NULL || io == NULL) {
+        return -1;
+    }
     size_t format_index = argc > 1U && strcmp(argv[1], "--") == 0 ? 2U : 1U;
     size_t argument = format_index + 1U;
     bool valid = true;
@@ -750,6 +822,9 @@ static int builtin_printf(size_t argc, char *const argv[],
 
 static bool parse_test_integer(const char *text, intmax_t *value)
 {
+    if (text == NULL || value == NULL) {
+        return false;
+    }
     char *end;
 
     errno = 0;
@@ -760,6 +835,9 @@ static bool parse_test_integer(const char *text, intmax_t *value)
 static bool test_file_unary(const char *operator, const char *operand,
                             bool *recognized)
 {
+    if (operand == NULL || operator == NULL || recognized == NULL) {
+        return false;
+    }
     struct stat information;
     int stat_status = (strcmp(operator, "-h") == 0 ||
                        strcmp(operator, "-L") == 0)
@@ -788,6 +866,9 @@ static bool test_file_unary(const char *operator, const char *operand,
 static bool test_unary(const char *operator, const char *operand,
                        bool *recognized)
 {
+    if (operand == NULL || recognized == NULL) {
+        return false;
+    }
     if (strcmp(operator, "-n") == 0) {
         *recognized = true;
         return operand[0] != '\0';
@@ -809,6 +890,9 @@ static bool test_unary(const char *operator, const char *operand,
 static bool test_file_binary(const char *left, const char *operator,
                              const char *right, bool *recognized)
 {
+    if (left == NULL || recognized == NULL || right == NULL) {
+        return false;
+    }
     struct stat first;
     struct stat second;
     bool first_exists = stat(left, &first) == 0;
@@ -851,6 +935,9 @@ static bool test_file_binary(const char *left, const char *operator,
 static bool test_binary(const char *left, const char *operator,
                         const char *right, bool *recognized, bool *valid)
 {
+    if (left == NULL || recognized == NULL || right == NULL || valid == NULL) {
+        return false;
+    }
     intmax_t first;
     intmax_t second;
 
@@ -879,6 +966,9 @@ static bool test_binary(const char *left, const char *operator,
 static int test_small_expression(size_t count, char *const operands[],
                                  bool *value)
 {
+    if (operands == NULL || value == NULL) {
+        return -1;
+    }
     bool recognized = false;
     bool valid = true;
 
@@ -895,9 +985,15 @@ static int test_small_expression(size_t count, char *const operands[],
         recognized = true;
         *value = operands[0][0] != '\0' || operands[2][0] != '\0';
     } else if (count == 3 && strcmp(operands[0], "!") == 0) {
-        int status = test_small_expression(2, operands + 1U, value);
-        *value = !*value;
-        return status;
+        bool nested;
+
+        if (strcmp(operands[1], "!") == 0) {
+            nested = operands[2][0] == '\0';
+            recognized = true;
+        } else {
+            nested = test_unary(operands[1], operands[2], &recognized);
+        }
+        *value = !nested;
     } else if (count == 3 && strcmp(operands[0], "(") == 0 &&
                strcmp(operands[2], ")") == 0) *value = operands[1][0] != '\0';
     else if (count == 3)
@@ -920,6 +1016,10 @@ static bool apply_test_operator(bool values[GSH_TEST_ARGUMENT_CAP],
                                 size_t *value_count,
                                 test_operator operator)
 {
+    if (value_count == NULL) return false;
+    if (values == NULL) {
+        return false;
+    }
     if (operator == TEST_OPERATOR_NOT && *value_count >= 1U) {
         values[*value_count - 1U] = !values[*value_count - 1U];
         return true;
@@ -941,6 +1041,9 @@ static bool reduce_test_operators(bool values[GSH_TEST_ARGUMENT_CAP],
                                   test_operator operators[GSH_TEST_ARGUMENT_CAP],
                                   size_t *operator_count, int precedence)
 {
+    if (operator_count == NULL || operators == NULL) {
+        return false;
+    }
     while (*operator_count > 0 &&
            operators[*operator_count - 1U] != TEST_OPERATOR_LEFT &&
            test_precedence(operators[*operator_count - 1U]) >= precedence) {
@@ -955,6 +1058,10 @@ static bool reduce_test_operators(bool values[GSH_TEST_ARGUMENT_CAP],
 static int test_primary(size_t count, char *const operands[], size_t *offset,
                         bool *value)
 {
+    if (offset == NULL) return -1;
+    if (operands == NULL || value == NULL) {
+        return -1;
+    }
     bool recognized = false;
     bool valid = true;
 
@@ -982,6 +1089,9 @@ static int test_primary(size_t count, char *const operands[], size_t *offset,
 static int test_large_expression(size_t count, char *const operands[],
                                  bool *result)
 {
+    if (operands == NULL || result == NULL) {
+        return -1;
+    }
     bool values[GSH_TEST_ARGUMENT_CAP];
     test_operator operators[GSH_TEST_ARGUMENT_CAP];
     size_t value_count = 0;
@@ -1033,6 +1143,9 @@ static int test_large_expression(size_t count, char *const operands[],
 static int builtin_test(gsh_builtin_kind kind, size_t argc,
                         char *const argv[], const gsh_builtin_io *io)
 {
+    if (argv == NULL || io == NULL) {
+        return -1;
+    }
     size_t first = 1U;
     size_t count;
     bool value = false;
@@ -1059,7 +1172,7 @@ static int builtin_test(gsh_builtin_kind kind, size_t argc,
 int gsh_builtin_run_pure(gsh_builtin_kind kind, size_t argc,
                          char *const argv[], const gsh_builtin_io *io)
 {
-    if (argc == 0 || argv == NULL || io == NULL || io->output == NULL) {
+    if (argc == 0 || argv == NULL || !gsh_builtin_io_valid(io)) {
         errno = EINVAL;
         return 125;
     }

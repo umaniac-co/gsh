@@ -5,7 +5,6 @@
 #include "shell_aliases.h"
 
 #include <errno.h>
-#include <limits.h>
 #include <string.h>
 
 static bool alias_byte(unsigned char byte)
@@ -33,6 +32,9 @@ bool gsh_alias_name_is_valid(const char *name, size_t length)
 
 static uint32_t alias_hash(const char *name, size_t length)
 {
+    if (name == NULL) {
+        return 0U;
+    }
     uint32_t hash = UINT32_C(2166136261);
     size_t offset;
 
@@ -45,13 +47,16 @@ static uint32_t alias_hash(const char *name, size_t length)
 
 void gsh_aliases_initialize(gsh_alias_store *store)
 {
+    if (store == NULL) {
+        return;
+    }
     /* ── Empty Metadata Leaves the Alias Arena Cold ──────────────
      * Whole-store clearing made an empty shell fault in every text-arena page.
      * No entry or text byte is observable while count and text_used are zero.
      * Only the hash table must start cleared before the first insertion.
      * Initializing metadata alone preserves semantics and demand paging.
      * ─────────────────────────────────────────────── */
-    memset(store->hash_slots, 0, sizeof(store->hash_slots));
+    (void)memset(store->hash_slots, 0, sizeof(store->hash_slots));
     store->count = 0;
     store->text_used = 0;
 }
@@ -60,6 +65,10 @@ static bool entry_matches(const gsh_alias_store *store,
                           const gsh_alias_entry *entry, const char *name,
                           size_t name_length, uint32_t hash)
 {
+    if (entry == NULL || store == NULL) return false;
+    if (name == NULL) {
+        return false;
+    }
     const char *assignment;
 
     if (entry->hash != hash || entry->name_length != name_length ||
@@ -74,6 +83,9 @@ static bool entry_matches(const gsh_alias_store *store,
 static size_t alias_index(const gsh_alias_store *store, const char *name,
                           size_t name_length, uint32_t hash)
 {
+    if (store == NULL) {
+        return 0U;
+    }
     size_t slot = hash & (GSH_ALIAS_HASH_CAP - 1U);
     size_t probes;
 
@@ -95,6 +107,9 @@ static size_t alias_index(const gsh_alias_store *store, const char *name,
 
 static int insert_hash(gsh_alias_store *store, size_t index)
 {
+    if (store == NULL) {
+        return -1;
+    }
     size_t slot = store->entries[index].hash & (GSH_ALIAS_HASH_CAP - 1U);
     size_t probes;
 
@@ -111,9 +126,12 @@ static int insert_hash(gsh_alias_store *store, size_t index)
 
 static int rebuild_hash(gsh_alias_store *store)
 {
+    if (store == NULL) {
+        return -1;
+    }
     size_t index;
 
-    memset(store->hash_slots, 0, sizeof(store->hash_slots));
+    (void)memset(store->hash_slots, 0, sizeof(store->hash_slots));
     for (index = 0; index < store->count; index++) {
         if (insert_hash(store, index) == -1) {
             return -1;
@@ -182,7 +200,7 @@ int gsh_aliases_set(gsh_alias_store *store, const char *name,
             errno = ENOSPC;
             return -1;
         }
-        memmove(store->text + old_offset + length,
+        (void)memmove(store->text + old_offset + length,
                 store->text + tail_offset, tail_length);
         if (length != old_length) {
             ptrdiff_t delta = (ptrdiff_t)length - (ptrdiff_t)old_length;
@@ -219,9 +237,9 @@ int gsh_aliases_set(gsh_alias_store *store, const char *name,
         char *assignment = store->text +
                            store->entries[index].assignment_offset;
 
-        memcpy(assignment, name, name_length);
+        (void)memcpy(assignment, name, name_length);
         assignment[name_length] = '=';
-        memcpy(assignment + name_length + 1U, value, value_length);
+        (void)memcpy(assignment + name_length + 1U, value, value_length);
         assignment[name_length + value_length + 1U] = '\0';
     }
     return inserted ? insert_hash(store, index) : 0;
@@ -247,7 +265,7 @@ int gsh_aliases_unset(gsh_alias_store *store, const char *name,
     }
     offset = store->entries[index].assignment_offset;
     length = store->entries[index].assignment_length;
-    memmove(store->text + offset, store->text + offset + length,
+    (void)memmove(store->text + offset, store->text + offset + length,
             store->text_used - offset - length);
     for (other = 0; other < store->count; other++) {
         if (other != index &&
@@ -255,24 +273,27 @@ int gsh_aliases_unset(gsh_alias_store *store, const char *name,
             store->entries[other].assignment_offset -= (uint32_t)length;
         }
     }
-    memmove(store->entries + index, store->entries + index + 1U,
+    (void)memmove(store->entries + index, store->entries + index + 1U,
             (store->count - index - 1U) * sizeof(store->entries[0]));
     store->count--;
     store->text_used -= (uint32_t)length;
-    memset(store->text + store->text_used, 0, length);
-    memset(&store->entries[store->count], 0, sizeof(store->entries[0]));
+    (void)memset(store->text + store->text_used, 0, length);
+    (void)memset(&store->entries[store->count], 0, sizeof(store->entries[0]));
     return rebuild_hash(store);
 }
 
 void gsh_aliases_clear(gsh_alias_store *store)
 {
     if (store != NULL) {
-        memset(store, 0, sizeof(*store));
+        (void)memset(store, 0, sizeof(*store));
     }
 }
 
 size_t gsh_aliases_count(const gsh_alias_store *store)
 {
+    if (store == NULL) {
+        return 0U;
+    }
     return store == NULL ? 0U : store->count;
 }
 
@@ -288,7 +309,10 @@ const char *gsh_aliases_assignment(const gsh_alias_store *store,
 void gsh_alias_journal_initialize(gsh_alias_journal *journal,
                                   uint64_t base_generation)
 {
-    memset(journal, 0, sizeof(*journal));
+    if (journal == NULL) {
+        return;
+    }
+    (void)memset(journal, 0, sizeof(*journal));
     journal->version = GSH_ALIAS_JOURNAL_VERSION;
     journal->base_generation = base_generation;
 }
@@ -324,10 +348,10 @@ static int record_alias(gsh_alias_journal *journal, unsigned int operation,
     if (operation != GSH_ALIAS_JOURNAL_CLEAR) {
         char *text = journal->text + journal->text_used;
 
-        memcpy(text, name, name_length);
+        (void)memcpy(text, name, name_length);
         text[name_length] = operation == GSH_ALIAS_JOURNAL_SET ? '=' : '\0';
         if (operation == GSH_ALIAS_JOURNAL_SET) {
-            memcpy(text + name_length + 1U, value, value_length);
+            (void)memcpy(text + name_length + 1U, value, value_length);
             text[name_length + value_length + 1U] = '\0';
         }
         journal->text_used += (uint32_t)length;
@@ -339,6 +363,9 @@ int gsh_alias_journal_record_set(gsh_alias_journal *journal,
                                  const char *name, size_t name_length,
                                  const char *value, size_t value_length)
 {
+    if (journal == NULL || name == NULL || value == NULL) {
+        return -1;
+    }
     return record_alias(journal, GSH_ALIAS_JOURNAL_SET, name, name_length,
                         value, value_length);
 }
@@ -346,12 +373,18 @@ int gsh_alias_journal_record_set(gsh_alias_journal *journal,
 int gsh_alias_journal_record_unset(gsh_alias_journal *journal,
                                    const char *name, size_t name_length)
 {
+    if (journal == NULL || name == NULL) {
+        return -1;
+    }
     return record_alias(journal, GSH_ALIAS_JOURNAL_UNSET, name, name_length,
                         NULL, 0);
 }
 
 int gsh_alias_journal_record_clear(gsh_alias_journal *journal)
 {
+    if (journal == NULL) {
+        return -1;
+    }
     return record_alias(journal, GSH_ALIAS_JOURNAL_CLEAR, NULL, 0, NULL, 0);
 }
 
@@ -438,10 +471,10 @@ int gsh_aliases_apply_journal(gsh_alias_store *store,
         errno = EPROTO;
         return -1;
     }
-    memcpy(scratch, store, sizeof(*scratch));
+    (void)memcpy(scratch, store, sizeof(*scratch));
     if (gsh_aliases_apply_journal_in_place(scratch, journal) == -1) {
         return -1;
     }
-    memcpy(store, scratch, sizeof(*store));
+    (void)memcpy(store, scratch, sizeof(*store));
     return 0;
 }

@@ -27,13 +27,17 @@ the alternative guarantee, and executable evidence for that guarantee. Cost,
 convenience, legacy precedent, or a favorable benchmark are not sufficient
 reasons.
 
-## 02. Adoption and verification
+## 02. Compliance and verification
 
-This canon is effective immediately for new and materially changed code. The
-current implementation predates its adoption and is not yet claimed to comply
-fully: known migration work includes production `goto` paths, callback function
-pointers, dynamic allocation outside initial process setup, and oversized
-functions. Those facts are a backlog to remove, not exemptions to copy.
+The repository-owned production, test, fuzz, policy, and executable support
+code is governed by this canon without an adoption baseline. The permanent
+source-policy gate compares every violation category directly with zero, and
+the complete source-to-target manifest makes every retained C source part of a
+declared build root. Compliance requires the clean macOS arm64 and Linux x86_64
+Clang/GCC matrices, static analysis, dependency and include isolation, linker
+maps, behavioral tests, sanitizers, fault and resource tests, fuzzing, soak,
+and benchmarks to pass on the same commit. Any failure withdraws the compliance
+claim until that commit satisfies the complete gate again.
 
 Every change must:
 
@@ -46,8 +50,28 @@ Every change must:
   gates;
 - update nearby Literate Code, tests, and linked specifications when an
   invariant or design decision changes; and
-- report unresolved legacy violations honestly instead of treating a passing
-  build as proof of complete compliance.
+- treat every detected violation as a release blocker; suppressions and
+  accepted-debt baselines are not permitted.
+
+### Approved narrow exceptions
+
+The project approved the following exceptions on 2026-09-01. Approval is
+limited to the exact C or POSIX interface named here. Each use must carry a
+nearby Literate Code section, must be exercised by an executable test, and
+must not be used to hide a repository-owned abstraction with the same shape.
+
+| ID | Required surface | Alternative guarantee | Evidence |
+| --- | --- | --- | --- |
+| `POSIX-SIGNAL-DISPOSITION` | Function pointers stored in `struct sigaction` to install `SIG_DFL`, `SIG_IGN`, or one of gsh's bounded signal handlers | The pointer never escapes the signal adapter; the handler performs only documented async-signal-safe reporting | signal, trap, fault, and sanitizer gates |
+| `C-PROCESS-ABI` | The `argv` and `envp` pointer shapes required by `main()` and `execve()` | Entry points validate counts and convert arguments to bounded spans before ordinary processing; execution adapters validate the terminating null entry | invocation, environment, exec, and conformance gates |
+| `PLATFORM-CAPABILITY` | Conditional compilation that selects an unavoidable macOS or Linux signal, PTY, resource, or directory-enumeration interface | Both branches implement one shared bounded contract and compile in the supported platform matrix | macOS arm64 and Linux x86_64 build, PTY, resource, and sanitizer gates |
+
+These exceptions do not permit dead code, unused compatibility branches,
+general callback interfaces, unrestricted pointer indirection, or conditional
+code that is absent from every supported build. The source-policy gate rejects
+unknown exception identifiers and function-pointer declarations outside the
+registered signal adapter; the supported platform matrix supplies the separate
+proof that capability branches remain live and confined to their surfaces.
 
 For gsh, the long-lived reactor is a lifecycle loop: its individual turns must
 have statically bounded work, explicit resource ceilings, and an explicit
@@ -395,6 +419,26 @@ somewhat of a bad reputation due to early predecessors, such as `lint`, that
 produced mostly invalid messages, but this is no longer the case. The best
 static analyzers today are fast, and they produce selective and accurate
 messages. Their use should not be negotiable at any serious software project.
+
+#### 11. Bonus Rule
+
+Do not retain dead or unused repository-owned code. Every statement,
+declaration, function, object, type, field, enumerator, macro, include, source
+file, conditional branch, and build target must be statically reachable from a
+declared root in at least one supported production, test, fault, fuzz, or
+policy build. Commented-out implementations, `#if 0` blocks, compatibility
+stubs with no supported caller, and code kept only for possible future use are
+not allowed.
+
+**Rationale:** Dead code enlarges the review and verification state space while
+providing no current behavior. It can conceal stale assumptions, prevent
+warnings from identifying real mistakes, and become unsafe when it is later
+reactivated without its original context. Version control is the archive for
+future possibilities. Platform-specific code is live only when the matching
+supported build reaches it; fault and fuzz code is live only when its declared
+target reaches it. Compiler diagnostics, whole-target reachability, and the
+source-policy call graph must agree that every retained element has a current
+owner and use.
 
 The first two rules guarantee the creation of a clear and transparent control
 flow structure that is easier to build, test, and analyze. The absence of

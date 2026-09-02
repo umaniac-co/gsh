@@ -11,32 +11,26 @@
 #error "gsh requires the POSIX.1-2024 feature-test baseline"
 #endif
 
-#include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <fnmatch.h>
 #include <limits.h>
 #include <locale.h>
 #include <poll.h>
-#include <signal.h>
-#include <stdbool.h>
-#include <stdarg.h>
-#include <stdint.h>
+#include <signal.h> /* CANON-INCLUDE: macos */
+#include <stdarg.h> /* CANON-INCLUDE: macos */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
-#include <sys/mman.h>
-#include <sys/socket.h>
+#include <sys/socket.h> /* CANON-INCLUDE: linux */
 #include <sys/stat.h>
-#include <sys/types.h>
-#include <sys/wait.h>
+#include <sys/wait.h> /* CANON-INCLUDE: linux */
 #include <termios.h>
-#include <time.h>
+#include <time.h> /* CANON-INCLUDE: linux */
 #include <unistd.h>
 
 #if defined(__APPLE__)
-#include <mach-o/dyld.h>
 #endif
 
 #include "builtin_cd.h"
@@ -45,7 +39,6 @@
 #include "builtin_fc.h"
 #include "builtin_job_control.h"
 #include "builtin_pure.h"
-#include "builtin_registry.h"
 #include "builtin_stateful.h"
 #include "builtin_times.h"
 #include "builtin_trap.h"
@@ -55,23 +48,13 @@
 #include "builtin_variables.h"
 #include "builtin_set.h"
 #include "builtin_shift.h"
-#include "async_repl.h"
-#include "background_jobs.h"
-#include "alias_expansion.h"
+#include "fault_injection.h"
 #include "history_client.h"
 #include "history_protocol.h"
-#include "history_store.h"
-#include "native_plan.h"
-#include "positional_parameters.h"
-#include "posix_lexer.h"
-#include "posix_parser.h"
-#include "shell_variables.h"
-#include "shell_aliases.h"
-#include "shell_functions.h"
-#include "shell_options.h"
-#include "shell_traps.h"
 #include "shell_config.h"
 #include "source_workspace.h"
+
+#define require(condition) (condition)
 
 extern char **environ;
 
@@ -89,6 +72,9 @@ enum {
     GSH_NATIVE_JOB_MEMBER_CAP =
         GSH_NATIVE_PIPELINE_CAP + GSH_NATIVE_HEREDOC_CAP,
     CHILD_ENVIRONMENT_CAP = GSH_VARIABLE_ENVIRONMENT_CAP,
+    CHILD_WRITE_ATTEMPT_CAP = OUTPUT_CAP,
+    EVALUATOR_WAIT_RETRY_CAP = 1024,
+    AST_WALK_STEP_CAP = GSH_PARSE_NODE_CAP + 1,
 };
 
 _Static_assert((unsigned int)GSH_POSITIONAL_CAP ==
@@ -103,9 +89,24 @@ _Static_assert(sizeof(off_t) >= sizeof(int64_t),
 static const char PROMPT[] = "gsh$ ";
 static const char ASYNC_PENDING_PROMPT[] = "gsh* ";
 static const uint64_t REACTOR_DEADLINE_NS = 5U * 1000U * 1000U;
-static char g_shell_executable[EXEC_PATH_CAP];
-static dev_t g_shell_executable_device;
-static ino_t g_shell_executable_inode;
+
+typedef struct {
+    char path[EXEC_PATH_CAP];
+    dev_t device;
+    ino_t inode;
+} shell_executable_identity;
+
+_Static_assert(sizeof(((shell_executable_identity *)0)->path) ==
+                   EXEC_PATH_CAP,
+               "shell executable identity must retain the full path cap");
+
+static shell_executable_identity *shell_executable_storage(void)
+{
+    static shell_executable_identity identity;
+
+    if (!require(identity.path[EXEC_PATH_CAP - 1U] == '\0')) return NULL;
+    return &identity;
+}
 
 typedef enum {
     MODE_EDITOR,
@@ -229,6 +230,7 @@ typedef struct {
     size_t line_len;
     unsigned int escape_state;
     gsh_history_store *history;
+    unsigned char *history_snapshot;
     gsh_history_client history_client;
     gsh_shell_config config;
     bool config_error;
@@ -314,6 +316,7 @@ typedef struct {
     gsh_function_store *function_scratch;
     gsh_function_snapshot_header function_commit_header;
     gsh_positional_store *positionals;
+    gsh_positional_store *positional_storage;
     gsh_positional_store *positional_commit;
     gsh_shell_options option_commit;
     state_control_commit control_commit;
@@ -368,13 +371,87 @@ typedef struct {
     uint64_t redirection_worker_failures;
 } shell_state;
 
-static int g_signal_write_fd = -1;
+static gsh_async_repl *state_async_repl(const shell_state *state)
+{
+    if (!require(state != NULL)) return NULL;
+    if (!require(state->async_repl != NULL)) return NULL;
+    return state->async_repl;
+}
+
+static gsh_parse_storage *state_parse_storage(const shell_state *state)
+{
+    if (!require(state != NULL)) return NULL;
+    if (!require(state->parse_storage != NULL)) return NULL;
+    return state->parse_storage;
+}
+
+static gsh_source_workspace_stack *state_source_workspaces(
+    const shell_state *state)
+{
+    if (!require(state != NULL)) return NULL;
+    if (!require(state->source_workspaces != NULL)) return NULL;
+    return state->source_workspaces;
+}
+
+static gsh_native_pipeline *state_native_pipeline(const shell_state *state)
+{
+    if (!require(state != NULL)) return NULL;
+    if (!require(state->native_pipeline != NULL)) return NULL;
+    return state->native_pipeline;
+}
+
+static gsh_variable_store *state_variables(const shell_state *state)
+{
+    if (!require(state != NULL)) return NULL;
+    if (!require(state->variables != NULL)) return NULL;
+    return state->variables;
+}
+
+static gsh_history_store *state_history(const shell_state *state)
+{
+    if (!require(state != NULL)) return NULL;
+    if (!require(state->history != NULL)) return NULL;
+    return state->history;
+}
+
+static gsh_variable_journal *state_variable_commit(const shell_state *state)
+{
+    if (!require(state != NULL)) return NULL;
+    if (!require(state->variable_commit != NULL)) return NULL;
+    return state->variable_commit;
+}
+
+static gsh_alias_journal *state_alias_commit(const shell_state *state)
+{
+    if (!require(state != NULL)) return NULL;
+    if (!require(state->alias_commit != NULL)) return NULL;
+    return state->alias_commit;
+}
+
+typedef struct {
+    gsh_history_store history;
+    unsigned char history_snapshot[GSH_HISTORY_SERIALIZED_CAP];
+    gsh_async_repl async_repl;
+    gsh_parse_storage parse_storage;
+    gsh_native_pipeline native_pipeline;
+    gsh_command_cache command_cache;
+    gsh_command_cache command_cache_scratch;
+    gsh_variable_store variables;
+    gsh_variable_store variable_scratch;
+    gsh_variable_store pipeline_variables;
+    gsh_variable_journal variable_commit;
+    gsh_variable_journal pipeline_changes;
+    gsh_source_workspace_stack source_workspaces;
+    gsh_positional_store positionals;
+    gsh_positional_store positional_commit;
+} interactive_storage;
+
+static volatile sig_atomic_t g_signal_write_fd = -1;
 static volatile sig_atomic_t g_sigchld_pending = 0;
 static volatile sig_atomic_t g_sigint_pending = 0;
 static volatile sig_atomic_t g_sigtstp_pending = 0;
 static volatile sig_atomic_t g_sigwinch_pending = 0;
 static volatile sig_atomic_t g_shutdown_pending = 0;
-static gsh_positional_store g_interactive_positionals;
 
 typedef struct pipeline_expansion_scope pipeline_expansion_scope;
 
@@ -428,76 +505,20 @@ static int apply_native_assignments(gsh_variable_store *variables,
                                     const gsh_native_command *command,
                                     const gsh_shell_options *options);
 
-#ifdef GSH_FAULT_INJECTION
-static char g_fault_name[64];
-static unsigned long g_fault_trigger = 1;
-static unsigned long g_fault_calls = 0;
-
-static void initialize_fault_injection(void)
+static void configure_expansion_assignment_fault(
+    gsh_native_variable_state *state)
 {
-    const char *configuration = getenv("GSH_FAULT");
-    const char *separator;
-    size_t length;
-
-    if (configuration == NULL || configuration[0] == '\0') {
-        return;
-    }
-    separator = strchr(configuration, ':');
-    length = separator != NULL ? (size_t)(separator - configuration)
-                               : strlen(configuration);
-    if (length == 0 || length >= sizeof(g_fault_name)) {
-        return;
-    }
-    memcpy(g_fault_name, configuration, length);
-    g_fault_name[length] = '\0';
-    if (separator != NULL && separator[1] != '\0') {
-        char *end;
-        unsigned long trigger = strtoul(separator + 1, &end, 10);
-
-        if (*end == '\0' && trigger > 0) {
-            g_fault_trigger = trigger;
-        }
-    }
+    if (!require(state != NULL)) return;
+    state->assignment_fault_enabled =
+        gsh_fault_selected(GSH_FAULT_EXPANSION_ASSIGNMENT);
+    state->assignment_fault_trigger = gsh_fault_trigger();
+    state->assignment_fault_calls = gsh_fault_counter();
 }
-
-static bool fault_should_fail(const char *name, int error)
-{
-    if (g_fault_name[0] == '\0' || strcmp(g_fault_name, name) != 0) {
-        return false;
-    }
-    g_fault_calls++;
-    if (g_fault_calls != g_fault_trigger) {
-        return false;
-    }
-    errno = error;
-    return true;
-}
-
-static bool fault_injection_active(void)
-{
-    return g_fault_name[0] != '\0';
-}
-
-#define GSH_FAULT_PARAMETER(name) , const char *name
-#define GSH_FAULT_ARGUMENT(name) , name
-#else
-static void initialize_fault_injection(void)
-{
-}
-
-static bool fault_injection_active(void)
-{
-    return false;
-}
-
-#define fault_should_fail(name, error) false
-#define GSH_FAULT_PARAMETER(name)
-#define GSH_FAULT_ARGUMENT(name)
-#endif
 
 static int ensure_alias_state(shell_state *state, bool transaction)
 {
-    if (fault_should_fail("alias-allocation", ENOMEM) ||
+    if (state == NULL) return -1;
+    if (gsh_fault_should_fail(GSH_FAULT_ALIAS_ALLOCATION, ENOMEM) ||
         state->aliases == NULL || state->alias_expansion == NULL) {
         errno = ENOMEM;
         return -1;
@@ -505,7 +526,7 @@ static int ensure_alias_state(shell_state *state, bool transaction)
     if (!transaction) {
         return 0;
     }
-    if (fault_should_fail("alias-transaction-allocation", ENOMEM) ||
+    if (gsh_fault_should_fail(GSH_FAULT_ALIAS_TRANSACTION_ALLOCATION, ENOMEM) ||
         state->alias_scratch == NULL || state->alias_commit == NULL) {
         errno = ENOMEM;
         return -1;
@@ -515,13 +536,14 @@ static int ensure_alias_state(shell_state *state, bool transaction)
 
 static int ensure_function_state(shell_state *state, bool scratch)
 {
-    if (fault_should_fail("function-allocation", ENOMEM) ||
+    if (state == NULL) return -1;
+    if (gsh_fault_should_fail(GSH_FAULT_FUNCTION_ALLOCATION, ENOMEM) ||
         state->functions == NULL) {
         errno = ENOMEM;
         return -1;
     }
     if (scratch &&
-        (fault_should_fail("function-compact-allocation", ENOMEM) ||
+        (gsh_fault_should_fail(GSH_FAULT_FUNCTION_COMPACT_ALLOCATION, ENOMEM) ||
          state->function_scratch == NULL)) {
         errno = ENOMEM;
         return -1;
@@ -531,6 +553,9 @@ static int ensure_function_state(shell_state *state, bool scratch)
 
 static void reset_pending_input(shell_state *state)
 {
+    if (state == NULL) {
+        return;
+    }
     state->pending_input = state->pending_line;
     state->pending_input_length = strlen(state->pending_line);
     state->pending_alias_expanded = false;
@@ -540,7 +565,7 @@ static uint64_t monotonic_ns(void)
 {
     struct timespec now;
 
-    if (fault_should_fail("time-source-failure", EIO) ||
+    if (gsh_fault_should_fail(GSH_FAULT_TIME_SOURCE_FAILURE, EIO) ||
         clock_gettime(CLOCK_MONOTONIC, &now) == -1) {
         return 0;
     }
@@ -583,10 +608,11 @@ static int set_fd_flags(int fd, int command, int flag)
     return 0;
 }
 
-static int make_pipe(int descriptors[2], bool nonblocking
-                     GSH_FAULT_PARAMETER(fault_name))
+static int make_pipe(int descriptors[2], bool nonblocking,
+                     gsh_fault_point fault_point)
 {
-    if (fault_should_fail(fault_name, EMFILE) || pipe(descriptors) == -1) {
+    if (gsh_fault_should_fail(fault_point, EMFILE) ||
+        pipe(descriptors) == -1) {
         return -1;
     }
     if (set_fd_flags(descriptors[0], F_GETFD, FD_CLOEXEC) == -1 ||
@@ -595,8 +621,8 @@ static int make_pipe(int descriptors[2], bool nonblocking
          (set_fd_flags(descriptors[0], F_GETFL, O_NONBLOCK) == -1 ||
           set_fd_flags(descriptors[1], F_GETFL, O_NONBLOCK) == -1))) {
         int saved_errno = errno;
-        close(descriptors[0]);
-        close(descriptors[1]);
+        (void)close(descriptors[0]);
+        (void)close(descriptors[1]);
         errno = saved_errno;
         return -1;
     }
@@ -606,17 +632,21 @@ static int make_pipe(int descriptors[2], bool nonblocking
 static bool raw_output_push(shell_state *state, const char *data,
                             size_t length)
 {
+    if (state == NULL) return false;
+    if (data == NULL) {
+        return false;
+    }
     if (length > OUTPUT_CAP - state->output_len) {
         state->overloads++;
         return false;
     }
 
     if (state->output_offset + state->output_len + length > OUTPUT_CAP) {
-        memmove(state->output, state->output + state->output_offset,
+        (void)memmove(state->output, state->output + state->output_offset,
                 state->output_len);
         state->output_offset = 0;
     }
-    memcpy(state->output + state->output_offset + state->output_len, data,
+    (void)memcpy(state->output + state->output_offset + state->output_len, data,
            length);
     state->output_len += length;
     return true;
@@ -624,7 +654,11 @@ static bool raw_output_push(shell_state *state, const char *data,
 
 static bool output_push(shell_state *state, const char *data, size_t length)
 {
-    if (state->async_repl != NULL && state->async_repl->enabled &&
+    if (state == NULL) return false;
+    if (data == NULL) {
+        return false;
+    }
+    if (state->async_repl != NULL && state_async_repl(state)->enabled &&
         state->async_capture_cell >= 0) {
         return gsh_async_repl_append(state->async_repl,
                                      state->async_capture_cell, data,
@@ -633,20 +667,40 @@ static bool output_push(shell_state *state, const char *data, size_t length)
     return raw_output_push(state, data, length);
 }
 
-static int reactor_builtin_output(void *opaque, int descriptor,
-                                  const char *text, size_t length)
+static gsh_builtin_io reactor_builtin_sink(shell_state *state)
 {
-    (void)descriptor;
-    return output_push(opaque, text, length) ? 0 : 1;
+    if (state == NULL) return (gsh_builtin_io){0};
+    gsh_builtin_io io;
+
+    (void)memset(&io, 0, sizeof(io));
+    io.kind = GSH_BUILTIN_SINK_BUFFER;
+    if (state->async_repl != NULL && state_async_repl(state)->enabled &&
+        state->async_capture_cell >= 0) {
+        io.buffer.async_repl = state->async_repl;
+        io.buffer.async_cell = state->async_capture_cell;
+    } else {
+        io.buffer.bytes = state->output;
+        io.buffer.capacity = sizeof(state->output);
+        io.buffer.offset = &state->output_offset;
+        io.buffer.length = &state->output_len;
+        io.buffer.overloads = &state->overloads;
+    }
+    return io;
 }
 
 static bool output_text(shell_state *state, const char *text)
 {
+    if (state == NULL || text == NULL) {
+        return false;
+    }
     return output_push(state, text, strlen(text));
 }
 
 static void output_format(shell_state *state, const char *format, ...)
 {
+    if (format == NULL || state == NULL) {
+        return;
+    }
     char message[512];
     va_list arguments;
     int length;
@@ -666,6 +720,9 @@ static void output_format(shell_state *state, const char *format, ...)
 
 static void flush_output(shell_state *state)
 {
+    if (state == NULL) {
+        return;
+    }
     unsigned int writes = 0;
 
     while (state->output_len > 0 && writes < 4) {
@@ -675,7 +732,7 @@ static void flush_output(shell_state *state)
         if (chunk > 4096) {
             chunk = 4096;
         }
-        written = fault_should_fail("output-write", EIO)
+        written = gsh_fault_should_fail(GSH_FAULT_OUTPUT_WRITE, EIO)
                       ? -1
                       : write(state->tty_fd,
                               state->output + state->output_offset, chunk);
@@ -710,6 +767,9 @@ static void flush_output(shell_state *state)
  * ─────────────────────────────────────────────────────────────── */
 static void wipe_secret(char *secret, size_t capacity)
 {
+    if (secret == NULL) {
+        return;
+    }
     volatile unsigned char *bytes = (volatile unsigned char *)secret;
     size_t index;
 
@@ -720,6 +780,9 @@ static void wipe_secret(char *secret, size_t capacity)
 
 static void flush_secret_prompt(shell_state *state)
 {
+    if (state == NULL) {
+        return;
+    }
     unsigned int attempt;
 
     for (attempt = 0; attempt < 20U && state->output_len != 0; attempt++) {
@@ -734,6 +797,9 @@ static int read_secret_line(shell_state *state, const char *prompt,
                             char secret[GSH_HISTORY_SECRET_CAP],
                             size_t *secret_length)
 {
+    if (prompt == NULL || secret == NULL || secret_length == NULL || state == NULL) {
+        return -1;
+    }
     bool reading = true;
     size_t length = 0;
 
@@ -783,6 +849,9 @@ static int read_secret_line(shell_state *state, const char *prompt,
 static void schedule_history_reminder(shell_state *state,
                                       uint64_t interval_ns)
 {
+    if (state == NULL) {
+        return;
+    }
     uint64_t now = monotonic_ns();
 
     if (interval_ns == 0) {
@@ -877,6 +946,7 @@ static void offer_history_reset(shell_state *state)
 
 static void initialize_history(shell_state *state)
 {
+    if (state == NULL) return;
     int status = GSH_HISTORY_STATUS_LOCKED;
     uint64_t reminder = 0;
     unsigned int attempt;
@@ -892,7 +962,9 @@ static void initialize_history(shell_state *state)
     }
     if (gsh_history_client_initialize(&state->history_client,
                                       getenv("HOME"),
-                                      state->parameter_zero) == -1 ||
+                                      state->parameter_zero,
+                                      state->history_snapshot,
+                                      GSH_HISTORY_SERIALIZED_CAP) == -1 ||
         gsh_history_client_status(
             &state->history_client,
             state->config.history_reminder_min_ns,
@@ -923,6 +995,9 @@ static void initialize_history(shell_state *state)
 
 static void verify_history_reminder(shell_state *state)
 {
+    if (state == NULL) {
+        return;
+    }
     char secret[GSH_HISTORY_SECRET_CAP] = {0};
     size_t length = 0;
     uint64_t reminder = state->config.history_reminder_min_ns;
@@ -949,6 +1024,10 @@ static void verify_history_reminder(shell_state *state)
 static size_t primary_prompt_text(const shell_state *state, char *prompt,
                                   size_t capacity, bool include_async_state)
 {
+    if (state == NULL) return 0U;
+    if (prompt == NULL) {
+        return 0U;
+    }
     const char *text = PROMPT;
     size_t length;
 
@@ -960,14 +1039,15 @@ static size_t primary_prompt_text(const shell_state *state, char *prompt,
     if (length >= capacity) {
         return 0;
     }
-    memcpy(prompt, text, length + 1U);
+    (void)memcpy(prompt, text, length + 1U);
     return length;
 }
 
 static void queue_prompt(shell_state *state)
 {
-    if (state->async_repl != NULL && state->async_repl->enabled) {
-        state->async_repl->render_pending = true;
+    if (state == NULL) return;
+    if (state->async_repl != NULL && state_async_repl(state)->enabled) {
+        state_async_repl(state)->render_pending = true;
         return;
     }
     state->classic_redraw_pending = false;
@@ -1012,8 +1092,9 @@ static void queue_prompt(shell_state *state)
 
 static void queue_redraw(shell_state *state)
 {
-    if (state->async_repl != NULL && state->async_repl->enabled) {
-        state->async_repl->render_pending = true;
+    if (state == NULL) return;
+    if (state->async_repl != NULL && state_async_repl(state)->enabled) {
+        state_async_repl(state)->render_pending = true;
         return;
     }
     state->classic_redraw_pending = true;
@@ -1021,8 +1102,9 @@ static void queue_redraw(shell_state *state)
 
 static void queue_clear_redraw(shell_state *state)
 {
-    if (state->async_repl != NULL && state->async_repl->enabled) {
-        state->async_repl->render_pending = true;
+    if (state == NULL) return;
+    if (state->async_repl != NULL && state_async_repl(state)->enabled) {
+        state_async_repl(state)->render_pending = true;
         return;
     }
     state->classic_clear_pending = true;
@@ -1038,10 +1120,11 @@ static void queue_clear_redraw(shell_state *state)
  * ─────────────────────────────────────────────────────────────── */
 static void prepare_classic_redraw(shell_state *state)
 {
+    if (state == NULL) return;
     bool clear;
 
     if (!state->classic_redraw_pending ||
-        (state->async_repl != NULL && state->async_repl->enabled)) {
+        (state->async_repl != NULL && state_async_repl(state)->enabled)) {
         return;
     }
     clear = state->classic_clear_pending;
@@ -1058,6 +1141,10 @@ static void prepare_classic_redraw(shell_state *state)
 static size_t active_prompt_text(shell_state *state,
                                  char prompt[GSH_ASYNC_PROMPT_CAP])
 {
+    if (state == NULL) return 0U;
+    if (prompt == NULL) {
+        return 0U;
+    }
     size_t length = 0;
     const char *secondary;
 
@@ -1079,11 +1166,11 @@ static size_t active_prompt_text(shell_state *state,
             secondary = "> ";
             length = 2;
         }
-        memcpy(prompt, secondary, length);
+        (void)memcpy(prompt, secondary, length);
     } else {
         length = primary_prompt_text(state, prompt, GSH_ASYNC_PROMPT_CAP,
                                      state->async_repl != NULL &&
-                                         state->async_repl->enabled);
+                                         state_async_repl(state)->enabled);
     }
     prompt[length] = '\0';
     return length;
@@ -1091,18 +1178,19 @@ static size_t active_prompt_text(shell_state *state,
 
 static void prepare_managed_render(shell_state *state)
 {
+    if (state == NULL) return;
     char prompt[GSH_ASYNC_PROMPT_CAP];
     const char *render;
     size_t length;
     int focused;
 
-    if (state->async_repl == NULL || !state->async_repl->enabled ||
-        !state->async_repl->render_pending || state->output_len != 0) {
+    if (state->async_repl == NULL || !state_async_repl(state)->enabled ||
+        !state_async_repl(state)->render_pending || state->output_len != 0) {
         return;
     }
     focused = gsh_async_repl_focused_job(state->async_repl);
-    if (focused >= 0 && state->async_repl->cells[focused].fullscreen &&
-        state->async_repl->cells[focused].fullscreen_presented) {
+    if (focused >= 0 && state_async_repl(state)->cells[focused].fullscreen &&
+        state_async_repl(state)->cells[focused].fullscreen_presented) {
         return;
     }
     (void)active_prompt_text(state, prompt);
@@ -1123,9 +1211,12 @@ static void prepare_managed_render(shell_state *state)
 
 static void make_editor_modes(shell_state *state)
 {
+    if (state == NULL) {
+        return;
+    }
     state->editor_modes = state->original_modes;
     state->editor_modes.c_lflag &= (tcflag_t)~(ICANON | ECHO);
-    if (state->async_repl != NULL && state->async_repl->enabled) {
+    if (state->async_repl != NULL && state_async_repl(state)->enabled) {
         state->editor_modes.c_lflag &= (tcflag_t)~ISIG;
         state->editor_modes.c_cc[VINTR] = _POSIX_VDISABLE;
         state->editor_modes.c_cc[VSUSP] = _POSIX_VDISABLE;
@@ -1140,6 +1231,7 @@ static void make_editor_modes(shell_state *state)
 
 static int enter_editor(shell_state *state)
 {
+    if (state == NULL) return -1;
     if (tcsetpgrp(state->tty_fd, state->shell_pgid) == -1) {
         return -1;
     }
@@ -1153,6 +1245,7 @@ static int enter_editor(shell_state *state)
 
 static void restore_terminal(shell_state *state)
 {
+    if (state == NULL) return;
     if (state->tty_fd < 0 || !state->terminal_changed) {
         return;
     }
@@ -1161,14 +1254,21 @@ static void restore_terminal(shell_state *state)
     state->terminal_changed = false;
 }
 
+/* ── POSIX Owns the Signal-Handler Pointer Shape ─────────────────
+ * The reactor needs signal events, but repository code may not dispatch work
+ * through callbacks. CANON-EXCEPTION: POSIX-SIGNAL-DISPOSITION confines the
+ * required function pointer to this sigaction adapter and its fixed call list.
+ * Handlers only set sig_atomic_t flags; the reactor performs all state changes.
+ * Signal, trap, fault, and sanitizer gates exercise the alternative guarantee.
+ * ─────────────────────────────────────────────────────────────── */
 static int install_handler(int signo, void (*handler)(int), int flags)
 {
     struct sigaction action;
 
-    memset(&action, 0, sizeof(action));
+    (void)memset(&action, 0, sizeof(action));
     action.sa_handler = handler;
     action.sa_flags = flags;
-    sigemptyset(&action.sa_mask);
+    (void)sigemptyset(&action.sa_mask);
     return sigaction(signo, &action, NULL);
 }
 
@@ -1191,6 +1291,9 @@ static int install_signal_handlers(void)
 
 static bool managed_repl_requested(const gsh_shell_config *config)
 {
+    if (config == NULL) {
+        return false;
+    }
     const char *mode = getenv("GSH_REPL");
 
     if (mode != NULL) {
@@ -1201,12 +1304,13 @@ static bool managed_repl_requested(const gsh_shell_config *config)
 
 static void initialize_repl_size(shell_state *state)
 {
+    if (state == NULL) return;
     struct winsize size;
 
-    if (state->async_repl == NULL || !state->async_repl->enabled) {
+    if (state->async_repl == NULL || !state_async_repl(state)->enabled) {
         return;
     }
-    memset(&size, 0, sizeof(size));
+    (void)memset(&size, 0, sizeof(size));
     if (ioctl(state->tty_fd, TIOCGWINSZ, &size) == -1) {
         gsh_async_repl_resize(state->async_repl, 24, 80);
         return;
@@ -1214,17 +1318,56 @@ static void initialize_repl_size(shell_state *state)
     gsh_async_repl_resize(state->async_repl, size.ws_row, size.ws_col);
 }
 
-static int initialize_interactive(shell_state *state,
-                                  const char *program_path)
+/* ── Interactive State Has One Bounded Owner ─────────────────────
+ * The shell used to acquire its long-lived stores piecemeal from the heap.
+ * Their capacities are compile-time contracts, so a function-local static
+ * owner is both stricter and simpler: every pointer below is a view into that
+ * owner and can never outlive it.  Fault hooks remain at the old acquisition
+ * boundaries so the resource-failure suite still exercises each response.
+ * ─────────────────────────────────────────────────────────────── */
+static int bind_interactive_storage(shell_state *state,
+                                    interactive_storage *storage)
 {
-    const char *terminal_name;
-    const char *history_override;
-    const char *home;
-    size_t default_path_size;
-    pid_t foreground_group;
-    pid_t current_group;
+    if (state == NULL || storage == NULL) {
+        return -1;
+    }
+    (void)memset(storage, 0, sizeof(*storage));
+    if (gsh_fault_should_fail(GSH_FAULT_HISTORY_ALLOCATION, ENOMEM)) return -1;
+    state->history = &storage->history;
+    state->history_snapshot = storage->history_snapshot;
+    if (gsh_fault_should_fail(GSH_FAULT_ALLOCATION, ENOMEM)) return -1;
+    state->parse_storage = &storage->parse_storage;
+    if (gsh_fault_should_fail(GSH_FAULT_ALLOCATION, ENOMEM)) return -1;
+    state->native_pipeline = &storage->native_pipeline;
+    if (gsh_fault_should_fail(GSH_FAULT_ALLOCATION, ENOMEM)) return -1;
+    state->command_cache = &storage->command_cache;
+    if (gsh_fault_should_fail(GSH_FAULT_ALLOCATION, ENOMEM)) return -1;
+    state->command_cache_scratch = &storage->command_cache_scratch;
+    if (gsh_fault_should_fail(GSH_FAULT_ALLOCATION, ENOMEM)) return -1;
+    state->variables = &storage->variables;
+    if (gsh_fault_should_fail(GSH_FAULT_ALLOCATION, ENOMEM)) return -1;
+    state->variable_scratch = &storage->variable_scratch;
+    if (gsh_fault_should_fail(GSH_FAULT_ALLOCATION, ENOMEM)) return -1;
+    state->pipeline_variables = &storage->pipeline_variables;
+    if (gsh_fault_should_fail(GSH_FAULT_ALLOCATION, ENOMEM)) return -1;
+    state->variable_commit = &storage->variable_commit;
+    if (gsh_fault_should_fail(GSH_FAULT_ALLOCATION, ENOMEM)) return -1;
+    state->pipeline_changes = &storage->pipeline_changes;
+    if (gsh_fault_should_fail(GSH_FAULT_ALLOCATION, ENOMEM)) return -1;
+    state->source_workspaces = &storage->source_workspaces;
+    if (gsh_fault_should_fail(GSH_FAULT_ALLOCATION, ENOMEM)) return -1;
+    state->async_repl = &storage->async_repl;
+    state->positional_storage = &storage->positionals;
+    state->positional_commit = &storage->positional_commit;
+    return 0;
+}
 
-    memset(state, 0, sizeof(*state));
+static void initialize_shell_state(shell_state *state,
+                                   const char *program_path)
+{
+    if (!require(state != NULL)) return;
+    if (!require(program_path != NULL)) return;
+    (void)memset(state, 0, sizeof(*state));
     state->parameter_zero = program_path;
     state->pending_input = state->pending_line;
     state->tty_fd = -1;
@@ -1244,7 +1387,15 @@ static int initialize_interactive(shell_state *state,
     state->async_dispatch_cell = -1;
     state->history_client.descriptor = -1;
     state->running = true;
-    state->last_status = 0;
+}
+
+static void load_interactive_config(shell_state *state)
+{
+    const char *history_override;
+    const char *home;
+
+    if (!require(state != NULL)) return;
+    if (!require(state->config.diagnostic[0] == '\0')) return;
     gsh_config_defaults(&state->config);
     history_override = getenv("GSH_HISTORY");
     home = getenv("HOME");
@@ -1260,76 +1411,26 @@ static int initialize_interactive(shell_state *state,
         state->config_error = true;
         state->config.history_enabled = false;
     }
-    state->history = fault_should_fail("history-allocation", ENOMEM)
-                         ? NULL
-                         : malloc(sizeof(*state->history));
-    if (state->history == NULL) {
-        return -1;
-    }
+}
+
+static int initialize_interactive_stores(shell_state *state,
+                                         interactive_storage *storage)
+{
+    if (!require(state != NULL)) return -1;
+    if (!require(storage != NULL)) return -1;
+    if (bind_interactive_storage(state, storage) == -1) return -1;
     gsh_history_initialize(state->history);
     gsh_options_initialize(&state->options, true);
     gsh_background_initialize(&state->background_jobs);
     state->redirection_next_request_id = 1;
-    state->parse_storage = fault_should_fail("allocation", ENOMEM)
-                               ? NULL
-                               : malloc(sizeof(*state->parse_storage));
-    if (state->parse_storage == NULL) {
-        return -1;
-    }
-    state->native_pipeline = fault_should_fail("allocation", ENOMEM)
-                                 ? NULL
-                                 : malloc(sizeof(*state->native_pipeline));
-    if (state->native_pipeline == NULL) {
-        return -1;
-    }
-    state->command_cache = fault_should_fail("allocation", ENOMEM)
-                               ? NULL
-                               : malloc(sizeof(*state->command_cache));
-    state->command_cache_scratch =
-        fault_should_fail("allocation", ENOMEM)
-            ? NULL
-            : malloc(sizeof(*state->command_cache_scratch));
-    state->variables = fault_should_fail("allocation", ENOMEM)
-                           ? NULL
-                           : malloc(sizeof(*state->variables));
-    state->variable_scratch = fault_should_fail("allocation", ENOMEM)
-                                  ? NULL
-                                  : malloc(sizeof(*state->variable_scratch));
-    state->pipeline_variables = fault_should_fail("allocation", ENOMEM)
-                                    ? NULL
-                                    : malloc(sizeof(*state->pipeline_variables));
-    state->variable_commit = fault_should_fail("allocation", ENOMEM)
-                                 ? NULL
-                                 : malloc(sizeof(*state->variable_commit));
-    state->pipeline_changes = fault_should_fail("allocation", ENOMEM)
-                                  ? NULL
-                                  : malloc(sizeof(*state->pipeline_changes));
-    state->source_workspaces = fault_should_fail("allocation", ENOMEM)
-                                   ? NULL
-                                   : malloc(sizeof(*state->source_workspaces));
-    state->async_repl = fault_should_fail("allocation", ENOMEM)
-                            ? NULL
-                            : malloc(sizeof(*state->async_repl));
-    if (state->command_cache == NULL ||
-        state->command_cache_scratch == NULL || state->variables == NULL ||
-        state->variable_scratch == NULL ||
-        state->pipeline_variables == NULL ||
-        state->variable_commit == NULL || state->pipeline_changes == NULL ||
-        state->source_workspaces == NULL ||
-        state->async_repl == NULL ||
-        gsh_variables_import(state->variables, environ) == -1) {
-        return -1;
-    }
+    if (gsh_variables_import(state->variables, environ) == -1) return -1;
     gsh_source_workspaces_initialize(state->source_workspaces);
-    state->aliases = &state->source_workspaces->root_aliases;
-    state->alias_expansion =
-        state->source_workspaces->root_alias_expansion;
-    state->alias_scratch =
-        &state->source_workspaces->root_alias_scratch;
-    state->alias_commit = &state->source_workspaces->root_alias_commit;
-    state->functions = &state->source_workspaces->root_functions;
-    state->function_scratch =
-        &state->source_workspaces->root_function_scratch;
+    state->aliases = &state_source_workspaces(state)->root_aliases;
+    state->alias_expansion = state_source_workspaces(state)->root_alias_expansion;
+    state->alias_scratch = &state_source_workspaces(state)->root_alias_scratch;
+    state->alias_commit = &state_source_workspaces(state)->root_alias_commit;
+    state->functions = &state_source_workspaces(state)->root_functions;
+    state->function_scratch = &state_source_workspaces(state)->root_function_scratch;
     gsh_command_cache_initialize(
         state->command_cache,
         gsh_variables_path_generation(state->variables));
@@ -1344,47 +1445,56 @@ static int initialize_interactive(shell_state *state,
     state->function_generation = 1;
     gsh_variable_journal_initialize(state->variable_commit,
                                     state->variable_generation);
+    return 0;
+}
 
+static void initialize_interactive_paths(shell_state *state)
+{
+    size_t default_path_size;
+
+    if (!require(state != NULL)) return;
+    if (!require(state->default_path[sizeof(state->default_path) - 1U] ==
+                 '\0')) {
+        return;
+    }
     default_path_size =
         confstr(_CS_PATH, state->default_path, sizeof(state->default_path));
     if (default_path_size == 0 ||
         default_path_size > sizeof(state->default_path) ||
         state->default_path[0] == '\0') {
-        memcpy(state->default_path, "/bin:/usr/bin", 14);
+        (void)memcpy(state->default_path, "/bin:/usr/bin", 14U);
     }
     if (getcwd(state->current_directory,
                sizeof(state->current_directory)) == NULL) {
         state->current_directory[0] = '\0';
     }
+}
 
+static int claim_interactive_terminal(shell_state *state)
+{
+    const char *terminal_name;
+    pid_t foreground_group;
+    pid_t current_group;
+
+    if (!require(state != NULL)) return -1;
+    if (!require(state->tty_fd == -1)) return -1;
     terminal_name = ttyname(STDIN_FILENO);
-    if (terminal_name == NULL) {
-        return -1;
-    }
-    state->tty_fd = fault_should_fail("tty-open", EMFILE)
+    if (terminal_name == NULL) return -1;
+    state->tty_fd = gsh_fault_should_fail(GSH_FAULT_TTY_OPEN, EMFILE)
                         ? -1
-                        : open(terminal_name,
-                               O_RDWR | O_NOCTTY | O_NONBLOCK);
+                        : open(terminal_name, O_RDWR | O_NOCTTY | O_NONBLOCK);
     if (state->tty_fd == -1 ||
         set_fd_flags(state->tty_fd, F_GETFD, FD_CLOEXEC) == -1) {
         return -1;
     }
-
     current_group = getpgrp();
-    for (;;) {
-        foreground_group = tcgetpgrp(state->tty_fd);
-        if (foreground_group == -1) {
-            return -1;
-        }
-        if (foreground_group == current_group) {
-            break;
-        }
-        if (kill(-current_group, SIGTTIN) == -1) {
-            return -1;
-        }
+    foreground_group = tcgetpgrp(state->tty_fd);
+    while (foreground_group != current_group) {
+        if (foreground_group == -1) return -1;
+        if (kill(-current_group, SIGTTIN) == -1) return -1;
         current_group = getpgrp();
+        foreground_group = tcgetpgrp(state->tty_fd);
     }
-
     state->shell_pgid = getpid();
     if (setpgid(0, state->shell_pgid) == -1 &&
         !(errno == EACCES || errno == EPERM)) {
@@ -1395,9 +1505,17 @@ static int initialize_interactive(shell_state *state,
         return -1;
     }
     make_editor_modes(state);
+    return 0;
+}
 
-    if (make_pipe(state->signal_pipe, true
-                  GSH_FAULT_ARGUMENT("signal-pipe")) == -1) {
+static int activate_interactive_signals(shell_state *state)
+{
+    if (!require(state != NULL)) return -1;
+    if (!require(state->signal_pipe[0] == -1 &&
+                 state->signal_pipe[1] == -1)) {
+        return -1;
+    }
+    if (make_pipe(state->signal_pipe, true, GSH_FAULT_SIGNAL_PIPE) == -1) {
         return -1;
     }
     g_signal_write_fd = state->signal_pipe[1];
@@ -1406,6 +1524,23 @@ static int initialize_interactive(shell_state *state,
     }
     initialize_repl_size(state);
     return 0;
+}
+
+static int initialize_interactive(shell_state *state,
+                                  interactive_storage *storage,
+                                  const char *program_path)
+{
+    if (!require(state != NULL)) return -1;
+    if (!require(storage != NULL && program_path != NULL)) return -1;
+    initialize_shell_state(state, program_path);
+    load_interactive_config(state);
+    if (initialize_interactive_stores(state, storage) == -1) {
+        return -1;
+    }
+    initialize_interactive_paths(state);
+    return claim_interactive_terminal(state) == -1
+               ? -1
+               : activate_interactive_signals(state);
 }
 
 static void reset_child_signals(void)
@@ -1417,16 +1552,20 @@ static void reset_child_signals(void)
     for (index = 0; index < sizeof(signals) / sizeof(signals[0]); index++) {
         struct sigaction action;
 
-        memset(&action, 0, sizeof(action));
+        (void)memset(&action, 0, sizeof(action));
         action.sa_handler = SIG_DFL;
-        sigemptyset(&action.sa_mask);
+        (void)sigemptyset(&action.sa_mask);
         (void)sigaction(signals[index], &action, NULL);
     }
 }
 
 static void redirection_worker_loop(int fd)
 {
-    for (;;) {
+    bool connection_open = true;
+
+    /* Lifecycle loop: the socket peer owns termination; every iteration
+     * consumes exactly one versioned request or exits the worker. */
+    while (connection_open) {
         redirection_request request;
         redirection_result result;
         ssize_t received;
@@ -1443,7 +1582,7 @@ static void redirection_worker_loop(int fd)
             _exit(1);
         }
 
-        memset(&result, 0, sizeof(result));
+        (void)memset(&result, 0, sizeof(result));
         result.version = REDIRECTION_WORKER_PROTOCOL_VERSION;
         result.request_id = request.request_id;
         {
@@ -1456,7 +1595,7 @@ static void redirection_worker_loop(int fd)
                 result.status = 1;
                 result.error = errno;
             } else {
-                close(descriptor);
+                (void)close(descriptor);
                 result.status = request.builtin_status;
             }
         }
@@ -1471,8 +1610,9 @@ static void redirection_worker_loop(int fd)
 
 static void disable_redirection_worker(shell_state *state, bool terminate)
 {
+    if (state == NULL) return;
     if (state->redirection_worker_fd >= 0) {
-        close(state->redirection_worker_fd);
+        (void)close(state->redirection_worker_fd);
         state->redirection_worker_fd = -1;
     }
     if (terminate && state->redirection_worker_pid > 0) {
@@ -1485,12 +1625,15 @@ static void disable_redirection_worker(shell_state *state, bool terminate)
 
 static int start_redirection_worker(shell_state *state)
 {
+    if (state == NULL) {
+        return -1;
+    }
     int sockets[2];
     sigset_t blocked;
     sigset_t previous;
     pid_t pid;
 
-    if (fault_should_fail("worker-socket", EMFILE) ||
+    if (gsh_fault_should_fail(GSH_FAULT_WORKER_SOCKET, EMFILE) ||
         socketpair(AF_UNIX, SOCK_DGRAM, 0, sockets) == -1) {
         return -1;
     }
@@ -1499,44 +1642,44 @@ static int start_redirection_worker(shell_state *state)
         set_fd_flags(sockets[0], F_GETFL, O_NONBLOCK) == -1) {
         int saved_errno = errno;
 
-        close(sockets[0]);
-        close(sockets[1]);
+        (void)close(sockets[0]);
+        (void)close(sockets[1]);
         errno = saved_errno;
         return -1;
     }
 
-    sigemptyset(&blocked);
-    sigaddset(&blocked, SIGCHLD);
+    (void)sigemptyset(&blocked);
+    (void)sigaddset(&blocked, SIGCHLD);
     if (sigprocmask(SIG_BLOCK, &blocked, &previous) == -1) {
         int saved_errno = errno;
 
-        close(sockets[0]);
-        close(sockets[1]);
+        (void)close(sockets[0]);
+        (void)close(sockets[1]);
         errno = saved_errno;
         return -1;
     }
 
-    pid = fault_should_fail("worker-fork", EAGAIN) ? -1 : fork();
+    pid = gsh_fault_should_fail(GSH_FAULT_WORKER_FORK, EAGAIN) ? -1 : fork();
     if (pid == 0) {
-        close(sockets[0]);
+        (void)close(sockets[0]);
         (void)setpgid(0, 0);
         reset_child_signals();
         (void)sigprocmask(SIG_SETMASK, &previous, NULL);
-        close(state->tty_fd);
-        close(state->signal_pipe[0]);
-        close(state->signal_pipe[1]);
-        close(STDIN_FILENO);
-        close(STDOUT_FILENO);
-        close(STDERR_FILENO);
+        (void)close(state->tty_fd);
+        (void)close(state->signal_pipe[0]);
+        (void)close(state->signal_pipe[1]);
+        (void)close(STDIN_FILENO);
+        (void)close(STDOUT_FILENO);
+        (void)close(STDERR_FILENO);
         (void)umask(0);
         redirection_worker_loop(sockets[1]);
     }
 
-    close(sockets[1]);
+    (void)close(sockets[1]);
     if (pid == -1) {
         int saved_errno = errno;
 
-        close(sockets[0]);
+        (void)close(sockets[0]);
         (void)sigprocmask(SIG_SETMASK, &previous, NULL);
         errno = saved_errno;
         return -1;
@@ -1552,6 +1695,9 @@ static int start_redirection_worker(shell_state *state)
 
 static void receive_redirection_result(shell_state *state)
 {
+    if (state == NULL) {
+        return;
+    }
     redirection_result result;
     ssize_t received;
 
@@ -1570,7 +1716,7 @@ static void receive_redirection_result(shell_state *state)
         state->redirection_worker_failures++;
         disable_redirection_worker(state, true);
         if (command) {
-            output_text(state, "gsh: asynchronous redirection failed\r\n");
+            (void)output_text(state, "gsh: asynchronous redirection failed\r\n");
             state->last_status = 1;
             state->mode = MODE_EDITOR;
             queue_prompt(state);
@@ -1596,6 +1742,9 @@ static void receive_redirection_result(shell_state *state)
 
 static int history_poll_timeout(const shell_state *state)
 {
+    if (state == NULL) {
+        return -1;
+    }
     bool history_deadline =
         state->history_persistent &&
         state->history_reminder_deadline_ns != 0 &&
@@ -1620,6 +1769,9 @@ static int history_poll_timeout(const shell_state *state)
 
 static void reclaim_terminal(shell_state *state, bool save_job_modes)
 {
+    if (state == NULL) {
+        return;
+    }
     (void)tcsetpgrp(state->tty_fd, state->shell_pgid);
     if (save_job_modes) {
         (void)tcgetattr(state->tty_fd, &state->current_job.modes);
@@ -1642,9 +1794,12 @@ static void initialize_job(job *current, pid_t pgid, pid_t status_pid,
                            const pid_t *members, size_t member_count,
                            bool foreground, bool negated)
 {
+    if (current == NULL || members == NULL) {
+        return;
+    }
     size_t index;
 
-    memset(current, 0, sizeof(*current));
+    (void)memset(current, 0, sizeof(*current));
     current->active = true;
     current->foreground = foreground;
     current->pid = pgid;
@@ -1659,18 +1814,62 @@ static void initialize_job(job *current, pid_t pgid, pid_t status_pid,
     }
 }
 
+enum {
+    ISOLATED_JOB_TABLE_CAP =
+        GSH_FUNCTION_DEPTH_CAP + GSH_SOURCE_DEPTH_CAP + 4,
+};
+
+typedef struct {
+    gsh_background_table tables[ISOLATED_JOB_TABLE_CAP];
+    bool used[ISOLATED_JOB_TABLE_CAP];
+} isolated_job_pool;
+
+static isolated_job_pool *process_isolated_job_pool(void)
+{
+    static isolated_job_pool pool;
+
+    return &pool;
+}
+
 static gsh_background_table *allocate_isolated_job_table(void)
 {
-    gsh_background_table *table =
-        fault_should_fail("job-table-allocation", ENOMEM)
-            ? NULL : malloc(sizeof(*table));
+    isolated_job_pool *pool = process_isolated_job_pool();
+    size_t index;
 
-    if (table != NULL) gsh_background_initialize(table);
-    return table;
+    if (gsh_fault_should_fail(GSH_FAULT_JOB_TABLE_ALLOCATION, ENOMEM)) {
+        return NULL;
+    }
+    for (index = 0; index < ISOLATED_JOB_TABLE_CAP; index++) {
+        if (!pool->used[index]) {
+            pool->used[index] = true;
+            gsh_background_initialize(&pool->tables[index]);
+            return &pool->tables[index];
+        }
+    }
+    errno = ENOSPC;
+    return NULL;
+}
+
+static void release_isolated_job_table(gsh_background_table *table)
+{
+    isolated_job_pool *pool = process_isolated_job_pool();
+    size_t index;
+
+    for (index = 0; index < ISOLATED_JOB_TABLE_CAP; index++) {
+        if (table == &pool->tables[index]) {
+            (void)memset(table, 0, sizeof(*table));
+            pool->used[index] = false;
+            return;
+        }
+    }
+    if (table != NULL) errno = EINVAL;
 }
 
 static size_t find_job_member(const job *current, pid_t pid)
 {
+    if (current == NULL) {
+        return 0U;
+    }
     size_t index;
 
     for (index = 0; index < current->member_count; index++) {
@@ -1683,6 +1882,7 @@ static size_t find_job_member(const job *current, pid_t pid)
 
 static bool all_remaining_members_stopped(const job *current)
 {
+    if (current == NULL) return false;
     size_t index;
 
     if (current->remaining == 0) {
@@ -1720,14 +1920,14 @@ static int send_directory_descriptor(int socket)
     int descriptor;
     ssize_t sent;
 
-    descriptor = fault_should_fail("directory-commit-open", EMFILE)
+    descriptor = gsh_fault_should_fail(GSH_FAULT_DIRECTORY_COMMIT_OPEN, EMFILE)
                      ? -1
                      : open(".", O_RDONLY);
-    if (descriptor == -1) {
+    if (descriptor < 0) {
         return -1;
     }
-    memset(&control, 0, sizeof(control));
-    memset(&message, 0, sizeof(message));
+    (void)memset(&control, 0, sizeof(control));
+    (void)memset(&message, 0, sizeof(message));
     vector.iov_base = &marker;
     vector.iov_len = sizeof(marker);
     message.msg_iov = &vector;
@@ -1738,18 +1938,19 @@ static int send_directory_descriptor(int socket)
     header->cmsg_level = SOL_SOCKET;
     header->cmsg_type = SCM_RIGHTS;
     header->cmsg_len = CMSG_LEN(sizeof(descriptor));
-    memcpy(CMSG_DATA(header), &descriptor, sizeof(descriptor));
+    (void)memcpy(CMSG_DATA(header), &descriptor, sizeof(descriptor));
     do {
-        sent = fault_should_fail("directory-commit-send", EIO)
+        sent = gsh_fault_should_fail(GSH_FAULT_DIRECTORY_COMMIT_SEND, EIO)
                    ? -1
                    : sendmsg(socket, &message, 0);
     } while (sent == -1 && errno == EINTR);
-    close(descriptor);
+    (void)close(descriptor);
     return sent == (ssize_t)sizeof(marker) ? 0 : -1;
 }
 
 static int receive_directory_descriptor(shell_state *state)
 {
+    if (state == NULL) return -1;
     union {
         struct cmsghdr alignment;
         unsigned char bytes[CMSG_SPACE(sizeof(int))];
@@ -1768,8 +1969,8 @@ static int receive_directory_descriptor(shell_state *state)
         errno = EPROTO;
         return -1;
     }
-    memset(&control, 0, sizeof(control));
-    memset(&message, 0, sizeof(message));
+    (void)memset(&control, 0, sizeof(control));
+    (void)memset(&message, 0, sizeof(message));
     vector.iov_base = &marker;
     vector.iov_len = sizeof(marker);
     message.msg_iov = &vector;
@@ -1777,18 +1978,18 @@ static int receive_directory_descriptor(shell_state *state)
     message.msg_control = control.bytes;
     message.msg_controllen = sizeof(control.bytes);
     do {
-        received = fault_should_fail("directory-commit-receive", EIO)
+        received = gsh_fault_should_fail(GSH_FAULT_DIRECTORY_COMMIT_RECEIVE, EIO)
                        ? -1
                        : recvmsg(state->directory_commit_socket, &message,
                                  0);
     } while (received == -1 && errno == EINTR);
-    close(state->directory_commit_socket);
+    (void)close(state->directory_commit_socket);
     state->directory_commit_socket = -1;
     header = CMSG_FIRSTHDR(&message);
     if (header != NULL && header->cmsg_level == SOL_SOCKET &&
         header->cmsg_type == SCM_RIGHTS &&
         header->cmsg_len >= CMSG_LEN(sizeof(descriptor))) {
-        memcpy(&descriptor, CMSG_DATA(header), sizeof(descriptor));
+        (void)memcpy(&descriptor, CMSG_DATA(header), sizeof(descriptor));
     }
     if (received != (ssize_t)sizeof(marker) || marker != 1 ||
         (message.msg_flags & (MSG_CTRUNC | MSG_TRUNC)) != 0 ||
@@ -1797,7 +1998,7 @@ static int receive_directory_descriptor(shell_state *state)
         header->cmsg_len != CMSG_LEN(sizeof(descriptor)) ||
         CMSG_NXTHDR(&message, header) != NULL) {
         if (descriptor >= 0) {
-            close(descriptor);
+            (void)close(descriptor);
         }
         errno = EPROTO;
         return -1;
@@ -1807,7 +2008,7 @@ static int receive_directory_descriptor(shell_state *state)
         int saved_errno = errno;
 
         if (descriptor >= 0) {
-            close(descriptor);
+            (void)close(descriptor);
         }
         errno = saved_errno;
         return -1;
@@ -1818,6 +2019,9 @@ static int receive_directory_descriptor(shell_state *state)
 
 static size_t state_commit_size(const shell_state *state)
 {
+    if (state == NULL) {
+        return 0U;
+    }
     size_t size = sizeof(*state->variable_commit) +
                   (state->alias_commit_expected
                        ? sizeof(*state->alias_commit)
@@ -1867,8 +2071,9 @@ static bool state_control_commit_valid(const state_control_commit *commit)
 
 static void close_variable_commit(shell_state *state)
 {
+    if (state == NULL) return;
     if (state->variable_commit_fd >= 0) {
-        close(state->variable_commit_fd);
+        (void)close(state->variable_commit_fd);
     }
     state->variable_commit_fd = -1;
     state->variable_commit_received = 0;
@@ -1876,29 +2081,27 @@ static void close_variable_commit(shell_state *state)
     state->variable_commit_eof = false;
     state->variable_commit_invalid = false;
     if (state->job_service_socket >= 0) {
-        close(state->job_service_socket);
+        (void)close(state->job_service_socket);
     }
     state->job_service_socket = -1;
     state->pending_job_service = false;
     if (state->job_service_wait_reply_fd >= 0) {
-        close(state->job_service_wait_reply_fd);
+        (void)close(state->job_service_wait_reply_fd);
     }
     state->job_service_wait_reply_fd = -1;
     state->job_service_wait_target_count = 0;
     state->job_service_wait_all = false;
     if (state->exec_outcome_fd >= 0) {
-        close(state->exec_outcome_fd);
+        (void)close(state->exec_outcome_fd);
     }
     state->exec_outcome_fd = -1;
     state->pending_exec_possible = false;
     if (state->exec_descriptor_socket >= 0) {
-        close(state->exec_descriptor_socket);
+        (void)close(state->exec_descriptor_socket);
     }
     state->exec_descriptor_socket = -1;
     state->pending_exec_descriptor_count = 0;
     state->pending_exec_protected_descriptor_count = 0;
-    free(state->positional_commit);
-    state->positional_commit = NULL;
     state->positional_commit_expected = false;
     state->pending_positional_commit = false;
     state->alias_commit_expected = false;
@@ -1906,18 +2109,18 @@ static void close_variable_commit(shell_state *state)
     state->function_commit_expected = false;
     state->pending_function_commit = false;
     state->function_commit_header_complete = false;
-    memset(&state->function_commit_header, 0,
+    (void)memset(&state->function_commit_header, 0,
            sizeof(state->function_commit_header));
     state->command_cache_commit_expected = false;
     state->pending_command_cache_commit = false;
-    memset(&state->command_cache_commit_header, 0,
+    (void)memset(&state->command_cache_commit_header, 0,
            sizeof(state->command_cache_commit_header));
-    memset(&state->control_commit, 0, sizeof(state->control_commit));
+    (void)memset(&state->control_commit, 0, sizeof(state->control_commit));
     if (state->directory_commit_socket >= 0) {
-        close(state->directory_commit_socket);
+        (void)close(state->directory_commit_socket);
     }
     if (state->directory_commit_fd >= 0) {
-        close(state->directory_commit_fd);
+        (void)close(state->directory_commit_fd);
     }
     state->directory_commit_socket = -1;
     state->directory_commit_fd = -1;
@@ -1925,11 +2128,130 @@ static void close_variable_commit(shell_state *state)
     state->pending_directory_commit = false;
 }
 
+typedef struct {
+    unsigned char *data;
+    size_t size;
+} commit_span;
+
+static size_t initialize_commit_spans(shell_state *state,
+                                      commit_span spans[8])
+{
+    if (!require(state != NULL)) return 0U;
+    if (!require(spans != NULL)) return 0U;
+    spans[0] = (commit_span){(unsigned char *)state->variable_commit,
+                             sizeof(*state->variable_commit)};
+    spans[1] = (commit_span){(unsigned char *)state->alias_commit,
+                             state->alias_commit_expected
+                                 ? sizeof(*state->alias_commit)
+                                 : 0U};
+    spans[2] = (commit_span){(unsigned char *)state->positional_commit,
+                             state->positional_commit_expected
+                                 ? sizeof(*state->positional_commit)
+                                 : 0U};
+    spans[3] = (commit_span){
+        (unsigned char *)&state->command_cache_commit_header,
+        state->command_cache_commit_expected
+            ? sizeof(state->command_cache_commit_header)
+            : 0U};
+    spans[4] = (commit_span){(unsigned char *)state->command_cache_scratch,
+                             state->command_cache_commit_expected
+                                 ? sizeof(*state->command_cache_scratch)
+                                 : 0U};
+    spans[5] = (commit_span){(unsigned char *)&state->option_commit,
+                             sizeof(state->option_commit)};
+    spans[6] = (commit_span){(unsigned char *)&state->control_commit,
+                             sizeof(state->control_commit)};
+    spans[7] = (commit_span){
+        (unsigned char *)&state->function_commit_header,
+        state->function_commit_expected
+            ? sizeof(state->function_commit_header)
+            : 0U};
+    return 8U;
+}
+
+static void *select_commit_destination(shell_state *state,
+                                       unsigned char *extra,
+                                       size_t *capacity)
+{
+    commit_span spans[8];
+    size_t span_count;
+    size_t offset;
+    size_t index;
+
+    if (!require(state != NULL && extra != NULL)) return NULL;
+    if (!require(capacity != NULL)) return NULL;
+    *capacity = state_commit_size(state) - state->variable_commit_received;
+    if (*capacity > 4096U) *capacity = 4096U;
+    offset = state->variable_commit_received;
+    span_count = initialize_commit_spans(state, spans);
+    for (index = 0; index < 8U && index < span_count; index++) {
+        if (offset < spans[index].size) {
+            size_t remaining = spans[index].size - offset;
+
+            if (*capacity > remaining) *capacity = remaining;
+            return spans[index].data + offset;
+        }
+        offset -= spans[index].size;
+    }
+    if (state->function_commit_expected &&
+        state->function_commit_header_complete) {
+        size_t available;
+        void *destination = gsh_functions_snapshot_destination(
+            state->function_scratch, &state->function_commit_header, offset,
+            &available);
+
+        if (destination != NULL && available > 0U) {
+            if (*capacity > available) *capacity = available;
+            return destination;
+        }
+    }
+    state->variable_commit_invalid = true;
+    *capacity = 1U;
+    return extra;
+}
+
+static void accept_variable_commit_bytes(shell_state *state, size_t count)
+{
+    size_t header_end;
+
+    if (!require(state != NULL)) return;
+    if (!require(count > 0U)) return;
+    if (state->variable_commit_received >= state_commit_size(state)) {
+        state->variable_commit_invalid = true;
+        return;
+    }
+    state->variable_commit_received += count;
+    if (!state->function_commit_expected ||
+        state->function_commit_header_complete) {
+        return;
+    }
+    header_end = sizeof(*state->variable_commit) +
+        (state->alias_commit_expected ? sizeof(*state->alias_commit) : 0U) +
+        (state->positional_commit_expected
+             ? sizeof(*state->positional_commit)
+             : 0U) +
+        (state->command_cache_commit_expected
+             ? sizeof(state->command_cache_commit_header) +
+                   sizeof(*state->command_cache_scratch)
+             : 0U) +
+        sizeof(state->option_commit) + sizeof(state->control_commit) +
+        sizeof(state->function_commit_header);
+    if (state->variable_commit_received < header_end) return;
+    state->function_commit_header_complete = true;
+    if (!gsh_functions_snapshot_header_valid(&state->function_commit_header) ||
+        state->function_commit_header.base_generation !=
+            state->function_generation) {
+        state->variable_commit_invalid = true;
+    }
+}
+
 static void receive_variable_commit(shell_state *state, bool drain_all)
 {
     unsigned int reads = 0;
     unsigned int limit = drain_all ? 1024U : 4U;
 
+    if (!require(state != NULL)) return;
+    if (!require(limit == 4U || limit == 1024U)) return;
     while (state->variable_commit_fd >= 0 && reads++ < limit) {
         unsigned char extra;
         void *destination;
@@ -1937,192 +2259,23 @@ static void receive_variable_commit(shell_state *state, bool drain_all)
         ssize_t count;
 
         if (state->variable_commit_received < state_commit_size(state)) {
-            size_t variable_size = sizeof(*state->variable_commit);
-            size_t alias_size = state->alias_commit_expected
-                                    ? sizeof(*state->alias_commit)
-                                    : 0U;
-
-            capacity = state_commit_size(state) -
-                       state->variable_commit_received;
-            if (capacity > 4096U) {
-                capacity = 4096U;
-            }
-            size_t positional_size =
-                state->positional_commit_expected
-                    ? sizeof(*state->positional_commit)
-                    : 0U;
-            size_t cache_header_size =
-                state->command_cache_commit_expected
-                    ? sizeof(state->command_cache_commit_header)
-                    : 0U;
-            size_t cache_size = state->command_cache_commit_expected
-                                    ? sizeof(*state->command_cache_scratch)
-                                    : 0U;
-            size_t cache_begin = variable_size + alias_size +
-                                 positional_size;
-            size_t cache_store_begin = cache_begin + cache_header_size;
-            size_t option_begin = cache_store_begin + cache_size;
-            size_t option_end = option_begin + sizeof(state->option_commit);
-            size_t control_end = option_end + sizeof(state->control_commit);
-
-            if (state->variable_commit_received < variable_size) {
-                size_t remaining = variable_size -
-                                   state->variable_commit_received;
-
-                if (capacity > remaining) {
-                    capacity = remaining;
-                }
-                destination = (unsigned char *)state->variable_commit +
-                              state->variable_commit_received;
-            } else if (state->variable_commit_received <
-                       variable_size + alias_size) {
-                size_t remaining = variable_size + alias_size -
-                                   state->variable_commit_received;
-
-                if (capacity > remaining) {
-                    capacity = remaining;
-                }
-                destination = (unsigned char *)state->alias_commit +
-                              state->variable_commit_received -
-                                  variable_size;
-            } else if (state->variable_commit_received <
-                       variable_size + alias_size + positional_size) {
-                size_t remaining = variable_size + alias_size +
-                                   positional_size -
-                                   state->variable_commit_received;
-
-                if (capacity > remaining) {
-                    capacity = remaining;
-                }
-                destination = (unsigned char *)state->positional_commit +
-                              state->variable_commit_received -
-                                  variable_size - alias_size;
-            } else if (state->variable_commit_received <
-                       cache_store_begin) {
-                size_t offset = state->variable_commit_received -
-                                cache_begin;
-                size_t remaining = cache_header_size - offset;
-
-                if (capacity > remaining) {
-                    capacity = remaining;
-                }
-                destination =
-                    (unsigned char *)&state->command_cache_commit_header +
-                    offset;
-            } else if (state->variable_commit_received < option_begin) {
-                size_t offset = state->variable_commit_received -
-                                cache_store_begin;
-                size_t remaining = cache_size - offset;
-
-                if (capacity > remaining) {
-                    capacity = remaining;
-                }
-                destination =
-                    (unsigned char *)state->command_cache_scratch + offset;
-            } else if (state->variable_commit_received < option_end) {
-                size_t remaining = option_end -
-                                   state->variable_commit_received;
-
-                if (capacity > remaining) {
-                    capacity = remaining;
-                }
-                destination = (unsigned char *)&state->option_commit +
-                              state->variable_commit_received -
-                                  option_begin;
-            } else if (state->variable_commit_received < control_end) {
-                size_t remaining = control_end -
-                                   state->variable_commit_received;
-
-                if (capacity > remaining) {
-                    capacity = remaining;
-                }
-                destination = (unsigned char *)&state->control_commit +
-                              state->variable_commit_received - option_end;
-            } else if (state->function_commit_expected &&
-                       state->variable_commit_received <
-                           control_end +
-                               sizeof(state->function_commit_header)) {
-                size_t header_offset = state->variable_commit_received -
-                                       control_end;
-                size_t remaining = sizeof(state->function_commit_header) -
-                                   header_offset;
-
-                if (capacity > remaining) {
-                    capacity = remaining;
-                }
-                destination =
-                    (unsigned char *)&state->function_commit_header +
-                    header_offset;
-            } else if (state->function_commit_expected &&
-                       state->function_commit_header_complete) {
-                size_t payload_offset = state->variable_commit_received -
-                                        control_end -
-                                        sizeof(state->function_commit_header);
-                size_t available;
-
-                destination = gsh_functions_snapshot_destination(
-                    state->function_scratch,
-                    &state->function_commit_header, payload_offset,
-                    &available);
-                if (destination == NULL || available == 0) {
-                    destination = &extra;
-                    capacity = 1;
-                    state->variable_commit_invalid = true;
-                } else if (capacity > available) {
-                    capacity = available;
-                }
-            } else {
-                destination = &extra;
-                capacity = 1;
-                state->variable_commit_invalid = true;
-            }
+            destination = select_commit_destination(state, &extra, &capacity);
+            if (destination == NULL) return;
         } else {
             destination = &extra;
-            capacity = 1;
+            capacity = 1U;
         }
-        count = fault_should_fail("state-commit-read", EIO)
+        count = gsh_fault_should_fail(GSH_FAULT_STATE_COMMIT_READ, EIO)
                     ? -1
                     : read(state->variable_commit_fd, destination,
                            capacity);
         if (count > 0) {
-            if (state->variable_commit_received >=
-                state_commit_size(state)) {
-                state->variable_commit_invalid = true;
-            } else {
-                state->variable_commit_received += (size_t)count;
-                if (state->function_commit_expected &&
-                    !state->function_commit_header_complete) {
-                    size_t header_end = sizeof(*state->variable_commit) +
-                        (state->alias_commit_expected
-                             ? sizeof(*state->alias_commit)
-                             : 0U) +
-                        (state->positional_commit_expected
-                             ? sizeof(*state->positional_commit)
-                             : 0U) +
-                        (state->command_cache_commit_expected
-                             ? sizeof(state->command_cache_commit_header) +
-                                   sizeof(*state->command_cache_scratch)
-                             : 0U) +
-                        sizeof(state->option_commit) +
-                        sizeof(state->control_commit) +
-                        sizeof(state->function_commit_header);
-
-                    if (state->variable_commit_received >= header_end) {
-                        state->function_commit_header_complete = true;
-                        if (!gsh_functions_snapshot_header_valid(
-                                &state->function_commit_header) ||
-                            state->function_commit_header.base_generation !=
-                                state->function_generation) {
-                            state->variable_commit_invalid = true;
-                        }
-                    }
-                }
-            }
+            accept_variable_commit_bytes(state, (size_t)count);
             continue;
         }
         if (count == 0) {
             state->variable_commit_eof = true;
-            close(state->variable_commit_fd);
+            (void)close(state->variable_commit_fd);
             state->variable_commit_fd = -1;
             return;
         }
@@ -2133,14 +2286,57 @@ static void receive_variable_commit(shell_state *state, bool drain_all)
             return;
         }
         state->variable_commit_invalid = true;
-        close(state->variable_commit_fd);
+        (void)close(state->variable_commit_fd);
         state->variable_commit_fd = -1;
         return;
     }
 }
 
+static void reject_variable_commit(shell_state *state,
+                                   bool directory_changed,
+                                   int previous_directory)
+{
+    if (!require(state != NULL)) return;
+    if (!require(!directory_changed || previous_directory >= 0)) return;
+    if (directory_changed && fchdir(previous_directory) == -1) {
+        int saved_errno = errno;
+
+        output_format(state, "gsh: directory rollback failed: %s\r\n",
+                      strerror(saved_errno));
+        state->running = false;
+    }
+    (void)output_text(state, "gsh: state transaction rejected or incomplete\r\n");
+}
+
+static bool stage_variable_commit(shell_state *state)
+{
+    if (state == NULL) return false;
+    (void)memcpy(state->variable_scratch, state->variables,
+                 sizeof(*state->variable_scratch));
+    if (gsh_variables_apply_journal_in_place(
+            state->variable_scratch, state->variable_commit) == -1) {
+        return false;
+    }
+    if (state->alias_commit_expected) {
+        (void)memcpy(state->alias_scratch, state->aliases,
+                     sizeof(*state->alias_scratch));
+        if (gsh_aliases_apply_journal_in_place(
+                state->alias_scratch, state->alias_commit) == -1) {
+            return false;
+        }
+    }
+    if (state->command_cache_commit_expected) {
+        gsh_command_cache_rebind(
+            state->command_cache_scratch,
+            state->command_cache_commit_header.final_path_generation,
+            gsh_variables_path_generation(state->variable_scratch));
+    }
+    return true;
+}
+
 static bool finish_variable_commit(shell_state *state, int wait_status)
 {
+    if (state == NULL) return false;
     bool valid;
     bool directory_changed = false;
     int previous_directory = -1;
@@ -2157,7 +2353,7 @@ static bool finish_variable_commit(shell_state *state, int wait_status)
             gsh_variable_journal_validate(state->variable_commit) &&
             (!state->alias_commit_expected ||
              (gsh_alias_journal_validate(state->alias_commit) &&
-              state->alias_commit->base_generation ==
+              state_alias_commit(state)->base_generation ==
                   state->alias_generation)) &&
             (!state->positional_commit_expected ||
              gsh_positionals_validate(state->positional_commit)) &&
@@ -2182,7 +2378,7 @@ static bool finish_variable_commit(shell_state *state, int wait_status)
                 gsh_options_enabled(&state->options,
                                     GSH_OPTION_INTERACTIVE) &&
             state_control_commit_valid(&state->control_commit) &&
-            state->variable_commit->base_generation ==
+            state_variable_commit(state)->base_generation ==
                 state->variable_generation;
     if (valid && receive_directory_descriptor(state) == -1) {
         valid = false;
@@ -2190,40 +2386,19 @@ static bool finish_variable_commit(shell_state *state, int wait_status)
     if (valid && state->directory_commit_expected) {
         previous_directory = open(".", O_RDONLY);
         if (previous_directory == -1 ||
-            fault_should_fail("directory-commit-apply", EIO) ||
+            gsh_fault_should_fail(GSH_FAULT_DIRECTORY_COMMIT_APPLY, EIO) ||
             fchdir(state->directory_commit_fd) == -1) {
             valid = false;
         } else {
             directory_changed = true;
         }
     }
+    if (valid) valid = stage_variable_commit(state);
     if (valid) {
-        memcpy(state->variable_scratch, state->variables,
-               sizeof(*state->variable_scratch));
-        if (gsh_variables_apply_journal_in_place(
-                state->variable_scratch, state->variable_commit) == -1) {
-            valid = false;
-        }
-        if (valid && state->alias_commit_expected) {
-            memcpy(state->alias_scratch, state->aliases,
-                   sizeof(*state->alias_scratch));
-            if (gsh_aliases_apply_journal_in_place(
-                    state->alias_scratch, state->alias_commit) == -1) {
-                valid = false;
-            }
-        }
-        if (valid && state->command_cache_commit_expected) {
-            gsh_command_cache_rebind(
-                state->command_cache_scratch,
-                state->command_cache_commit_header.final_path_generation,
-                gsh_variables_path_generation(state->variable_scratch));
-        }
-    }
-    if (valid) {
-        memcpy(state->variables, state->variable_scratch,
+        (void)memcpy(state->variables, state->variable_scratch,
                sizeof(*state->variables));
         if (state->alias_commit_expected) {
-            memcpy(state->aliases, state->alias_scratch,
+            (void)memcpy(state->aliases, state->alias_scratch,
                    sizeof(*state->aliases));
             state->alias_generation++;
         }
@@ -2236,13 +2411,13 @@ static bool finish_variable_commit(shell_state *state, int wait_status)
         }
         if (state->positional_commit_expected) {
             if (state->positionals == NULL) {
-                state->positionals = &g_interactive_positionals;
+                state->positionals = state->positional_storage;
             }
-            memcpy(state->positionals, state->positional_commit,
+            (void)memcpy(state->positionals, state->positional_commit,
                    sizeof(*state->positionals));
         }
         if (state->command_cache_commit_expected) {
-            memcpy(state->command_cache, state->command_cache_scratch,
+            (void)memcpy(state->command_cache, state->command_cache_scratch,
                    sizeof(*state->command_cache));
             state->command_cache_generation++;
         }
@@ -2258,29 +2433,34 @@ static bool finish_variable_commit(shell_state *state, int wait_status)
         }
         state->variable_generation++;
     } else if (WIFEXITED(wait_status) || state->variable_commit_invalid) {
-        if (directory_changed) {
-            if (fchdir(previous_directory) == -1) {
-                int saved_errno = errno;
-
-                output_format(state,
-                              "gsh: directory rollback failed: %s\r\n",
-                              strerror(saved_errno));
-                state->running = false;
-            }
-        }
-        output_text(state,
-                    "gsh: state transaction rejected or incomplete\r\n");
+        reject_variable_commit(state, directory_changed,
+                               previous_directory);
         valid = false;
     }
     if (previous_directory >= 0) {
-        close(previous_directory);
+        (void)close(previous_directory);
     }
     close_variable_commit(state);
     return valid;
 }
 
+static void schedule_pending_continuation(shell_state *state)
+{
+    if (!require(state != NULL)) return;
+    if (!require(state->mode != MODE_FOREGROUND)) return;
+    if (state->pending_and_or_active || state->pending_list_active) {
+        state->mode = MODE_DISPATCH;
+    } else {
+        state->mode = MODE_EDITOR;
+        queue_prompt(state);
+    }
+}
+
 static bool finish_background_wait(shell_state *state)
 {
+    if (state == NULL) {
+        return false;
+    }
     size_t index;
     int status = state->wait_all ? 0 : 127;
 
@@ -2292,48 +2472,39 @@ static bool finish_background_wait(shell_state *state)
                 &state->background_jobs)) {
             return false;
         }
-        goto completed;
-    }
-    for (index = 0; index < state->wait_target_count; index++) {
-        bool done;
+    } else {
+        for (index = 0; index < state->wait_target_count; index++) {
+            bool done;
 
-        if (state->wait_targets[index] > 0 &&
-            gsh_background_get(&state->background_jobs,
-                               state->wait_targets[index], &done, NULL) &&
-            !done) {
-            return false;
-        }
-    }
-    for (index = 0; index < state->wait_target_count; index++) {
-        int wait_status;
-
-        if (state->wait_targets[index] > 0 &&
-            gsh_background_consume(&state->background_jobs,
-                                   state->wait_targets[index],
-                                   &wait_status)) {
-            if (!state->wait_all &&
-                index + 1U == state->wait_target_count) {
-                status = wait_status_value(wait_status);
+            if (state->wait_targets[index] > 0 &&
+                gsh_background_get(&state->background_jobs,
+                                   state->wait_targets[index], &done,
+                                   NULL) &&
+                !done) {
+                return false;
             }
-        } else if (!state->wait_all &&
-                   index + 1U == state->wait_target_count) {
-            status = 127;
+        }
+        for (index = 0; index < state->wait_target_count; index++) {
+            int wait_status;
+
+            if (state->wait_targets[index] > 0 &&
+                gsh_background_consume(&state->background_jobs,
+                                       state->wait_targets[index],
+                                       &wait_status)) {
+                if (index + 1U == state->wait_target_count) {
+                    status = wait_status_value(wait_status);
+                }
+            } else if (index + 1U == state->wait_target_count) {
+                status = 127;
+            }
         }
     }
-completed:
     state->wait_target_count = 0;
     state->wait_all = false;
     state->last_status = state->wait_negated ? (status == 0 ? 1 : 0)
                                              : status;
-    state->mode = MODE_EDITOR;
     state->wait_negated = false;
-    if (state->pending_and_or_active) {
-        continue_native_and_or(state);
-    } else if (state->pending_list_active) {
-        continue_native_list(state);
-    } else {
-        queue_prompt(state);
-    }
+    schedule_pending_continuation(state);
     return true;
 }
 
@@ -2346,6 +2517,7 @@ enum {
 
 static int finish_exec_outcome(shell_state *state)
 {
+    if (state == NULL) return -1;
     unsigned char outcomes[3];
     size_t received = 0;
 
@@ -2367,7 +2539,7 @@ static int finish_exec_outcome(shell_state *state)
             break;
         }
     }
-    close(state->exec_outcome_fd);
+    (void)close(state->exec_outcome_fd);
     state->exec_outcome_fd = -1;
     if (received == 0) {
         return GSH_EXEC_OUTCOME_NONE;
@@ -2387,8 +2559,9 @@ static bool exec_commit_targets_valid(
     size_t index;
     size_t open_count = 0;
 
-    assert(state->pending_exec_descriptor_count <=
-           GSH_EXEC_DESCRIPTOR_COMMIT_CAP);
+    if (state == NULL || commit == NULL ||
+        state->pending_exec_descriptor_count >
+            GSH_EXEC_DESCRIPTOR_COMMIT_CAP) return false;
     if (commit->version != GSH_EXEC_DESCRIPTOR_COMMIT_VERSION ||
         commit->reserved != 0 ||
         commit->count != state->pending_exec_descriptor_count ||
@@ -2409,6 +2582,9 @@ static bool exec_commit_targets_valid(
 static bool exec_commit_contains_target(
     const exec_descriptor_commit *commit, int descriptor)
 {
+    if (commit == NULL) {
+        return false;
+    }
     size_t index;
 
     for (index = 0; index < commit->count; index++) {
@@ -2422,6 +2598,7 @@ static bool exec_commit_contains_target(
 static bool exec_targets_contain(const int32_t targets[], size_t count,
                                  int descriptor)
 {
+    if (targets == NULL) return false;
     size_t index;
 
     for (index = 0; index < count; index++) {
@@ -2435,20 +2612,21 @@ static bool exec_targets_contain(const int32_t targets[], size_t count,
 static int relocate_exec_owner_fd(const int32_t targets[], size_t count,
                                   int minimum, int *descriptor)
 {
+    if (descriptor == NULL) return -1;
     int duplicate;
 
     if (*descriptor < 0 ||
         !exec_targets_contain(targets, count, *descriptor)) {
         return 0;
     }
-    duplicate = fault_should_fail("exec-owner-descriptor-relocation",
+    duplicate = gsh_fault_should_fail(GSH_FAULT_EXEC_OWNER_DESCRIPTOR_RELOCATION,
                                   EMFILE)
                     ? -1
                     : fcntl(*descriptor, F_DUPFD_CLOEXEC, minimum);
     if (duplicate == -1) {
         return -1;
     }
-    close(*descriptor);
+    (void)close(*descriptor);
     *descriptor = duplicate;
     return 0;
 }
@@ -2456,6 +2634,9 @@ static int relocate_exec_owner_fd(const int32_t targets[], size_t count,
 static int relocate_exec_signal_fd(const int32_t targets[], size_t count,
                                    int minimum, int *descriptor)
 {
+    if (descriptor == NULL) {
+        return -1;
+    }
     int previous = *descriptor;
     int duplicate;
 
@@ -2463,7 +2644,7 @@ static int relocate_exec_signal_fd(const int32_t targets[], size_t count,
         !exec_targets_contain(targets, count, previous)) {
         return 0;
     }
-    duplicate = fault_should_fail("exec-owner-descriptor-relocation",
+    duplicate = gsh_fault_should_fail(GSH_FAULT_EXEC_OWNER_DESCRIPTOR_RELOCATION,
                                   EMFILE)
                     ? -1
                     : fcntl(previous, F_DUPFD_CLOEXEC, minimum);
@@ -2472,7 +2653,7 @@ static int relocate_exec_signal_fd(const int32_t targets[], size_t count,
     }
     g_signal_write_fd = duplicate;
     *descriptor = duplicate;
-    close(previous);
+    (void)close(previous);
     return 0;
 }
 
@@ -2487,6 +2668,10 @@ static int relocate_exec_signal_fd(const int32_t targets[], size_t count,
 static int protect_exec_owner_descriptors(
     shell_state *state, const int32_t targets[], size_t count)
 {
+    if (targets == NULL) return -1;
+    if (state == NULL) {
+        return -1;
+    }
     int *owned[] = {
         &state->tty_fd, &state->signal_pipe[0],
         &state->redirection_worker_fd, &state->history_client.descriptor,
@@ -2520,7 +2705,7 @@ static int protect_exec_owner_descriptors(
                     index < GSH_ASYNC_CELL_CAP; index++) {
         if (relocate_exec_owner_fd(
                 targets, count, minimum,
-                &state->async_repl->cells[index].pty_fd) == -1) {
+                &state_async_repl(state)->cells[index].pty_fd) == -1) {
             return -1;
         }
     }
@@ -2529,11 +2714,12 @@ static int protect_exec_owner_descriptors(
 
 static void close_exec_commit_fds(int descriptors[], size_t count)
 {
+    if (descriptors == NULL) return;
     size_t index;
 
     for (index = 0; index < count; index++) {
         if (descriptors[index] >= 0) {
-            close(descriptors[index]);
+            (void)close(descriptors[index]);
             descriptors[index] = -1;
         }
     }
@@ -2542,17 +2728,21 @@ static void close_exec_commit_fds(int descriptors[], size_t count)
 static int stabilize_exec_commit_fds(
     const exec_descriptor_commit *commit, int descriptors[], size_t count)
 {
+    if (descriptors == NULL) return -1;
     int reservations[GSH_EXEC_DESCRIPTOR_COMMIT_CAP];
     size_t reservation_count = 0;
     size_t index;
 
     for (index = 0; index < count; index++) {
+        size_t attempt;
+
         if (!exec_commit_contains_target(commit, descriptors[index])) {
             continue;
         }
-        for (;;) {
+        for (attempt = 0; attempt <= GSH_EXEC_DESCRIPTOR_COMMIT_CAP;
+             attempt++) {
             int duplicate =
-                fault_should_fail("exec-descriptor-stabilize", EMFILE)
+                gsh_fault_should_fail(GSH_FAULT_EXEC_DESCRIPTOR_STABILIZE, EMFILE)
                     ? -1
                     : fcntl(descriptors[index], F_DUPFD_CLOEXEC,
                             STDERR_FILENO + 1);
@@ -2562,17 +2752,22 @@ static int stabilize_exec_commit_fds(
                 return -1;
             }
             if (!exec_commit_contains_target(commit, duplicate)) {
-                close(descriptors[index]);
+                (void)close(descriptors[index]);
                 descriptors[index] = duplicate;
                 break;
             }
             if (reservation_count == GSH_EXEC_DESCRIPTOR_COMMIT_CAP) {
-                close(duplicate);
+                (void)close(duplicate);
                 close_exec_commit_fds(reservations, reservation_count);
                 errno = EMFILE;
                 return -1;
             }
             reservations[reservation_count++] = duplicate;
+        }
+        if (attempt > GSH_EXEC_DESCRIPTOR_COMMIT_CAP) {
+            close_exec_commit_fds(reservations, reservation_count);
+            errno = EMFILE;
+            return -1;
         }
     }
     close_exec_commit_fds(reservations, reservation_count);
@@ -2583,6 +2778,9 @@ static int apply_exec_descriptor_commit(
     shell_state *state, const exec_descriptor_commit *commit,
     int descriptors[])
 {
+    if (state == NULL) {
+        return -1;
+    }
     size_t index;
     size_t open_index = 0;
     int status = 0;
@@ -2595,7 +2793,7 @@ static int apply_exec_descriptor_commit(
     for (index = 0; index < commit->count; index++) {
         int target = commit->targets[index];
 
-        if (fault_should_fail("exec-descriptor-apply", EIO)) {
+        if (gsh_fault_should_fail(GSH_FAULT_EXEC_DESCRIPTOR_APPLY, EIO)) {
             status = -1;
             if (commit->open[index] != 0) {
                 open_index++;
@@ -2621,6 +2819,9 @@ static int apply_exec_descriptor_commit(
 static size_t receive_exec_commit_fds(
     struct msghdr *message, int descriptors[], bool *control_valid)
 {
+    if (control_valid == NULL || descriptors == NULL || message == NULL) {
+        return 0U;
+    }
     struct cmsghdr *header = CMSG_FIRSTHDR(message);
     size_t rights_count = 0;
 
@@ -2642,7 +2843,7 @@ static size_t receive_exec_commit_fds(
         if (rights_count == 0) {
             return 0;
         }
-        memcpy(descriptors, CMSG_DATA(header), rights_bytes);
+        (void)memcpy(descriptors, CMSG_DATA(header), rights_bytes);
     }
     *control_valid = CMSG_NXTHDR(message, header) == NULL;
     return rights_count;
@@ -2650,6 +2851,7 @@ static size_t receive_exec_commit_fds(
 
 static int receive_exec_descriptor_commit(shell_state *state)
 {
+    if (state == NULL) return -1;
     exec_descriptor_commit commit;
     int descriptors[GSH_EXEC_DESCRIPTOR_COMMIT_CAP];
     unsigned char control[
@@ -2664,15 +2866,15 @@ static int receive_exec_descriptor_commit(shell_state *state)
     if (state->exec_descriptor_socket < 0) {
         return 0;
     }
-    memset(&commit, 0, sizeof(commit));
-    memset(descriptors, -1, sizeof(descriptors));
-    memset(control, 0, sizeof(control));
-    memset(&message, 0, sizeof(message));
+    (void)memset(&commit, 0, sizeof(commit));
+    (void)memset(descriptors, -1, sizeof(descriptors));
+    (void)memset(control, 0, sizeof(control));
+    (void)memset(&message, 0, sizeof(message));
     message.msg_iov = &payload;
     message.msg_iovlen = 1;
     message.msg_control = control;
     message.msg_controllen = sizeof(control);
-    if (fault_should_fail("exec-descriptor-receive", EIO)) {
+    if (gsh_fault_should_fail(GSH_FAULT_EXEC_DESCRIPTOR_RECEIVE, EIO)) {
         received = -1;
     } else {
         received = recvmsg(state->exec_descriptor_socket, &message,
@@ -2681,7 +2883,7 @@ static int receive_exec_descriptor_commit(shell_state *state)
             receive_error = errno;
         }
     }
-    close(state->exec_descriptor_socket);
+    (void)close(state->exec_descriptor_socket);
     state->exec_descriptor_socket = -1;
     if (received == -1 &&
         (receive_error == EAGAIN || receive_error == EWOULDBLOCK)) {
@@ -2710,6 +2912,9 @@ static int receive_exec_descriptor_commit(shell_state *state)
 
 static void finish_job(shell_state *state)
 {
+    if (state == NULL) {
+        return;
+    }
     bool was_foreground = state->current_job.foreground;
     pid_t pid = state->current_job.pid;
     int wait_status = state->current_job.pipeline_wait_status;
@@ -2724,7 +2929,6 @@ static void finish_job(shell_state *state)
         overlaid ? 0 : receive_exec_descriptor_commit(state);
     const gsh_background_entry *tracked =
         gsh_background_entry_for_pid(&state->background_jobs, pid);
-    uint32_t tracked_job_id = tracked == NULL ? 0 : tracked->job_id;
 
     if (overlaid) {
         close_variable_commit(state);
@@ -2738,11 +2942,12 @@ static void finish_job(shell_state *state)
             status = state->committed_exit_status;
         }
     }
-    if (exec_outcome == GSH_EXEC_OUTCOME_INVALID) {
-        status = 125;
-    }
-    if (descriptor_commit_status == -1) {
-        output_text(state, "gsh: exec descriptor transaction rejected\r\n");
+    if (exec_outcome == GSH_EXEC_OUTCOME_INVALID ||
+        descriptor_commit_status == -1) {
+        if (descriptor_commit_status == -1) {
+            (void)output_text(state,
+                        "gsh: exec descriptor transaction rejected\r\n");
+        }
         status = 125;
     }
 
@@ -2753,12 +2958,12 @@ static void finish_job(shell_state *state)
         status = status == 0 ? 1 : 0;
     }
     state->last_status = status;
-    if (was_foreground && tracked_job_id != 0) {
+    if (was_foreground && tracked != NULL) {
         (void)gsh_background_remove_job(&state->background_jobs,
-                                        tracked_job_id);
+                                        tracked->job_id);
     }
 
-    if (state->async_repl != NULL && state->async_repl->enabled &&
+    if (state->async_repl != NULL && state_async_repl(state)->enabled &&
         state->async_state_cell >= 0) {
         leave_managed_fullscreen(state, state->async_state_cell);
         (void)gsh_async_repl_reap(state->async_repl, pid, wait_status);
@@ -2783,13 +2988,7 @@ static void finish_job(shell_state *state)
                               WTERMSIG(wait_status));
             }
         }
-        if (state->pending_and_or_active) {
-            continue_native_and_or(state);
-        } else if (state->pending_list_active) {
-            continue_native_list(state);
-        } else {
-            queue_prompt(state);
-        }
+        schedule_pending_continuation(state);
     } else if (!silent) {
         output_format(state, "\r\n[done %ld, status %d]\r\n", (long)pid,
                       state->last_status);
@@ -2801,6 +3000,7 @@ static void finish_job(shell_state *state)
 
 static void update_job_state(shell_state *state, pid_t pid, int status)
 {
+    if (state == NULL) return;
     size_t member;
 
     if (!state->current_job.active) {
@@ -2839,7 +3039,7 @@ static void update_job_state(shell_state *state, pid_t pid, int status)
                            state->pending_input,
                            state->pending_input_length,
                            GSH_JOB_ORIGIN_CLASSIC, &job_id) == -1) {
-                output_text(state,
+                (void)output_text(state,
                             "gsh: stopped job registry exhausted\r\n");
             } else {
                 size_t stopped_member;
@@ -2893,8 +3093,50 @@ static void update_job_state(shell_state *state, pid_t pid, int status)
     }
 }
 
+static void reap_redirection_worker(shell_state *state)
+{
+    bool unexpected;
+    bool command;
+    bool restart;
+
+    if (!require(state != NULL)) return;
+    if (!require(state->redirection_worker_pid > 0)) return;
+    unexpected = state->redirection_worker_alive;
+    command = state->mode == MODE_ASYNC_REDIRECTION;
+    restart = state->redirection_worker_restart_pending;
+    disable_redirection_worker(state, false);
+    state->redirection_worker_pid = -1;
+    state->redirection_worker_restart_pending = false;
+    if (unexpected) state->redirection_worker_failures++;
+    if (command) {
+        (void)output_text(state, "gsh: asynchronous redirection worker exited\r\n");
+        state->last_status = 1;
+        state->mode = MODE_EDITOR;
+        queue_prompt(state);
+    }
+    if (restart && state->running &&
+        start_redirection_worker(state) == -1) {
+        state->redirection_worker_failures++;
+    }
+}
+
+static void requeue_child_signal(shell_state *state)
+{
+    unsigned char byte = (unsigned char)SIGCHLD;
+    ssize_t notified;
+
+    if (!require(state != NULL)) return;
+    if (!require(state->signal_pipe[1] >= 0)) return;
+    g_sigchld_pending = 1;
+    notified = write(state->signal_pipe[1], &byte, sizeof(byte));
+    (void)notified;
+}
+
 static void reap_children(shell_state *state)
 {
+    if (state == NULL) {
+        return;
+    }
     unsigned int count;
     int options = WNOHANG | WUNTRACED;
 
@@ -2912,28 +3154,7 @@ static void reap_children(shell_state *state)
                                        state->async_repl, pid);
 
             if (pid == state->redirection_worker_pid) {
-                bool unexpected = state->redirection_worker_alive;
-                bool command = state->mode == MODE_ASYNC_REDIRECTION;
-                bool restart = state->redirection_worker_restart_pending;
-
-                disable_redirection_worker(state, false);
-                state->redirection_worker_pid = -1;
-                state->redirection_worker_restart_pending = false;
-                if (unexpected) {
-                    state->redirection_worker_failures++;
-                }
-                if (command) {
-                    output_text(
-                        state,
-                        "gsh: asynchronous redirection worker exited\r\n");
-                    state->last_status = 1;
-                    state->mode = MODE_EDITOR;
-                    queue_prompt(state);
-                }
-                if (restart && state->running &&
-                    start_redirection_worker(state) == -1) {
-                    state->redirection_worker_failures++;
-                }
+                reap_redirection_worker(state);
             } else if (state->current_job.active &&
                        find_job_member(&state->current_job, pid) !=
                            GSH_NATIVE_JOB_MEMBER_CAP) {
@@ -3009,30 +3230,26 @@ static void reap_children(shell_state *state)
         break;
     }
     if (count == MAX_SIGNAL_REAPS) {
-        unsigned char byte = (unsigned char)SIGCHLD;
-        ssize_t notified;
-
-        g_sigchld_pending = 1;
-        notified = write(state->signal_pipe[1], &byte, sizeof(byte));
-        (void)notified;
+        requeue_child_signal(state);
     }
 }
 
 static void resize_managed_jobs(shell_state *state)
 {
+    if (state == NULL) return;
     struct winsize size;
     int index;
 
-    if (state->async_repl == NULL || !state->async_repl->enabled) {
+    if (state->async_repl == NULL || !state_async_repl(state)->enabled) {
         return;
     }
-    memset(&size, 0, sizeof(size));
+    (void)memset(&size, 0, sizeof(size));
     if (ioctl(state->tty_fd, TIOCGWINSZ, &size) == -1) {
         return;
     }
     gsh_async_repl_resize(state->async_repl, size.ws_row, size.ws_col);
     for (index = 0; index < GSH_ASYNC_CELL_CAP; index++) {
-        gsh_async_cell *cell = &state->async_repl->cells[index];
+        gsh_async_cell *cell = &state_async_repl(state)->cells[index];
 
         if (cell->occupied && cell->pty_fd >= 0) {
             (void)ioctl(cell->pty_fd, TIOCSWINSZ, &size);
@@ -3045,6 +3262,9 @@ static void resize_managed_jobs(shell_state *state)
 
 static void drain_signal_pipe(shell_state *state)
 {
+    if (state == NULL) {
+        return;
+    }
     unsigned char bytes[256];
     ssize_t drained;
 
@@ -3061,12 +3281,13 @@ static void drain_signal_pipe(shell_state *state)
  * ─────────────────────────────────────────────────────────────── */
 static size_t available_history(const shell_state *state)
 {
+    if (state == NULL) return 0U;
     size_t available;
 
     if (state->history == NULL) {
         return 0;
     }
-    available = state->history->count;
+    available = state_history(state)->count;
     if (available > state->config.history_max_entries) {
         available = state->config.history_max_entries;
     }
@@ -3075,6 +3296,9 @@ static size_t available_history(const shell_state *state)
 
 static bool load_history_position(shell_state *state, size_t position)
 {
+    if (state == NULL) {
+        return false;
+    }
     size_t length = 0;
     const char *entry = gsh_history_from_newest(state->history, position,
                                                 &length);
@@ -3082,7 +3306,7 @@ static bool load_history_position(shell_state *state, size_t position)
     if (entry == NULL || length >= sizeof(state->line)) {
         return false;
     }
-    memcpy(state->line, entry, length);
+    (void)memcpy(state->line, entry, length);
     state->line[length] = '\0';
     state->line_len = length;
     return true;
@@ -3090,6 +3314,9 @@ static bool load_history_position(shell_state *state, size_t position)
 
 static void reset_history_editor(shell_state *state)
 {
+    if (state == NULL) {
+        return;
+    }
     state->history_navigation = false;
     state->history_position = 0;
     state->history_draft_length = 0;
@@ -3104,6 +3331,9 @@ static void reset_history_editor(shell_state *state)
 
 static void history_previous(shell_state *state)
 {
+    if (state == NULL) {
+        return;
+    }
     size_t available = available_history(state);
 
     if (available == 0) {
@@ -3111,7 +3341,7 @@ static void history_previous(shell_state *state)
         return;
     }
     if (!state->history_navigation) {
-        memcpy(state->history_draft, state->line, state->line_len + 1U);
+        (void)memcpy(state->history_draft, state->line, state->line_len + 1U);
         state->history_draft_length = state->line_len;
         state->history_position = 0;
         state->history_navigation = true;
@@ -3126,6 +3356,7 @@ static void history_previous(shell_state *state)
 
 static void history_next(shell_state *state)
 {
+    if (state == NULL) return;
     if (!state->history_navigation) {
         (void)output_text(state, "\a");
         return;
@@ -3134,7 +3365,7 @@ static void history_next(shell_state *state)
         state->history_position--;
         (void)load_history_position(state, state->history_position);
     } else {
-        memcpy(state->line, state->history_draft,
+        (void)memcpy(state->line, state->history_draft,
                state->history_draft_length + 1U);
         state->line_len = state->history_draft_length;
         state->history_navigation = false;
@@ -3144,6 +3375,7 @@ static void history_next(shell_state *state)
 
 static bool find_history_match(shell_state *state, size_t before)
 {
+    if (state == NULL) return false;
     size_t position;
 
     if (gsh_history_search_reverse(
@@ -3167,7 +3399,7 @@ static void search_history(shell_state *state)
         return;
     }
     if (!state->history_search) {
-        memcpy(state->history_search_draft, state->line,
+        (void)memcpy(state->history_search_draft, state->line,
                state->line_len + 1U);
         state->history_search_draft_length = state->line_len;
         state->history_search_query_length = 0;
@@ -3182,13 +3414,19 @@ static void search_history(shell_state *state)
 
 static void update_history_search(shell_state *state)
 {
+    if (state == NULL) {
+        return;
+    }
     (void)find_history_match(state, 0);
     queue_redraw(state);
 }
 
 static void cancel_history_search(shell_state *state)
 {
-    memcpy(state->line, state->history_search_draft,
+    if (state == NULL) {
+        return;
+    }
+    (void)memcpy(state->line, state->history_search_draft,
            state->history_search_draft_length + 1U);
     state->line_len = state->history_search_draft_length;
     state->history_search = false;
@@ -3199,6 +3437,9 @@ static void cancel_history_search(shell_state *state)
 
 static void accept_history_search(shell_state *state)
 {
+    if (state == NULL) {
+        return;
+    }
     state->history_search = false;
     state->history_search_query_length = 0;
     state->history_search_query[0] = '\0';
@@ -3208,6 +3449,9 @@ static void accept_history_search(shell_state *state)
 
 static void cancel_editor_line(shell_state *state)
 {
+    if (state == NULL) {
+        return;
+    }
     state->line_len = 0;
     state->line[0] = '\0';
     state->pending_len = 0;
@@ -3216,7 +3460,7 @@ static void cancel_editor_line(shell_state *state)
     state->continuation_prompt = false;
     state->escape_state = 0;
     reset_history_editor(state);
-    if (state->async_repl == NULL || !state->async_repl->enabled) {
+    if (state->async_repl == NULL || !state_async_repl(state)->enabled) {
         (void)output_text(state, "^C\r\n");
     }
     queue_prompt(state);
@@ -3233,7 +3477,10 @@ static void cancel_editor_line(shell_state *state)
  * ─────────────────────────────────────────────────────────────── */
 static pid_t managed_job_group(shell_state *state, int cell_index)
 {
-    gsh_async_cell *cell = &state->async_repl->cells[cell_index];
+    if (state == NULL) {
+        return -1;
+    }
+    gsh_async_cell *cell = &state_async_repl(state)->cells[cell_index];
     pid_t foreground = cell->pty_fd < 0 ? -1 : tcgetpgrp(cell->pty_fd);
 
     if (foreground > 0) {
@@ -3245,7 +3492,10 @@ static pid_t managed_job_group(shell_state *state, int cell_index)
 static int signal_managed_job(shell_state *state, int cell_index,
                               int signal_number)
 {
-    gsh_async_cell *cell = &state->async_repl->cells[cell_index];
+    if (state == NULL) {
+        return -1;
+    }
+    gsh_async_cell *cell = &state_async_repl(state)->cells[cell_index];
     pid_t pgid = managed_job_group(state, cell_index);
 
 #ifdef TIOCSIG
@@ -3270,7 +3520,7 @@ static void stop_managed_job(shell_state *state, int cell_index)
         const gsh_background_entry *entry =
             gsh_background_entry_for_pid(
                 &state->background_jobs,
-                state->async_repl->cells[cell_index].pid);
+                state_async_repl(state)->cells[cell_index].pid);
 
         if (entry != NULL) {
             (void)gsh_background_stop_job(&state->background_jobs,
@@ -3282,43 +3532,55 @@ static void stop_managed_job(shell_state *state, int cell_index)
     }
 }
 
-static void process_pending_signals(shell_state *state)
-{
-    sigset_t signals;
-    sigset_t previous;
+typedef struct {
     bool child;
     bool interrupt;
     bool suspend;
     bool resize;
     bool shutdown;
+} pending_signal_batch;
 
-    sigemptyset(&signals);
-    sigaddset(&signals, SIGCHLD);
-    sigaddset(&signals, SIGINT);
-    sigaddset(&signals, SIGTSTP);
-    sigaddset(&signals, SIGWINCH);
-    sigaddset(&signals, SIGHUP);
-    sigaddset(&signals, SIGTERM);
+static void take_pending_signals(pending_signal_batch *pending)
+{
+    sigset_t signals;
+    sigset_t previous;
+
+    if (!require(pending != NULL)) return;
+    if (!require(g_signal_write_fd >= -1)) return;
+    (void)sigemptyset(&signals);
+    (void)sigaddset(&signals, SIGCHLD);
+    (void)sigaddset(&signals, SIGINT);
+    (void)sigaddset(&signals, SIGTSTP);
+    (void)sigaddset(&signals, SIGWINCH);
+    (void)sigaddset(&signals, SIGHUP);
+    (void)sigaddset(&signals, SIGTERM);
     (void)sigprocmask(SIG_BLOCK, &signals, &previous);
-
-    child = g_sigchld_pending != 0;
-    interrupt = g_sigint_pending != 0;
-    suspend = g_sigtstp_pending != 0;
-    resize = g_sigwinch_pending != 0;
-    shutdown = g_shutdown_pending != 0;
+    pending->child = g_sigchld_pending != 0;
+    pending->interrupt = g_sigint_pending != 0;
+    pending->suspend = g_sigtstp_pending != 0;
+    pending->resize = g_sigwinch_pending != 0;
+    pending->shutdown = g_shutdown_pending != 0;
     g_sigchld_pending = 0;
     g_sigint_pending = 0;
     g_sigtstp_pending = 0;
     g_sigwinch_pending = 0;
     g_shutdown_pending = 0;
-
     (void)sigprocmask(SIG_SETMASK, &previous, NULL);
+}
 
-    if (child) {
+static void process_pending_signals(shell_state *state)
+{
+    if (state == NULL) {
+        return;
+    }
+    pending_signal_batch pending = {0};
+
+    take_pending_signals(&pending);
+    if (pending.child) {
         reap_children(state);
     }
-    if (interrupt && state->async_repl != NULL &&
-        state->async_repl->enabled) {
+    if (pending.interrupt && state->async_repl != NULL &&
+        state_async_repl(state)->enabled) {
         int focused = gsh_async_repl_focused_job(state->async_repl);
 
         if (focused >= 0) {
@@ -3326,13 +3588,14 @@ static void process_pending_signals(shell_state *state)
         } else {
             cancel_editor_line(state);
         }
-    } else if (interrupt && state->mode == MODE_EDITOR) {
+    } else if (pending.interrupt && state->mode == MODE_EDITOR) {
         cancel_editor_line(state);
-    } else if (interrupt && state->mode == MODE_DISPATCH) {
+    } else if (pending.interrupt && state->mode == MODE_DISPATCH) {
         state->mode = MODE_EDITOR;
         state->pending_line[0] = '\0';
         cancel_editor_line(state);
-    } else if (interrupt && state->mode == MODE_ASYNC_REDIRECTION) {
+    } else if (pending.interrupt &&
+               state->mode == MODE_ASYNC_REDIRECTION) {
         disable_redirection_worker(state, true);
         state->redirection_worker_restart_pending = true;
         state->last_status = 130;
@@ -3340,7 +3603,7 @@ static void process_pending_signals(shell_state *state)
         state->redirection_target[0] = '\0';
         abandon_pending_list(state);
         cancel_editor_line(state);
-    } else if (interrupt && state->mode == MODE_WAIT) {
+    } else if (pending.interrupt && state->mode == MODE_WAIT) {
         state->wait_target_count = 0;
         state->wait_all = false;
         state->last_status = 130;
@@ -3349,25 +3612,25 @@ static void process_pending_signals(shell_state *state)
         abandon_pending_list(state);
         cancel_editor_line(state);
     }
-    if (resize) {
-        if (state->async_repl != NULL && state->async_repl->enabled) {
+    if (pending.resize) {
+        if (state->async_repl != NULL && state_async_repl(state)->enabled) {
             resize_managed_jobs(state);
-        } else if (!interrupt && state->mode == MODE_EDITOR) {
+        } else if (!pending.interrupt && state->mode == MODE_EDITOR) {
             /* Ctrl-C already emitted a complete prompt for the empty line.
              * Folding a simultaneous resize into that frame prevents a
              * second prompt from escaping after the caller synchronized. */
             queue_redraw(state);
         }
     }
-    if (suspend && state->async_repl != NULL &&
-        state->async_repl->enabled) {
+    if (pending.suspend && state->async_repl != NULL &&
+        state_async_repl(state)->enabled) {
         int focused = gsh_async_repl_focused_job(state->async_repl);
 
         if (focused >= 0) {
             stop_managed_job(state, focused);
         }
     }
-    if (shutdown) {
+    if (pending.shutdown) {
         state->running = false;
     }
 }
@@ -3437,6 +3700,10 @@ static bool is_native_command_name(const char *name)
 static bool prepare_simple_command(const char *line, char storage[LINE_CAP],
                                    simple_command *command)
 {
+    if (command == NULL) return false;
+    if (line == NULL || storage == NULL) {
+        return false;
+    }
     size_t length = strlen(line);
     size_t index;
     gsh_lexer lexer;
@@ -3452,9 +3719,9 @@ static bool prepare_simple_command(const char *line, char storage[LINE_CAP],
         }
     }
 
-    memcpy(storage, line, length + 1);
+    (void)memcpy(storage, line, length + 1);
     gsh_lexer_init(&lexer, line, length);
-    for (;;) {
+    for (index = 0; index <= SIMPLE_ARG_CAP; index++) {
         gsh_token token;
 
         if (gsh_lexer_next(&lexer, &token) != GSH_LEX_OK) {
@@ -3470,6 +3737,7 @@ static bool prepare_simple_command(const char *line, char storage[LINE_CAP],
         command->argv[command->argc++] = storage + token.begin;
         storage[token.end] = '\0';
     }
+    if (index > SIMPLE_ARG_CAP) return false;
     if (command->argc == 0) {
         return false;
     }
@@ -3484,6 +3752,9 @@ static bool prepare_simple_command(const char *line, char storage[LINE_CAP],
 
 static size_t child_string_length(const char *text, size_t limit)
 {
+    if (text == NULL) {
+        return 0U;
+    }
     size_t length = 0;
 
     while (length < limit && text[length] != '\0') {
@@ -3494,6 +3765,9 @@ static size_t child_string_length(const char *text, size_t limit)
 
 static bool child_string_contains(const char *text, char wanted)
 {
+    if (text == NULL) {
+        return false;
+    }
     while (*text != '\0') {
         if (*text++ == wanted) {
             return true;
@@ -3505,6 +3779,9 @@ static bool child_string_contains(const char *text, char wanted)
 static void child_copy_bytes(char *destination, const char *source,
                              size_t length)
 {
+    if (destination == NULL || source == NULL) {
+        return;
+    }
     size_t index;
 
     for (index = 0; index < length; index++) {
@@ -3514,6 +3791,9 @@ static void child_copy_bytes(char *destination, const char *source,
 
 static void child_write_text(const char *text)
 {
+    if (text == NULL) {
+        return;
+    }
     size_t length = child_string_length(text, EXEC_PATH_CAP);
 
     while (length > 0) {
@@ -3532,6 +3812,9 @@ static void child_write_text(const char *text)
 
 static int write_exec_error(const char *name, int error)
 {
+    if (name == NULL) {
+        return -1;
+    }
     child_write_text("gsh: ");
     child_write_text(name);
     if (error == ENOENT || error == ENOTDIR) {
@@ -3546,15 +3829,21 @@ static int write_exec_error(const char *name, int error)
     return 126;
 }
 
-static void child_exec_error(const char *name, int error)
+_Noreturn static void child_exec_error(const char *name, int error)
 {
+    if (name == NULL) {
+        _exit(125);
+    }
     _exit(write_exec_error(name, error));
 }
 
 static int resolve_launch_candidate(const char *path)
 {
+    shell_executable_identity *identity = shell_executable_storage();
+
+    if (!require(identity != NULL)) return -1;
     if (access(path, X_OK) == -1 ||
-        realpath(path, g_shell_executable) == NULL) {
+        realpath(path, identity->path) == NULL) {
         return -1;
     }
     return 0;
@@ -3603,10 +3892,10 @@ static int resolve_launch_argument(const char *argument_zero)
             if (directory_length == 0) {
                 candidate[0] = '.';
             } else {
-                memcpy(candidate, cursor, directory_length);
+                (void)memcpy(candidate, cursor, directory_length);
             }
             candidate[offset++] = '/';
-            memcpy(candidate + offset, argument_zero, name_length + 1U);
+            (void)memcpy(candidate + offset, argument_zero, name_length + 1U);
             if (resolve_launch_candidate(candidate) == 0) {
                 return 0;
             }
@@ -3622,8 +3911,14 @@ static int resolve_launch_argument(const char *argument_zero)
 
 static int initialize_shell_executable(const char *argument_zero)
 {
+    if (argument_zero == NULL) {
+        return -1;
+    }
+    shell_executable_identity *identity = shell_executable_storage();
     int resolved = -1;
     struct stat information;
+
+    if (!require(identity != NULL)) return -1;
 
 #if defined(__APPLE__)
     char candidate[EXEC_PATH_CAP];
@@ -3634,23 +3929,23 @@ static int initialize_shell_executable(const char *argument_zero)
         resolved = 0;
     }
 #elif defined(__linux__)
-    ssize_t length = readlink("/proc/self/exe", g_shell_executable,
-                              sizeof(g_shell_executable) - 1U);
+    ssize_t length = readlink("/proc/self/exe", identity->path,
+                              sizeof(identity->path) - 1U);
 
-    if (length > 0 && (size_t)length < sizeof(g_shell_executable) - 1U) {
-        g_shell_executable[length] = '\0';
+    if (length > 0 && (size_t)length < sizeof(identity->path) - 1U) {
+        identity->path[length] = '\0';
         resolved = 0;
     }
 #endif
     if (resolved == -1) {
         resolved = resolve_launch_argument(argument_zero);
     }
-    if (resolved == -1 || stat(g_shell_executable, &information) == -1 ||
+    if (resolved == -1 || stat(identity->path, &information) == -1 ||
         !S_ISREG(information.st_mode)) {
         return -1;
     }
-    g_shell_executable_device = information.st_dev;
-    g_shell_executable_inode = information.st_ino;
+    identity->device = information.st_dev;
+    identity->inode = information.st_ino;
     return 0;
 }
 
@@ -3660,71 +3955,76 @@ static int initialize_shell_executable(const char *argument_zero)
  * initialization-time canonical path preserves the child PID, process group,
  * descriptors, environment, script `$0`, and operands while ensuring every
  * command still passes through gsh's bounded first-party evaluator.
+ * CANON-EXCEPTION: C-PROCESS-ABI applies only to null-terminated argv/envp.
+ * The open descriptor and two identity checks prevent an already-replaced
+ * interpreter from being selected before the final path-based execve.
  * ─────────────────────────────────────────────────────────────── */
 static void child_exec_script(const char *path, char *const arguments[],
                               char *const environment[])
 {
+    if (arguments == NULL || environment == NULL || path == NULL) {
+        return;
+    }
+    const shell_executable_identity *identity = shell_executable_storage();
     char *shell_arguments[SIMPLE_ARG_CAP + 2];
     struct stat information;
-#if !defined(__linux__)
     struct stat current;
-#endif
     size_t index = 1;
     int descriptor;
     int error;
 
-    shell_arguments[0] = g_shell_executable;
+    if (!require(identity != NULL)) return;
+    shell_arguments[0] = (char *)identity->path;
     shell_arguments[1] = (char *)path;
     while (arguments[index] != NULL && index < SIMPLE_ARG_CAP) {
         shell_arguments[index + 1] = arguments[index];
         index++;
     }
     shell_arguments[index + 1] = NULL;
-    descriptor = fault_should_fail("enoexec-interpreter-open", EIO)
+    descriptor = gsh_fault_should_fail(GSH_FAULT_ENOEXEC_INTERPRETER_OPEN, EIO)
                      ? -1
-                     : open(g_shell_executable, O_RDONLY | O_CLOEXEC);
-    if (descriptor == -1) {
+                     : open(identity->path, O_RDONLY | O_CLOEXEC);
+    if (descriptor < 0) {
         return;
     }
     if (fstat(descriptor, &information) == -1) {
         error = errno;
-        close(descriptor);
+        (void)close(descriptor);
         errno = error;
         return;
     }
-    if (information.st_dev != g_shell_executable_device ||
-        information.st_ino != g_shell_executable_inode) {
+    if (information.st_dev != identity->device ||
+        information.st_ino != identity->inode) {
         error = EIO;
-        close(descriptor);
+        (void)close(descriptor);
         errno = error;
         return;
     }
-#if defined(__linux__)
-    fexecve(descriptor, shell_arguments, environment);
-#else
-    if (stat(g_shell_executable, &current) == -1) {
+    if (stat(identity->path, &current) == -1) {
         error = errno;
-        close(descriptor);
+        (void)close(descriptor);
         errno = error;
         return;
     }
     if (current.st_dev != information.st_dev ||
         current.st_ino != information.st_ino) {
         error = EIO;
-        close(descriptor);
+        (void)close(descriptor);
         errno = error;
         return;
     }
-    execve(g_shell_executable, shell_arguments, environment);
-#endif
+    execve(identity->path, shell_arguments, environment);
     error = errno;
-    close(descriptor);
+    (void)close(descriptor);
     errno = error;
 }
 
 static void child_try_exec(const char *path, char *const arguments[],
                            char *const environment[])
 {
+    if (arguments == NULL || environment == NULL || path == NULL) {
+        return;
+    }
     execve(path, arguments, environment);
     if (errno == ENOEXEC) {
         child_exec_script(path, arguments, environment);
@@ -3736,6 +4036,9 @@ static int exec_direct_error(char *const arguments[], const char *path_value,
                              const gsh_command_cache *cache,
                              uint64_t path_generation, bool cacheable)
 {
+    if (arguments == NULL || cache == NULL || environment == NULL || path_value == NULL) {
+        return -1;
+    }
     const char *name = arguments[0];
     size_t name_length = child_string_length(name, EXEC_PATH_CAP);
     const char *cursor;
@@ -3763,7 +4066,7 @@ static int exec_direct_error(char *const arguments[], const char *path_value,
     }
 
     cursor = path_value;
-    for (;;) {
+    for (size_t component = 0; component <= PATH_SCAN_CAP; component++) {
         char candidate[EXEC_PATH_CAP];
         const char *separator = cursor;
         size_t directory_length;
@@ -3796,11 +4099,11 @@ static int exec_direct_error(char *const arguments[], const char *path_value,
             return error;
         }
         if (*separator == '\0') {
-            break;
+            return access_denied ? EACCES : ENOENT;
         }
         cursor = separator + 1;
     }
-    return access_denied ? EACCES : ENOENT;
+    return ENAMETOOLONG;
 }
 
 static void child_exec_direct(char *const arguments[], const char *path_value,
@@ -3808,6 +4111,9 @@ static void child_exec_direct(char *const arguments[], const char *path_value,
                               const gsh_command_cache *cache,
                               uint64_t path_generation, bool cacheable)
 {
+    if (arguments == NULL || cache == NULL || environment == NULL || path_value == NULL) {
+        return;
+    }
     int error = exec_direct_error(arguments, path_value, environment, cache,
                                   path_generation, cacheable);
 
@@ -3817,6 +4123,10 @@ static void child_exec_direct(char *const arguments[], const char *path_value,
 static bool direct_path_is_bounded(const simple_command *command,
                                    const char *path_value)
 {
+    if (!require(command != NULL && path_value != NULL)) return false;
+    if (!require(command->argc > 0U && command->argv[0] != NULL)) {
+        return false;
+    }
     const char *cursor;
     size_t name_length;
 
@@ -3829,7 +4139,7 @@ static bool direct_path_is_bounded(const simple_command *command,
 
     name_length = strlen(command->argv[0]);
     cursor = path_value;
-    for (;;) {
+    for (size_t component = 0; component <= PATH_SCAN_CAP; component++) {
         const char *separator = cursor;
         size_t directory_length;
 
@@ -3847,11 +4157,16 @@ static bool direct_path_is_bounded(const simple_command *command,
         }
         cursor = separator + 1;
     }
+    return false;
 }
 
 static bool native_stateless_builtin(const gsh_native_command *command,
                                      int *status)
 {
+    if (command == NULL) return false;
+    if (status == NULL) {
+        return false;
+    }
     const gsh_builtin_descriptor *descriptor;
     const char *name;
     size_t length;
@@ -3916,6 +4231,9 @@ static gsh_builtin_kind native_pure_kind(
 
 static bool native_pure_builtin(const gsh_native_command *command)
 {
+    if (command == NULL) {
+        return false;
+    }
     gsh_builtin_kind kind = native_pure_kind(command);
 
     return kind != GSH_BUILTIN_NONE && kind != GSH_BUILTIN_OTHER;
@@ -3924,27 +4242,42 @@ static bool native_pure_builtin(const gsh_native_command *command)
 static int run_native_pure_builtin(const gsh_native_command *command,
                                    const gsh_builtin_io *io)
 {
+    if (command == NULL || io == NULL) {
+        return -1;
+    }
     return gsh_builtin_run_pure(native_pure_kind(command), command->argc,
                                 command->argv, io);
 }
 
 static bool native_colon_builtin(const gsh_native_command *command)
 {
+    if (command == NULL) {
+        return false;
+    }
     return command->argc > 0 && strcmp(command->argv[0], ":") == 0;
 }
 
 static bool native_pwd_builtin(const gsh_native_command *command)
 {
+    if (command == NULL) {
+        return false;
+    }
     return command->argc > 0 && strcmp(command->argv[0], "pwd") == 0;
 }
 
 static bool native_cd_builtin(const gsh_native_command *command)
 {
+    if (command == NULL) {
+        return false;
+    }
     return command->argc > 0 && strcmp(command->argv[0], "cd") == 0;
 }
 
 static bool native_environment_builtin(const gsh_native_command *command)
 {
+    if (command == NULL) {
+        return false;
+    }
     return command->argc > 0 &&
            (strcmp(command->argv[0], "ulimit") == 0 ||
             strcmp(command->argv[0], "umask") == 0);
@@ -3952,6 +4285,9 @@ static bool native_environment_builtin(const gsh_native_command *command)
 
 static bool native_variable_builtin(const gsh_native_command *command)
 {
+    if (command == NULL) {
+        return false;
+    }
     return command->argc > 0 &&
            (strcmp(command->argv[0], "export") == 0 ||
             strcmp(command->argv[0], "readonly") == 0 ||
@@ -3960,6 +4296,9 @@ static bool native_variable_builtin(const gsh_native_command *command)
 
 static bool native_state_builtin(const gsh_native_command *command)
 {
+    if (command == NULL) {
+        return false;
+    }
     return command->argc > 0 &&
            (strcmp(command->argv[0], "set") == 0 ||
             strcmp(command->argv[0], "shift") == 0);
@@ -3967,48 +4306,75 @@ static bool native_state_builtin(const gsh_native_command *command)
 
 static bool native_getopts_builtin(const gsh_native_command *command)
 {
+    if (command == NULL) {
+        return false;
+    }
     return command->argc > 0 && strcmp(command->argv[0], "getopts") == 0;
 }
 
 static bool native_read_builtin(const gsh_native_command *command)
 {
+    if (command == NULL) {
+        return false;
+    }
     return command->argc > 0 && strcmp(command->argv[0], "read") == 0;
 }
 
 static bool native_fc_builtin(const gsh_native_command *command)
 {
+    if (command == NULL) {
+        return false;
+    }
     return command->argc > 0 && strcmp(command->argv[0], "fc") == 0;
 }
 
 static bool native_jobs_builtin(const gsh_native_command *command)
 {
+    if (command == NULL) {
+        return false;
+    }
     return command->argc > 0 && strcmp(command->argv[0], "jobs") == 0;
 }
 
 static bool native_kill_builtin(const gsh_native_command *command)
 {
+    if (command == NULL) {
+        return false;
+    }
     return command->argc > 0 && strcmp(command->argv[0], "kill") == 0;
 }
 
 static bool native_fg_builtin(const gsh_native_command *command)
 {
+    if (command == NULL) {
+        return false;
+    }
     return command->argc > 0 && strcmp(command->argv[0], "fg") == 0;
 }
 
 static bool native_bg_builtin(const gsh_native_command *command)
 {
+    if (command == NULL) {
+        return false;
+    }
     return command->argc > 0 && strcmp(command->argv[0], "bg") == 0;
 }
 
 static bool native_snapshot_job_control_builtin(
     const gsh_native_command *command)
 {
+    if (command == NULL) {
+        return false;
+    }
     return native_jobs_builtin(command) || native_kill_builtin(command);
 }
 
 static bool native_job_control_builtin(
     const gsh_native_command *command)
 {
+    if (command == NULL) {
+        return false;
+    }
     return native_snapshot_job_control_builtin(command) ||
            native_fg_builtin(command) || native_bg_builtin(command);
 }
@@ -4016,16 +4382,25 @@ static bool native_job_control_builtin(
 static bool native_posix_stateful_builtin(
     const gsh_native_command *command)
 {
+    if (command == NULL) {
+        return false;
+    }
     return native_getopts_builtin(command) || native_read_builtin(command);
 }
 
 static bool native_wait_builtin(const gsh_native_command *command)
 {
+    if (command == NULL) {
+        return false;
+    }
     return command->argc > 0 && strcmp(command->argv[0], "wait") == 0;
 }
 
 static bool native_alias_builtin(const gsh_native_command *command)
 {
+    if (command == NULL) {
+        return false;
+    }
     return command->argc > 0 &&
            (strcmp(command->argv[0], "alias") == 0 ||
             strcmp(command->argv[0], "unalias") == 0);
@@ -4033,47 +4408,74 @@ static bool native_alias_builtin(const gsh_native_command *command)
 
 static bool native_hash_builtin(const gsh_native_command *command)
 {
+    if (command == NULL) {
+        return false;
+    }
     return command->argc > 0 && strcmp(command->argv[0], "hash") == 0;
 }
 
 static bool native_times_builtin(const gsh_native_command *command)
 {
+    if (command == NULL) {
+        return false;
+    }
     return command->argc > 0 && strcmp(command->argv[0], "times") == 0;
 }
 
 static bool native_trap_builtin(const gsh_native_command *command)
 {
+    if (command == NULL) {
+        return false;
+    }
     return command->argc > 0 && strcmp(command->argv[0], "trap") == 0;
 }
 
 static bool native_exec_builtin(const gsh_native_command *command)
 {
+    if (command == NULL) {
+        return false;
+    }
     return command->argc > 0 && strcmp(command->argv[0], "exec") == 0;
 }
 
 static bool native_exit_builtin(const gsh_native_command *command)
 {
+    if (command == NULL) {
+        return false;
+    }
     return command->argc > 0 && strcmp(command->argv[0], "exit") == 0;
 }
 
 static bool native_eval_builtin(const gsh_native_command *command)
 {
+    if (command == NULL) {
+        return false;
+    }
     return command->argc > 0 && strcmp(command->argv[0], "eval") == 0;
 }
 
 static bool native_dot_builtin(const gsh_native_command *command)
 {
+    if (command == NULL) {
+        return false;
+    }
     return command->argc > 0 && strcmp(command->argv[0], ".") == 0;
 }
 
 static bool native_source_builtin(const gsh_native_command *command)
 {
+    if (command == NULL) {
+        return false;
+    }
     return native_eval_builtin(command) || native_dot_builtin(command);
 }
 
 static bool native_command_inspection_builtin(
     const gsh_native_command *command)
 {
+    if (command == NULL) {
+        return false;
+    }
     return command->argc > 0 && gsh_command_is_inspection_builtin(
                                       command->argc, command->argv);
 }
@@ -4089,6 +4491,9 @@ static bool native_command_inspection_builtin(
 static void normalize_command_invocations(
     gsh_native_pipeline *pipeline, const gsh_function_store *functions)
 {
+    if (pipeline == NULL) {
+        return;
+    }
     size_t command_index;
 
     for (command_index = 0;
@@ -4113,7 +4518,7 @@ static void normalize_command_invocations(
                 break;
             }
             remaining = command->argc - invocation.first_operand;
-            memmove(command->argv,
+            (void)memmove(command->argv,
                     command->argv + invocation.first_operand,
                     remaining * sizeof(command->argv[0]));
             command->argc = remaining;
@@ -4129,12 +4534,18 @@ static void normalize_command_invocations(
 
 static bool native_return_builtin(const gsh_native_command *command)
 {
+    if (command == NULL) {
+        return false;
+    }
     return command->argc > 0 && strcmp(command->argv[0], "return") == 0;
 }
 
 static bool native_loop_control_builtin(
     const gsh_native_command *command)
 {
+    if (command == NULL) {
+        return false;
+    }
     return command->argc > 0 &&
            (strcmp(command->argv[0], "break") == 0 ||
             strcmp(command->argv[0], "continue") == 0);
@@ -4143,11 +4554,15 @@ static bool native_loop_control_builtin(
 static bool parse_exit_status(const gsh_native_command *command,
                               int last_status, int *status)
 {
+    if (command == NULL) return false;
+    if (status == NULL) {
+        return false;
+    }
     unsigned int value = (unsigned int)(last_status & 255);
     const char *cursor;
 
     if (command->argc > 2U) {
-        fputs("gsh: exit: too many operands\n", stderr);
+        (void)fputs("gsh: exit: too many operands\n", stderr);
         *status = 1;
         return false;
     }
@@ -4158,20 +4573,20 @@ static bool parse_exit_status(const gsh_native_command *command,
     value = 0;
     cursor = command->argv[1];
     if (*cursor == '\0') {
-        fputs("gsh: exit: invalid status\n", stderr);
+        (void)fputs("gsh: exit: invalid status\n", stderr);
         *status = 2;
         return false;
     }
     while (*cursor != '\0') {
         if (*cursor < '0' || *cursor > '9' || value > 25U) {
-            fputs("gsh: exit: invalid status\n", stderr);
+            (void)fputs("gsh: exit: invalid status\n", stderr);
             *status = 2;
             return false;
         }
         value = value * 10U + (unsigned int)(*cursor++ - '0');
     }
     if (value > 255U) {
-        fputs("gsh: exit: invalid status\n", stderr);
+        (void)fputs("gsh: exit: invalid status\n", stderr);
         *status = 2;
         return false;
     }
@@ -4181,6 +4596,9 @@ static bool parse_exit_status(const gsh_native_command *command,
 
 static bool special_builtin_name(const char *name, size_t length)
 {
+    if (name == NULL) {
+        return false;
+    }
     return gsh_command_special_builtin_name(name, length);
 }
 
@@ -4205,6 +4623,7 @@ static bool native_alias_mutates(const gsh_native_command *command)
 
 static bool native_function_mutates(const gsh_native_command *command)
 {
+    if (command == NULL) return false;
     size_t index = 1U;
 
     if (command->argc == 0 || strcmp(command->argv[0], "unset") != 0) {
@@ -4229,11 +4648,17 @@ static bool native_function_mutates(const gsh_native_command *command)
 
 static bool native_set_variable_listing(const gsh_native_command *command)
 {
+    if (command == NULL) {
+        return false;
+    }
     return command->argc == 1 && strcmp(command->argv[0], "set") == 0;
 }
 
 static bool native_variable_listing(const gsh_native_command *command)
 {
+    if (command == NULL) {
+        return false;
+    }
     return command->argc == 2 && strcmp(command->argv[1], "-p") == 0 &&
            (strcmp(command->argv[0], "export") == 0 ||
             strcmp(command->argv[0], "readonly") == 0);
@@ -4242,6 +4667,9 @@ static bool native_variable_listing(const gsh_native_command *command)
 static bool native_pipeline_requires_evaluator(
     const gsh_native_pipeline *pipeline)
 {
+    if (pipeline == NULL) {
+        return false;
+    }
     const gsh_native_command *command;
     size_t index;
 
@@ -4288,6 +4716,9 @@ static bool native_pipeline_requires_evaluator(
 static unsigned int assignment_attributes(
     const gsh_shell_options *options)
 {
+    if (options == NULL) {
+        return -1;
+    }
     return gsh_options_enabled(options, GSH_OPTION_ALLEXPORT)
                ? GSH_VARIABLE_EXPORTED
                : 0U;
@@ -4297,6 +4728,10 @@ static int unset_native_functions(
     const gsh_native_command *command, gsh_function_store *functions,
     const gsh_builtin_io *io)
 {
+    if (command == NULL) return -1;
+    if (io == NULL) {
+        return -1;
+    }
     size_t index = 1U;
     bool selected = false;
     int status = 0;
@@ -4345,6 +4780,10 @@ static int run_native_variable_builtin(
     gsh_variable_journal *journal, const gsh_shell_options *options,
     gsh_function_store *functions, const gsh_builtin_io *io)
 {
+    if (command == NULL || io == NULL || options == NULL ||
+        variables == NULL) {
+        return -1;
+    }
     int status = gsh_builtin_variables(
         command->argc, command->argv, variables, journal,
         assignment_attributes(options), io);
@@ -4358,7 +4797,18 @@ static int run_native_state_builtin(
     gsh_positional_store *positionals, gsh_shell_options *options,
     const gsh_builtin_io *io)
 {
-    return strcmp(command->argv[0], "set") == 0
+    if (command == NULL || io == NULL || options == NULL || variables == NULL) {
+        return -1;
+    }
+    bool set_builtin = strcmp(command->argv[0], "set") == 0;
+
+    if (positionals == NULL &&
+        (!set_builtin ||
+         gsh_builtin_set_mutates_positionals(command->argc,
+                                             command->argv))) {
+        return -1;
+    }
+    return set_builtin
                ? gsh_builtin_set(command->argc, command->argv, variables,
                                  positionals, options, io)
                : gsh_builtin_shift(command->argc, command->argv,
@@ -4373,6 +4823,11 @@ static int run_native_posix_stateful_builtin(
     const gsh_positional_store *positionals, gsh_shell_options *options,
     const gsh_builtin_io *io)
 {
+    if (command == NULL || io == NULL || lookup_variables == NULL ||
+        options == NULL || positionals == NULL || scratch == NULL ||
+        variables == NULL) {
+        return -1;
+    }
     return native_read_builtin(command)
                ? gsh_builtin_read(command->argc, command->argv,
                                   lookup_variables, variables, scratch,
@@ -4390,6 +4845,11 @@ static int run_native_cd_builtin(
     const gsh_builtin_io *io, char *directory,
     size_t directory_capacity)
 {
+    if (command == NULL || io == NULL || lookup_variables == NULL ||
+        options == NULL || variables == NULL ||
+        (directory_capacity != 0U && directory == NULL)) {
+        return -1;
+    }
     return gsh_builtin_cd(command->argc, command->argv, lookup_variables,
                           variables, journal, assignment_attributes(options),
                           io, directory, directory_capacity);
@@ -4398,6 +4858,9 @@ static int run_native_cd_builtin(
 static int run_native_environment_builtin(const gsh_native_command *command,
                                           const gsh_builtin_io *io)
 {
+    if (command == NULL || io == NULL) {
+        return -1;
+    }
     return strcmp(command->argv[0], "ulimit") == 0
                ? gsh_builtin_ulimit(command->argc, command->argv, io)
                : gsh_builtin_umask(command->argc, command->argv, io);
@@ -4407,6 +4870,9 @@ static int run_native_alias_builtin(
     const gsh_native_command *command, gsh_alias_store *aliases,
     gsh_alias_journal *journal, const gsh_builtin_io *io)
 {
+    if (aliases == NULL || command == NULL || io == NULL) {
+        return -1;
+    }
     return strcmp(command->argv[0], "alias") == 0
                ? gsh_builtin_alias(command->argc, command->argv, aliases,
                                    journal, io)
@@ -4421,6 +4887,11 @@ static int run_native_command_inspection(
     uint64_t path_generation, bool cacheable, bool *cache_changed,
     const gsh_builtin_io *io)
 {
+    if (aliases == NULL || cache == NULL || command == NULL ||
+        default_path == NULL || functions == NULL || io == NULL ||
+        path == NULL) {
+        return -1;
+    }
     if (strcmp(command->argv[0], "type") == 0) {
         return gsh_builtin_type(command->argc, command->argv, path, aliases,
                                 functions, cache, path_generation,
@@ -4437,6 +4908,10 @@ static int run_native_hash_builtin(
     uint64_t path_generation, bool *cache_changed,
     const gsh_builtin_io *io)
 {
+    if (cache == NULL || command == NULL || functions == NULL || io == NULL ||
+        path == NULL) {
+        return -1;
+    }
     return gsh_builtin_hash(command->argc, command->argv, path, functions,
                             cache, path_generation, cache_changed, io);
 }
@@ -4446,17 +4921,28 @@ static int run_native_times_builtin(
     const gsh_times_context *times_context,
     const gsh_builtin_io *io)
 {
+    if (command == NULL || io == NULL) {
+        return -1;
+    }
     return gsh_builtin_times(command->argc, command->argv, times_context,
                              io);
 }
 
 static const gsh_builtin_io descriptor_builtin_io = {
-    gsh_builtin_descriptor_output, NULL};
+    .kind = GSH_BUILTIN_SINK_DESCRIPTORS,
+    .descriptors = {STDOUT_FILENO, STDERR_FILENO},
+};
 
 static void child_write_descriptor(int descriptor, const char *text,
                                    size_t length)
 {
-    while (length > 0) {
+    if (text == NULL) {
+        return;
+    }
+    size_t attempt;
+
+    for (attempt = 0; attempt < CHILD_WRITE_ATTEMPT_CAP && length > 0;
+         attempt++) {
         ssize_t written = write(descriptor, text, length);
 
         if (written > 0) {
@@ -4482,7 +4968,7 @@ static bool logical_pwd_is_valid(const char *path)
         return false;
     }
     component = path + 1;
-    for (;;) {
+    for (size_t part = 0; part <= PATH_MAX; part++) {
         const char *end = component;
         size_t length;
 
@@ -4499,11 +4985,15 @@ static bool logical_pwd_is_valid(const char *path)
         }
         component = end + 1;
     }
+    return false;
 }
 
 static int child_run_pwd(const gsh_native_command *command,
                          const gsh_variable_store *variables)
 {
+    if (command == NULL || variables == NULL) {
+        return -1;
+    }
     char physical[PATH_MAX];
     const char *directory = NULL;
     bool logical = true;
@@ -4549,6 +5039,10 @@ static int child_run_pwd(const gsh_native_command *command,
 static bool assignment_overrides_environment(const char *assignment,
                                              const char *entry)
 {
+    if (entry == NULL) return false;
+    if (assignment == NULL) {
+        return false;
+    }
     size_t offset = 0;
 
     while (assignment[offset] != '\0' && assignment[offset] != '=') {
@@ -4565,10 +5059,16 @@ static char *const *child_command_environment(
     const gsh_native_command *command,
     char *storage[CHILD_ENVIRONMENT_CAP])
 {
+    if (storage == NULL || variables == NULL) {
+        return NULL;
+    }
     size_t source;
     size_t used = 0;
-    size_t assignment_count =
-        command != NULL ? command->assignment_count : 0;
+    size_t assignment_count = 0U;
+
+    if (command != NULL) {
+        assignment_count = command->assignment_count;
+    }
 
     for (source = 0; source < gsh_variables_count(variables); source++) {
         size_t assignment;
@@ -4609,7 +5109,6 @@ struct pipeline_expansion_scope {
     const gsh_variable_store *base;
     gsh_variable_journal *changes;
     size_t command_count;
-    size_t current_scope;
 };
 
 static const char *store_path_value(const gsh_variable_store *variables,
@@ -4625,6 +5124,9 @@ static bool native_planned_command_is_supported(
     const gsh_native_pipeline *pipeline, size_t index,
     const char *path_value)
 {
+    if (pipeline == NULL) {
+        return false;
+    }
     const gsh_native_command *native = &pipeline->commands[index];
     simple_command command = {0};
     size_t argument;
@@ -4712,7 +5214,7 @@ static bool native_planned_command_is_supported(
         command.argv[argument] = native->argv[argument];
     }
     command.argv[command.argc] = NULL;
-    return direct_path_is_bounded(&command, path_value);
+    return path_value != NULL && direct_path_is_bounded(&command, path_value);
 }
 
 static bool native_pipeline_is_supported_scoped(
@@ -4720,6 +5222,9 @@ static bool native_pipeline_is_supported_scoped(
     const gsh_variable_store *variables,
     const pipeline_expansion_scope *scope)
 {
+    if (default_path == NULL || pipeline == NULL || variables == NULL) {
+        return false;
+    }
     size_t index;
 
     for (index = 0; index < pipeline->command_count; index++) {
@@ -4751,6 +5256,9 @@ static int apply_native_assignments_with_attributes(
     gsh_variable_store *variables, gsh_variable_journal *journal,
     const gsh_native_command *command, unsigned int attributes)
 {
+    if (command == NULL || variables == NULL) {
+        return -1;
+    }
     size_t index;
 
     for (index = 0; index < command->assignment_count; index++) {
@@ -4789,6 +5297,9 @@ static int apply_native_assignments(gsh_variable_store *variables,
                                     const gsh_native_command *command,
                                     const gsh_shell_options *options)
 {
+    if (command == NULL || options == NULL || variables == NULL) {
+        return -1;
+    }
     return apply_native_assignments_with_attributes(
         variables, journal, command, assignment_attributes(options));
 }
@@ -4798,10 +5309,14 @@ static int child_run_posix_stateful_builtin(
     gsh_variable_store *scratch,
     const gsh_positional_store *positionals, gsh_shell_options *options)
 {
+    if (command == NULL) return -1;
+    if (options == NULL || positionals == NULL || scratch == NULL || variables == NULL) {
+        return -1;
+    }
     const gsh_variable_store *lookup = variables;
 
     if (command->assignment_count != 0) {
-        memcpy(scratch, variables, sizeof(*scratch));
+        (void)memcpy(scratch, variables, sizeof(*scratch));
         if (apply_native_assignments(scratch, NULL, command, options) !=
             GSH_ASSIGNMENT_OK) {
             return 1;
@@ -4818,6 +5333,9 @@ static int apply_special_builtin_assignments(
     const gsh_native_command *command,
     const gsh_shell_options *options)
 {
+    if (command == NULL || options == NULL || variables == NULL) {
+        return -1;
+    }
     return command->command_regular_context
                ? GSH_ASSIGNMENT_OK
                : apply_native_assignments(variables, journal, command,
@@ -4829,7 +5347,7 @@ static int child_duplicate_descriptor(int source, int destination)
     if (source == destination) {
         return fcntl(source, F_GETFD) == -1 ? -1 : destination;
     }
-    if (fault_should_fail("descriptor-dup", EMFILE)) {
+    if (gsh_fault_should_fail(GSH_FAULT_DESCRIPTOR_DUP, EMFILE)) {
         return -1;
     }
     return dup2(source, destination);
@@ -4844,6 +5362,10 @@ static int save_redirect_descriptors(
     const gsh_native_command *command,
     gsh_saved_descriptor saved[GSH_NATIVE_REDIRECT_CAP], size_t *saved_count)
 {
+    if (saved == NULL) return -1;
+    if (command == NULL || saved_count == NULL) {
+        return -1;
+    }
     int minimum = STDERR_FILENO + 1;
     size_t index;
 
@@ -4875,7 +5397,7 @@ static int save_redirect_descriptors(
         }
         saved[*saved_count].descriptor = descriptor;
         saved[*saved_count].saved =
-            fault_should_fail("descriptor-save", EMFILE)
+            gsh_fault_should_fail(GSH_FAULT_DESCRIPTOR_SAVE, EMFILE)
                 ? -1
                 : fcntl(descriptor, F_DUPFD_CLOEXEC, minimum);
         if (saved[*saved_count].saved == -1 && errno != EBADF) {
@@ -4883,7 +5405,7 @@ static int save_redirect_descriptors(
                 int prior_saved = saved[--(*saved_count)].saved;
 
                 if (prior_saved >= 0) {
-                    close(prior_saved);
+                    (void)close(prior_saved);
                 }
             }
             return -1;
@@ -4896,6 +5418,9 @@ static int save_redirect_descriptors(
 static int restore_redirect_descriptors(
     gsh_saved_descriptor saved[GSH_NATIVE_REDIRECT_CAP], size_t saved_count)
 {
+    if (saved == NULL) {
+        return -1;
+    }
     int status = 0;
 
     while (saved_count > 0) {
@@ -4910,7 +5435,7 @@ static int restore_redirect_descriptors(
             if (dup2(entry->saved, entry->descriptor) == -1) {
                 status = -1;
             }
-            close(entry->saved);
+            (void)close(entry->saved);
         } else if (close(entry->descriptor) == -1 && errno != EBADF) {
             status = -1;
         }
@@ -4921,6 +5446,7 @@ static int restore_redirect_descriptors(
 static int materialize_heredoc(const gsh_native_pipeline *pipeline,
                                size_t heredoc_index)
 {
+    if (pipeline == NULL) return -1;
     char path[] = "/tmp/gsh-heredoc-XXXXXX";
     const gsh_native_heredoc *heredoc;
     const char *cursor;
@@ -4938,7 +5464,7 @@ static int materialize_heredoc(const gsh_native_pipeline *pipeline,
     if (unlink(path) == -1) {
         int saved_errno = errno;
 
-        close(descriptor);
+        (void)close(descriptor);
         errno = saved_errno;
         return -1;
     }
@@ -4946,7 +5472,7 @@ static int materialize_heredoc(const gsh_native_pipeline *pipeline,
     cursor = heredoc->body;
     remaining = heredoc->length;
     while (remaining > 0) {
-        ssize_t written = fault_should_fail("heredoc-write", EIO)
+        ssize_t written = gsh_fault_should_fail(GSH_FAULT_HEREDOC_WRITE, EIO)
                               ? -1
                               : write(descriptor, cursor, remaining);
 
@@ -4958,7 +5484,7 @@ static int materialize_heredoc(const gsh_native_pipeline *pipeline,
         } else {
             int saved_errno = written == 0 ? EIO : errno;
 
-            close(descriptor);
+            (void)close(descriptor);
             errno = saved_errno;
             return -1;
         }
@@ -4966,7 +5492,7 @@ static int materialize_heredoc(const gsh_native_pipeline *pipeline,
     if (lseek(descriptor, 0, SEEK_SET) == -1) {
         int saved_errno = errno;
 
-        close(descriptor);
+        (void)close(descriptor);
         errno = saved_errno;
         return -1;
     }
@@ -4978,9 +5504,12 @@ static int open_redirect_path(const char *target,
                               const gsh_shell_options *options,
                               mode_t creation_mode)
 {
+    if (target == NULL) {
+        return -1;
+    }
     int flags;
 
-    if (fault_should_fail("redirect-open", EMFILE)) {
+    if (gsh_fault_should_fail(GSH_FAULT_REDIRECT_OPEN, EMFILE)) {
         return -1;
     }
     if (operator_kind == GSH_TOKEN_GREAT &&
@@ -4999,12 +5528,12 @@ static int open_redirect_path(const char *target,
         if (fstat(descriptor, &status) == -1) {
             int saved_errno = errno;
 
-            close(descriptor);
+            (void)close(descriptor);
             errno = saved_errno;
             return -1;
         }
         if (S_ISREG(status.st_mode)) {
-            close(descriptor);
+            (void)close(descriptor);
             errno = EEXIST;
             return -1;
         }
@@ -5029,6 +5558,9 @@ static int open_redirect_path(const char *target,
 static int open_redirect_target(const gsh_native_redirect *redirect,
                                 const gsh_shell_options *options)
 {
+    if (options == NULL || redirect == NULL) {
+        return -1;
+    }
     return open_redirect_path(redirect->target, redirect->operator_kind,
                               options, 0666);
 }
@@ -5037,6 +5569,9 @@ static int apply_evaluator_redirects_record(
     const gsh_native_pipeline *pipeline, const gsh_native_command *command,
     const gsh_shell_options *options, bool standard_changes[3])
 {
+    if (command == NULL || options == NULL || pipeline == NULL) {
+        return -1;
+    }
     size_t index;
 
     for (index = 0; index < command->redirect_count; index++) {
@@ -5078,13 +5613,13 @@ static int apply_evaluator_redirects_record(
             int saved_errno = errno;
 
             if (descriptor >= 0 && descriptor != redirect->descriptor) {
-                close(descriptor);
+                (void)close(descriptor);
             }
             errno = saved_errno;
             return -1;
         }
         if (descriptor != redirect->descriptor) {
-            close(descriptor);
+            (void)close(descriptor);
         }
         if (standard_changes != NULL && redirect->descriptor >= 0 &&
             redirect->descriptor <= 2) {
@@ -5098,6 +5633,9 @@ static int apply_evaluator_redirects(
     const gsh_native_pipeline *pipeline, const gsh_native_command *command,
     const gsh_shell_options *options)
 {
+    if (command == NULL || options == NULL || pipeline == NULL) {
+        return -1;
+    }
     return apply_evaluator_redirects_record(
         pipeline, command, options, NULL);
 }
@@ -5112,6 +5650,10 @@ static int apply_evaluator_redirects(
 static int exec_utility_index(const gsh_native_command *command,
                               size_t *utility_index)
 {
+    if (command == NULL) return -1;
+    if (utility_index == NULL) {
+        return -1;
+    }
     size_t index = 1U;
 
     if (index < command->argc && strcmp(command->argv[index], "--") == 0) {
@@ -5164,7 +5706,7 @@ static int prepare_interactive_exec(shell_state *owner)
         child_write_text("gsh: exec: terminal handoff failed\n");
         return -1;
     }
-    if (owner->async_repl != NULL && owner->async_repl->enabled) {
+    if (owner->async_repl != NULL && state_async_repl(owner)->enabled) {
         child_write_descriptor(owner->tty_fd, leave_managed_screen,
                                sizeof(leave_managed_screen) - 1U);
     }
@@ -5184,8 +5726,8 @@ static int restore_interactive_exec(shell_state *owner)
         return -1;
     }
     owner->terminal_changed = true;
-    if (owner->async_repl != NULL && owner->async_repl->enabled) {
-        owner->async_repl->render_pending = true;
+    if (owner->async_repl != NULL && state_async_repl(owner)->enabled) {
+        state_async_repl(owner)->render_pending = true;
     }
     return 0;
 }
@@ -5197,10 +5739,12 @@ static int protect_interactive_exec(
     size_t count = 0;
     size_t index;
 
-    if (owner == NULL || command->redirect_count == 0) {
+    if (owner == NULL) {
         return 0;
     }
-    assert(command->redirect_count <= GSH_NATIVE_REDIRECT_CAP);
+    if (command == NULL ||
+        command->redirect_count > GSH_NATIVE_REDIRECT_CAP) return -1;
+    if (command->redirect_count == 0U) return 0;
     for (index = 0; index < command->redirect_count; index++) {
         const gsh_native_redirect *redirect = &command->redirects[index];
 
@@ -5209,7 +5753,7 @@ static int protect_interactive_exec(
             targets[count++] = redirect->duplicate_descriptor;
         }
     }
-    assert(count <= GSH_NATIVE_REDIRECT_CAP * 2U);
+    if (count > GSH_NATIVE_REDIRECT_CAP * 2U) return -1;
     return protect_exec_owner_descriptors(owner, targets, count);
 }
 
@@ -5218,11 +5762,14 @@ static int exec_external_utility(
     const gsh_variable_store *variables, const char *default_path,
     gsh_command_cache *cache, int outcome_fd)
 {
+    if (cache == NULL || command == NULL || default_path == NULL || variables == NULL) {
+        return -1;
+    }
     char *environment_storage[CHILD_ENVIRONMENT_CAP];
     char *const *environment;
     int exec_error;
 
-    if (fault_should_fail("exec", EIO)) {
+    if (gsh_fault_should_fail(GSH_FAULT_EXEC, EIO)) {
         exec_error = errno;
     } else {
         environment = child_command_environment(
@@ -5247,6 +5794,10 @@ static int run_evaluator_exec_builtin(
     shell_state *interactive_owner, int outcome_fd,
     bool *descriptors_dirty, bool *builtin_failed)
 {
+    if (builtin_failed == NULL || cache == NULL || default_path == NULL ||
+        pipeline == NULL || variables == NULL || options == NULL) {
+        return -1;
+    }
     const gsh_native_command *command = &pipeline->commands[0];
     size_t utility_index;
     int assignment_status;
@@ -5304,6 +5855,9 @@ static int run_evaluator_variable_builtin(
     gsh_variable_journal *journal, const gsh_shell_options *options,
     gsh_function_store *functions)
 {
+    if (pipeline == NULL || variables == NULL || options == NULL) {
+        return -1;
+    }
     const gsh_native_command *command = &pipeline->commands[0];
     gsh_saved_descriptor saved[GSH_NATIVE_REDIRECT_CAP];
     size_t saved_count;
@@ -5348,6 +5902,9 @@ static int run_evaluator_alias_builtin(
     const gsh_native_pipeline *pipeline, gsh_alias_store *aliases,
     gsh_alias_journal *journal, const gsh_shell_options *options)
 {
+    if (aliases == NULL || pipeline == NULL || options == NULL) {
+        return -1;
+    }
     const gsh_native_command *command = &pipeline->commands[0];
     gsh_saved_descriptor saved[GSH_NATIVE_REDIRECT_CAP];
     size_t saved_count;
@@ -5378,6 +5935,9 @@ static int run_evaluator_hash_builtin(
     const char *default_path, const gsh_function_store *functions,
     gsh_command_cache *cache, const gsh_shell_options *options)
 {
+    if (cache == NULL || default_path == NULL || functions == NULL || pipeline == NULL || variables == NULL) {
+        return -1;
+    }
     const gsh_native_command *command = &pipeline->commands[0];
     gsh_saved_descriptor saved[GSH_NATIVE_REDIRECT_CAP];
     size_t saved_count;
@@ -5412,6 +5972,10 @@ static int run_evaluator_times_builtin(
     gsh_variable_journal *journal, const gsh_shell_options *options,
     const gsh_times_context *times_context, bool *builtin_failed)
 {
+    if (builtin_failed == NULL || pipeline == NULL || variables == NULL ||
+        options == NULL) {
+        return -1;
+    }
     const gsh_native_command *command = &pipeline->commands[0];
     gsh_saved_descriptor saved[GSH_NATIVE_REDIRECT_CAP];
     size_t saved_count;
@@ -5454,6 +6018,9 @@ static int run_evaluator_state_builtin(
     gsh_variable_journal *journal, gsh_positional_store *positionals,
     gsh_shell_options *options)
 {
+    if (pipeline == NULL || variables == NULL || options == NULL) {
+        return -1;
+    }
     const gsh_native_command *command = &pipeline->commands[0];
     gsh_saved_descriptor saved[GSH_NATIVE_REDIRECT_CAP];
     size_t saved_count;
@@ -5492,6 +6059,10 @@ static int run_evaluator_posix_stateful_builtin(
     gsh_variable_store *scratch, gsh_variable_journal *journal,
     const gsh_positional_store *positionals, gsh_shell_options *options)
 {
+    if (pipeline == NULL || positionals == NULL || scratch == NULL ||
+        variables == NULL || options == NULL) {
+        return -1;
+    }
     const gsh_native_command *command = &pipeline->commands[0];
     const gsh_variable_store *lookup = variables;
     gsh_saved_descriptor saved[GSH_NATIVE_REDIRECT_CAP];
@@ -5508,7 +6079,7 @@ static int run_evaluator_posix_stateful_builtin(
         return 1;
     }
     if (command->assignment_count != 0) {
-        memcpy(scratch, variables, sizeof(*scratch));
+        (void)memcpy(scratch, variables, sizeof(*scratch));
         if (apply_native_assignments(scratch, NULL, command, options) !=
             GSH_ASSIGNMENT_OK) {
             perror("gsh: builtin assignment");
@@ -5539,7 +6110,7 @@ static int open_job_service_temp(void)
         set_fd_flags(descriptor, F_GETFD, FD_CLOEXEC) == -1) {
         int saved_errno = errno;
 
-        close(descriptor);
+        (void)close(descriptor);
         errno = saved_errno;
         return -1;
     }
@@ -5557,7 +6128,7 @@ static int pack_job_service_request(
         errno = EINVAL;
         return -1;
     }
-    memset(request, 0, sizeof(*request));
+    (void)memset(request, 0, sizeof(*request));
     request->version = GSH_JOB_SERVICE_VERSION;
     request->type = native_jobs_builtin(command)
                         ? GSH_JOB_SERVICE_JOBS
@@ -5574,7 +6145,7 @@ static int pack_job_service_request(
             return -1;
         }
         request->offsets[argument] = (uint32_t)used;
-        memcpy(request->text + used, command->argv[argument], length + 1U);
+        (void)memcpy(request->text + used, command->argv[argument], length + 1U);
         used += length + 1U;
     }
     request->text_length = (uint32_t)used;
@@ -5584,6 +6155,10 @@ static int pack_job_service_request(
 static int copy_job_service_output(int source, int target)
 {
     char buffer[4096];
+    const gsh_builtin_io io = {
+        .kind = GSH_BUILTIN_SINK_DESCRIPTORS,
+        .descriptors = {target, target},
+    };
     size_t total = 0;
     const size_t limit = GSH_BACKGROUND_CAP *
                          (GSH_BACKGROUND_COMMAND_CAP + 128U);
@@ -5594,8 +6169,8 @@ static int copy_job_service_output(int source, int target)
 
         if (count > 0) {
             if ((size_t)count > limit - total ||
-                gsh_builtin_descriptor_output(
-                    NULL, target, buffer, (size_t)count) != 0) {
+                gsh_builtin_output(
+                    &io, target, buffer, (size_t)count) != 0) {
                 errno = EFBIG;
                 return -1;
             }
@@ -5616,6 +6191,42 @@ static int copy_job_service_output(int source, int target)
 #if defined(__GNUC__) || defined(__clang__)
 __attribute__((noinline))
 #endif
+static int close_job_service_request(int outputs[2], int response[2],
+                                     int status)
+{
+    if (outputs == NULL || response == NULL) return -1;
+    if (outputs[0] >= 0) (void)close(outputs[0]);
+    if (outputs[1] >= 0) (void)close(outputs[1]);
+    if (response[0] >= 0) (void)close(response[0]);
+    if (response[1] >= 0) (void)close(response[1]);
+    return status;
+}
+
+static int finish_job_service_reply(ssize_t received,
+                                    const job_service_reply *reply,
+                                    int outputs[2], int response[2])
+{
+    int status = 125;
+
+    if (!require(reply != NULL && outputs != NULL && response != NULL)) {
+        return close_job_service_request(outputs, response, status);
+    }
+    if (!require(received >= -1)) {
+        return close_job_service_request(outputs, response, status);
+    }
+    if (received != (ssize_t)sizeof(*reply) ||
+        reply->version != GSH_JOB_SERVICE_VERSION || reply->reserved != 0U ||
+        reply->status < 0 || reply->status > 255) {
+        errno = EPROTO;
+        return close_job_service_request(outputs, response, status);
+    }
+    if (copy_job_service_output(outputs[0], STDOUT_FILENO) == -1 ||
+        copy_job_service_output(outputs[1], STDERR_FILENO) == -1) {
+        return close_job_service_request(outputs, response, status);
+    }
+    return close_job_service_request(outputs, response, reply->status);
+}
+
 static int request_reactor_job_service(
     int service_socket, const gsh_native_command *command)
 {
@@ -5644,13 +6255,13 @@ static int request_reactor_job_service(
         socketpair(AF_UNIX, SOCK_DGRAM, 0, response) == -1 ||
         set_fd_flags(response[0], F_GETFD, FD_CLOEXEC) == -1 ||
         set_fd_flags(response[1], F_GETFD, FD_CLOEXEC) == -1) {
-        goto done;
+        return close_job_service_request(outputs, response, status);
     }
     rights[0] = outputs[0];
     rights[1] = outputs[1];
     rights[2] = response[1];
-    memset(control, 0, sizeof(control));
-    memset(&message, 0, sizeof(message));
+    (void)memset(control, 0, sizeof(control));
+    (void)memset(&message, 0, sizeof(message));
     message.msg_iov = &payload;
     message.msg_iovlen = 1;
     message.msg_control = control;
@@ -5659,12 +6270,14 @@ static int request_reactor_job_service(
     header->cmsg_level = SOL_SOCKET;
     header->cmsg_type = SCM_RIGHTS;
     header->cmsg_len = CMSG_LEN(sizeof(rights));
-    memcpy(CMSG_DATA(header), rights, sizeof(rights));
+    (void)memcpy(CMSG_DATA(header), rights, sizeof(rights));
     do {
         sent = sendmsg(service_socket, &message, 0);
     } while (sent == -1 && errno == EINTR);
-    if (sent != (ssize_t)request_size) goto done;
-    close(response[1]);
+    if (sent != (ssize_t)request_size) {
+        return close_job_service_request(outputs, response, status);
+    }
+    (void)close(response[1]);
     response[1] = -1;
     ready.fd = response[0];
     ready.events = POLLIN;
@@ -5675,29 +6288,12 @@ static int request_reactor_job_service(
     } while (received == -1 && errno == EINTR);
     if (received != 1 || (ready.revents & POLLIN) == 0) {
         if (received == 0) errno = ETIMEDOUT;
-        goto done;
+        return close_job_service_request(outputs, response, status);
     }
     do {
         received = recv(response[0], &reply, sizeof(reply), 0);
     } while (received == -1 && errno == EINTR);
-    if (received != (ssize_t)sizeof(reply) ||
-        reply.version != GSH_JOB_SERVICE_VERSION || reply.reserved != 0U ||
-        reply.status < 0 || reply.status > 255) {
-        errno = EPROTO;
-        goto done;
-    }
-    if (copy_job_service_output(outputs[0], STDOUT_FILENO) == -1 ||
-        copy_job_service_output(outputs[1], STDERR_FILENO) == -1) {
-        goto done;
-    }
-    status = reply.status;
-
-done:
-    if (outputs[0] >= 0) close(outputs[0]);
-    if (outputs[1] >= 0) close(outputs[1]);
-    if (response[0] >= 0) close(response[0]);
-    if (response[1] >= 0) close(response[1]);
-    return status;
+    return finish_job_service_reply(received, &reply, outputs, response);
 }
 
 static int run_evaluator_job_control_builtin(
@@ -5706,6 +6302,9 @@ static int run_evaluator_job_control_builtin(
     gsh_background_table *jobs, int job_service_socket,
     bool job_service_available)
 {
+    if (jobs == NULL || pipeline == NULL || scratch == NULL || variables == NULL) {
+        return -1;
+    }
     const gsh_native_command *command = &pipeline->commands[0];
     gsh_saved_descriptor saved[GSH_NATIVE_REDIRECT_CAP];
     size_t saved_count;
@@ -5724,7 +6323,7 @@ static int run_evaluator_job_control_builtin(
         if (scratch == NULL) {
             status = 125;
         } else {
-            memcpy(scratch, variables, sizeof(*scratch));
+            (void)memcpy(scratch, variables, sizeof(*scratch));
             status = apply_native_assignments(
                 scratch, NULL, command, options) == GSH_ASSIGNMENT_OK
                          ? 0 : 1;
@@ -5763,6 +6362,10 @@ static int run_evaluator_trap_builtin(
     gsh_variable_journal *journal, const gsh_shell_options *options,
     gsh_trap_store *traps, bool *builtin_failed)
 {
+    if (builtin_failed == NULL || pipeline == NULL || variables == NULL ||
+        options == NULL) {
+        return -1;
+    }
     const gsh_native_command *command = &pipeline->commands[0];
     gsh_saved_descriptor saved[GSH_NATIVE_REDIRECT_CAP];
     size_t saved_count;
@@ -5808,6 +6411,10 @@ static int run_evaluator_cd_builtin(
     gsh_variable_journal *journal, const gsh_shell_options *options,
     char *directory, size_t directory_capacity)
 {
+    if (pipeline == NULL || variables == NULL || options == NULL ||
+        (directory_capacity != 0U && directory == NULL)) {
+        return -1;
+    }
     const gsh_native_command *command = &pipeline->commands[0];
     gsh_saved_descriptor saved[GSH_NATIVE_REDIRECT_CAP];
     const gsh_variable_store *lookup_variables = variables;
@@ -5824,19 +6431,25 @@ static int run_evaluator_cd_builtin(
         return 1;
     }
     if (command->assignment_count != 0) {
-        memcpy(scratch, variables, sizeof(*scratch));
+        if (scratch == NULL) {
+            return 125;
+        }
+        (void)memcpy(scratch, variables, sizeof(*scratch));
         status = apply_native_assignments(scratch, NULL, command, options);
         if (status != GSH_ASSIGNMENT_OK) {
             perror("gsh: assignment");
             status = 1;
-            goto restore;
+        } else {
+            lookup_variables = scratch;
+            status = run_native_cd_builtin(
+                command, lookup_variables, variables, journal, options,
+                &descriptor_builtin_io, directory, directory_capacity);
         }
-        lookup_variables = scratch;
+    } else {
+        status = run_native_cd_builtin(
+            command, lookup_variables, variables, journal, options,
+            &descriptor_builtin_io, directory, directory_capacity);
     }
-    status = run_native_cd_builtin(
-        command, lookup_variables, variables, journal, options,
-        &descriptor_builtin_io, directory, directory_capacity);
-restore:
     if (restore_redirect_descriptors(saved, saved_count) == -1) {
         perror("gsh: redirection restore");
         return 125;
@@ -5848,6 +6461,9 @@ static int run_evaluator_colon_builtin(
     const gsh_native_pipeline *pipeline, gsh_variable_store *variables,
     gsh_variable_journal *journal, const gsh_shell_options *options)
 {
+    if (pipeline == NULL || variables == NULL || options == NULL) {
+        return -1;
+    }
     const gsh_native_command *command = &pipeline->commands[0];
     gsh_saved_descriptor saved[GSH_NATIVE_REDIRECT_CAP];
     size_t saved_count;
@@ -5884,6 +6500,9 @@ static void child_apply_redirects(
     int heredoc_descriptors[GSH_NATIVE_HEREDOC_CAP][2],
     size_t heredoc_count, const gsh_shell_options *options)
 {
+    if (command == NULL || heredoc_descriptors == NULL || options == NULL) {
+        return;
+    }
     size_t index;
 
     for (index = 0; index < command->redirect_count; index++) {
@@ -5926,12 +6545,12 @@ static void child_apply_redirects(
             int saved_errno = errno;
 
             if (descriptor >= 0 && descriptor != redirect->descriptor) {
-                close(descriptor);
+                (void)close(descriptor);
             }
             child_exec_error(redirect->target, saved_errno);
         }
         if (descriptor != redirect->descriptor) {
-            close(descriptor);
+            (void)close(descriptor);
         }
     }
 }
@@ -5939,6 +6558,9 @@ static void child_apply_redirects(
 static void initialize_heredoc_descriptors(
     int descriptors[GSH_NATIVE_HEREDOC_CAP][2])
 {
+    if (descriptors == NULL) {
+        return;
+    }
     size_t index;
 
     for (index = 0; index < GSH_NATIVE_HEREDOC_CAP; index++) {
@@ -5950,15 +6572,16 @@ static void initialize_heredoc_descriptors(
 static void close_heredoc_descriptors(
     int descriptors[GSH_NATIVE_HEREDOC_CAP][2], size_t count)
 {
+    if (descriptors == NULL) return;
     size_t index;
 
     for (index = 0; index < count; index++) {
         if (descriptors[index][0] >= 0) {
-            close(descriptors[index][0]);
+            (void)close(descriptors[index][0]);
             descriptors[index][0] = -1;
         }
         if (descriptors[index][1] >= 0) {
-            close(descriptors[index][1]);
+            (void)close(descriptors[index][1]);
             descriptors[index][1] = -1;
         }
     }
@@ -5968,6 +6591,9 @@ static void child_write_heredoc(
     const gsh_native_pipeline *pipeline, size_t heredoc_index,
     int descriptors[GSH_NATIVE_HEREDOC_CAP][2])
 {
+    if (descriptors == NULL || pipeline == NULL) {
+        return;
+    }
     const gsh_native_heredoc *heredoc =
         &pipeline->heredocs[heredoc_index];
     int descriptor = descriptors[heredoc_index][1];
@@ -5977,14 +6603,14 @@ static void child_write_heredoc(
 
     for (index = 0; index < pipeline->heredoc_count; index++) {
         if (descriptors[index][0] >= 0) {
-            close(descriptors[index][0]);
+            (void)close(descriptors[index][0]);
         }
         if (index != heredoc_index && descriptors[index][1] >= 0) {
-            close(descriptors[index][1]);
+            (void)close(descriptors[index][1]);
         }
     }
     while (remaining > 0) {
-        ssize_t written = fault_should_fail("heredoc-write", EIO)
+        ssize_t written = gsh_fault_should_fail(GSH_FAULT_HEREDOC_WRITE, EIO)
                               ? -1
                               : write(descriptor, cursor, remaining);
 
@@ -5994,31 +6620,32 @@ static void child_write_heredoc(
         } else if (written == -1 && errno == EINTR) {
             continue;
         } else if (written == -1 && errno == EPIPE) {
-            close(descriptor);
+            (void)close(descriptor);
             _exit(0);
         } else {
             int saved_errno = written == 0 ? EIO : errno;
 
-            close(descriptor);
+            (void)close(descriptor);
             child_exec_error("here-document", saved_errno);
         }
     }
-    close(descriptor);
+    (void)close(descriptor);
     _exit(0);
 }
 
 static void close_pipeline_descriptors(
     int descriptors[GSH_NATIVE_PIPELINE_CAP - 1][2], size_t count)
 {
+    if (descriptors == NULL) return;
     size_t index;
 
     for (index = 0; index < count; index++) {
         if (descriptors[index][0] >= 0) {
-            close(descriptors[index][0]);
+            (void)close(descriptors[index][0]);
             descriptors[index][0] = -1;
         }
         if (descriptors[index][1] >= 0) {
-            close(descriptors[index][1]);
+            (void)close(descriptors[index][1]);
             descriptors[index][1] = -1;
         }
     }
@@ -6027,6 +6654,9 @@ static void close_pipeline_descriptors(
 static void initialize_pipeline_descriptors(
     int descriptors[GSH_NATIVE_PIPELINE_CAP - 1][2])
 {
+    if (descriptors == NULL) {
+        return;
+    }
     size_t index;
 
     for (index = 0; index < GSH_NATIVE_PIPELINE_CAP - 1U; index++) {
@@ -6035,404 +6665,554 @@ static void initialize_pipeline_descriptors(
     }
 }
 
-static void start_native_pipeline(shell_state *state,
-                                  const gsh_native_pipeline *pipeline,
-                                  const pipeline_expansion_scope *scope)
-{
+typedef struct {
     int pipes[GSH_NATIVE_PIPELINE_CAP - 1][2];
     int heredoc_pipes[GSH_NATIVE_HEREDOC_CAP][2];
-    int gate[2] = {-1, -1};
+    int gate[2];
     pid_t members[GSH_NATIVE_JOB_MEMBER_CAP];
-    size_t pipe_count = pipeline->command_count - 1U;
-    size_t created_pipes = 0;
-    size_t created_heredocs = 0;
-    size_t launched = 0;
-    pid_t pgid = 0;
-    pid_t status_pid = -1;
-    sigset_t blocked;
+    size_t pipe_count;
+    size_t created_pipes;
+    size_t created_heredocs;
+    size_t launched;
+    pid_t pgid;
+    pid_t status_pid;
     sigset_t previous;
+} native_pipeline_launch;
+
+static void initialize_native_pipeline_launch(
+    native_pipeline_launch *launch, size_t command_count)
+{
+    if (!require(launch != NULL)) return;
+    initialize_pipeline_descriptors(launch->pipes);
+    initialize_heredoc_descriptors(launch->heredoc_pipes);
+    launch->gate[0] = -1;
+    launch->gate[1] = -1;
+    launch->pipe_count = command_count > 0U ? command_count - 1U : 0U;
+    launch->created_pipes = 0U;
+    launch->created_heredocs = 0U;
+    launch->launched = 0U;
+    launch->pgid = 0;
+    launch->status_pid = -1;
+    if (!require(command_count > 0U)) return;
+}
+
+static void cache_native_pipeline_commands(
+    shell_state *state, const gsh_native_pipeline *pipeline)
+{
+    bool cache_changed = false;
     size_t index;
 
-    if (scope == NULL) {
-        bool cache_changed = false;
-
-        for (index = 0; index < pipeline->command_count; index++) {
-            cache_changed = cache_planned_external(
-                                state->command_cache, state->variables,
-                                &pipeline->commands[index],
-                                state->default_path, state->functions) ||
-                            cache_changed;
-        }
-        if (cache_changed) {
-            state->command_cache_generation++;
-        }
+    if (!require(state != NULL)) return;
+    if (!require(pipeline != NULL)) return;
+    for (index = 0; index < pipeline->command_count; index++) {
+        cache_changed = cache_planned_external(
+                            state->command_cache, state->variables,
+                            &pipeline->commands[index],
+                            state->default_path, state->functions) ||
+                        cache_changed;
     }
-
-    if (state->async_repl != NULL && state->async_repl->enabled) {
-        start_async_native_pipeline(state, pipeline, scope);
-        return;
+    if (cache_changed) {
+        state->command_cache_generation++;
     }
-    initialize_pipeline_descriptors(pipes);
-    initialize_heredoc_descriptors(heredoc_pipes);
+}
+
+static bool native_pipeline_capacity_is_available(shell_state *state)
+{
+    if (!require(state != NULL)) return false;
+    if (!require(state->mode == MODE_DISPATCH)) return false;
     if (state->current_job.active) {
-        output_text(state,
+        (void)output_text(state,
                     "gsh: this MVP supports one job at a time; use fg or wait "
                     "for it\r\n");
         state->mode = MODE_EDITOR;
         queue_prompt(state);
-        return;
+        return false;
     }
     if (!gsh_background_has_capacity(&state->background_jobs)) {
-        output_text(state, "gsh: job registry full\r\n");
+        (void)output_text(state, "gsh: job registry full\r\n");
         state->mode = MODE_EDITOR;
         queue_prompt(state);
+        return false;
+    }
+    return true;
+}
+
+static void reject_native_pipeline_setup(
+    shell_state *state, native_pipeline_launch *launch,
+    const char *operation, int error)
+{
+    if (operation == NULL) {
         return;
     }
-    for (created_heredocs = 0;
-         created_heredocs < pipeline->heredoc_count;
-         created_heredocs++) {
-        if (make_pipe(heredoc_pipes[created_heredocs], false
-                      GSH_FAULT_ARGUMENT("heredoc-pipe")) == -1) {
-            output_format(state, "gsh: here-document pipe: %s\r\n",
-                          strerror(errno));
-            close_heredoc_descriptors(heredoc_pipes,
-                                      created_heredocs);
-            state->mode = MODE_EDITOR;
-            queue_prompt(state);
-            return;
+    if (!require(state != NULL)) return;
+    if (!require(launch != NULL)) return;
+    output_format(state, "gsh: %s: %s\r\n", operation, strerror(error));
+    if (launch->gate[0] >= 0) {
+        (void)close(launch->gate[0]);
+    }
+    if (launch->gate[1] >= 0) {
+        (void)close(launch->gate[1]);
+    }
+    close_pipeline_descriptors(launch->pipes, launch->created_pipes);
+    close_heredoc_descriptors(launch->heredoc_pipes,
+                              launch->created_heredocs);
+    state->mode = MODE_EDITOR;
+    queue_prompt(state);
+}
+
+static bool create_native_pipeline_descriptors(
+    shell_state *state, const gsh_native_pipeline *pipeline,
+    native_pipeline_launch *launch)
+{
+    if (launch == NULL) {
+        return false;
+    }
+    if (!require(state != NULL)) return false;
+    if (!require(pipeline != NULL)) return false;
+    for (launch->created_heredocs = 0;
+         launch->created_heredocs < pipeline->heredoc_count;
+         launch->created_heredocs++) {
+        if (make_pipe(launch->heredoc_pipes[launch->created_heredocs], false,
+                      GSH_FAULT_HEREDOC_PIPE) == -1) {
+            reject_native_pipeline_setup(state, launch,
+                                         "here-document pipe", errno);
+            return false;
         }
     }
-    for (created_pipes = 0; created_pipes < pipe_count; created_pipes++) {
-        if (make_pipe(pipes[created_pipes], false
-                      GSH_FAULT_ARGUMENT("pipeline-pipe")) == -1) {
-            output_format(state, "gsh: pipeline pipe: %s\r\n",
-                          strerror(errno));
-            close_pipeline_descriptors(pipes, created_pipes);
-            close_heredoc_descriptors(heredoc_pipes,
-                                      created_heredocs);
-            state->mode = MODE_EDITOR;
-            queue_prompt(state);
-            return;
+    for (launch->created_pipes = 0;
+         launch->created_pipes < launch->pipe_count;
+         launch->created_pipes++) {
+        if (make_pipe(launch->pipes[launch->created_pipes], false,
+                      GSH_FAULT_PIPELINE_PIPE) == -1) {
+            reject_native_pipeline_setup(state, launch,
+                                         "pipeline pipe", errno);
+            return false;
         }
     }
-    if (make_pipe(gate, false GSH_FAULT_ARGUMENT("job-pipe")) == -1) {
-        output_format(state, "gsh: launch gate: %s\r\n", strerror(errno));
-        close_pipeline_descriptors(pipes, created_pipes);
-        close_heredoc_descriptors(heredoc_pipes, created_heredocs);
-        state->mode = MODE_EDITOR;
-        queue_prompt(state);
+    if (make_pipe(launch->gate, false, GSH_FAULT_JOB_PIPE) == -1) {
+        reject_native_pipeline_setup(state, launch, "launch gate", errno);
+        return false;
+    }
+    return true;
+}
+
+static bool block_pipeline_child_notifications(
+    shell_state *state, native_pipeline_launch *launch)
+{
+    sigset_t blocked;
+
+    if (!require(state != NULL)) return false;
+    if (!require(launch != NULL)) return false;
+    (void)sigemptyset(&blocked);
+    (void)sigaddset(&blocked, SIGCHLD);
+    if (sigprocmask(SIG_BLOCK, &blocked, &launch->previous) == -1) {
+        reject_native_pipeline_setup(state, launch, "sigprocmask", errno);
+        return false;
+    }
+    return true;
+}
+
+static bool primary_pipeline_builtin_status(
+    shell_state *state, const gsh_native_command *command, int *status)
+{
+    if (!require(state != NULL)) return false;
+    if (!require(command != NULL && status != NULL)) return false;
+    if (native_pure_builtin(command)) {
+        *status = run_native_pure_builtin(command, &descriptor_builtin_io);
+        return true;
+    }
+    if (native_posix_stateful_builtin(command)) {
+        *status = child_run_posix_stateful_builtin(
+            command, state->variables, state->pipeline_variables,
+            state->positionals, &state->options);
+        return true;
+    }
+    if (native_exit_builtin(command)) {
+        if (apply_special_builtin_assignments(
+                state->variables, NULL, command, &state->options) !=
+            GSH_ASSIGNMENT_OK) {
+            child_exec_error("exit assignment", errno);
+        }
+        (void)parse_exit_status(command, state->last_status, status);
+        *status &= 255;
+        return true;
+    }
+    if (native_pwd_builtin(command)) {
+        *status = child_run_pwd(command, state->variables);
+        return true;
+    }
+    if (native_cd_builtin(command)) {
+        if (apply_native_assignments(state->variables, NULL, command,
+                                     &state->options) != GSH_ASSIGNMENT_OK) {
+            child_exec_error("assignment", errno);
+        }
+        *status = run_native_cd_builtin(
+            command, state->variables, state->variables, NULL,
+            &state->options, &descriptor_builtin_io, NULL, 0);
+        return true;
+    }
+    if (native_environment_builtin(command)) {
+        *status = run_native_environment_builtin(
+            command, &descriptor_builtin_io);
+        return true;
+    }
+    return false;
+}
+
+static bool state_pipeline_builtin_status(
+    shell_state *state, const gsh_native_command *command, int *status)
+{
+    if (status == NULL) {
+        return false;
+    }
+    if (!require(state != NULL)) return false;
+    if (!require(command != NULL)) return false;
+    if (native_variable_builtin(command)) {
+        if (apply_special_builtin_assignments(
+                state->variables, NULL, command, &state->options) !=
+            GSH_ASSIGNMENT_OK) {
+            child_exec_error("assignment", errno);
+        }
+        *status = run_native_variable_builtin(
+            command, state->variables, NULL, &state->options, NULL,
+            &descriptor_builtin_io);
+        return true;
+    }
+    if (native_state_builtin(command)) {
+        gsh_positional_store empty;
+        gsh_positional_store *positionals = state->positionals;
+
+        if (positionals == NULL) {
+            gsh_positionals_initialize(&empty);
+            positionals = &empty;
+        }
+        if (apply_special_builtin_assignments(
+                state->variables, NULL, command, &state->options) !=
+            GSH_ASSIGNMENT_OK) {
+            child_exec_error("assignment", errno);
+        }
+        *status = run_native_state_builtin(
+            command, state->variables, positionals, &state->options,
+            &descriptor_builtin_io);
+        return true;
+    }
+    if (native_job_control_builtin(command)) {
+        if (native_jobs_builtin(command)) {
+            *status = gsh_builtin_jobs(
+                command->argc, command->argv, &state->background_jobs,
+                &descriptor_builtin_io);
+        } else if (native_kill_builtin(command)) {
+            *status = gsh_builtin_kill(
+                command->argc, command->argv, &state->background_jobs,
+                &descriptor_builtin_io);
+        } else {
+            *status = gsh_builtin_error(
+                &descriptor_builtin_io, command->argv[0],
+                "not available in a pipeline");
+        }
+        return true;
+    }
+    if (native_wait_builtin(command)) {
+        *status = command->argc == 1 ? 0 : 127;
+        return true;
+    }
+    if (native_alias_builtin(command)) {
+        *status = run_native_alias_builtin(
+            command, state->aliases, NULL, &descriptor_builtin_io);
+        return true;
+    }
+    return false;
+}
+
+static bool inspection_pipeline_builtin_status(
+    shell_state *state, const gsh_native_command *command, int *status)
+{
+    if (status == NULL) {
+        return false;
+    }
+    if (!require(state != NULL)) return false;
+    if (!require(command != NULL)) return false;
+    if (native_hash_builtin(command)) {
+        const char *path = hash_command_path_value(
+            state->variables, command, state->default_path);
+
+        *status = run_native_hash_builtin(
+            command, path, state->functions, state->command_cache,
+            hash_command_path_generation(state->variables, command),
+            NULL, &descriptor_builtin_io);
+        return true;
+    }
+    if (native_times_builtin(command)) {
+        if (apply_special_builtin_assignments(
+                state->variables, NULL, command, &state->options) !=
+            GSH_ASSIGNMENT_OK) {
+            child_exec_error("assignment", errno);
+        }
+        *status = run_native_times_builtin(
+            command, NULL, &descriptor_builtin_io);
+        return true;
+    }
+    if (native_command_inspection_builtin(command)) {
+        const char *path = command_path_value(
+            state->variables, command, state->default_path);
+
+        *status = run_native_command_inspection(
+            command, path, state->default_path, state->aliases,
+            state->functions, state->command_cache,
+            gsh_variables_path_generation(state->variables),
+            command_uses_persistent_path(command), NULL,
+            &descriptor_builtin_io);
+        return true;
+    }
+    return false;
+}
+
+static bool pipeline_builtin_status(
+    shell_state *state, const gsh_native_command *command, int *status)
+{
+    if (!require(state != NULL)) return false;
+    if (!require(status != NULL)) return false;
+    if (primary_pipeline_builtin_status(state, command, status)) {
+        return true;
+    }
+    if (state_pipeline_builtin_status(state, command, status)) {
+        return true;
+    }
+    return inspection_pipeline_builtin_status(state, command, status);
+}
+
+static void close_pipeline_child_reactor(shell_state *state)
+{
+    if (!require(state != NULL)) _exit(125);
+    if (!require(state->tty_fd >= 0)) _exit(125);
+    (void)close(state->tty_fd);
+    (void)close(state->signal_pipe[0]);
+    (void)close(state->signal_pipe[1]);
+    if (state->redirection_worker_fd >= 0) {
+        (void)close(state->redirection_worker_fd);
+    }
+}
+
+_Noreturn static void execute_native_pipeline_child(
+    shell_state *state, const gsh_native_pipeline *pipeline,
+    const pipeline_expansion_scope *scope,
+    native_pipeline_launch *launch, size_t index)
+{
+    if (launch == NULL || pipeline == NULL) {
+        _exit(125);
+    }
+    const gsh_native_command *command = &pipeline->commands[index];
+    char release;
+    size_t close_index;
+    int builtin_status;
+
+    if (!require(state != NULL)) _exit(125);
+    if (!require(index < pipeline->command_count)) _exit(125);
+    (void)close(launch->gate[1]);
+    (void)setpgid(0, launch->pgid == 0 ? 0 : launch->pgid);
+    reset_child_signals();
+    (void)sigprocmask(SIG_SETMASK, &launch->previous, NULL);
+    if (command->expansion_error) {
+        _exit(1);
+    }
+    if (scope != NULL &&
+        gsh_variables_apply_journal_scope_in_place(
+            state->variables, scope->changes, index + 1U) == -1) {
+        child_exec_error("pipeline variable scope", errno);
+    }
+    if (index > 0 &&
+        child_duplicate_descriptor(launch->pipes[index - 1U][0],
+                                   STDIN_FILENO) == -1) {
+        child_exec_error("pipeline input", errno);
+    }
+    if (index + 1U < pipeline->command_count &&
+        child_duplicate_descriptor(launch->pipes[index][1],
+                                   STDOUT_FILENO) == -1) {
+        child_exec_error("pipeline output", errno);
+    }
+    child_apply_redirects(command, launch->heredoc_pipes,
+                          pipeline->heredoc_count, &state->options);
+    for (close_index = 0; close_index < launch->created_pipes;
+         close_index++) {
+        (void)close(launch->pipes[close_index][0]);
+        (void)close(launch->pipes[close_index][1]);
+    }
+    close_heredoc_descriptors(launch->heredoc_pipes,
+                              pipeline->heredoc_count);
+    while (read(launch->gate[0], &release, sizeof(release)) == -1 &&
+           errno == EINTR) {
+    }
+    (void)close(launch->gate[0]);
+    close_pipeline_child_reactor(state);
+    if (gsh_fault_should_fail(GSH_FAULT_EXEC, EIO)) {
+        child_exec_error(command->argv[0], errno);
+    }
+    if (pipeline_builtin_status(state, command, &builtin_status)) {
+        _exit(builtin_status);
+    }
+    {
+        char *environment_storage[CHILD_ENVIRONMENT_CAP];
+        char *const *environment = child_command_environment(
+            state->variables, command, environment_storage);
+
+        child_exec_direct(
+            command->argv,
+            command_path_value(state->variables, command,
+                               state->default_path),
+            environment, state->command_cache,
+            command_cache_path_generation(state->variables, command),
+            command_uses_persistent_path(command));
+    }
+    _exit(126);
+}
+
+static void reject_native_pipeline_fork(
+    shell_state *state, native_pipeline_launch *launch,
+    const char *operation, int error)
+{
+    if (operation == NULL) {
         return;
     }
-
-    sigemptyset(&blocked);
-    sigaddset(&blocked, SIGCHLD);
-    if (sigprocmask(SIG_BLOCK, &blocked, &previous) == -1) {
-        output_format(state, "gsh: sigprocmask: %s\r\n", strerror(errno));
-        close(gate[0]);
-        close(gate[1]);
-        close_pipeline_descriptors(pipes, created_pipes);
-        close_heredoc_descriptors(heredoc_pipes, created_heredocs);
-        state->mode = MODE_EDITOR;
-        queue_prompt(state);
-        return;
+    if (!require(state != NULL)) return;
+    if (!require(launch != NULL)) return;
+    close_pipeline_descriptors(launch->pipes, launch->created_pipes);
+    close_heredoc_descriptors(launch->heredoc_pipes,
+                              launch->created_heredocs);
+    (void)close(launch->gate[0]);
+    (void)close(launch->gate[1]);
+    if (launch->pgid > 0) {
+        (void)kill(-launch->pgid, SIGKILL);
+        initialize_job(&state->current_job, launch->pgid,
+                       launch->members[launch->launched - 1U],
+                       launch->members, launch->launched, false, false);
+        state->current_job.silent = true;
+        state->current_job.modes = state->original_modes;
     }
+    (void)sigprocmask(SIG_SETMASK, &launch->previous, NULL);
+    output_format(state, "gsh: %s: %s\r\n", operation, strerror(error));
+    state->mode = MODE_EDITOR;
+    queue_prompt(state);
+}
 
+static bool launch_native_pipeline_commands(
+    shell_state *state, const gsh_native_pipeline *pipeline,
+    const pipeline_expansion_scope *scope,
+    native_pipeline_launch *launch)
+{
+    size_t index;
+
+    if (!require(state != NULL)) return false;
+    if (!require(pipeline != NULL && launch != NULL)) return false;
     for (index = 0; index < pipeline->command_count; index++) {
-        pid_t pid = fault_should_fail("pipeline-fork", EAGAIN) ? -1 : fork();
+        pid_t pid = gsh_fault_should_fail(GSH_FAULT_PIPELINE_FORK, EAGAIN) ? -1 : fork();
 
         if (pid == 0) {
-            char release;
-            size_t close_index;
-
-            close(gate[1]);
-            (void)setpgid(0, pgid == 0 ? 0 : pgid);
-            reset_child_signals();
-            (void)sigprocmask(SIG_SETMASK, &previous, NULL);
-            if (pipeline->commands[index].expansion_error) {
-                _exit(1);
-            }
-            if (scope != NULL &&
-                gsh_variables_apply_journal_scope_in_place(
-                    state->variables, scope->changes, index + 1U) == -1) {
-                child_exec_error("pipeline variable scope", errno);
-            }
-            if (index > 0 &&
-                child_duplicate_descriptor(pipes[index - 1U][0],
-                                           STDIN_FILENO) == -1) {
-                child_exec_error("pipeline input", errno);
-            }
-            if (index + 1U < pipeline->command_count &&
-                child_duplicate_descriptor(pipes[index][1],
-                                           STDOUT_FILENO) == -1) {
-                child_exec_error("pipeline output", errno);
-            }
-            child_apply_redirects(&pipeline->commands[index],
-                                  heredoc_pipes,
-                                  pipeline->heredoc_count,
-                                  &state->options);
-            for (close_index = 0; close_index < created_pipes;
-                 close_index++) {
-                close(pipes[close_index][0]);
-                close(pipes[close_index][1]);
-            }
-            close_heredoc_descriptors(heredoc_pipes,
-                                      pipeline->heredoc_count);
-            while (read(gate[0], &release, sizeof(release)) == -1 &&
-                   errno == EINTR) {
-            }
-            close(gate[0]);
-            close(state->tty_fd);
-            close(state->signal_pipe[0]);
-            close(state->signal_pipe[1]);
-            if (state->redirection_worker_fd >= 0) {
-                close(state->redirection_worker_fd);
-            }
-            if (fault_should_fail("exec", EIO)) {
-                child_exec_error(pipeline->commands[index].argv[0], errno);
-            }
-            {
-                int builtin_status;
-
-                if (native_pure_builtin(&pipeline->commands[index])) {
-                    _exit(run_native_pure_builtin(
-                        &pipeline->commands[index], &descriptor_builtin_io));
-                }
-                if (native_posix_stateful_builtin(
-                        &pipeline->commands[index])) {
-                    _exit(child_run_posix_stateful_builtin(
-                        &pipeline->commands[index], state->variables,
-                        state->pipeline_variables, state->positionals,
-                        &state->options));
-                }
-                if (native_exit_builtin(&pipeline->commands[index])) {
-                    if (apply_special_builtin_assignments(
-                            state->variables, NULL,
-                            &pipeline->commands[index], &state->options) !=
-                        GSH_ASSIGNMENT_OK) {
-                        child_exec_error("exit assignment", errno);
-                    }
-                    (void)parse_exit_status(
-                        &pipeline->commands[index], state->last_status,
-                        &builtin_status);
-                    _exit(builtin_status & 255);
-                }
-                if (native_pwd_builtin(&pipeline->commands[index])) {
-                    _exit(child_run_pwd(&pipeline->commands[index],
-                                        state->variables));
-                }
-                if (native_cd_builtin(&pipeline->commands[index])) {
-                    if (apply_native_assignments(
-                            state->variables, NULL,
-                            &pipeline->commands[index], &state->options) !=
-                        GSH_ASSIGNMENT_OK) {
-                        child_exec_error("assignment", errno);
-                    }
-                    _exit(run_native_cd_builtin(
-                        &pipeline->commands[index], state->variables,
-                        state->variables, NULL,
-                        &state->options, &descriptor_builtin_io, NULL, 0));
-                }
-                if (native_environment_builtin(
-                        &pipeline->commands[index])) {
-                    _exit(run_native_environment_builtin(
-                        &pipeline->commands[index], &descriptor_builtin_io));
-                }
-                if (native_variable_builtin(
-                        &pipeline->commands[index])) {
-                    if (apply_special_builtin_assignments(
-                            state->variables, NULL,
-                            &pipeline->commands[index], &state->options) !=
-                        GSH_ASSIGNMENT_OK) {
-                        child_exec_error("assignment", errno);
-                    }
-                    _exit(run_native_variable_builtin(
-                        &pipeline->commands[index], state->variables, NULL,
-                        &state->options, NULL, &descriptor_builtin_io));
-                }
-                if (native_state_builtin(
-                        &pipeline->commands[index])) {
-                    gsh_positional_store empty;
-                    gsh_positional_store *positionals = state->positionals;
-
-                    if (positionals == NULL) {
-                        gsh_positionals_initialize(&empty);
-                        positionals = &empty;
-                    }
-                    if (apply_special_builtin_assignments(
-                            state->variables, NULL,
-                            &pipeline->commands[index], &state->options) !=
-                        GSH_ASSIGNMENT_OK) {
-                        child_exec_error("assignment", errno);
-                    }
-                    _exit(run_native_state_builtin(
-                        &pipeline->commands[index], state->variables,
-                        positionals, &state->options,
-                        &descriptor_builtin_io));
-                }
-                if (native_wait_builtin(&pipeline->commands[index])) {
-                    _exit(pipeline->commands[index].argc == 1 ? 0 : 127);
-                }
-                if (native_alias_builtin(&pipeline->commands[index])) {
-                    _exit(run_native_alias_builtin(
-                        &pipeline->commands[index], state->aliases, NULL,
-                        &descriptor_builtin_io));
-                }
-                if (native_hash_builtin(&pipeline->commands[index])) {
-                    const gsh_native_command *command =
-                        &pipeline->commands[index];
-                    const char *path = hash_command_path_value(
-                        state->variables, command, state->default_path);
-
-                    _exit(run_native_hash_builtin(
-                        command, path, state->functions,
-                        state->command_cache,
-                        hash_command_path_generation(state->variables,
-                                                     command),
-                        NULL, &descriptor_builtin_io));
-                }
-                if (native_times_builtin(&pipeline->commands[index])) {
-                    if (apply_special_builtin_assignments(
-                            state->variables, NULL,
-                            &pipeline->commands[index], &state->options) !=
-                        GSH_ASSIGNMENT_OK) {
-                        child_exec_error("assignment", errno);
-                    }
-                    _exit(run_native_times_builtin(
-                        &pipeline->commands[index], NULL,
-                        &descriptor_builtin_io));
-                }
-                if (native_command_inspection_builtin(
-                        &pipeline->commands[index])) {
-                    const gsh_native_command *command =
-                        &pipeline->commands[index];
-                    const char *path = command_path_value(
-                        state->variables, command, state->default_path);
-
-                    _exit(run_native_command_inspection(
-                        command, path, state->default_path,
-                        state->aliases, state->functions,
-                        state->command_cache,
-                        gsh_variables_path_generation(state->variables),
-                        command_uses_persistent_path(command), NULL,
-                        &descriptor_builtin_io));
-                }
-            }
-            {
-                char *environment_storage[CHILD_ENVIRONMENT_CAP];
-                char *const *environment = child_command_environment(
-                    state->variables, &pipeline->commands[index],
-                    environment_storage);
-
-                child_exec_direct(
-                    pipeline->commands[index].argv,
-                    command_path_value(state->variables,
-                                       &pipeline->commands[index],
-                                       state->default_path),
-                    environment, state->command_cache,
-                    command_cache_path_generation(
-                        state->variables, &pipeline->commands[index]),
-                    command_uses_persistent_path(
-                        &pipeline->commands[index]));
-            }
+            execute_native_pipeline_child(state, pipeline, scope, launch,
+                                          index);
         }
         if (pid == -1) {
             int saved_errno = errno;
 
-            close_pipeline_descriptors(pipes, created_pipes);
-            close_heredoc_descriptors(heredoc_pipes,
-                                      created_heredocs);
-            close(gate[0]);
-            close(gate[1]);
-            if (pgid > 0) {
-                (void)kill(-pgid, SIGKILL);
-                initialize_job(&state->current_job, pgid,
-                               members[launched - 1U], members, launched,
-                               false, false);
-                state->current_job.silent = true;
-                state->current_job.modes = state->original_modes;
-            }
-            (void)sigprocmask(SIG_SETMASK, &previous, NULL);
-            output_format(state, "gsh: pipeline fork: %s\r\n",
-                          strerror(saved_errno));
-            state->mode = MODE_EDITOR;
-            queue_prompt(state);
-            return;
+            reject_native_pipeline_fork(state, launch, "pipeline fork",
+                                        saved_errno);
+            return false;
         }
-        if (pgid == 0) {
-            pgid = pid;
+        if (launch->pgid == 0) {
+            launch->pgid = pid;
         }
-        members[launched++] = pid;
-        if (setpgid(pid, pgid) == -1 && errno != EACCES && errno != ESRCH) {
+        launch->members[launch->launched++] = pid;
+        if (setpgid(pid, launch->pgid) == -1 && errno != EACCES &&
+            errno != ESRCH) {
             (void)kill(pid, SIGKILL);
         }
     }
+    launch->status_pid = launch->members[pipeline->command_count - 1U];
+    return true;
+}
 
-    status_pid = members[pipeline->command_count - 1U];
+_Noreturn static void execute_pipeline_heredoc_child(
+    shell_state *state, const gsh_native_pipeline *pipeline,
+    native_pipeline_launch *launch, size_t index)
+{
+    if (pipeline == NULL) _exit(125);
+    if (launch == NULL) {
+        _exit(125);
+    }
+    char release;
+
+    if (!require(state != NULL)) _exit(125);
+    if (!require(index < pipeline->heredoc_count)) _exit(125);
+    (void)close(launch->gate[1]);
+    (void)setpgid(0, launch->pgid);
+    reset_child_signals();
+    (void)sigprocmask(SIG_SETMASK, &launch->previous, NULL);
+    close_pipeline_descriptors(launch->pipes, launch->created_pipes);
+    while (read(launch->gate[0], &release, sizeof(release)) == -1 &&
+           errno == EINTR) {
+    }
+    (void)close(launch->gate[0]);
+    close_pipeline_child_reactor(state);
+    child_write_heredoc(pipeline, index, launch->heredoc_pipes);
+    _exit(126);
+}
+
+static bool launch_pipeline_heredoc_writers(
+    shell_state *state, const gsh_native_pipeline *pipeline,
+    native_pipeline_launch *launch)
+{
+    size_t index;
+
+    if (!require(state != NULL)) return false;
+    if (!require(pipeline != NULL && launch != NULL)) return false;
     for (index = 0; index < pipeline->heredoc_count; index++) {
-        pid_t pid = fault_should_fail("heredoc-fork", EAGAIN) ? -1 : fork();
+        pid_t pid = gsh_fault_should_fail(GSH_FAULT_HEREDOC_FORK, EAGAIN) ? -1 : fork();
 
         if (pid == 0) {
-            char release;
-
-            close(gate[1]);
-            (void)setpgid(0, pgid);
-            reset_child_signals();
-            (void)sigprocmask(SIG_SETMASK, &previous, NULL);
-            close_pipeline_descriptors(pipes, created_pipes);
-            while (read(gate[0], &release, sizeof(release)) == -1 &&
-                   errno == EINTR) {
-            }
-            close(gate[0]);
-            close(state->tty_fd);
-            close(state->signal_pipe[0]);
-            close(state->signal_pipe[1]);
-            if (state->redirection_worker_fd >= 0) {
-                close(state->redirection_worker_fd);
-            }
-            child_write_heredoc(pipeline, index, heredoc_pipes);
+            execute_pipeline_heredoc_child(state, pipeline, launch, index);
         }
         if (pid == -1) {
             int saved_errno = errno;
 
-            close_pipeline_descriptors(pipes, created_pipes);
-            close_heredoc_descriptors(heredoc_pipes,
-                                      created_heredocs);
-            close(gate[0]);
-            close(gate[1]);
-            (void)kill(-pgid, SIGKILL);
-            initialize_job(&state->current_job, pgid, status_pid,
-                           members, launched, false, false);
-            state->current_job.silent = true;
-            state->current_job.modes = state->original_modes;
-            (void)sigprocmask(SIG_SETMASK, &previous, NULL);
-            output_format(state, "gsh: here-document fork: %s\r\n",
-                          strerror(saved_errno));
-            state->mode = MODE_EDITOR;
-            queue_prompt(state);
-            return;
+            reject_native_pipeline_fork(state, launch,
+                                        "here-document fork", saved_errno);
+            return false;
         }
-        members[launched++] = pid;
-        if (setpgid(pid, pgid) == -1 && errno != EACCES && errno != ESRCH) {
+        launch->members[launch->launched++] = pid;
+        if (setpgid(pid, launch->pgid) == -1 && errno != EACCES &&
+            errno != ESRCH) {
             (void)kill(pid, SIGKILL);
         }
     }
+    return true;
+}
 
-    close_pipeline_descriptors(pipes, created_pipes);
-    close_heredoc_descriptors(heredoc_pipes, created_heredocs);
-    close(gate[0]);
-    initialize_job(&state->current_job, pgid, status_pid,
-                   members, launched, true, pipeline->negated);
+static void handoff_native_pipeline(
+    shell_state *state, const gsh_native_pipeline *pipeline,
+    native_pipeline_launch *launch)
+{
+    if (launch == NULL) {
+        return;
+    }
+    if (!require(state != NULL)) return;
+    if (!require(pipeline != NULL)) return;
+    close_pipeline_descriptors(launch->pipes, launch->created_pipes);
+    close_heredoc_descriptors(launch->heredoc_pipes,
+                              launch->created_heredocs);
+    (void)close(launch->gate[0]);
+    initialize_job(&state->current_job, launch->pgid, launch->status_pid,
+                   launch->members, launch->launched, true,
+                   pipeline->negated);
     state->current_job.modes = state->original_modes;
-    if (fault_should_fail("terminal-handoff", EIO) ||
+    if (gsh_fault_should_fail(GSH_FAULT_TERMINAL_HANDOFF, EIO) ||
         tcsetattr(state->tty_fd, TCSANOW, &state->original_modes) == -1 ||
-        tcsetpgrp(state->tty_fd, pgid) == -1) {
+        tcsetpgrp(state->tty_fd, launch->pgid) == -1) {
         int saved_errno = errno;
 
         state->current_job.foreground = false;
         state->current_job.silent = true;
-        (void)kill(-pgid, SIGKILL);
-        close(gate[1]);
-        (void)sigprocmask(SIG_SETMASK, &previous, NULL);
+        (void)kill(-launch->pgid, SIGKILL);
+        (void)close(launch->gate[1]);
+        (void)sigprocmask(SIG_SETMASK, &launch->previous, NULL);
         (void)enter_editor(state);
         output_format(state, "gsh: terminal handoff: %s\r\n",
                       strerror(saved_errno));
@@ -6441,8 +7221,36 @@ static void start_native_pipeline(shell_state *state,
     }
     state->terminal_changed = false;
     state->mode = MODE_FOREGROUND;
-    close(gate[1]);
-    (void)sigprocmask(SIG_SETMASK, &previous, NULL);
+    (void)close(launch->gate[1]);
+    (void)sigprocmask(SIG_SETMASK, &launch->previous, NULL);
+}
+
+static void start_native_pipeline(shell_state *state,
+                                  const gsh_native_pipeline *pipeline,
+                                  const pipeline_expansion_scope *scope)
+{
+    native_pipeline_launch launch;
+
+    if (!require(state != NULL)) return;
+    if (!require(pipeline != NULL)) return;
+    if (scope == NULL) {
+        cache_native_pipeline_commands(state, pipeline);
+    }
+    if (state->async_repl != NULL && state_async_repl(state)->enabled) {
+        start_async_native_pipeline(state, pipeline, scope);
+        return;
+    }
+    initialize_native_pipeline_launch(&launch, pipeline->command_count);
+    if (!native_pipeline_capacity_is_available(state) ||
+        !create_native_pipeline_descriptors(state, pipeline, &launch) ||
+        !block_pipeline_child_notifications(state, &launch)) {
+        return;
+    }
+    if (!launch_native_pipeline_commands(state, pipeline, scope, &launch) ||
+        !launch_pipeline_heredoc_writers(state, pipeline, &launch)) {
+        return;
+    }
+    handoff_native_pipeline(state, pipeline, &launch);
 }
 
 typedef struct {
@@ -6483,7 +7291,7 @@ static int open_managed_pty(managed_pty *pty)
         errno = ENAMETOOLONG;
         return -1;
     }
-    memcpy(pty->slave, name, strlen(name) + 1U);
+    (void)memcpy(pty->slave, name, strlen(name) + 1U);
     pty->slave_hold = open(pty->slave, O_RDWR | O_NOCTTY | O_CLOEXEC);
     if (pty->slave_hold == -1 ||
         set_fd_flags(pty->master, F_GETFD, FD_CLOEXEC) == -1) {
@@ -6504,6 +7312,7 @@ static int open_managed_pty(managed_pty *pty)
 static void close_child_reactor_descriptors(shell_state *state,
                                             int retained)
 {
+    if (state == NULL) return;
     int index;
 
     if (state->tty_fd >= 0 && state->tty_fd != retained) {
@@ -6518,7 +7327,7 @@ static void close_child_reactor_descriptors(shell_state *state,
         return;
     }
     for (index = 0; index < GSH_ASYNC_CELL_CAP; index++) {
-        int descriptor = state->async_repl->cells[index].pty_fd;
+        int descriptor = state_async_repl(state)->cells[index].pty_fd;
 
         if (descriptor >= 0 && descriptor != retained) {
             (void)close(descriptor);
@@ -6528,6 +7337,10 @@ static void close_child_reactor_descriptors(shell_state *state,
 
 static int attach_child_pty(shell_state *state, const managed_pty *pty)
 {
+    if (state == NULL) return -1;
+    if (pty == NULL) {
+        return -1;
+    }
     struct winsize size;
     int slave;
 
@@ -6544,7 +7357,7 @@ static int attach_child_pty(shell_state *state, const managed_pty *pty)
         return -1;
     }
 #endif
-    memset(&size, 0, sizeof(size));
+    (void)memset(&size, 0, sizeof(size));
     if (ioctl(state->tty_fd, TIOCGWINSZ, &size) == 0) {
         (void)ioctl(slave, TIOCSWINSZ, &size);
     }
@@ -6571,6 +7384,9 @@ static int attach_child_pty(shell_state *state, const managed_pty *pty)
 static void child_exec_managed_external(shell_state *state,
                                         simple_command *direct)
 {
+    if (state == NULL) {
+        return;
+    }
     char *environment_storage[CHILD_ENVIRONMENT_CAP];
     char *const *environment = child_command_environment(
         state->variables, NULL, environment_storage);
@@ -6594,6 +7410,9 @@ static void managed_external_child(shell_state *state, managed_pty *pty,
                                    const sigset_t *previous,
                                    simple_command *direct)
 {
+    if (direct == NULL || previous == NULL || pty == NULL) {
+        return;
+    }
     char release;
 
     (void)close(gate_write);
@@ -6621,7 +7440,7 @@ static int register_managed_job(shell_state *state, int cell_index,
         errno = EINVAL;
         return -1;
     }
-    cell = &state->async_repl->cells[cell_index];
+    cell = &state_async_repl(state)->cells[cell_index];
     return gsh_background_add_job(
         &state->background_jobs, pgid, pid, &pid, 1U,
         cell->command, cell->command_length, GSH_JOB_ORIGIN_MANAGED, NULL);
@@ -6629,6 +7448,10 @@ static int register_managed_job(shell_state *state, int cell_index,
 
 static void start_async_external(shell_state *state, simple_command *direct)
 {
+    if (state == NULL) return;
+    if (direct == NULL) {
+        return;
+    }
     managed_pty pty = {.master = -1, .slave_hold = -1};
     int gate[2] = {-1, -1};
     sigset_t blocked;
@@ -6636,12 +7459,12 @@ static void start_async_external(shell_state *state, simple_command *direct)
     pid_t pid;
 
     if (!gsh_background_has_capacity(&state->background_jobs)) {
-        output_text(state, "gsh: managed job registry full\r\n");
+        (void)output_text(state, "gsh: managed job registry full\r\n");
         state->mode = MODE_EDITOR;
         return;
     }
     if (open_managed_pty(&pty) == -1 ||
-        make_pipe(gate, false GSH_FAULT_ARGUMENT("job-pipe")) == -1) {
+        make_pipe(gate, false, GSH_FAULT_JOB_PIPE) == -1) {
         output_format(state, "gsh: managed launch: %s\r\n",
                       strerror(errno));
         if (pty.master >= 0) {
@@ -6653,8 +7476,8 @@ static void start_async_external(shell_state *state, simple_command *direct)
         state->mode = MODE_EDITOR;
         return;
     }
-    sigemptyset(&blocked);
-    sigaddset(&blocked, SIGCHLD);
+    (void)sigemptyset(&blocked);
+    (void)sigaddset(&blocked, SIGCHLD);
     if (sigprocmask(SIG_BLOCK, &blocked, &previous) == -1) {
         output_format(state, "gsh: managed sigprocmask: %s\r\n",
                       strerror(errno));
@@ -6696,130 +7519,93 @@ static void start_async_external(shell_state *state, simple_command *direct)
     queue_prompt(state);
 }
 
-static void start_external(shell_state *state, simple_command *direct)
+static simple_command *prepare_external_direct(shell_state *state,
+                                               simple_command *direct,
+                                               const char *path_value)
 {
-    int gate[2];
-    sigset_t blocked;
-    sigset_t previous;
-    const char *path_value =
-        store_path_value(state->variables, state->default_path);
-    pid_t pid;
+    char resolved[GSH_COMMAND_PATH_CAP];
+    bool cache_changed = false;
 
-    if (!gsh_background_has_capacity(&state->background_jobs)) {
-        output_text(state, "gsh: job registry full\r\n");
-        state->mode = MODE_EDITOR;
-        queue_prompt(state);
+    if (!require(state != NULL && path_value != NULL)) return NULL;
+    if (!require(state->command_cache != NULL)) return NULL;
+    if (direct == NULL || !direct_path_is_bounded(direct, path_value)) {
+        return NULL;
+    }
+    (void)gsh_command_cache_resolve(
+        state->command_cache,
+        gsh_variables_path_generation(state->variables), direct->argv[0],
+        path_value, false, &cache_changed, resolved);
+    if (cache_changed) state->command_cache_generation++;
+    return direct;
+}
+
+static void execute_external_child(shell_state *state, simple_command *direct,
+                                   const char *path_value, int gate_read,
+                                   int gate_write, const sigset_t *previous)
+{
+    if (previous == NULL || state == NULL) {
         return;
     }
+    char release;
+    char *environment_storage[CHILD_ENVIRONMENT_CAP];
+    char *const *environment;
+    char *shell_arguments[] = {(char *)"sh", (char *)"-c",
+                               (char *)state->pending_input, NULL};
 
-    if (direct != NULL && !direct_path_is_bounded(direct, path_value)) {
-        direct = NULL;
+    if (!require(state != NULL && path_value != NULL)) _exit(125);
+    if (!require(gate_read >= 0 && gate_write >= 0)) _exit(125);
+    environment = child_command_environment(state->variables, NULL,
+                                            environment_storage);
+    (void)close(gate_write);
+    (void)setpgid(0, 0);
+    reset_child_signals();
+    (void)sigprocmask(SIG_SETMASK, previous, NULL);
+    while (read(gate_read, &release, sizeof(release)) == -1 &&
+           errno == EINTR) {
+    }
+    (void)close(gate_read);
+    (void)close(state->tty_fd);
+    (void)close(state->signal_pipe[0]);
+    (void)close(state->signal_pipe[1]);
+    if (state->redirection_worker_fd >= 0) {
+        (void)close(state->redirection_worker_fd);
     }
     if (direct != NULL) {
-        char resolved[GSH_COMMAND_PATH_CAP];
-        bool cache_changed = false;
-
-        (void)gsh_command_cache_resolve(
-            state->command_cache,
-            gsh_variables_path_generation(state->variables),
-            direct->argv[0], path_value, false, &cache_changed, resolved);
-        if (cache_changed) {
-            state->command_cache_generation++;
+        if (gsh_fault_should_fail(GSH_FAULT_EXEC, EIO)) {
+            child_exec_error(direct->argv[0], errno);
         }
+        child_exec_direct(
+            direct->argv, path_value, environment, state->command_cache,
+            gsh_variables_path_generation(state->variables), true);
     }
-    if (state->async_repl != NULL && state->async_repl->enabled) {
-        start_async_external(state, direct);
-        return;
-    }
+    if (gsh_fault_should_fail(GSH_FAULT_EXEC, EIO)) child_exec_error("/bin/sh", errno);
+    execve("/bin/sh", shell_arguments, environment);
+    (void)write(STDERR_FILENO, "gsh: cannot execute /bin/sh\n", 28U);
+    _exit(127);
+}
 
-    if (state->current_job.active) {
-        output_text(state,
-                    "gsh: this MVP supports one job at a time; use fg or wait "
-                    "for it\r\n");
-        state->mode = MODE_EDITOR;
-        queue_prompt(state);
-        return;
-    }
-    if (make_pipe(gate, false GSH_FAULT_ARGUMENT("job-pipe")) == -1) {
-        output_format(state, "gsh: pipe: %s\r\n", strerror(errno));
-        state->mode = MODE_EDITOR;
-        queue_prompt(state);
-        return;
-    }
+static void reject_external_fork(shell_state *state, int gate_write,
+                                 const sigset_t *previous, int saved_errno)
+{
+    if (!require(state != NULL && previous != NULL)) return;
+    if (!require(gate_write >= 0)) return;
+    (void)close(gate_write);
+    (void)sigprocmask(SIG_SETMASK, previous, NULL);
+    output_format(state, "gsh: fork: %s\r\n", strerror(saved_errno));
+    state->mode = MODE_EDITOR;
+    queue_prompt(state);
+}
 
-    sigemptyset(&blocked);
-    sigaddset(&blocked, SIGCHLD);
-    if (sigprocmask(SIG_BLOCK, &blocked, &previous) == -1) {
-        close(gate[0]);
-        close(gate[1]);
-        output_format(state, "gsh: sigprocmask: %s\r\n", strerror(errno));
-        state->mode = MODE_EDITOR;
-        queue_prompt(state);
-        return;
-    }
-
-    pid = fault_should_fail("job-fork", EAGAIN) ? -1 : fork();
-    if (pid == 0) {
-        char release;
-        char *environment_storage[CHILD_ENVIRONMENT_CAP];
-        char *const *environment = child_command_environment(
-            state->variables, NULL, environment_storage);
-        char *shell_arguments[] = {(char *)"sh", (char *)"-c",
-                                   (char *)state->pending_input, NULL};
-
-        close(gate[1]);
-        (void)setpgid(0, 0);
-        reset_child_signals();
-        (void)sigprocmask(SIG_SETMASK, &previous, NULL);
-        while (read(gate[0], &release, sizeof(release)) == -1 &&
-               errno == EINTR) {
-        }
-        close(gate[0]);
-        close(state->tty_fd);
-        close(state->signal_pipe[0]);
-        close(state->signal_pipe[1]);
-        if (state->redirection_worker_fd >= 0) {
-            close(state->redirection_worker_fd);
-        }
-        if (direct != NULL) {
-            if (fault_should_fail("exec", EIO)) {
-                child_exec_error(direct->argv[0], errno);
-            }
-            child_exec_direct(
-                direct->argv, path_value, environment,
-                state->command_cache,
-                gsh_variables_path_generation(state->variables), true);
-        }
-        if (fault_should_fail("exec", EIO)) {
-            child_exec_error("/bin/sh", errno);
-        }
-        execve("/bin/sh", shell_arguments, environment);
-        {
-            ssize_t reported = write(
-                STDERR_FILENO, "gsh: cannot execute /bin/sh\n", 28);
-
-            (void)reported;
-        }
-        _exit(127);
-    }
-
-    close(gate[0]);
-    if (pid == -1) {
-        int saved_errno = errno;
-
-        close(gate[1]);
-        (void)sigprocmask(SIG_SETMASK, &previous, NULL);
-        output_format(state, "gsh: fork: %s\r\n", strerror(saved_errno));
-        state->mode = MODE_EDITOR;
-        queue_prompt(state);
-        return;
-    }
-
-    initialize_job(&state->current_job, pid, pid, &pid, 1, true, false);
+static bool handoff_external_job(shell_state *state, pid_t pid,
+                                 int gate_write,
+                                 const sigset_t *previous)
+{
+    if (!require(state != NULL && previous != NULL)) return false;
+    if (!require(pid > 0 && gate_write >= 0)) return false;
+    initialize_job(&state->current_job, pid, pid, &pid, 1U, true, false);
     state->current_job.modes = state->original_modes;
-
     (void)setpgid(pid, pid);
-    if (fault_should_fail("terminal-handoff", EIO) ||
+    if (gsh_fault_should_fail(GSH_FAULT_TERMINAL_HANDOFF, EIO) ||
         tcsetattr(state->tty_fd, TCSANOW, &state->original_modes) == -1 ||
         tcsetpgrp(state->tty_fd, pid) == -1) {
         int saved_errno = errno;
@@ -6827,23 +7613,95 @@ static void start_external(shell_state *state, simple_command *direct)
         state->current_job.foreground = false;
         (void)kill(-pid, SIGKILL);
         (void)kill(pid, SIGKILL);
-        close(gate[1]);
-        (void)sigprocmask(SIG_SETMASK, &previous, NULL);
+        (void)close(gate_write);
+        (void)sigprocmask(SIG_SETMASK, previous, NULL);
         (void)enter_editor(state);
         output_format(state, "gsh: terminal handoff: %s\r\n",
                       strerror(saved_errno));
         queue_prompt(state);
+        return false;
+    }
+    state->terminal_changed = false;
+    state->mode = MODE_FOREGROUND;
+    (void)close(gate_write);
+    (void)sigprocmask(SIG_SETMASK, previous, NULL);
+    return true;
+}
+
+static void start_external(shell_state *state, simple_command *direct)
+{
+    if (direct == NULL) {
+        return;
+    }
+    int gate[2];
+    sigset_t blocked;
+    sigset_t previous;
+    const char *path_value;
+    pid_t pid;
+
+    if (!require(state != NULL)) return;
+    if (!require(state->variables != NULL)) return;
+    path_value = store_path_value(state->variables, state->default_path);
+    if (!gsh_background_has_capacity(&state->background_jobs)) {
+        (void)output_text(state, "gsh: job registry full\r\n");
+        state->mode = MODE_EDITOR;
+        queue_prompt(state);
         return;
     }
 
-    state->terminal_changed = false;
-    state->mode = MODE_FOREGROUND;
-    close(gate[1]);
-    (void)sigprocmask(SIG_SETMASK, &previous, NULL);
+    direct = prepare_external_direct(state, direct, path_value);
+    if (state->async_repl != NULL && state_async_repl(state)->enabled) {
+        start_async_external(state, direct);
+        return;
+    }
+
+    if (state->current_job.active) {
+        (void)output_text(state,
+                    "gsh: this MVP supports one job at a time; use fg or wait "
+                    "for it\r\n");
+        state->mode = MODE_EDITOR;
+        queue_prompt(state);
+        return;
+    }
+    if (make_pipe(gate, false, GSH_FAULT_JOB_PIPE) == -1) {
+        output_format(state, "gsh: pipe: %s\r\n", strerror(errno));
+        state->mode = MODE_EDITOR;
+        queue_prompt(state);
+        return;
+    }
+
+    (void)sigemptyset(&blocked);
+    (void)sigaddset(&blocked, SIGCHLD);
+    if (sigprocmask(SIG_BLOCK, &blocked, &previous) == -1) {
+        (void)close(gate[0]);
+        (void)close(gate[1]);
+        output_format(state, "gsh: sigprocmask: %s\r\n", strerror(errno));
+        state->mode = MODE_EDITOR;
+        queue_prompt(state);
+        return;
+    }
+
+    pid = gsh_fault_should_fail(GSH_FAULT_JOB_FORK, EAGAIN) ? -1 : fork();
+    if (pid == 0) {
+        execute_external_child(state, direct, path_value, gate[0], gate[1],
+                               &previous);
+    }
+
+    (void)close(gate[0]);
+    if (pid == -1) {
+        int saved_errno = errno;
+
+        reject_external_fork(state, gate[1], &previous, saved_errno);
+        return;
+    }
+    (void)handoff_external_job(state, pid, gate[1], &previous);
 }
 
 static char *trim_command(char *command)
 {
+    if (command == NULL) {
+        return NULL;
+    }
     char *start = command;
     char *end;
 
@@ -6861,6 +7719,9 @@ static char *trim_command(char *command)
 static const char *store_path_value(const gsh_variable_store *variables,
                                     const char *default_path)
 {
+    if (default_path == NULL || variables == NULL) {
+        return NULL;
+    }
     bool found;
     const char *path =
         gsh_variables_lookup(variables, "PATH", 4, &found);
@@ -6871,6 +7732,9 @@ static const char *store_path_value(const gsh_variable_store *variables,
 static const char *command_path_override(
     const gsh_native_command *command, const char *path)
 {
+    if (path == NULL) {
+        return NULL;
+    }
     size_t index;
 
     if (command == NULL) {
@@ -6904,6 +7768,9 @@ static uint64_t command_cache_path_generation(
     const gsh_variable_store *variables,
     const gsh_native_command *command)
 {
+    if (variables == NULL) {
+        return 0U;
+    }
     uint64_t generation = gsh_variables_path_generation(variables);
 
     if (command_uses_persistent_path(command)) {
@@ -6916,6 +7783,9 @@ static const char *hash_command_path_value(
     const gsh_variable_store *variables,
     const gsh_native_command *command, const char *default_path)
 {
+    if (command == NULL || default_path == NULL || variables == NULL) {
+        return NULL;
+    }
     return command_path_override(
         command, store_path_value(variables, default_path));
 }
@@ -6924,6 +7794,9 @@ static uint64_t hash_command_path_generation(
     const gsh_variable_store *variables,
     const gsh_native_command *command)
 {
+    if (command == NULL || variables == NULL) {
+        return 0U;
+    }
     uint64_t generation = gsh_variables_path_generation(variables);
     size_t index;
 
@@ -6939,6 +7812,9 @@ static bool command_can_populate_cache(
     const gsh_native_command *command,
     const gsh_function_store *functions)
 {
+    if (functions == NULL) {
+        return false;
+    }
     const char *name;
     size_t length;
 
@@ -6961,6 +7837,9 @@ static bool cache_planned_external(
     const gsh_native_command *command, const char *default_path,
     const gsh_function_store *functions)
 {
+    if (default_path == NULL || variables == NULL) {
+        return false;
+    }
     char resolved[GSH_COMMAND_PATH_CAP];
     const char *name;
     const char *path;
@@ -6982,6 +7861,9 @@ static const char *command_path_value(
     const gsh_variable_store *variables, const gsh_native_command *command,
     const char *default_path)
 {
+    if (default_path == NULL || variables == NULL) {
+        return NULL;
+    }
     if (command != NULL && command->command_uses_default_path) {
         return default_path;
     }
@@ -6993,6 +7875,9 @@ static const char *scoped_command_path_value(
     const pipeline_expansion_scope *scope, unsigned int command_scope,
     const gsh_native_command *command, const char *default_path)
 {
+    if (default_path == NULL || scope == NULL) {
+        return NULL;
+    }
     gsh_variable_journal_value_state state;
     const char *path = gsh_variable_journal_lookup_scoped(
         scope->changes, command_scope, "PATH", 4, &state);
@@ -7015,153 +7900,40 @@ typedef struct {
     bool isolated;
 } main_expansion_transaction;
 
-static gsh_native_plan_status main_transaction_command_begin(
-    void *opaque, size_t command_index, size_t command_count)
+static shell_state *main_transaction_state(
+    const main_expansion_transaction *transaction)
 {
-    main_expansion_transaction *transaction = opaque;
-
-    transaction->isolated = command_count > 1U;
-    if (transaction->isolated) {
-        if (command_index == 0) {
-            gsh_variable_journal_initialize(
-                transaction->state->pipeline_changes, 0);
-            transaction->scope.base = transaction->state->variables;
-            transaction->scope.changes =
-                transaction->state->pipeline_changes;
-            transaction->scope.command_count = command_count;
-        }
-        transaction->scope.current_scope = command_index + 1U;
-    }
-    return GSH_NATIVE_PLAN_OK;
-}
-
-static const char *main_transaction_lookup(void *opaque, const char *name,
-                                           size_t name_length, bool *found)
-{
-    main_expansion_transaction *transaction = opaque;
-    const char *value;
-    gsh_variable_journal_value_state state;
-
-    if (transaction->isolated) {
-        value = gsh_variable_journal_lookup_scoped(
-            transaction->scope.changes,
-            transaction->scope.current_scope, name, name_length, &state);
-        if (state != GSH_VARIABLE_JOURNAL_VALUE_ABSENT) {
-            *found = state == GSH_VARIABLE_JOURNAL_VALUE_SET;
-            return value;
-        }
-        return gsh_variables_lookup(transaction->scope.base, name,
-                                    name_length, found);
-    }
-    if (transaction->mutated) {
-        value = gsh_variable_journal_lookup(
-            transaction->state->variable_commit, name, name_length, &state);
-        if (state != GSH_VARIABLE_JOURNAL_VALUE_ABSENT) {
-            *found = state == GSH_VARIABLE_JOURNAL_VALUE_SET;
-            return value;
-        }
-    }
-    return gsh_variables_lookup(transaction->state->variables, name,
-                                name_length, found);
-}
-
-static gsh_native_plan_status main_transaction_assign(
-    void *opaque, const char *name, size_t name_length, const char *value,
-    size_t value_length)
-{
-    main_expansion_transaction *transaction = opaque;
-    unsigned int attributes = assignment_attributes(
-        &transaction->state->options);
-
-    if (transaction->isolated) {
-        if (gsh_variable_journal_record_scoped(
-                transaction->scope.changes,
-                transaction->scope.current_scope, name, name_length, value,
-                value_length, attributes, attributes) == -1 ||
-            gsh_variables_can_apply_journal_scope(
-                transaction->scope.base, transaction->scope.changes,
-                transaction->scope.current_scope) == -1) {
-            output_text(transaction->state,
-                        "gsh: pipeline parameter assignment failed\r\n");
-            return errno == ENOSPC || errno == E2BIG
-                       ? GSH_NATIVE_PLAN_LIMIT
-                       : GSH_NATIVE_PLAN_ERROR;
-        }
-        return GSH_NATIVE_PLAN_OK;
-    }
-    if (!transaction->mutated) {
-        gsh_variable_journal_initialize(
-            transaction->state->variable_commit,
-            transaction->state->variable_generation);
-    }
-    if (gsh_variable_journal_record(transaction->state->variable_commit,
-                                    name, name_length, value, value_length,
-                                    attributes, attributes) == -1 ||
-        gsh_variables_can_apply_journal(
-            transaction->state->variables,
-            transaction->state->variable_commit) == -1) {
-        output_text(transaction->state,
-                    "gsh: parameter assignment failed\r\n");
-        return GSH_NATIVE_PLAN_ERROR;
-    }
-    transaction->mutated = true;
-    return GSH_NATIVE_PLAN_OK;
-}
-
-static gsh_native_plan_status main_transaction_parameter_error(
-    void *opaque, const char *name, size_t name_length, const char *message,
-    size_t message_length, bool default_message)
-{
-    main_expansion_transaction *transaction = opaque;
-    shell_state *state = transaction->state;
-
-    output_text(state, "gsh: ");
-    output_push(state, name, name_length);
-    output_text(state, ": ");
-    if (default_message) {
-        output_text(state, "parameter null or not set");
-    } else {
-        output_push(state, message, message_length);
-    }
-    output_text(state, "\r\n");
-    return GSH_NATIVE_PLAN_ERROR;
-}
-
-static gsh_native_plan_status main_transaction_expansion_error(
-    void *opaque, const char *message, size_t message_length)
-{
-    main_expansion_transaction *transaction = opaque;
-
-    output_text(transaction->state, "gsh: arithmetic expansion: ");
-    output_push(transaction->state, message, message_length);
-    output_text(transaction->state, "\r\n");
-    return GSH_NATIVE_PLAN_ERROR;
+    if (!require(transaction != NULL)) return NULL;
+    if (!require(transaction->state != NULL)) return NULL;
+    return transaction->state;
 }
 
 static void commit_main_transaction(main_expansion_transaction *transaction)
 {
+    if (transaction == NULL) return;
     if (transaction->isolated || !transaction->mutated) {
         return;
     }
     if (gsh_variables_apply_journal_in_place(
-            transaction->state->variables,
-            transaction->state->variable_commit) == 0) {
-        transaction->state->variable_generation++;
+            main_transaction_state(transaction)->variables,
+            main_transaction_state(transaction)->variable_commit) == 0) {
+        main_transaction_state(transaction)->variable_generation++;
     } else {
-        output_text(transaction->state,
+        (void)output_text(transaction->state,
                     "gsh: variable transaction commit failed\r\n");
     }
 }
 
 static int ensure_main_positionals(shell_state *state)
 {
+    if (state == NULL) return -1;
     if (state->positionals != NULL) {
         return 0;
     }
-    if (fault_should_fail("positional-allocation", ENOMEM)) {
+    if (gsh_fault_should_fail(GSH_FAULT_POSITIONAL_ALLOCATION, ENOMEM)) {
         return -1;
     }
-    state->positionals = &g_interactive_positionals;
+    state->positionals = state->positional_storage;
     gsh_positionals_initialize(state->positionals);
     return 0;
 }
@@ -7170,6 +7942,10 @@ static bool start_async_stateless_redirection(
     shell_state *state, const gsh_native_pipeline *pipeline,
     const gsh_native_command *command)
 {
+    if (state == NULL || command == NULL) return false;
+    if (pipeline == NULL) {
+        return false;
+    }
     const gsh_native_redirect *redirect;
     redirection_request request;
     mode_t mask;
@@ -7178,7 +7954,7 @@ static bool start_async_stateless_redirection(
     ssize_t sent;
 
     if (!state->redirection_worker_alive || state->redirection_worker_busy ||
-        fault_injection_active() || command->assignment_count != 0 ||
+        gsh_fault_active() || command->assignment_count != 0 ||
         command->redirect_count != 1U ||
         !native_stateless_builtin(command, &builtin_status)) {
         return false;
@@ -7189,7 +7965,7 @@ static bool start_async_stateless_redirection(
         redirect->operator_kind != GSH_TOKEN_DGREAT) {
         return false;
     }
-    memset(&request, 0, sizeof(request));
+    (void)memset(&request, 0, sizeof(request));
     if (redirect->target[0] == '/') {
         length = snprintf(request.directory, sizeof(request.directory),
                           "%s", redirect->target);
@@ -7227,7 +8003,7 @@ static bool start_async_stateless_redirection(
     state->redirection_worker_busy = true;
     state->redirection_active_request_id = request.request_id;
     state->redirection_pipeline_negated = pipeline->negated;
-    memcpy(state->redirection_target, request.directory,
+    (void)memcpy(state->redirection_target, request.directory,
            (size_t)length + 1U);
     state->mode = MODE_ASYNC_REDIRECTION;
     return true;
@@ -7236,6 +8012,9 @@ static bool start_async_stateless_redirection(
 static void begin_background_wait(shell_state *state,
                                   const gsh_native_pipeline *pipeline)
 {
+    if (pipeline == NULL || state == NULL) {
+        return;
+    }
     const gsh_native_command *command = &pipeline->commands[0];
     size_t argument;
 
@@ -7280,11 +8059,372 @@ static void run_fg(shell_state *state,
 static void run_bg(shell_state *state,
                    const gsh_native_command *command, bool negated);
 
+static bool finish_main_builtin(shell_state *state,
+                                const gsh_native_pipeline *pipeline,
+                                int status)
+{
+    if (!require(state != NULL)) return false;
+    if (!require(pipeline != NULL)) return false;
+    state->last_status = pipeline->negated ? (status == 0 ? 1 : 0) : status;
+    state->mode = MODE_EDITOR;
+    queue_prompt(state);
+    return true;
+}
+
+static bool run_main_simple_builtin(shell_state *state,
+                                    const gsh_native_pipeline *pipeline,
+                                    const gsh_native_command *command)
+{
+    if (pipeline == NULL) {
+        return false;
+    }
+    if (!require(state != NULL)) return false;
+    if (!require(command != NULL)) return false;
+    if (native_times_builtin(command) && command->redirect_count == 0 &&
+        command->assignment_count == 0) {
+        const gsh_builtin_io io = reactor_builtin_sink(state);
+        int status = run_native_times_builtin(command, NULL, &io);
+
+        return finish_main_builtin(state, pipeline, status);
+    }
+    if (!pipeline->negated && command->redirect_count == 0 &&
+        command->assignment_count == 0 &&
+        native_environment_builtin(command)) {
+        const gsh_builtin_io io = reactor_builtin_sink(state);
+        int status = run_native_environment_builtin(command, &io);
+
+        return finish_main_builtin(state, pipeline, status);
+    }
+    return false;
+}
+
+static bool run_main_job_control_builtin(
+    shell_state *state, const gsh_native_pipeline *pipeline,
+    const gsh_native_command *command)
+{
+    if (!require(state != NULL)) return false;
+    if (!require(pipeline != NULL && command != NULL)) return false;
+    const gsh_builtin_io io = reactor_builtin_sink(state);
+    int status = 0;
+
+    if (!native_job_control_builtin(command) ||
+        command->redirect_count != 0) {
+        return false;
+    }
+    if (command->assignment_count != 0) {
+        (void)memcpy(state->variable_scratch, state->variables,
+               sizeof(*state->variable_scratch));
+        if (apply_native_assignments(state->variable_scratch, NULL, command,
+                                     &state->options) != GSH_ASSIGNMENT_OK) {
+            status = 1;
+        }
+    }
+    if (status == 0 && native_fg_builtin(command)) {
+        run_fg(state, command, pipeline->negated);
+        return true;
+    }
+    if (status == 0 && native_bg_builtin(command)) {
+        run_bg(state, command, pipeline->negated);
+        return true;
+    }
+    if (status == 0) {
+        status = native_jobs_builtin(command)
+                     ? gsh_builtin_jobs(command->argc, command->argv,
+                                        &state->background_jobs, &io)
+                     : gsh_builtin_kill(command->argc, command->argv,
+                                        &state->background_jobs, &io);
+    }
+    return finish_main_builtin(state, pipeline, status);
+}
+
+static bool run_main_getopts_or_exec(
+    shell_state *state, const gsh_native_pipeline *pipeline,
+    const gsh_native_command *command)
+{
+    if (!require(state != NULL)) return false;
+    if (!require(pipeline != NULL && command != NULL)) return false;
+    if (native_getopts_builtin(command) && command->assignment_count == 0 &&
+        command->redirect_count == 0) {
+        const gsh_builtin_io io = reactor_builtin_sink(state);
+        int status = run_native_posix_stateful_builtin(
+            command, state->variables, state->variables,
+            state->variable_scratch, NULL, state->positionals,
+            &state->options, &io);
+
+        state->variable_generation++;
+        return finish_main_builtin(state, pipeline, status);
+    }
+    if (native_exec_builtin(command)) {
+        bool builtin_failed;
+        int status = run_evaluator_exec_builtin(
+            pipeline, state->variables, NULL, &state->options,
+            state->default_path, state->command_cache, state,
+            -1, NULL, &builtin_failed);
+
+        (void)builtin_failed;
+        if (command->assignment_count != 0) {
+            state->variable_generation++;
+        }
+        state->last_status = status;
+        state->mode = MODE_EDITOR;
+        queue_prompt(state);
+        return true;
+    }
+    return false;
+}
+
+static bool run_main_alias_builtin(
+    shell_state *state, const gsh_native_pipeline *pipeline,
+    const gsh_native_command *command)
+{
+    if (!require(state != NULL)) return false;
+    if (!require(pipeline != NULL && command != NULL)) return false;
+    const gsh_builtin_io io = reactor_builtin_sink(state);
+    bool mutates;
+    int status;
+
+    if (!native_alias_builtin(command) || command->redirect_count != 0) {
+        return false;
+    }
+    mutates = native_alias_mutates(command);
+    if (mutates && ensure_alias_state(state, false) == -1) {
+        output_format(state, "gsh: alias allocation: %s\r\n",
+                      strerror(errno));
+        status = 125;
+    } else if (command->assignment_count == 0) {
+        status = run_native_alias_builtin(command, state->aliases, NULL,
+                                          &io);
+    } else {
+        (void)memcpy(state->variable_scratch, state->variables,
+               sizeof(*state->variable_scratch));
+        if (apply_native_assignments(state->variable_scratch, NULL, command,
+                                     &state->options) != GSH_ASSIGNMENT_OK) {
+            output_format(state, "gsh: assignment: %s\r\n",
+                          strerror(errno));
+            status = 1;
+        } else {
+            status = run_native_alias_builtin(command, state->aliases, NULL,
+                                              &io);
+        }
+    }
+    if (mutates && state->aliases != NULL) {
+        state->alias_generation++;
+    }
+    return finish_main_builtin(state, pipeline, status);
+}
+
+static bool run_main_inspection_builtin(
+    shell_state *state, const gsh_native_pipeline *pipeline,
+    const gsh_native_command *command)
+{
+    if (!require(state != NULL)) return false;
+    if (!require(pipeline != NULL && command != NULL)) return false;
+    const gsh_builtin_io io = reactor_builtin_sink(state);
+    bool cache_changed = false;
+    int status;
+
+    if (native_hash_builtin(command) && command->redirect_count == 0) {
+        const char *path = hash_command_path_value(
+            state->variables, command, state->default_path);
+
+        status = run_native_hash_builtin(
+            command, path, state->functions, state->command_cache,
+            hash_command_path_generation(state->variables, command),
+            &cache_changed, &io);
+    } else if (native_command_inspection_builtin(command) &&
+               command->redirect_count == 0 &&
+               gsh_functions_lookup(state->functions, command->argv[0],
+                                    strlen(command->argv[0])) == NULL) {
+        const char *path = command_path_value(
+            state->variables, command, state->default_path);
+
+        status = run_native_command_inspection(
+            command, path, state->default_path, state->aliases,
+            state->functions, state->command_cache,
+            gsh_variables_path_generation(state->variables),
+            command_uses_persistent_path(command), &cache_changed, &io);
+    } else {
+        return false;
+    }
+    if (cache_changed) {
+        state->command_cache_generation++;
+    }
+    return finish_main_builtin(state, pipeline, status);
+}
+
+static bool run_main_state_builtin(
+    shell_state *state, const gsh_native_pipeline *pipeline,
+    const gsh_native_command *command)
+{
+    if (!require(state != NULL)) return false;
+    if (!require(pipeline != NULL && command != NULL)) return false;
+    const gsh_builtin_io io = reactor_builtin_sink(state);
+    int status;
+
+    if (!native_state_builtin(command) || command->redirect_count != 0) {
+        return false;
+    }
+    if (ensure_main_positionals(state) == -1) {
+        (void)output_text(state, "gsh: positional parameter allocation failed\r\n");
+        status = 125;
+    } else if (apply_special_builtin_assignments(
+                   state->variables, NULL, command, &state->options) !=
+               GSH_ASSIGNMENT_OK) {
+        output_format(state, "gsh: assignment: %s\r\n", strerror(errno));
+        status = 1;
+    } else {
+        status = run_native_state_builtin(
+            command, state->variables, state->positionals, &state->options,
+            &io);
+    }
+    state->variable_generation++;
+    return finish_main_builtin(state, pipeline, status);
+}
+
+static bool run_main_variable_builtin(
+    shell_state *state, const gsh_native_pipeline *pipeline,
+    const gsh_native_command *command)
+{
+    if (!require(state != NULL)) return false;
+    if (!require(pipeline != NULL && command != NULL)) return false;
+    const gsh_builtin_io io = reactor_builtin_sink(state);
+    bool function_mutates;
+    int status;
+
+    if (!native_variable_builtin(command) || command->redirect_count != 0 ||
+        native_variable_listing(command)) {
+        return false;
+    }
+    function_mutates = native_function_mutates(command);
+    if (apply_special_builtin_assignments(
+            state->variables, NULL, command, &state->options) !=
+        GSH_ASSIGNMENT_OK) {
+        output_format(state, "gsh: assignment: %s\r\n", strerror(errno));
+        status = 1;
+    } else {
+        status = run_native_variable_builtin(
+            command, state->variables, NULL, &state->options,
+            state->functions, &io);
+    }
+    if (status == 0 && function_mutates && state->functions != NULL) {
+        state->function_generation++;
+    }
+    state->variable_generation++;
+    return finish_main_builtin(state, pipeline, status);
+}
+
+static bool run_main_assignment_builtin(
+    shell_state *state, const gsh_native_pipeline *pipeline,
+    const gsh_native_command *command)
+{
+    if (!require(state != NULL)) return false;
+    if (!require(pipeline != NULL && command != NULL)) return false;
+    if (native_colon_builtin(command) && command->assignment_count != 0 &&
+        command->redirect_count == 0) {
+        int status = apply_special_builtin_assignments(
+            state->variables, NULL, command, &state->options);
+
+        state->last_status = status == GSH_ASSIGNMENT_OK
+                                 ? (pipeline->negated ? 1 : 0)
+                                 : 1;
+        if (status != GSH_ASSIGNMENT_OK) {
+            output_format(state, "gsh: assignment: %s\r\n",
+                          strerror(errno));
+        }
+        state->variable_generation++;
+        state->mode = MODE_EDITOR;
+        queue_prompt(state);
+        return true;
+    }
+    if (pipeline->negated || command->redirect_count != 0 ||
+        command->argc != 0 || command->assignment_count == 0) {
+        return false;
+    }
+    if (apply_native_assignments(state->variables, NULL, command,
+                                 &state->options) != GSH_ASSIGNMENT_OK) {
+        output_format(state, "gsh: assignment: %s\r\n", strerror(errno));
+        state->last_status = 1;
+    } else {
+        state->last_status = command->command_substitution_performed
+                                 ? command->command_substitution_status
+                                 : 0;
+    }
+    state->variable_generation++;
+    state->mode = MODE_EDITOR;
+    queue_prompt(state);
+    return true;
+}
+
+static bool run_main_cd_builtin(shell_state *state,
+                                const gsh_native_command *command)
+{
+    if (!require(state != NULL)) return false;
+    if (!require(command != NULL)) return false;
+    const gsh_builtin_io io = reactor_builtin_sink(state);
+    const gsh_variable_store *lookup_variables = state->variables;
+
+    if (!native_cd_builtin(command)) return false;
+    if (command->assignment_count != 0) {
+        (void)memcpy(state->variable_scratch, state->variables,
+               sizeof(*state->variable_scratch));
+        if (apply_native_assignments(state->variable_scratch, NULL, command,
+                                     &state->options) != GSH_ASSIGNMENT_OK) {
+            output_format(state, "gsh: assignment: %s\r\n",
+                          strerror(errno));
+            state->last_status = 1;
+            state->mode = MODE_EDITOR;
+            queue_prompt(state);
+            return true;
+        }
+        lookup_variables = state->variable_scratch;
+    }
+    state->last_status = run_native_cd_builtin(
+        command, lookup_variables, state->variables, NULL, &state->options,
+        &io, state->current_directory, sizeof(state->current_directory));
+    state->mode = MODE_EDITOR;
+    queue_prompt(state);
+    return true;
+}
+
+static bool run_main_exit_builtin(shell_state *state,
+                                  const gsh_native_command *command)
+{
+    if (!require(state != NULL)) return false;
+    if (!require(command != NULL)) return false;
+    if (command->assignment_count != 0 || command->argc == 0 ||
+        strcmp(command->argv[0], "exit") != 0) {
+        return false;
+    }
+    if (command->argc > 2) {
+        (void)output_text(state, "gsh: exit: too many operands\r\n");
+        state->last_status = 1;
+        state->mode = MODE_EDITOR;
+        queue_prompt(state);
+        return true;
+    }
+    if (command->argc == 2) {
+        char *end;
+        long status = strtol(command->argv[1], &end, 10);
+
+        if (*end != '\0') {
+            (void)output_text(state, "gsh: exit: numeric argument required\r\n");
+            state->last_status = 2;
+            state->running = false;
+            return true;
+        }
+        state->last_status = (int)((unsigned long)status & 255U);
+    }
+    state->running = false;
+    return true;
+}
+
 static bool run_planned_main_builtin(shell_state *state,
                                      const gsh_native_pipeline *pipeline)
 {
     const gsh_native_command *command;
 
+    if (!require(state != NULL)) return false;
+    if (!require(pipeline != NULL)) return false;
     if (pipeline->command_count != 1) {
         return false;
     }
@@ -7304,346 +8444,37 @@ static bool run_planned_main_builtin(shell_state *state,
         begin_background_wait(state, pipeline);
         return true;
     }
-    if (native_times_builtin(command) && command->redirect_count == 0 &&
-        command->assignment_count == 0) {
-        const gsh_builtin_io io = {reactor_builtin_output, state};
-        int status = run_native_times_builtin(command, NULL, &io);
-
-        state->last_status = pipeline->negated
-                                 ? (status == 0 ? 1 : 0)
-                                 : status;
-        state->mode = MODE_EDITOR;
-        queue_prompt(state);
+    if (run_main_simple_builtin(state, pipeline, command) ||
+        run_main_job_control_builtin(state, pipeline, command) ||
+        run_main_getopts_or_exec(state, pipeline, command) ||
+        run_main_alias_builtin(state, pipeline, command) ||
+        run_main_inspection_builtin(state, pipeline, command) ||
+        run_main_state_builtin(state, pipeline, command) ||
+        run_main_variable_builtin(state, pipeline, command) ||
+        run_main_assignment_builtin(state, pipeline, command)) {
         return true;
     }
-    if (!pipeline->negated && command->redirect_count == 0 &&
-        command->assignment_count == 0 &&
-        native_environment_builtin(command)) {
-        const gsh_builtin_io io = {reactor_builtin_output, state};
-
-        state->last_status = run_native_environment_builtin(command, &io);
-        state->mode = MODE_EDITOR;
-        queue_prompt(state);
-        return true;
-    }
-    if (native_job_control_builtin(command) &&
-        command->redirect_count == 0) {
-        const gsh_builtin_io io = {reactor_builtin_output, state};
-        int status = 0;
-
-        if (command->assignment_count != 0) {
-            memcpy(state->variable_scratch, state->variables,
-                   sizeof(*state->variable_scratch));
-            if (apply_native_assignments(
-                    state->variable_scratch, NULL, command,
-                    &state->options) != GSH_ASSIGNMENT_OK) {
-                status = 1;
-            }
-        }
-        if (status == 0 && native_fg_builtin(command)) {
-            run_fg(state, command, pipeline->negated);
-            return true;
-        }
-        if (status == 0 && native_bg_builtin(command)) {
-            run_bg(state, command, pipeline->negated);
-            return true;
-        }
-        if (status == 0) {
-            status = native_jobs_builtin(command)
-                         ? gsh_builtin_jobs(command->argc, command->argv,
-                                            &state->background_jobs, &io)
-                         : gsh_builtin_kill(command->argc, command->argv,
-                                            &state->background_jobs, &io);
-        }
-        state->last_status = pipeline->negated
-                                 ? (status == 0 ? 1 : 0) : status;
-        state->mode = MODE_EDITOR;
-        queue_prompt(state);
-        return true;
-    }
-    if (native_getopts_builtin(command) &&
-        command->assignment_count == 0 && command->redirect_count == 0) {
-        const gsh_builtin_io io = {reactor_builtin_output, state};
-        int status = run_native_posix_stateful_builtin(
-            command, state->variables, state->variables,
-            state->variable_scratch, NULL, state->positionals,
-            &state->options, &io);
-
-        state->variable_generation++;
-        state->last_status = pipeline->negated
-                                 ? (status == 0 ? 1 : 0)
-                                 : status;
-        state->mode = MODE_EDITOR;
-        queue_prompt(state);
-        return true;
-    }
-    if (native_exec_builtin(command)) {
-        bool builtin_failed;
-        int status = run_evaluator_exec_builtin(
-            pipeline, state->variables, NULL, &state->options,
-            state->default_path, state->command_cache, state,
-            -1, NULL, &builtin_failed);
-
-        (void)builtin_failed;
-        if (command->assignment_count != 0) {
-            state->variable_generation++;
-        }
-        state->last_status = status;
-        state->mode = MODE_EDITOR;
-        queue_prompt(state);
-        return true;
-    }
-    if (native_alias_builtin(command) && command->redirect_count == 0) {
-        const gsh_builtin_io io = {reactor_builtin_output, state};
-        bool mutates = native_alias_mutates(command);
-        int status;
-
-        if (mutates && ensure_alias_state(state, false) == -1) {
-            output_format(state, "gsh: alias allocation: %s\r\n",
-                          strerror(errno));
-            status = 125;
-        } else if (command->assignment_count == 0) {
-            status = run_native_alias_builtin(
-                command, state->aliases, NULL, &io);
-        } else {
-            memcpy(state->variable_scratch, state->variables,
-                   sizeof(*state->variable_scratch));
-            if (apply_native_assignments(
-                    state->variable_scratch, NULL, command,
-                    &state->options) != GSH_ASSIGNMENT_OK) {
-                output_format(state, "gsh: assignment: %s\r\n",
-                              strerror(errno));
-                status = 1;
-            } else {
-                status = run_native_alias_builtin(
-                    command, state->aliases, NULL, &io);
-            }
-        }
-        if (mutates && state->aliases != NULL) {
-            state->alias_generation++;
-        }
-        state->last_status = pipeline->negated
-                                 ? (status == 0 ? 1 : 0)
-                                 : status;
-        state->mode = MODE_EDITOR;
-        queue_prompt(state);
-        return true;
-    }
-    if (native_hash_builtin(command) && command->redirect_count == 0) {
-        const gsh_builtin_io io = {reactor_builtin_output, state};
-        const char *path = hash_command_path_value(
-            state->variables, command, state->default_path);
-        bool cache_changed = false;
-        int status = run_native_hash_builtin(
-            command, path, state->functions, state->command_cache,
-            hash_command_path_generation(state->variables, command),
-            &cache_changed, &io);
-
-        if (cache_changed) {
-            state->command_cache_generation++;
-        }
-        state->last_status = pipeline->negated
-                                 ? (status == 0 ? 1 : 0)
-                                 : status;
-        state->mode = MODE_EDITOR;
-        queue_prompt(state);
-        return true;
-    }
-    if (native_command_inspection_builtin(command) &&
-        command->redirect_count == 0 &&
-        gsh_functions_lookup(state->functions, command->argv[0],
-                             strlen(command->argv[0])) == NULL) {
-        const gsh_builtin_io io = {reactor_builtin_output, state};
-        const char *path = command_path_value(
-            state->variables, command, state->default_path);
-        bool cache_changed = false;
-        int status = run_native_command_inspection(
-            command, path, state->default_path, state->aliases,
-            state->functions, state->command_cache,
-            gsh_variables_path_generation(state->variables),
-            command_uses_persistent_path(command), &cache_changed, &io);
-
-        if (cache_changed) {
-            state->command_cache_generation++;
-        }
-
-        state->last_status = pipeline->negated
-                                 ? (status == 0 ? 1 : 0)
-                                 : status;
-        state->mode = MODE_EDITOR;
-        queue_prompt(state);
-        return true;
-    }
-    if (native_state_builtin(command) &&
-        command->redirect_count == 0) {
-        const gsh_builtin_io io = {reactor_builtin_output, state};
-        int status;
-
-        if (ensure_main_positionals(state) == -1) {
-            output_text(state,
-                        "gsh: positional parameter allocation failed\r\n");
-            status = 125;
-        } else if (apply_special_builtin_assignments(
-                       state->variables, NULL, command, &state->options) !=
-                   GSH_ASSIGNMENT_OK) {
-            output_format(state, "gsh: assignment: %s\r\n",
-                          strerror(errno));
-            status = 1;
-        } else {
-            status = run_native_state_builtin(
-                command, state->variables, state->positionals,
-                &state->options, &io);
-        }
-        state->variable_generation++;
-        state->last_status = pipeline->negated
-                                 ? (status == 0 ? 1 : 0)
-                                 : status;
-        state->mode = MODE_EDITOR;
-        queue_prompt(state);
-        return true;
-    }
-    if (native_variable_builtin(command) &&
-        command->redirect_count == 0 &&
-        !native_variable_listing(command)) {
-        const gsh_builtin_io io = {reactor_builtin_output, state};
-        bool function_mutates = native_function_mutates(command);
-        int status;
-
-        if (apply_special_builtin_assignments(
-                state->variables, NULL, command, &state->options) !=
-            GSH_ASSIGNMENT_OK) {
-            output_format(state, "gsh: assignment: %s\r\n",
-                          strerror(errno));
-            status = 1;
-        } else {
-            status = run_native_variable_builtin(
-                command, state->variables, NULL, &state->options,
-                state->functions, &io);
-        }
-        if (status == 0 && function_mutates && state->functions != NULL) {
-            state->function_generation++;
-        }
-        state->variable_generation++;
-        state->last_status = pipeline->negated
-                                 ? (status == 0 ? 1 : 0)
-                                 : status;
-        state->mode = MODE_EDITOR;
-        queue_prompt(state);
-        return true;
-    }
-    if (native_colon_builtin(command) &&
-        command->assignment_count != 0 &&
-        command->redirect_count == 0) {
-        int assignment_status = apply_special_builtin_assignments(
-            state->variables, NULL, command, &state->options);
-
-        if (assignment_status != GSH_ASSIGNMENT_OK) {
-            output_format(state, "gsh: assignment: %s\r\n",
-                          strerror(errno));
-            state->last_status = 1;
-        } else {
-            state->last_status = pipeline->negated ? 1 : 0;
-        }
-        state->variable_generation++;
-        state->mode = MODE_EDITOR;
-        queue_prompt(state);
-        return true;
-    }
-    if (pipeline->negated || command->redirect_count != 0) {
-        return false;
-    }
-    if (command->argc == 0 && command->assignment_count > 0) {
-        if (apply_native_assignments(state->variables, NULL, command,
-                                     &state->options) !=
-            GSH_ASSIGNMENT_OK) {
-            output_format(state, "gsh: assignment: %s\r\n",
-                          strerror(errno));
-            state->last_status = 1;
-        } else {
-            int assignment_status =
-                command->command_substitution_performed
-                    ? command->command_substitution_status
-                    : 0;
-
-            state->last_status = pipeline->negated
-                                     ? (assignment_status == 0 ? 1 : 0)
-                                     : assignment_status;
-        }
-        state->variable_generation++;
-        state->mode = MODE_EDITOR;
-        queue_prompt(state);
-        return true;
-    }
-    if (native_cd_builtin(command)) {
-        const gsh_builtin_io io = {reactor_builtin_output, state};
-        const gsh_variable_store *lookup_variables = state->variables;
-
-        if (command->assignment_count != 0) {
-            memcpy(state->variable_scratch, state->variables,
-                   sizeof(*state->variable_scratch));
-            if (apply_native_assignments(
-                    state->variable_scratch, NULL, command,
-                    &state->options) != GSH_ASSIGNMENT_OK) {
-                output_format(state, "gsh: assignment: %s\r\n",
-                              strerror(errno));
-                state->last_status = 1;
-                state->mode = MODE_EDITOR;
-                queue_prompt(state);
-                return true;
-            }
-            lookup_variables = state->variable_scratch;
-        }
-
-        state->last_status = run_native_cd_builtin(
-            command, lookup_variables, state->variables, NULL,
-            &state->options, &io, state->current_directory,
-            sizeof(state->current_directory));
-        state->mode = MODE_EDITOR;
-        queue_prompt(state);
-        return true;
-    }
+    if (pipeline->negated || command->redirect_count != 0) return false;
+    if (run_main_cd_builtin(state, command)) return true;
     if (native_environment_builtin(command)) {
-        const gsh_builtin_io io = {reactor_builtin_output, state};
+        const gsh_builtin_io io = reactor_builtin_sink(state);
 
         state->last_status = run_native_environment_builtin(command, &io);
         state->mode = MODE_EDITOR;
         queue_prompt(state);
         return true;
     }
-    if (command->assignment_count != 0 || command->argc == 0) {
-        return false;
-    }
-    if (strcmp(command->argv[0], "exit") == 0) {
-        if (command->argc > 2) {
-            output_text(state, "gsh: exit: too many operands\r\n");
-            state->last_status = 1;
-            state->mode = MODE_EDITOR;
-            queue_prompt(state);
-            return true;
-        }
-        if (command->argc == 2) {
-            char *end;
-            long status = strtol(command->argv[1], &end, 10);
-
-            if (*end != '\0') {
-                output_text(state,
-                            "gsh: exit: numeric argument required\r\n");
-                state->last_status = 2;
-                state->running = false;
-                return true;
-            }
-            state->last_status = (int)((unsigned long)status & 255U);
-        }
-        state->running = false;
-        return true;
-    }
-    return false;
+    return run_main_exit_builtin(state, command);
 }
 
 static const gsh_background_entry *resolve_reactor_job(
     shell_state *state, const gsh_native_command *command,
     const char *builtin_name, uint32_t *job_id)
 {
+    if (command == NULL) return NULL;
+    if (builtin_name == NULL || job_id == NULL || state == NULL) {
+        return NULL;
+    }
     const char *jobspec;
     gsh_jobspec_status status;
 
@@ -7678,6 +8509,9 @@ static const gsh_background_entry *resolve_reactor_job(
 static void finish_immediate_job_builtin(shell_state *state, int status,
                                          bool negated)
 {
+    if (state == NULL) {
+        return;
+    }
     state->last_status = negated ? (status == 0 ? 1 : 0) : status;
     state->mode = MODE_EDITOR;
     queue_prompt(state);
@@ -7686,11 +8520,14 @@ static void finish_immediate_job_builtin(shell_state *state, int status,
 static void load_current_job_from_service(
     shell_state *state, const gsh_background_entry *entry, bool negated)
 {
+    if (entry == NULL || state == NULL) {
+        return;
+    }
     size_t member;
 
     initialize_job(&state->current_job, entry->pgid, entry->status_pid,
                    entry->members, entry->member_count, true, negated);
-    memcpy(state->current_job.member_states, entry->member_states,
+    (void)memcpy(state->current_job.member_states, entry->member_states,
            entry->member_count * sizeof(entry->member_states[0]));
     state->current_job.remaining = entry->remaining;
     state->current_job.stopped = entry->state == GSH_JOB_STOPPED;
@@ -7705,9 +8542,47 @@ static void load_current_job_from_service(
     state->current_job.modes = state->original_modes;
 }
 
+static void run_managed_fg(shell_state *state,
+                           const gsh_background_entry *entry,
+                           uint32_t job_id, bool negated)
+{
+    int cell_index;
+
+    if (!require(state != NULL && entry != NULL)) return;
+    if (!require(entry->origin == GSH_JOB_ORIGIN_MANAGED)) return;
+    cell_index = gsh_async_repl_cell_for_pid(state->async_repl,
+                                             entry->status_pid);
+    if (cell_index < 0 ||
+        gsh_async_repl_focus(state->async_repl, cell_index) == -1) {
+        (void)output_text(state, "gsh: fg: managed job unavailable\r\n");
+        finish_immediate_job_builtin(state, 1, negated);
+        return;
+    }
+    if (entry->state == GSH_JOB_STOPPED &&
+        signal_managed_job(state, cell_index, SIGCONT) == -1) {
+        output_format(state, "gsh: fg: %s\r\n", strerror(errno));
+        finish_immediate_job_builtin(state, 1, negated);
+        return;
+    }
+    if (entry->state == GSH_JOB_STOPPED) {
+        (void)gsh_background_continue_job(&state->background_jobs, job_id);
+        gsh_async_repl_mark_running(state->async_repl, cell_index);
+    }
+    if (state_async_repl(state)->cells[cell_index].fullscreen) {
+        (void)signal_managed_job(state, cell_index, SIGWINCH);
+    }
+    output_format(state, "[focused cell %llu; Ctrl-] returns to editor]\r\n",
+                  (unsigned long long)
+                      state_async_repl(state)->cells[cell_index].id);
+    finish_immediate_job_builtin(state, 0, negated);
+}
+
 static void run_fg(shell_state *state,
                    const gsh_native_command *command, bool negated)
 {
+    if (command == NULL || state == NULL) {
+        return;
+    }
     const gsh_background_entry *entry;
     gsh_background_entry *mutable_entry;
     uint32_t job_id = 0;
@@ -7719,47 +8594,20 @@ static void run_fg(shell_state *state,
         return;
     }
     if (entry->origin == GSH_JOB_ORIGIN_MANAGED) {
-        int cell_index = gsh_async_repl_cell_for_pid(
-            state->async_repl, entry->status_pid);
-
-        if (cell_index < 0 ||
-            gsh_async_repl_focus(state->async_repl, cell_index) == -1) {
-            output_text(state, "gsh: fg: managed job unavailable\r\n");
-            finish_immediate_job_builtin(state, 1, negated);
-            return;
-        }
-        if (entry->state == GSH_JOB_STOPPED &&
-            signal_managed_job(state, cell_index, SIGCONT) == -1) {
-            output_format(state, "gsh: fg: %s\r\n", strerror(errno));
-            finish_immediate_job_builtin(state, 1, negated);
-            return;
-        }
-        if (entry->state == GSH_JOB_STOPPED) {
-            (void)gsh_background_continue_job(&state->background_jobs,
-                                               job_id);
-            gsh_async_repl_mark_running(state->async_repl, cell_index);
-        }
-        if (state->async_repl->cells[cell_index].fullscreen) {
-            (void)signal_managed_job(state, cell_index, SIGWINCH);
-        }
-        output_format(state,
-                      "[focused cell %llu; Ctrl-] returns to editor]\r\n",
-                      (unsigned long long)
-                          state->async_repl->cells[cell_index].id);
-        finish_immediate_job_builtin(state, 0, negated);
+        run_managed_fg(state, entry, job_id, negated);
         return;
     }
     if (state->current_job.active &&
         state->current_job.pgid != entry->pgid) {
         if (state->variable_commit_active ||
             state->pending_and_or_active || state->pending_list_active) {
-            output_text(state,
+            (void)output_text(state,
                         "gsh: fg: another foreground transaction is "
                         "suspended\r\n");
             finish_immediate_job_builtin(state, 1, negated);
             return;
         }
-        memset(&state->current_job, 0, sizeof(state->current_job));
+        (void)memset(&state->current_job, 0, sizeof(state->current_job));
     }
     if (!state->current_job.active) {
         load_current_job_from_service(state, entry, negated);
@@ -7768,15 +8616,15 @@ static void run_fg(shell_state *state,
         state->current_job.negated = negated;
     }
     if (entry->command_length != 0) {
-        output_push(state, entry->command, entry->command_length);
-        output_text(state, "\r\n");
+        (void)output_push(state, entry->command, entry->command_length);
+        (void)output_text(state, "\r\n");
     }
     if (tcsetattr(state->tty_fd, TCSANOW, &state->current_job.modes) == -1 ||
         tcsetpgrp(state->tty_fd, state->current_job.pgid) == -1) {
         int saved_errno = errno;
 
         if (reconstructed) {
-            memset(&state->current_job, 0, sizeof(state->current_job));
+            (void)memset(&state->current_job, 0, sizeof(state->current_job));
         }
         output_format(state, "gsh: fg: %s\r\n", strerror(saved_errno));
         (void)enter_editor(state);
@@ -7820,6 +8668,9 @@ static void run_fg(shell_state *state,
 static void run_bg(shell_state *state,
                    const gsh_native_command *command, bool negated)
 {
+    if (command == NULL || state == NULL) {
+        return;
+    }
     const gsh_background_entry *entry;
     gsh_background_entry *mutable_entry;
     uint32_t job_id = 0;
@@ -7830,7 +8681,7 @@ static void run_bg(shell_state *state,
         return;
     }
     if (entry->state != GSH_JOB_STOPPED) {
-        output_text(state, "gsh: bg: job is not stopped\r\n");
+        (void)output_text(state, "gsh: bg: job is not stopped\r\n");
         finish_immediate_job_builtin(state, 1, negated);
         return;
     }
@@ -7848,7 +8699,7 @@ static void run_bg(shell_state *state,
         }
         (void)gsh_background_continue_job(&state->background_jobs, job_id);
         gsh_async_repl_mark_running(state->async_repl, cell_index);
-        output_text(state, "[continued]\r\n");
+        (void)output_text(state, "[continued]\r\n");
         finish_immediate_job_builtin(state, 0, negated);
         return;
     }
@@ -7880,7 +8731,7 @@ static void run_bg(shell_state *state,
         }
         if (!state->variable_commit_active &&
             !state->pending_and_or_active && !state->pending_list_active) {
-            memset(&state->current_job, 0, sizeof(state->current_job));
+            (void)memset(&state->current_job, 0, sizeof(state->current_job));
         }
     }
     output_format(state, "[continued %ld]\r\n", (long)entry->pgid);
@@ -7889,36 +8740,37 @@ static void run_bg(shell_state *state,
 
 static bool begin_native_list(shell_state *state)
 {
+    if (state == NULL) return false;
     const gsh_ast_node *program;
     const gsh_ast_node *list;
     size_t child;
     bool parent_owned = false;
 
     if (state->pending_parse.status != GSH_PARSE_OK ||
-        state->pending_parse.root >= state->parse_storage->node_count) {
+        state->pending_parse.root >= state_parse_storage(state)->node_count) {
         return false;
     }
-    program = &state->parse_storage->nodes[state->pending_parse.root];
+    program = &state_parse_storage(state)->nodes[state->pending_parse.root];
     if (program->kind != GSH_AST_PROGRAM ||
         program->first_child == GSH_AST_NONE ||
-        state->parse_storage->nodes[program->first_child].next_sibling !=
+        state_parse_storage(state)->nodes[program->first_child].next_sibling !=
             GSH_AST_NONE) {
         return false;
     }
-    list = &state->parse_storage->nodes[program->first_child];
+    list = &state_parse_storage(state)->nodes[program->first_child];
     if (list->kind != GSH_AST_LIST) {
         return false;
     }
     child = list->first_child;
     while (child != GSH_AST_NONE) {
-        if ((state->parse_storage->nodes[child].flags &
+        if ((state_parse_storage(state)->nodes[child].flags &
              GSH_AST_FLAG_ASYNC) != 0) {
             parent_owned = true;
         }
         if (native_list_node_is_wait(state, child)) {
             parent_owned = true;
         }
-        child = state->parse_storage->nodes[child].next_sibling;
+        child = state_parse_storage(state)->nodes[child].next_sibling;
     }
     if (!parent_owned || !native_command_is_supported(state)) {
         return false;
@@ -7927,12 +8779,15 @@ static bool begin_native_list(shell_state *state)
     state->pending_list_next = list->first_child;
     state->pending_and_or_active = false;
     state->pending_and_or_next = GSH_AST_NONE;
-    continue_native_list(state);
+    state->mode = MODE_DISPATCH;
     return true;
 }
 
 static size_t single_function_definition(const shell_state *state)
 {
+    if (state == NULL) {
+        return 0U;
+    }
     size_t node = state->pending_parse.root;
     static const gsh_ast_kind wrappers[] = {
         GSH_AST_PROGRAM, GSH_AST_LIST, GSH_AST_AND_OR, GSH_AST_PIPELINE,
@@ -7946,13 +8801,13 @@ static size_t single_function_definition(const shell_state *state)
          index++) {
         const gsh_ast_node *current;
 
-        if (node >= state->parse_storage->node_count) {
+        if (node >= state_parse_storage(state)->node_count) {
             return GSH_AST_NONE;
         }
-        current = &state->parse_storage->nodes[node];
+        current = &state_parse_storage(state)->nodes[node];
         if (current->kind != wrappers[index] ||
             current->first_child == GSH_AST_NONE ||
-            state->parse_storage->nodes[current->first_child].next_sibling !=
+            state_parse_storage(state)->nodes[current->first_child].next_sibling !=
                 GSH_AST_NONE ||
             (current->flags & (GSH_AST_FLAG_ASYNC |
                                GSH_AST_FLAG_NEGATED)) != 0) {
@@ -7960,14 +8815,17 @@ static size_t single_function_definition(const shell_state *state)
         }
         node = current->first_child;
     }
-    return node < state->parse_storage->node_count &&
-                   state->parse_storage->nodes[node].kind == GSH_AST_FUNCTION
+    return node < state_parse_storage(state)->node_count &&
+                   state_parse_storage(state)->nodes[node].kind == GSH_AST_FUNCTION
                ? node
                : GSH_AST_NONE;
 }
 
 static bool run_function_definition(shell_state *state)
 {
+    if (state == NULL) {
+        return false;
+    }
     size_t node_index = single_function_definition(state);
     const gsh_ast_node *node;
     gsh_word_ref name;
@@ -7976,11 +8834,11 @@ static bool run_function_definition(shell_state *state)
     if (node_index == GSH_AST_NONE) {
         return false;
     }
-    node = &state->parse_storage->nodes[node_index];
-    name = state->parse_storage->words[node->first_word];
+    node = &state_parse_storage(state)->nodes[node_index];
+    name = state_parse_storage(state)->words[node->first_word];
     if (special_builtin_name(state->pending_input + name.begin,
                              name.end - name.begin)) {
-        output_text(state,
+        (void)output_text(state,
                     "gsh: function name is a special builtin\r\n");
         state->last_status = 1;
     } else if (ensure_function_state(state, false) == -1) {
@@ -8020,12 +8878,16 @@ static bool pure_function_status(const gsh_function_store *functions,
                                  const gsh_function_entry *entry,
                                  int *status)
 {
+    if (entry == NULL || functions == NULL || status == NULL) {
+        return false;
+    }
     const gsh_parse_storage *storage = &functions->programs;
     const char *input = gsh_functions_text(functions);
     size_t node_index = entry->node_offset;
     bool negated = false;
+    size_t step;
 
-    for (;;) {
+    for (step = 0; step < AST_WALK_STEP_CAP; step++) {
         const gsh_ast_node *node;
         size_t child;
 
@@ -8073,16 +8935,21 @@ static bool pure_function_status(const gsh_function_store *functions,
         }
         node_index = child;
     }
+    return false;
 }
 
 static bool run_pure_function(shell_state *state,
                               const gsh_native_pipeline *pipeline)
 {
+    if (pipeline == NULL) return false;
+    if (state == NULL) {
+        return false;
+    }
     const gsh_native_command *command;
     const gsh_function_entry *function;
     int status;
 
-    if (fault_injection_active() || pipeline->command_count != 1U) {
+    if (gsh_fault_active() || pipeline->command_count != 1U) {
         return false;
     }
     command = &pipeline->commands[0];
@@ -8116,8 +8983,11 @@ static bool run_pure_function(shell_state *state,
 
 static void request_async_transition(shell_state *state)
 {
+    if (state == NULL) {
+        return;
+    }
     bool effective = state->async_repl != NULL &&
-                     state->async_repl->enabled;
+                     state_async_repl(state)->enabled;
     bool immediate = false;
 
     if (state->async_transition_pending) {
@@ -8142,25 +9012,10 @@ static void request_async_transition(shell_state *state)
     }
 }
 
-static void dispatch_pending(shell_state *state)
+static bool dispatch_history_control(shell_state *state, const char *command)
 {
-    char direct_storage[LINE_CAP];
-    simple_command direct = {0};
-    char *command = trim_command((char *)state->pending_input);
-
-    if (*command == '\0') {
-        state->mode = MODE_EDITOR;
-        queue_prompt(state);
-        return;
-    }
-
-    if (!state->pending_alias_expanded &&
-        state->pending_input == state->pending_line &&
-        strcmp(state->pending_line, "/async") == 0) {
-        request_async_transition(state);
-        return;
-    }
-
+    if (!require(state != NULL)) return false;
+    if (!require(command != NULL)) return false;
     if (strcmp(command, "history status") == 0 ||
         strcmp(command, "history") == 0) {
         output_format(state,
@@ -8168,7 +9023,7 @@ static void dispatch_pending(shell_state *state)
                       "max=%zu unlock=infinite reminder=%lluh-%lluh\r\n",
                       state->config.history_enabled ? "yes" : "no",
                       state->history_persistent ? "yes" : "no",
-                      state->history == NULL ? 0U : state->history->count,
+                      state->history == NULL ? 0U : state_history(state)->count,
                       state->config.history_max_entries,
                       (unsigned long long)(
                           state->config.history_reminder_min_ns /
@@ -8177,48 +9032,43 @@ static void dispatch_pending(shell_state *state)
                           state->config.history_reminder_max_ns /
                           (60ULL * 60ULL * 1000000000ULL)));
         state->last_status = 0;
-        state->mode = MODE_EDITOR;
-        queue_prompt(state);
-        return;
-    }
-    if (strcmp(command, "history lock") == 0 ||
-        strcmp(command, "history shutdown") == 0) {
+    } else if (strcmp(command, "history lock") == 0 ||
+               strcmp(command, "history shutdown") == 0) {
         bool shutdown = strcmp(command, "history shutdown") == 0;
         int result = state->history_persistent
-                         ? gsh_history_client_control(
-                               &state->history_client, shutdown)
+                         ? gsh_history_client_control(&state->history_client,
+                                                      shutdown)
                          : -1;
 
         state->last_status = result == 0 ? 0 : 1;
         state->history_persistent = false;
         state->history_reminder_deadline_ns = 0;
-        if (state->history != NULL) {
-            gsh_history_clear(state->history);
-        }
+        if (state->history != NULL) gsh_history_clear(state->history);
         output_format(state, "history %s%s\r\n",
                       shutdown ? "agent stopped" : "locked",
                       result == 0 ? "" : " (not connected)");
-        state->mode = MODE_EDITOR;
-        queue_prompt(state);
-        return;
-    }
-    if (strncmp(command, "history ", 8) == 0) {
-        output_text(state,
-                    "usage: history [status|lock|shutdown]\r\n");
+    } else if (strncmp(command, "history ", 8U) == 0) {
+        (void)output_text(state, "usage: history [status|lock|shutdown]\r\n");
         state->last_status = 2;
-        state->mode = MODE_EDITOR;
-        queue_prompt(state);
-        return;
+    } else {
+        return false;
     }
+    state->mode = MODE_EDITOR;
+    queue_prompt(state);
+    return true;
+}
+
+static bool dispatch_reactor_control(shell_state *state, const char *command)
+{
+    if (!require(state != NULL)) return false;
+    if (!require(command != NULL)) return false;
     if (strcmp(command, "rt") == 0) {
         output_format(state,
                       "reactor cycles=%llu max=%.3fms deadline=5.000ms "
                       "misses=%llu dispatches=%llu dispatch_max=%.3fms "
                       "dispatch_misses=%llu overloads=%llu direct=%llu "
-                      "native=%llu "
-                      "shell=%llu "
-                      "parsed=%llu parse_failures=%llu job=%s worker=%s "
-                      "busy=%u failures=%llu "
+                      "native=%llu shell=%llu parsed=%llu parse_failures=%llu "
+                      "job=%s worker=%s busy=%u failures=%llu "
                       "async_jobs=%zu focus=%s protected_bridge=%llu\r\n",
                       (unsigned long long)state->reactor_cycles,
                       (double)state->reactor_max_ns / 1000000.0,
@@ -8240,165 +9090,241 @@ static void dispatch_pending(shell_state *state)
                       gsh_async_repl_focused_job(state->async_repl) >= 0
                           ? "job"
                           : "editor",
-                      (unsigned long long)
-                          state->protected_bridge_dispatches);
-        state->last_status = 0;
-        state->mode = MODE_EDITOR;
-        queue_prompt(state);
-        return;
-    }
-    if (strcmp(command, "help") == 0) {
-        output_text(state,
+                      (unsigned long long)state->protected_bridge_dispatches);
+    } else if (strcmp(command, "help") == 0) {
+        (void)output_text(state,
                     "builtins: cd [path], exit [status], fg, bg, rt, help, "
-                    "/async, "
-                    "history [status|lock|shutdown]\r\n"
+                    "/async, history [status|lock|shutdown]\r\n"
                     "non-canonical PTYs receive contained full-screen focus; "
                     "Ctrl-] returns to the editor\r\n"
                     "simple commands use native execve; shell syntax falls "
                     "back to /bin/sh -c\r\n");
-        state->last_status = 0;
+    } else {
+        return false;
+    }
+    state->last_status = 0;
+    state->mode = MODE_EDITOR;
+    queue_prompt(state);
+    return true;
+}
+
+typedef struct {
+    main_expansion_transaction transaction;
+    char *positional_view[GSH_POSITIONAL_CAP];
+    char option_flags[GSH_OPTION_FLAG_CAP];
+    gsh_parse_result parsed;
+    gsh_native_plan_status plan_status;
+    bool deferred_work;
+    gsh_builtin_io diagnostic_io;
+    gsh_native_variable_state variable_state;
+    gsh_native_expansion_context expansion;
+} pending_native_dispatch;
+
+static void initialize_pending_native_dispatch(
+    shell_state *state, pending_native_dispatch *pending)
+{
+    size_t positional_count;
+
+    if (!require(state != NULL)) return;
+    if (!require(pending != NULL)) return;
+    (void)memset(pending, 0, sizeof(*pending));
+    positional_count = gsh_positionals_count(state->positionals);
+    pending->transaction.state = state;
+    pending->parsed = state->pending_parse;
+    pending->plan_status = GSH_NATIVE_PLAN_UNSUPPORTED;
+    pending->diagnostic_io = reactor_builtin_sink(state);
+    pending->variable_state.mode = GSH_NATIVE_VARIABLE_OVERLAY;
+    pending->variable_state.variables = state->variables;
+    pending->variable_state.journal = state->variable_commit;
+    pending->variable_state.journal_generation = state->variable_generation;
+    pending->variable_state.scope_changes = state->pipeline_changes;
+    pending->variable_state.attributes = assignment_attributes(&state->options);
+    pending->variable_state.diagnostic_io = &pending->diagnostic_io;
+    pending->variable_state.carriage_return = true;
+    pending->expansion.last_status = state->last_status;
+    pending->expansion.shell_pid = (long)state->shell_pgid;
+    pending->expansion.last_background_pid = state->last_background_pid;
+    pending->expansion.parameter_zero = state->parameter_zero;
+    pending->expansion.positional_parameters =
+        positional_count == 0 ? NULL : pending->positional_view;
+    pending->expansion.positional_count = positional_count;
+    pending->expansion.option_flags = pending->option_flags;
+    pending->expansion.variable_state = &pending->variable_state;
+    pending->expansion.pathname_mode =
+        gsh_options_enabled(&state->options, GSH_OPTION_NOGLOB)
+            ? GSH_NATIVE_PATHNAME_PREFLIGHT
+            : GSH_NATIVE_PATHNAME_REJECT;
+    pending->expansion.defer_complex_patterns = true;
+    pending->expansion.deferred_work = &pending->deferred_work;
+    pending->expansion.nounset =
+        gsh_options_enabled(&state->options, GSH_OPTION_NOUNSET);
+    gsh_options_flags(&state->options, pending->option_flags);
+    gsh_positionals_view(state->positionals, pending->positional_view);
+}
+
+static bool plan_pending_native_dispatch(shell_state *state,
+                                         pending_native_dispatch *pending)
+{
+    if (!require(state != NULL)) return true;
+    if (!require(pending != NULL)) return true;
+    if (pending->parsed.status == GSH_PARSE_OK) {
+        state->parsed_dispatches++;
+        if (run_function_definition(state) || begin_native_list(state) ||
+            try_native_reactor_compound(state)) {
+            state->native_pipeline_dispatches++;
+            return true;
+        }
+        pending->plan_status = gsh_native_plan_pipeline_with_context(
+            state->pending_input, state->parse_storage, pending->parsed.root,
+            &pending->expansion, state->native_pipeline);
+        if (pending->plan_status == GSH_NATIVE_PLAN_OK) {
+            normalize_command_invocations(state->native_pipeline,
+                                          state->functions);
+        }
+    } else {
+        state->parse_failures++;
+    }
+    pending->transaction.mutated = pending->variable_state.mutated;
+    pending->transaction.isolated = pending->variable_state.isolated;
+    pending->transaction.scope.base = pending->variable_state.scope_base;
+    pending->transaction.scope.changes = pending->variable_state.scope_changes;
+    pending->transaction.scope.command_count =
+        pending->variable_state.command_count;
+    if (pending->plan_status != GSH_NATIVE_PLAN_ERROR) return false;
+    state->last_status = 1;
+    state->mode = MODE_EDITOR;
+    queue_prompt(state);
+    return true;
+}
+
+static bool planned_pipeline_is_supported(
+    shell_state *state, const pending_native_dispatch *pending)
+{
+    const gsh_native_pipeline *pipeline;
+    bool single_function;
+
+    if (!require(state != NULL && pending != NULL)) return false;
+    pipeline = state->native_pipeline;
+    if (!require(pipeline != NULL)) return false;
+    single_function =
+        pipeline->command_count == 1U && pipeline->commands[0].argc != 0 &&
+        !pipeline->commands[0].command_suppresses_functions &&
+        gsh_functions_lookup(state->functions, pipeline->commands[0].argv[0],
+                             strlen(pipeline->commands[0].argv[0])) != NULL;
+    return pending->plan_status == GSH_NATIVE_PLAN_OK &&
+           !pending->deferred_work &&
+           !native_pipeline_requires_evaluator(pipeline) && !single_function &&
+           native_pipeline_is_supported_scoped(
+               pipeline, state->default_path, state->variables,
+               pending->transaction.isolated ? &pending->transaction.scope
+                                             : NULL);
+}
+
+static bool run_pending_pure_builtin(shell_state *state)
+{
+    const gsh_native_pipeline *pipeline;
+    gsh_builtin_io io;
+    int status;
+
+    if (!require(state != NULL)) return false;
+    pipeline = state->native_pipeline;
+    if (!require(pipeline != NULL)) return false;
+    io = reactor_builtin_sink(state);
+    if (pipeline->command_count != 1U ||
+        pipeline->commands[0].redirect_count != 0U ||
+        !native_pure_builtin(&pipeline->commands[0])) {
+        return false;
+    }
+    status = run_native_pure_builtin(&pipeline->commands[0], &io);
+    if (pipeline->negated) status = status == 0 ? 1 : 0;
+    state->last_status = status;
+    state->mode = MODE_EDITOR;
+    queue_prompt(state);
+    return true;
+}
+
+static bool dispatch_planned_native(shell_state *state,
+                                    pending_native_dispatch *pending)
+{
+    char direct_storage[LINE_CAP];
+    simple_command direct = {0};
+
+    if (!require(state != NULL)) return false;
+    if (!require(pending != NULL)) return false;
+    if (prepare_simple_command(state->pending_input, direct_storage, &direct) &&
+        gsh_functions_lookup(state->functions, direct.argv[0],
+                             strlen(direct.argv[0])) == NULL) {
+        state->direct_dispatches++;
+        start_external(state, &direct);
+        return true;
+    }
+    if (pending->plan_status == GSH_NATIVE_PLAN_OK &&
+        !pending->deferred_work) {
+        commit_main_transaction(&pending->transaction);
+        if (run_planned_main_builtin(state, state->native_pipeline) ||
+            run_pure_function(state, state->native_pipeline)) {
+            state->native_pipeline_dispatches++;
+            return true;
+        }
+    }
+    if (planned_pipeline_is_supported(state, pending)) {
+        state->native_pipeline_dispatches++;
+        if (run_pending_pure_builtin(state)) return true;
+        start_native_pipeline(
+            state, state->native_pipeline,
+            pending->transaction.isolated ? &pending->transaction.scope
+                                          : NULL);
+        return true;
+    }
+    if (pending->parsed.status == GSH_PARSE_OK &&
+        native_command_is_supported(state)) {
+        state->native_pipeline_dispatches++;
+        start_native_compound(state, pending->parsed.root);
+        return true;
+    }
+    return false;
+}
+
+static void dispatch_pending(shell_state *state)
+{
+    pending_native_dispatch pending;
+    char *command;
+
+    if (!require(state != NULL)) return;
+    if (!require(state->pending_input != NULL)) return;
+    if (state->pending_and_or_active) {
+        continue_native_and_or(state);
+        return;
+    }
+    if (state->pending_list_active) {
+        continue_native_list(state);
+        return;
+    }
+    command = trim_command((char *)state->pending_input);
+
+    if (*command == '\0') {
         state->mode = MODE_EDITOR;
         queue_prompt(state);
         return;
     }
 
-    {
-        main_expansion_transaction transaction = {.state = state};
-        char *positional_view[GSH_POSITIONAL_CAP];
-        char option_flags[GSH_OPTION_FLAG_CAP];
-        size_t positional_count =
-            gsh_positionals_count(state->positionals);
-        gsh_parse_result parsed = state->pending_parse;
-        gsh_native_plan_status plan_status = GSH_NATIVE_PLAN_UNSUPPORTED;
-        bool deferred_work = false;
-        gsh_native_expansion_context expansion = {
-            .last_status = state->last_status,
-            .shell_pid = (long)state->shell_pgid,
-            .last_background_pid = state->last_background_pid,
-            .parameter_zero = state->parameter_zero,
-            .positional_parameters = positional_count == 0
-                                         ? NULL
-                                         : positional_view,
-            .positional_count = positional_count,
-            .option_flags = option_flags,
-            .environment = NULL,
-            .variable_lookup = main_transaction_lookup,
-            .variable_assign = main_transaction_assign,
-            .parameter_error = main_transaction_parameter_error,
-            .expansion_error = main_transaction_expansion_error,
-            .variable_opaque = &transaction,
-            .command_begin = main_transaction_command_begin,
-            .command_opaque = &transaction,
-            .pathname_mode =
-                gsh_options_enabled(&state->options, GSH_OPTION_NOGLOB)
-                    ? GSH_NATIVE_PATHNAME_PREFLIGHT
-                    : GSH_NATIVE_PATHNAME_REJECT,
-            .defer_complex_patterns = true,
-            .deferred_work = &deferred_work,
-            .nounset = gsh_options_enabled(&state->options,
-                                            GSH_OPTION_NOUNSET),
-        };
-
-        gsh_options_flags(&state->options, option_flags);
-        gsh_positionals_view(state->positionals, positional_view);
-        if (parsed.status == GSH_PARSE_OK) {
-            state->parsed_dispatches++;
-            if (run_function_definition(state)) {
-                state->native_pipeline_dispatches++;
-                return;
-            }
-            if (begin_native_list(state)) {
-                state->native_pipeline_dispatches++;
-                return;
-            }
-            if (try_native_reactor_compound(state)) {
-                state->native_pipeline_dispatches++;
-                return;
-            }
-            plan_status = gsh_native_plan_pipeline_with_context(
-                state->pending_input, state->parse_storage, parsed.root,
-                &expansion, state->native_pipeline);
-            if (plan_status == GSH_NATIVE_PLAN_OK) {
-                normalize_command_invocations(state->native_pipeline,
-                                              state->functions);
-            }
-        } else {
-            state->parse_failures++;
-        }
-        if (plan_status == GSH_NATIVE_PLAN_ERROR) {
-            state->last_status = 1;
-            state->mode = MODE_EDITOR;
-            queue_prompt(state);
-            return;
-        }
-        if (prepare_simple_command(state->pending_input, direct_storage,
-                                   &direct) &&
-            gsh_functions_lookup(state->functions, direct.argv[0],
-                                 strlen(direct.argv[0])) == NULL) {
-            state->direct_dispatches++;
-            start_external(state, &direct);
-            return;
-        }
-        if (plan_status == GSH_NATIVE_PLAN_OK && !deferred_work) {
-            commit_main_transaction(&transaction);
-        }
-        if (plan_status == GSH_NATIVE_PLAN_OK && !deferred_work &&
-            run_planned_main_builtin(state, state->native_pipeline)) {
-            state->native_pipeline_dispatches++;
-            return;
-        }
-        if (plan_status == GSH_NATIVE_PLAN_OK && !deferred_work &&
-            run_pure_function(state, state->native_pipeline)) {
-            state->native_pipeline_dispatches++;
-            return;
-        }
-        if (plan_status == GSH_NATIVE_PLAN_OK && !deferred_work &&
-            !native_pipeline_requires_evaluator(state->native_pipeline) &&
-            !(state->native_pipeline->command_count == 1U &&
-              state->native_pipeline->commands[0].argc != 0 &&
-              !state->native_pipeline->commands[0]
-                   .command_suppresses_functions &&
-              gsh_functions_lookup(
-                  state->functions,
-                  state->native_pipeline->commands[0].argv[0],
-                  strlen(state->native_pipeline->commands[0].argv[0])) !=
-                  NULL) &&
-            native_pipeline_is_supported_scoped(
-                state->native_pipeline, state->default_path,
-                state->variables,
-                transaction.isolated ? &transaction.scope : NULL)) {
-            const gsh_builtin_io io = {reactor_builtin_output, state};
-            int builtin_status;
-
-            state->native_pipeline_dispatches++;
-            if (state->native_pipeline->command_count == 1 &&
-                state->native_pipeline->commands[0].redirect_count == 0 &&
-                native_pure_builtin(
-                    &state->native_pipeline->commands[0])) {
-                builtin_status = run_native_pure_builtin(
-                    &state->native_pipeline->commands[0], &io);
-                if (state->native_pipeline->negated) {
-                    builtin_status = builtin_status == 0 ? 1 : 0;
-                }
-                state->last_status = builtin_status;
-                state->mode = MODE_EDITOR;
-                queue_prompt(state);
-                return;
-            }
-            start_native_pipeline(
-                state, state->native_pipeline,
-                transaction.isolated ? &transaction.scope : NULL);
-            return;
-        }
-        if (parsed.status == GSH_PARSE_OK &&
-            native_command_is_supported(state)) {
-            state->native_pipeline_dispatches++;
-            start_native_compound(state, parsed.root);
-            return;
-        }
+    if (!state->pending_alias_expanded &&
+        state->pending_input == state->pending_line &&
+        strcmp(state->pending_line, "/async") == 0) {
+        request_async_transition(state);
+        return;
     }
+
+    if (dispatch_history_control(state, command) ||
+        dispatch_reactor_control(state, command)) {
+        return;
+    }
+
+    initialize_pending_native_dispatch(state, &pending);
+    if (plan_pending_native_dispatch(state, &pending)) return;
+    if (dispatch_planned_native(state, &pending)) return;
     if (state->pending_alias_expanded) {
-        output_text(state,
+        (void)output_text(state,
                     "gsh: native alias expansion produced an unsupported "
                     "command\r\n");
         state->last_status = 2;
@@ -8408,7 +9334,7 @@ static void dispatch_pending(shell_state *state)
     }
     if (fallback_mentions_protected_builtin(
             state->pending_input, state->pending_input_length)) {
-        output_text(state,
+        (void)output_text(state,
                     "gsh: native builtin ownership prevents compatibility "
                     "fallback\r\n");
         state->last_status = 2;
@@ -8416,7 +9342,12 @@ static void dispatch_pending(shell_state *state)
         queue_prompt(state);
         return;
     }
-    assert(state->protected_bridge_dispatches == 0U);
+    if (state->protected_bridge_dispatches != 0U) {
+        state->last_status = 125;
+        state->mode = MODE_EDITOR;
+        queue_prompt(state);
+        return;
+    }
     state->shell_dispatches++;
     start_external(state, NULL);
 }
@@ -8424,6 +9355,9 @@ static void dispatch_pending(shell_state *state)
 static bool command_has_status_dependency(const char *command,
                                           size_t length)
 {
+    if (command == NULL) {
+        return false;
+    }
     size_t offset;
     bool single_quoted = false;
 
@@ -8447,6 +9381,9 @@ static bool command_has_status_dependency(const char *command,
 
 static bool command_has_isolated_execution(const shell_state *state)
 {
+    if (state == NULL) {
+        return false;
+    }
     size_t node_index = state->pending_parse.root;
     unsigned int depth;
 
@@ -8455,10 +9392,10 @@ static bool command_has_isolated_execution(const shell_state *state)
         size_t child;
 
         if (node_index == GSH_AST_NONE ||
-            node_index >= state->parse_storage->node_count) {
+            node_index >= state_parse_storage(state)->node_count) {
             return false;
         }
-        node = &state->parse_storage->nodes[node_index];
+        node = &state_parse_storage(state)->nodes[node_index];
         if ((node->flags & GSH_AST_FLAG_ASYNC) != 0) {
             return false;
         }
@@ -8471,10 +9408,10 @@ static bool command_has_isolated_execution(const shell_state *state)
         }
         child = node->first_child;
         if (child == GSH_AST_NONE ||
-            child >= state->parse_storage->node_count) {
+            child >= state_parse_storage(state)->node_count) {
             return false;
         }
-        if (state->parse_storage->nodes[child].next_sibling != GSH_AST_NONE) {
+        if (state_parse_storage(state)->nodes[child].next_sibling != GSH_AST_NONE) {
             return node->kind == GSH_AST_PIPELINE;
         }
         node_index = child;
@@ -8485,6 +9422,7 @@ static bool command_has_isolated_execution(const shell_state *state)
 static size_t managed_assignment_name_length(const char *input,
                                              gsh_word_ref word)
 {
+    if (input == NULL) return 0U;
     size_t offset;
 
     for (offset = word.begin; offset < word.end; offset++) {
@@ -8501,6 +9439,9 @@ static size_t managed_assignment_name_length(const char *input,
 
 static bool managed_plain_word(const char *input, gsh_word_ref word)
 {
+    if (input == NULL) {
+        return false;
+    }
     size_t offset;
 
     if (word.begin >= word.end) {
@@ -8520,6 +9461,9 @@ static bool managed_plain_word(const char *input, gsh_word_ref word)
 static bool managed_word_is(const char *input, gsh_word_ref word,
                             const char *text)
 {
+    if (input == NULL || text == NULL) {
+        return false;
+    }
     size_t length = strlen(text);
 
     return managed_plain_word(input, word) &&
@@ -8531,6 +9475,9 @@ static bool managed_variable_affects_launch(const shell_state *state,
                                             gsh_word_ref word,
                                             size_t name_length)
 {
+    if (state == NULL) {
+        return false;
+    }
     bool is_set;
     unsigned int attributes;
     const char *name = state->pending_input + word.begin;
@@ -8549,6 +9496,7 @@ static bool managed_variable_affects_launch(const shell_state *state,
 static bool managed_simple_blocks_independent(const shell_state *state,
                                               const gsh_ast_node *node)
 {
+    if (node == NULL) return false;
     static const char *const launch_mutators[] = {
         ".",       "alias",  "cd",       "command", "eval",
         "exec",    "export", "getopts",  "read",    "readonly",
@@ -8560,13 +9508,13 @@ static bool managed_simple_blocks_independent(const shell_state *state,
     gsh_word_ref command;
     bool assignment_blocks = false;
 
-    if (node->first_word > state->parse_storage->word_count ||
+    if (node->first_word > state_parse_storage(state)->word_count ||
         node->word_count >
-            state->parse_storage->word_count - node->first_word) {
+            state_parse_storage(state)->word_count - node->first_word) {
         return true;
     }
     while (assignment_count < node->word_count) {
-        gsh_word_ref word = state->parse_storage->words[
+        gsh_word_ref word = state_parse_storage(state)->words[
             node->first_word + assignment_count];
 
         if (word.begin > word.end ||
@@ -8593,7 +9541,7 @@ static bool managed_simple_blocks_independent(const shell_state *state,
     if (assignment_blocks) {
         return true;
     }
-    command = state->parse_storage->words[
+    command = state_parse_storage(state)->words[
         node->first_word + assignment_count];
     if (!managed_plain_word(state->pending_input, command)) {
         return true;
@@ -8613,13 +9561,14 @@ static bool managed_simple_blocks_independent(const shell_state *state,
 
 static bool command_blocks_independent(shell_state *state)
 {
+    if (state == NULL) return false;
     size_t stack[GSH_PARSE_NODE_CAP];
     size_t stack_count = 0;
     size_t visited = 0;
 
     if (state->pending_parse.status != GSH_PARSE_OK ||
         state->pending_alias_expanded ||
-        state->pending_parse.root >= state->parse_storage->node_count) {
+        state->pending_parse.root >= state_parse_storage(state)->node_count) {
         return true;
     }
     stack[stack_count++] = state->pending_parse.root;
@@ -8629,10 +9578,10 @@ static bool command_blocks_independent(shell_state *state)
         size_t child;
         size_t sibling_count = 0;
 
-        if (node_index >= state->parse_storage->node_count) {
+        if (node_index >= state_parse_storage(state)->node_count) {
             return true;
         }
-        node = &state->parse_storage->nodes[node_index];
+        node = &state_parse_storage(state)->nodes[node_index];
         if ((node->flags & GSH_AST_FLAG_ASYNC) != 0 ||
             node->kind == GSH_AST_SUBSHELL) {
             continue;
@@ -8645,10 +9594,10 @@ static bool command_blocks_independent(shell_state *state)
             size_t name_length;
 
             if (node->word_count == 0 ||
-                node->first_word >= state->parse_storage->word_count) {
+                node->first_word >= state_parse_storage(state)->word_count) {
                 return true;
             }
-            name = state->parse_storage->words[node->first_word];
+            name = state_parse_storage(state)->words[node->first_word];
             if (name.begin > name.end ||
                 name.end > state->pending_input_length) {
                 return true;
@@ -8665,24 +9614,24 @@ static bool command_blocks_independent(shell_state *state)
         }
         if (node->kind == GSH_AST_PIPELINE &&
             node->first_child != GSH_AST_NONE &&
-            node->first_child >= state->parse_storage->node_count) {
+            node->first_child >= state_parse_storage(state)->node_count) {
             return true;
         }
         if (node->kind == GSH_AST_PIPELINE &&
             node->first_child != GSH_AST_NONE &&
-            state->parse_storage->nodes[node->first_child].next_sibling !=
+            state_parse_storage(state)->nodes[node->first_child].next_sibling !=
                 GSH_AST_NONE) {
             continue;
         }
         child = node->first_child;
         while (child != GSH_AST_NONE &&
                sibling_count++ < GSH_PARSE_NODE_CAP) {
-            if (child >= state->parse_storage->node_count ||
+            if (child >= state_parse_storage(state)->node_count ||
                 stack_count == GSH_PARSE_NODE_CAP) {
                 return true;
             }
             stack[stack_count++] = child;
-            child = state->parse_storage->nodes[child].next_sibling;
+            child = state_parse_storage(state)->nodes[child].next_sibling;
         }
         if (child != GSH_AST_NONE) {
             return true;
@@ -8702,6 +9651,7 @@ static bool command_blocks_independent(shell_state *state)
 
 static bool command_is_session_barrier(shell_state *state)
 {
+    if (state == NULL) return false;
     char storage[LINE_CAP];
     simple_command command = {0};
 
@@ -8758,6 +9708,9 @@ static bool command_is_managed_control(const char *command, size_t length)
 static int accept_managed_submission(shell_state *state,
                                      size_t command_length)
 {
+    if (state == NULL) {
+        return -1;
+    }
     char prompt[GSH_ASYNC_PROMPT_CAP];
     bool status_dependency;
     bool barrier;
@@ -8787,6 +9740,9 @@ static int accept_managed_submission(shell_state *state,
 static bool history_submission_is_private(const shell_state *state,
                                           size_t length)
 {
+    if (state == NULL) {
+        return false;
+    }
     return state->config.history_ignore_space && length >= 2U &&
            state->pending_line[0] == ' ' &&
            state->pending_line[length - 1U] == ' ';
@@ -8795,6 +9751,7 @@ static bool history_submission_is_private(const shell_state *state,
 static void record_history_submission(shell_state *state, size_t length,
                                       gsh_parse_status parse_status)
 {
+    if (state == NULL) return;
     int added;
 
     if (state->history == NULL ||
@@ -8814,8 +9771,41 @@ static void record_history_submission(shell_state *state, size_t length,
     }
 }
 
+static gsh_parse_result parse_pending_line(shell_state *state,
+                                           size_t candidate_length)
+{
+    gsh_parse_result parsed;
+
+    if (!require(state != NULL && state->parse_storage != NULL)) {
+        return (gsh_parse_result){.status = GSH_PARSE_LIMIT,
+                                  .root = GSH_AST_NONE};
+    }
+    if (!require(candidate_length < sizeof(state->pending_line))) {
+        return (gsh_parse_result){.status = GSH_PARSE_LIMIT,
+                                  .root = GSH_AST_NONE};
+    }
+    if (gsh_aliases_count(state->aliases) == 0U) {
+        reset_pending_input(state);
+        return gsh_parse(state->pending_line, candidate_length,
+                         state->parse_storage);
+    }
+    parsed = gsh_alias_parse(
+        state->pending_line, candidate_length, state->aliases,
+        state->alias_expansion, GSH_ALIAS_EXPANSION_CAP,
+        state->parse_storage, &state->pending_input,
+        &state->pending_input_length);
+    state->pending_alias_expanded =
+        state->pending_input_length != candidate_length ||
+        memcmp(state->pending_input, state->pending_line,
+               candidate_length) != 0;
+    return parsed;
+}
+
 static void accept_line(shell_state *state)
 {
+    if (state == NULL) {
+        return;
+    }
     size_t candidate_length = state->pending_len + state->line_len;
     gsh_parse_result parsed;
 
@@ -8832,24 +9822,10 @@ static void accept_line(shell_state *state)
         queue_prompt(state);
         return;
     }
-    memcpy(state->pending_line + state->pending_len, state->line,
+    (void)memcpy(state->pending_line + state->pending_len, state->line,
            state->line_len);
     state->pending_line[candidate_length] = '\0';
-    if (gsh_aliases_count(state->aliases) != 0) {
-        parsed = gsh_alias_parse(
-            state->pending_line, candidate_length, state->aliases,
-            state->alias_expansion, GSH_ALIAS_EXPANSION_CAP,
-        state->parse_storage, &state->pending_input,
-            &state->pending_input_length);
-        state->pending_alias_expanded =
-            state->pending_input_length != candidate_length ||
-            memcmp(state->pending_input, state->pending_line,
-                   candidate_length) != 0;
-    } else {
-        reset_pending_input(state);
-        parsed = gsh_parse(state->pending_line, candidate_length,
-                           state->parse_storage);
-    }
+    parsed = parse_pending_line(state, candidate_length);
     state->pending_parse = parsed;
     state->line_len = 0;
     state->line[0] = '\0';
@@ -8863,7 +9839,7 @@ static void accept_line(shell_state *state)
             state->pending_line[0] = '\0';
             reset_pending_input(state);
             state->continuation_prompt = false;
-            output_text(state, "gsh: command exceeds input limit\r\n");
+            (void)output_text(state, "gsh: command exceeds input limit\r\n");
             queue_prompt(state);
             return;
         }
@@ -8877,7 +9853,7 @@ static void accept_line(shell_state *state)
     }
     state->pending_len = 0;
     state->continuation_prompt = false;
-    if (state->async_repl != NULL && state->async_repl->enabled) {
+    if (state->async_repl != NULL && state_async_repl(state)->enabled) {
         if (candidate_length == 0) {
             queue_prompt(state);
             return;
@@ -8885,7 +9861,7 @@ static void accept_line(shell_state *state)
         if (accept_managed_submission(state, candidate_length) == -1) {
             (void)raw_output_push(state, "\a", 1);
             if (memchr(state->pending_line, '\n', candidate_length) == NULL) {
-                memcpy(state->line, state->pending_line,
+                (void)memcpy(state->line, state->pending_line,
                        candidate_length + 1U);
                 state->line_len = candidate_length;
             }
@@ -8904,6 +9880,7 @@ static void accept_line(shell_state *state)
 
 static void erase_last_character(shell_state *state)
 {
+    if (state == NULL) return;
     if (state->line_len == 0) {
         (void)output_text(state, "\a");
         return;
@@ -8919,6 +9896,9 @@ static void erase_last_character(shell_state *state)
 
 static bool route_focused_input(shell_state *state, unsigned char byte)
 {
+    if (state == NULL) {
+        return false;
+    }
     int focused = state->async_repl == NULL
                       ? -1
                       : gsh_async_repl_focused_job(state->async_repl);
@@ -8947,7 +9927,8 @@ static bool route_focused_input(shell_state *state, unsigned char byte)
 static bool process_managed_editor_signal(shell_state *state,
                                           unsigned char byte)
 {
-    if (state->async_repl == NULL || !state->async_repl->enabled) {
+    if (state == NULL) return false;
+    if (state->async_repl == NULL || !state_async_repl(state)->enabled) {
         return false;
     }
     if (byte == 0x03U) {
@@ -8963,6 +9944,7 @@ static bool process_managed_editor_signal(shell_state *state,
 
 static bool process_escape_input(shell_state *state, unsigned char byte)
 {
+    if (state == NULL) return false;
     if (state->escape_state == 1) {
         if (byte == '[' || byte == 'O') {
             state->escape_state = 2U;
@@ -9000,6 +9982,7 @@ static bool process_escape_input(shell_state *state, unsigned char byte)
 
 static void erase_history_query(shell_state *state)
 {
+    if (state == NULL) return;
     if (state->history_search_query_length == 0) {
         (void)output_text(state, "\a");
         return;
@@ -9018,6 +10001,9 @@ static void erase_history_query(shell_state *state)
 static bool process_history_search_input(shell_state *state,
                                          unsigned char byte)
 {
+    if (state == NULL) {
+        return false;
+    }
     if (byte == 0x12U) {
         search_history(state);
         return true;
@@ -9054,6 +10040,9 @@ static bool process_history_search_input(shell_state *state,
 
 static bool process_editor_control(shell_state *state, unsigned char byte)
 {
+    if (state == NULL) {
+        return false;
+    }
     if (byte == 0x1bU) {
         state->escape_state = 1;
         return true;
@@ -9070,7 +10059,7 @@ static bool process_editor_control(shell_state *state, unsigned char byte)
             }
             if (state->current_job.active ||
                 gsh_async_repl_job_count(state->async_repl) != 0) {
-                output_text(state, "\r\ngsh: a job is still active\r\n");
+                (void)output_text(state, "\r\ngsh: a job is still active\r\n");
                 queue_prompt(state);
             } else {
                 state->running = false;
@@ -9097,11 +10086,12 @@ static bool process_editor_control(shell_state *state, unsigned char byte)
 
 static void insert_editor_byte(shell_state *state, unsigned char byte)
 {
+    if (state == NULL) return;
     if ((byte >= 0x20U || byte == '\t') && state->line_len < LINE_CAP - 1) {
         state->line[state->line_len++] = (char)byte;
         state->line[state->line_len] = '\0';
-        if (state->async_repl != NULL && state->async_repl->enabled) {
-            state->async_repl->render_pending = true;
+        if (state->async_repl != NULL && state_async_repl(state)->enabled) {
+            state_async_repl(state)->render_pending = true;
         } else {
             (void)output_push(state, (const char *)&byte, 1);
         }
@@ -9158,13 +10148,16 @@ static void process_input(shell_state *state)
 
 static int load_managed_submission(shell_state *state, int cell_index)
 {
-    const gsh_async_cell *cell = &state->async_repl->cells[cell_index];
+    if (state == NULL) {
+        return -1;
+    }
+    const gsh_async_cell *cell = &state_async_repl(state)->cells[cell_index];
 
     if (!cell->occupied || cell->command_length >= sizeof(state->pending_line)) {
         errno = EINVAL;
         return -1;
     }
-    memcpy(state->pending_line, cell->command, cell->command_length + 1U);
+    (void)memcpy(state->pending_line, cell->command, cell->command_length + 1U);
     state->pending_len = 0;
     if (gsh_aliases_count(state->aliases) != 0) {
         state->pending_parse = gsh_alias_parse(
@@ -9187,6 +10180,9 @@ static int load_managed_submission(shell_state *state, int cell_index)
 
 static bool managed_state_lane_busy(const shell_state *state)
 {
+    if (state == NULL) {
+        return false;
+    }
     return state->async_state_cell >= 0 || state->current_job.active ||
            state->mode == MODE_ASYNC_REDIRECTION || state->mode == MODE_WAIT ||
            state->pending_list_active || state->pending_and_or_active;
@@ -9194,6 +10190,9 @@ static bool managed_state_lane_busy(const shell_state *state)
 
 static void finish_managed_state_cell(shell_state *state)
 {
+    if (state == NULL) {
+        return;
+    }
     int cell_index = state->async_state_cell;
 
     if (cell_index < 0 || state->mode != MODE_EDITOR ||
@@ -9202,7 +10201,7 @@ static void finish_managed_state_cell(shell_state *state)
         state->pending_and_or_active) {
         return;
     }
-    if (state->async_repl->cells[cell_index].state == GSH_ASYNC_STARTING) {
+    if (state_async_repl(state)->cells[cell_index].state == GSH_ASYNC_STARTING) {
         gsh_async_repl_finish(state->async_repl, cell_index,
                               state->last_status << 8, true);
     }
@@ -9213,6 +10212,9 @@ static void finish_managed_state_cell(shell_state *state)
 
 static void record_dispatch_duration(shell_state *state, uint64_t start)
 {
+    if (state == NULL) {
+        return;
+    }
     uint64_t end = monotonic_ns();
     uint64_t duration = end >= start ? end - start : 0;
 
@@ -9227,6 +10229,9 @@ static void record_dispatch_duration(shell_state *state, uint64_t start)
 
 static bool managed_cell_terminal(const gsh_async_cell *cell)
 {
+    if (cell == NULL) {
+        return false;
+    }
     return cell->state == GSH_ASYNC_DONE ||
            cell->state == GSH_ASYNC_FAILED ||
            cell->state == GSH_ASYNC_CANCELLED ||
@@ -9235,7 +10240,10 @@ static bool managed_cell_terminal(const gsh_async_cell *cell)
 
 static void finalize_managed_dispatch(shell_state *state, int cell_index)
 {
-    gsh_async_cell *cell = &state->async_repl->cells[cell_index];
+    if (state == NULL) {
+        return;
+    }
+    gsh_async_cell *cell = &state_async_repl(state)->cells[cell_index];
 
     if (state->current_job.active &&
         state->current_job.pid == cell->pid) {
@@ -9259,6 +10267,9 @@ static void finalize_managed_dispatch(shell_state *state, int cell_index)
 
 static void dispatch_managed_cell(shell_state *state, int cell_index)
 {
+    if (state == NULL) {
+        return;
+    }
     int prior_state_cell = state->async_state_cell;
     int previous_status;
     uint64_t start;
@@ -9266,13 +10277,13 @@ static void dispatch_managed_cell(shell_state *state, int cell_index)
     gsh_async_repl_starting(state->async_repl, cell_index);
     state->async_dispatch_cell = cell_index;
     state->async_capture_cell = cell_index;
-    if (state->async_repl->cells[cell_index].status_dependency &&
+    if (state_async_repl(state)->cells[cell_index].status_dependency &&
         gsh_async_repl_previous_status(state->async_repl, cell_index,
                                        &previous_status) == 0) {
         state->last_status = previous_status;
     }
     if (load_managed_submission(state, cell_index) == -1) {
-        output_text(state, "gsh: invalid managed submission\r\n");
+        (void)output_text(state, "gsh: invalid managed submission\r\n");
         state->last_status = 125;
         state->mode = MODE_EDITOR;
         finalize_managed_dispatch(state, cell_index);
@@ -9290,9 +10301,10 @@ static void dispatch_managed_cell(shell_state *state, int cell_index)
 
 static void schedule_managed_submissions(shell_state *state)
 {
+    if (state == NULL) return;
     unsigned int dispatched;
 
-    if (state->async_repl == NULL || !state->async_repl->enabled) {
+    if (state->async_repl == NULL || !state_async_repl(state)->enabled) {
         return;
     }
     (void)gsh_async_repl_autofocus(state->async_repl);
@@ -9312,24 +10324,12 @@ static void schedule_managed_submissions(shell_state *state)
     }
 }
 
-typedef struct {
-    int output;
-    int error;
-} job_service_output;
-
-static int job_service_write(void *opaque, int descriptor,
-                             const char *text, size_t length)
-{
-    job_service_output *output = opaque;
-    int target = descriptor == STDERR_FILENO ? output->error
-                                              : output->output;
-
-    return gsh_builtin_descriptor_output(NULL, target, text, length);
-}
-
 static size_t receive_job_service_rights(
     struct msghdr *message, int rights[GSH_JOB_SERVICE_RIGHTS])
 {
+    if (message == NULL || rights == NULL) {
+        return 0U;
+    }
     struct cmsghdr *header = CMSG_FIRSTHDR(message);
 
     if (header == NULL || header->cmsg_level != SOL_SOCKET ||
@@ -9339,7 +10339,7 @@ static size_t receive_job_service_rights(
         CMSG_NXTHDR(message, header) != NULL) {
         return 0;
     }
-    memcpy(rights, CMSG_DATA(header),
+    (void)memcpy(rights, CMSG_DATA(header),
            sizeof(int) * GSH_JOB_SERVICE_RIGHTS);
     return GSH_JOB_SERVICE_RIGHTS;
 }
@@ -9348,6 +10348,10 @@ static bool validate_job_service_request(
     job_service_request *request,
     char *argv[GSH_NATIVE_ARGUMENT_CAP + 1U])
 {
+    if (request == NULL) return false;
+    if (argv == NULL) {
+        return false;
+    }
     size_t argument;
     size_t expected = 0;
 
@@ -9382,6 +10386,7 @@ static bool validate_job_service_request(
 
 static bool finish_job_service_wait(shell_state *state)
 {
+    if (state == NULL) return false;
     job_service_reply reply = {GSH_JOB_SERVICE_VERSION, 127, 0, 0};
     size_t target;
 
@@ -9392,37 +10397,37 @@ static bool finish_job_service_wait(shell_state *state)
             return false;
         }
         reply.status = 0;
-        goto completed;
-    }
-    for (target = 0; target < state->job_service_wait_target_count;
-         target++) {
-        bool done;
+    } else {
+        for (target = 0; target < state->job_service_wait_target_count;
+             target++) {
+            bool done;
 
-        if (state->job_service_wait_targets[target] > 0 &&
-            gsh_background_get(
-                &state->background_jobs,
-                state->job_service_wait_targets[target], &done, NULL) &&
-            !done) {
-            return false;
+            if (state->job_service_wait_targets[target] > 0 &&
+                gsh_background_get(
+                    &state->background_jobs,
+                    state->job_service_wait_targets[target], &done,
+                    NULL) &&
+                !done) {
+                return false;
+            }
+        }
+        reply.status = 127;
+        for (target = 0; target < state->job_service_wait_target_count;
+             target++) {
+            int wait_status;
+
+            if (state->job_service_wait_targets[target] > 0 &&
+                gsh_background_consume(
+                    &state->background_jobs,
+                    state->job_service_wait_targets[target],
+                    &wait_status) &&
+                target + 1U == state->job_service_wait_target_count) {
+                reply.status = wait_status_value(wait_status);
+            }
         }
     }
-    reply.status = state->job_service_wait_all ? 0 : 127;
-    for (target = 0; target < state->job_service_wait_target_count;
-         target++) {
-        int wait_status;
-
-        if (state->job_service_wait_targets[target] > 0 &&
-            gsh_background_consume(
-                &state->background_jobs,
-                state->job_service_wait_targets[target], &wait_status) &&
-            !state->job_service_wait_all &&
-            target + 1U == state->job_service_wait_target_count) {
-            reply.status = wait_status_value(wait_status);
-        }
-    }
-completed:
     (void)send(state->job_service_wait_reply_fd, &reply, sizeof(reply), 0);
-    close(state->job_service_wait_reply_fd);
+    (void)close(state->job_service_wait_reply_fd);
     state->job_service_wait_reply_fd = -1;
     state->job_service_wait_target_count = 0;
     state->job_service_wait_all = false;
@@ -9432,6 +10437,10 @@ completed:
 static int begin_job_service_wait(shell_state *state, uint32_t argc,
                                   char *const argv[], int reply_fd)
 {
+    if (state == NULL) return -1;
+    if (argv == NULL) {
+        return -1;
+    }
     size_t argument;
 
     if (state->job_service_wait_reply_fd >= 0 || argc == 0 ||
@@ -9480,6 +10489,9 @@ static int begin_job_service_wait(shell_state *state, uint32_t argc,
 
 static void service_job_requests(shell_state *state)
 {
+    if (state == NULL) {
+        return;
+    }
     unsigned int serviced;
 
     for (serviced = 0; serviced < GSH_JOB_SERVICE_BATCH; serviced++) {
@@ -9495,9 +10507,9 @@ static void service_job_requests(shell_state *state)
         ssize_t received;
         bool reply_deferred = false;
 
-        memset(&request, 0, sizeof(request));
-        memset(control, 0, sizeof(control));
-        memset(&message, 0, sizeof(message));
+        (void)memset(&request, 0, sizeof(request));
+        (void)memset(control, 0, sizeof(control));
+        (void)memset(&message, 0, sizeof(message));
         message.msg_iov = &payload;
         message.msg_iovlen = 1;
         message.msg_control = control;
@@ -9522,8 +10534,10 @@ static void service_job_requests(shell_state *state)
             ftruncate(rights[1], 0) == 0 &&
             lseek(rights[0], 0, SEEK_SET) != (off_t)-1 &&
             lseek(rights[1], 0, SEEK_SET) != (off_t)-1) {
-            job_service_output output = {rights[0], rights[1]};
-            const gsh_builtin_io io = {job_service_write, &output};
+            const gsh_builtin_io io = {
+                .kind = GSH_BUILTIN_SINK_DESCRIPTORS,
+                .descriptors = {rights[0], rights[1]},
+            };
 
             if (request.type == GSH_JOB_SERVICE_JOBS) {
                 reply.status = gsh_builtin_jobs(
@@ -9547,7 +10561,7 @@ static void service_job_requests(shell_state *state)
         while (rights_count > 0) {
             int descriptor = rights[--rights_count];
 
-            if (descriptor >= 0) close(descriptor);
+            if (descriptor >= 0) (void)close(descriptor);
         }
     }
 }
@@ -9558,14 +10572,18 @@ static size_t add_managed_poll_descriptors(
     shell_state *state,
     struct pollfd descriptors[GSH_REACTOR_BASE_FDS + GSH_ASYNC_CELL_CAP])
 {
+    if (state == NULL) return 0U;
+    if (descriptors == NULL) {
+        return 0U;
+    }
     size_t count = GSH_REACTOR_BASE_FDS;
     int index;
 
-    if (state->async_repl == NULL || !state->async_repl->enabled) {
+    if (state->async_repl == NULL || !state_async_repl(state)->enabled) {
         return count;
     }
     for (index = 0; index < GSH_ASYNC_CELL_CAP; index++) {
-        int descriptor = state->async_repl->cells[index].pty_fd;
+        int descriptor = state_async_repl(state)->cells[index].pty_fd;
 
         if (descriptor < 0) {
             continue;
@@ -9583,6 +10601,9 @@ static size_t add_managed_poll_descriptors(
 
 static void note_managed_private_input(shell_state *state, int cell_index)
 {
+    if (state == NULL) {
+        return;
+    }
     gsh_async_cell *cell;
     struct termios modes;
     const char *slave_name;
@@ -9593,7 +10614,7 @@ static void note_managed_private_input(shell_state *state, int cell_index)
     if (cell_index < 0) {
         return;
     }
-    cell = &state->async_repl->cells[cell_index];
+    cell = &state_async_repl(state)->cells[cell_index];
     if (cell->pty_fd < 0 ||
         (cell->fullscreen &&
          (cell->input_requested || cell->autofocus_suppressed))) {
@@ -9625,6 +10646,7 @@ static void note_managed_private_input(shell_state *state, int cell_index)
 
 static void leave_managed_fullscreen(shell_state *state, int cell_index)
 {
+    if (state == NULL) return;
     static const char restore[] =
         "\033[0m\033[?25h\033[?1000l\033[?1002l\033[?1003l"
         "\033[?1004l\033[?1006l\033[?1015l\033[?2004l\033[?2026l"
@@ -9635,7 +10657,7 @@ static void leave_managed_fullscreen(shell_state *state, int cell_index)
         cell_index >= GSH_ASYNC_CELL_CAP) {
         return;
     }
-    cell = &state->async_repl->cells[cell_index];
+    cell = &state_async_repl(state)->cells[cell_index];
     if (!cell->fullscreen_presented) {
         return;
     }
@@ -9645,15 +10667,18 @@ static void leave_managed_fullscreen(shell_state *state, int cell_index)
     cell->passthrough_utf8_length = 0;
     cell->passthrough_utf8_expected = 0;
     cell->passthrough_sequence_length = 0;
-    state->async_repl->render_pending = true;
+    state_async_repl(state)->render_pending = true;
 }
 
 static void present_managed_fullscreen(shell_state *state, int cell_index,
                                        const char *bytes, size_t length)
 {
+    if (state == NULL) {
+        return;
+    }
     static const char begin[] = "\033[0m\033[H\033[2J";
     char filtered[4096 + GSH_ASYNC_PASSTHROUGH_SEQUENCE_CAP];
-    gsh_async_cell *cell = &state->async_repl->cells[cell_index];
+    gsh_async_cell *cell = &state_async_repl(state)->cells[cell_index];
     size_t filtered_length = 0;
 
     if (!cell->focused || !cell->fullscreen) {
@@ -9678,9 +10703,13 @@ static void preflight_managed_input_focus(
     struct pollfd descriptors[GSH_REACTOR_BASE_FDS + GSH_ASYNC_CELL_CAP],
     size_t count)
 {
+    if (state == NULL) return;
+    if (descriptors == NULL) {
+        return;
+    }
     size_t index;
 
-    if (state->async_repl == NULL || !state->async_repl->enabled) {
+    if (state->async_repl == NULL || !state_async_repl(state)->enabled) {
         return;
     }
     for (index = GSH_REACTOR_BASE_FDS; index < count; index++) {
@@ -9689,10 +10718,10 @@ static void preflight_managed_input_focus(
 
         if (cell_index >= 0 &&
             ((descriptors[index].revents & POLLIN) != 0 ||
-             state->async_repl->cells[cell_index].input_probe_pending)) {
+             state_async_repl(state)->cells[cell_index].input_probe_pending)) {
             note_managed_private_input(state, cell_index);
-            if (!state->async_repl->cells[cell_index].input_requested) {
-                state->async_repl->cells[cell_index].input_probe_pending =
+            if (!state_async_repl(state)->cells[cell_index].input_requested) {
+                state_async_repl(state)->cells[cell_index].input_probe_pending =
                     false;
             }
         }
@@ -9702,6 +10731,9 @@ static void preflight_managed_input_focus(
 
 static void read_managed_output(shell_state *state, struct pollfd *descriptor)
 {
+    if (descriptor == NULL || state == NULL) {
+        return;
+    }
     char bytes[4096];
     gsh_async_cell *cell;
     int cell_index = gsh_async_repl_cell_for_fd(
@@ -9717,7 +10749,7 @@ static void read_managed_output(shell_state *state, struct pollfd *descriptor)
         if (count > 0) {
             note_managed_private_input(state, cell_index);
             (void)gsh_async_repl_autofocus(state->async_repl);
-            cell = &state->async_repl->cells[cell_index];
+            cell = &state_async_repl(state)->cells[cell_index];
             if (cell->fullscreen) {
                 present_managed_fullscreen(state, cell_index, bytes,
                                            (size_t)count);
@@ -9737,7 +10769,7 @@ static void read_managed_output(shell_state *state, struct pollfd *descriptor)
         gsh_async_repl_close_output(state->async_repl, cell_index);
         break;
     }
-    cell = &state->async_repl->cells[cell_index];
+    cell = &state_async_repl(state)->cells[cell_index];
     if (cell->pty_fd >= 0 && !cell->fullscreen) {
         /* A private terminal read disables echo before presenting its prompt.
          * Probe once per bounded PTY service turn: no text matching, no thread,
@@ -9752,9 +10784,13 @@ static void process_managed_descriptors(
     struct pollfd descriptors[GSH_REACTOR_BASE_FDS + GSH_ASYNC_CELL_CAP],
     size_t count)
 {
+    if (state == NULL) return;
+    if (descriptors == NULL) {
+        return;
+    }
     size_t index;
 
-    if (state->async_repl == NULL || !state->async_repl->enabled) {
+    if (state->async_repl == NULL || !state_async_repl(state)->enabled) {
         return;
     }
     for (index = GSH_REACTOR_BASE_FDS; index < count; index++) {
@@ -9771,7 +10807,7 @@ static void process_managed_descriptors(
                 gsh_async_repl_flush_input(state->async_repl,
                                            cell_index) == -1) {
                 leave_managed_fullscreen(state, cell_index);
-                state->async_repl->cells[cell_index].focused = false;
+                state_async_repl(state)->cells[cell_index].focused = false;
                 gsh_async_repl_close_output(state->async_repl, cell_index);
             }
         }
@@ -9781,13 +10817,19 @@ static void process_managed_descriptors(
 
 static bool editor_accepts_input(const shell_state *state)
 {
-    return state->async_repl != NULL && state->async_repl->enabled
+    if (state == NULL) {
+        return false;
+    }
+    return state->async_repl != NULL && state_async_repl(state)->enabled
                ? true
                : state->mode == MODE_EDITOR;
 }
 
 static bool async_transition_has_live_shell_state(const shell_state *state)
 {
+    if (state == NULL) {
+        return false;
+    }
     return state->current_job.active ||
            gsh_background_active_count(&state->background_jobs) != 0 ||
            state->async_state_cell >= 0 || state->variable_commit_active ||
@@ -9809,7 +10851,10 @@ static bool async_transition_has_live_shell_state(const shell_state *state)
 
 static bool async_transition_can_start_now(const shell_state *state)
 {
-    bool managed = state->async_repl != NULL && state->async_repl->enabled;
+    if (state == NULL) {
+        return false;
+    }
+    bool managed = state->async_repl != NULL && state_async_repl(state)->enabled;
     int control_cell = managed ? state->async_dispatch_cell : -1;
 
     if (async_transition_has_live_shell_state(state)) {
@@ -9821,7 +10866,7 @@ static bool async_transition_can_start_now(const shell_state *state)
     }
     if (control_cell < 0 || control_cell >= GSH_ASYNC_CELL_CAP ||
         state->async_capture_cell != control_cell ||
-        !state->async_repl->cells[control_cell].control) {
+        !state_async_repl(state)->cells[control_cell].control) {
         return false;
     }
     return gsh_async_repl_all_settled_except(state->async_repl,
@@ -9830,8 +10875,11 @@ static bool async_transition_can_start_now(const shell_state *state)
 
 static bool async_transition_quiescent(const shell_state *state)
 {
+    if (state == NULL) {
+        return false;
+    }
     bool managed = state->async_repl != NULL &&
-                   state->async_repl->enabled;
+                   state_async_repl(state)->enabled;
 
     if (state->mode != MODE_EDITOR || state->output_len != 0 ||
         async_transition_has_live_shell_state(state) ||
@@ -9841,11 +10889,14 @@ static bool async_transition_quiescent(const shell_state *state)
     }
     return !managed ||
            (gsh_async_repl_all_settled(state->async_repl) &&
-            !state->async_repl->render_pending);
+            !state_async_repl(state)->render_pending);
 }
 
 static int seed_async_enabled_notice(shell_state *state)
 {
+    if (state == NULL) {
+        return -1;
+    }
     static const char command[] = "/async";
     static const char notice[] = "async repl: on\n";
     char prompt[GSH_ASYNC_PROMPT_CAP];
@@ -9869,6 +10920,7 @@ static int seed_async_enabled_notice(shell_state *state)
 
 static void apply_async_transition(shell_state *state)
 {
+    if (state == NULL) return;
     static const char leave_screen[] = "\033[?1049l";
 
     if (!state->async_transition_pending ||
@@ -9915,11 +10967,12 @@ static void apply_async_transition(shell_state *state)
         return;
     }
     state->async_transition_pending = false;
-    state->async_repl->render_pending = true;
+    state_async_repl(state)->render_pending = true;
 }
 
 static void maybe_verify_history(shell_state *state)
 {
+    if (state == NULL) return;
     if (state->history_persistent &&
         state->history_reminder_deadline_ns != 0 &&
         monotonic_ns() >= state->history_reminder_deadline_ns &&
@@ -9930,8 +10983,120 @@ static void maybe_verify_history(shell_state *state)
     }
 }
 
+static bool dispatch_classic_pending(shell_state *state)
+{
+    uint64_t start;
+    uint64_t end;
+    uint64_t duration;
+
+    if (!require(state != NULL)) return false;
+    if (!require(state->async_repl != NULL)) return false;
+    if (state_async_repl(state)->enabled || state->mode != MODE_DISPATCH ||
+        state->output_len != 0U) {
+        return false;
+    }
+    start = monotonic_ns();
+    dispatch_pending(state);
+    end = monotonic_ns();
+    duration = end >= start ? end - start : 0U;
+    state->dispatch_cycles++;
+    if (duration > state->dispatch_max_ns) state->dispatch_max_ns = duration;
+    if (duration > REACTOR_DEADLINE_NS) state->dispatch_misses++;
+    return true;
+}
+
+static size_t prepare_reactor_descriptors(
+    shell_state *state,
+    struct pollfd descriptors[GSH_REACTOR_BASE_FDS + GSH_ASYNC_CELL_CAP])
+{
+    if (!require(state != NULL)) return 0U;
+    if (!require(descriptors != NULL)) return 0U;
+    descriptors[0] = (struct pollfd){state->signal_pipe[0], POLLIN, 0};
+    descriptors[1] = (struct pollfd){state->tty_fd, 0, 0};
+    if (editor_accepts_input(state)) descriptors[1].events |= POLLIN;
+    if (state->output_len > 0U) descriptors[1].events |= POLLOUT;
+    descriptors[2] = (struct pollfd){
+        state->redirection_worker_alive ? state->redirection_worker_fd : -1,
+        state->redirection_worker_alive ? POLLIN : 0, 0};
+    descriptors[3] = (struct pollfd){
+        state->variable_commit_active ? state->variable_commit_fd : -1,
+        state->variable_commit_active ? POLLIN : 0, 0};
+    descriptors[4] = (struct pollfd){state->job_service_socket,
+                                     state->job_service_socket >= 0 ? POLLIN
+                                                                    : 0,
+                                     0};
+    return add_managed_poll_descriptors(state, descriptors);
+}
+
+static void service_reactor_descriptors(
+    shell_state *state, struct pollfd *descriptors, size_t descriptor_count)
+{
+    if (!require(state != NULL && descriptors != NULL)) return;
+    if (!require(descriptor_count >= GSH_REACTOR_BASE_FDS)) return;
+    if (state->variable_commit_active &&
+        (descriptors[3].revents & (POLLIN | POLLERR | POLLHUP | POLLNVAL)) !=
+            0) {
+        receive_variable_commit(state, false);
+    }
+    if (state->job_service_socket >= 0 &&
+        (descriptors[4].revents & POLLIN) != 0) {
+        service_job_requests(state);
+    }
+    if ((descriptors[0].revents & POLLIN) != 0) {
+        drain_signal_pipe(state);
+        process_pending_signals(state);
+    }
+    if (editor_accepts_input(state) &&
+        (descriptors[1].revents & POLLIN) != 0) {
+        /* Ownership preflight closes the private-PTY race before editor I/O. */
+        preflight_managed_input_focus(state, descriptors, descriptor_count);
+        process_input(state);
+    }
+    if (editor_accepts_input(state) &&
+        (descriptors[1].revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
+        state->running = false;
+    }
+    process_managed_descriptors(state, descriptors, descriptor_count);
+    if (state->redirection_worker_alive &&
+        (descriptors[2].revents & POLLIN) != 0) {
+        receive_redirection_result(state);
+    }
+    if (state->redirection_worker_alive &&
+        (descriptors[2].revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
+        bool command = state->mode == MODE_ASYNC_REDIRECTION;
+
+        state->redirection_worker_failures++;
+        disable_redirection_worker(state, true);
+        if (command) {
+            (void)output_text(state, "gsh: asynchronous redirection failed\r\n");
+            state->last_status = 1;
+            state->mode = MODE_EDITOR;
+            queue_prompt(state);
+        }
+    }
+    schedule_managed_submissions(state);
+    apply_async_transition(state);
+    prepare_classic_redraw(state);
+    prepare_managed_render(state);
+    if (state->output_len > 0U) flush_output(state);
+}
+
+static void record_reactor_duration(shell_state *state, uint64_t start,
+                                    uint64_t end)
+{
+    uint64_t duration = end >= start ? end - start : 0U;
+
+    if (!require(state != NULL)) return;
+    if (!require(state->reactor_cycles < UINT64_MAX)) return;
+    state->reactor_cycles++;
+    if (duration > state->reactor_max_ns) state->reactor_max_ns = duration;
+    if (duration > REACTOR_DEADLINE_NS) state->reactor_misses++;
+}
+
 static int run_reactor(shell_state *state)
 {
+    if (!require(state != NULL)) return 1;
+    if (!require(state->signal_pipe[0] >= 0 && state->tty_fd >= 0)) return 1;
     queue_prompt(state);
 
     while (state->running) {
@@ -9940,8 +11105,6 @@ static int run_reactor(shell_state *state)
         size_t descriptor_count;
         int result;
         uint64_t service_start;
-        uint64_t service_end;
-        uint64_t service_duration;
 
         maybe_verify_history(state);
         schedule_managed_submissions(state);
@@ -9949,56 +11112,10 @@ static int run_reactor(shell_state *state)
         prepare_classic_redraw(state);
         prepare_managed_render(state);
 
-        if ((state->async_repl == NULL || !state->async_repl->enabled) &&
-            state->mode == MODE_DISPATCH && state->output_len == 0) {
-            uint64_t dispatch_start = monotonic_ns();
-            uint64_t dispatch_end;
-            uint64_t dispatch_duration;
+        if (dispatch_classic_pending(state)) continue;
+        descriptor_count = prepare_reactor_descriptors(state, descriptors);
 
-            dispatch_pending(state);
-            dispatch_end = monotonic_ns();
-            dispatch_duration = dispatch_end >= dispatch_start
-                                    ? dispatch_end - dispatch_start
-                                    : 0;
-            state->dispatch_cycles++;
-            if (dispatch_duration > state->dispatch_max_ns) {
-                state->dispatch_max_ns = dispatch_duration;
-            }
-            if (dispatch_duration > REACTOR_DEADLINE_NS) {
-                state->dispatch_misses++;
-            }
-            continue;
-        }
-
-        descriptors[0].fd = state->signal_pipe[0];
-        descriptors[0].events = POLLIN;
-        descriptors[0].revents = 0;
-        descriptors[1].fd = state->tty_fd;
-        descriptors[1].events = 0;
-        descriptors[1].revents = 0;
-        if (editor_accepts_input(state)) {
-            descriptors[1].events |= POLLIN;
-        }
-        if (state->output_len > 0) {
-            descriptors[1].events |= POLLOUT;
-        }
-
-        descriptors[2].fd = state->redirection_worker_alive
-                                ? state->redirection_worker_fd
-                                : -1;
-        descriptors[2].events = state->redirection_worker_alive ? POLLIN : 0;
-        descriptors[2].revents = 0;
-        descriptors[3].fd = state->variable_commit_active
-                                ? state->variable_commit_fd
-                                : -1;
-        descriptors[3].events = state->variable_commit_active ? POLLIN : 0;
-        descriptors[3].revents = 0;
-        descriptors[4].fd = state->job_service_socket;
-        descriptors[4].events = state->job_service_socket >= 0 ? POLLIN : 0;
-        descriptors[4].revents = 0;
-        descriptor_count = add_managed_poll_descriptors(state, descriptors);
-
-        result = fault_should_fail("poll", EIO)
+        result = gsh_fault_should_fail(GSH_FAULT_POLL, EIO)
                      ? -1
                      : poll(descriptors, descriptor_count,
                             history_poll_timeout(state));
@@ -10012,80 +11129,20 @@ static int run_reactor(shell_state *state)
         }
 
         service_start = monotonic_ns();
-        if (state->variable_commit_active &&
-            (descriptors[3].revents &
-             (POLLIN | POLLERR | POLLHUP | POLLNVAL)) != 0) {
-            receive_variable_commit(state, false);
-        }
-        if (state->job_service_socket >= 0 &&
-            (descriptors[4].revents & POLLIN) != 0) {
-            service_job_requests(state);
-        }
-        if ((descriptors[0].revents & POLLIN) != 0) {
-            drain_signal_pipe(state);
-            process_pending_signals(state);
-        }
-        if (editor_accepts_input(state) &&
-            (descriptors[1].revents & POLLIN) != 0) {
-            /* Preflight only ownership, not output: this closes the race with
-             * a private PTY while keeping editor latency ahead of job drains. */
-            preflight_managed_input_focus(state, descriptors,
-                                          descriptor_count);
-            process_input(state);
-        }
-        if (editor_accepts_input(state) &&
-            (descriptors[1].revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
-            state->running = false;
-        }
-        process_managed_descriptors(state, descriptors, descriptor_count);
-        if (state->redirection_worker_alive &&
-            (descriptors[2].revents & POLLIN) != 0) {
-            receive_redirection_result(state);
-        }
-        if (state->redirection_worker_alive &&
-            (descriptors[2].revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
-            bool command = state->mode == MODE_ASYNC_REDIRECTION;
-
-            state->redirection_worker_failures++;
-            disable_redirection_worker(state, true);
-            if (command) {
-                output_text(state,
-                            "gsh: asynchronous redirection failed\r\n");
-                state->last_status = 1;
-                state->mode = MODE_EDITOR;
-                queue_prompt(state);
-            }
-        }
-        schedule_managed_submissions(state);
-        apply_async_transition(state);
-        prepare_classic_redraw(state);
-        prepare_managed_render(state);
-        if (state->output_len > 0) {
-            flush_output(state);
-        }
-
-        service_end = monotonic_ns();
-        service_duration = service_end >= service_start
-                               ? service_end - service_start
-                               : 0;
-        state->reactor_cycles++;
-        if (service_duration > state->reactor_max_ns) {
-            state->reactor_max_ns = service_duration;
-        }
-        if (service_duration > REACTOR_DEADLINE_NS) {
-            state->reactor_misses++;
-        }
+        service_reactor_descriptors(state, descriptors, descriptor_count);
+        record_reactor_duration(state, service_start, monotonic_ns());
     }
     return state->last_status;
 }
 
 static void leave_managed_screen(shell_state *state)
 {
+    if (state == NULL) return;
     static const char sequence[] = "\033[?1049l";
     unsigned int attempts;
 
     if (state->async_repl == NULL ||
-        !state->async_repl->alternate_screen_entered || state->tty_fd < 0) {
+        !state_async_repl(state)->alternate_screen_entered || state->tty_fd < 0) {
         return;
     }
     for (attempts = 0; attempts < 2U; attempts++) {
@@ -10101,6 +11158,7 @@ static void leave_managed_screen(shell_state *state)
 
 static size_t reap_managed_children(pid_t pids[GSH_ASYNC_CELL_CAP])
 {
+    if (pids == NULL) return 0U;
     size_t remaining = 0;
     int index;
 
@@ -10126,6 +11184,7 @@ static void terminate_managed_children(
     const pid_t original_groups[GSH_ASYNC_CELL_CAP],
     const pid_t terminal_groups[GSH_ASYNC_CELL_CAP])
 {
+    if (pids == NULL || original_groups == NULL || terminal_groups == NULL) return;
     uint64_t deadline = monotonic_ns() + 100000000ULL;
     int index;
 
@@ -10159,8 +11218,39 @@ static void terminate_managed_children(
     }
 }
 
+static void clear_shell_workspaces(shell_state *state)
+{
+    if (!require(state != NULL)) return;
+    if (!require(state->signal_pipe[0] >= -1 &&
+                 state->signal_pipe[1] >= -1)) return;
+    state->history = NULL;
+    state->parse_storage = NULL;
+    state->native_pipeline = NULL;
+    state->command_cache = NULL;
+    state->command_cache_scratch = NULL;
+    state->variables = NULL;
+    state->variable_scratch = NULL;
+    state->pipeline_variables = NULL;
+    state->variable_commit = NULL;
+    state->pipeline_changes = NULL;
+    state->async_repl = NULL;
+    state->alias_expansion = NULL;
+    state->aliases = NULL;
+    state->alias_scratch = NULL;
+    state->alias_commit = NULL;
+    state->functions = NULL;
+    state->function_scratch = NULL;
+    state->source_workspaces = NULL;
+    state->positionals = NULL;
+    state->positional_storage = NULL;
+    state->positional_commit = NULL;
+}
+
 static void cleanup(shell_state *state)
 {
+    if (state == NULL) {
+        return;
+    }
     pid_t worker_pid = state->redirection_worker_pid;
     pid_t managed_pids[GSH_ASYNC_CELL_CAP] = {0};
     pid_t managed_groups[GSH_ASYNC_CELL_CAP] = {0};
@@ -10174,14 +11264,14 @@ static void cleanup(shell_state *state)
     if (state->async_repl != NULL) {
         for (managed = 0; managed < GSH_ASYNC_CELL_CAP; managed++) {
             managed_pids[managed] =
-                state->async_repl->cells[managed].pid;
+                state_async_repl(state)->cells[managed].pid;
             managed_groups[managed] =
-                state->async_repl->cells[managed].pgid;
+                state_async_repl(state)->cells[managed].pgid;
         }
         gsh_async_repl_close(state->async_repl);
         for (managed = 0; managed < GSH_ASYNC_CELL_CAP; managed++) {
             managed_terminal_groups[managed] =
-                state->async_repl->cells[managed].pgid;
+                state_async_repl(state)->cells[managed].pgid;
         }
     }
     if (state->current_job.active) {
@@ -10210,55 +11300,27 @@ static void cleanup(shell_state *state)
     restore_terminal(state);
     g_signal_write_fd = -1;
     if (state->signal_pipe[0] >= 0) {
-        close(state->signal_pipe[0]);
+        (void)close(state->signal_pipe[0]);
     }
     if (state->signal_pipe[1] >= 0) {
-        close(state->signal_pipe[1]);
+        (void)close(state->signal_pipe[1]);
     }
     if (state->tty_fd >= 0) {
-        close(state->tty_fd);
+        (void)close(state->tty_fd);
     }
     gsh_history_client_close(&state->history_client);
-    gsh_history_clear(state->history);
-    free(state->history);
-    state->history = NULL;
-    free(state->parse_storage);
-    state->parse_storage = NULL;
-    free(state->native_pipeline);
-    state->native_pipeline = NULL;
-    free(state->command_cache);
-    state->command_cache = NULL;
-    free(state->command_cache_scratch);
-    state->command_cache_scratch = NULL;
-    free(state->variables);
-    state->variables = NULL;
-    free(state->variable_scratch);
-    state->variable_scratch = NULL;
-    free(state->pipeline_variables);
-    state->pipeline_variables = NULL;
-    free(state->variable_commit);
-    state->variable_commit = NULL;
-    free(state->pipeline_changes);
-    state->pipeline_changes = NULL;
-    free(state->async_repl);
-    state->async_repl = NULL;
-    state->alias_expansion = NULL;
-    state->aliases = NULL;
-    state->alias_scratch = NULL;
-    state->alias_commit = NULL;
-    state->functions = NULL;
-    state->function_scratch = NULL;
-    free(state->source_workspaces);
-    state->source_workspaces = NULL;
-    if (state->positionals != &g_interactive_positionals) {
-        free(state->positionals);
+    if (state->history != NULL) {
+        gsh_history_clear(state->history);
     }
-    state->positionals = NULL;
+    clear_shell_workspaces(state);
 }
 
 static void print_usage(FILE *stream)
 {
-    fprintf(stream,
+    if (stream == NULL) {
+        return;
+    }
+    (void)fprintf(stream,
             "usage: gsh [command_file [argument ...]]\n"
             "       gsh -s [argument ...]\n"
             "       gsh -c command_string [command_name [argument ...]]\n"
@@ -10276,21 +11338,21 @@ static void print_usage(FILE *stream)
 
 static int check_native_syntax(const char *input)
 {
-    gsh_parse_storage *storage = fault_should_fail("allocation", ENOMEM)
-                                     ? NULL
-                                     : malloc(sizeof(*storage));
+    if (input == NULL) {
+        return -1;
+    }
+    static gsh_parse_storage storage;
     gsh_parse_result result;
 
-    if (storage == NULL) {
+    if (gsh_fault_should_fail(GSH_FAULT_ALLOCATION, ENOMEM)) {
         perror("gsh: syntax allocation");
         return 2;
     }
-    result = gsh_parse(input, strlen(input), storage);
-    free(storage);
+    result = gsh_parse(input, strlen(input), &storage);
     if (result.status == GSH_PARSE_OK) {
         return 0;
     }
-    fprintf(stderr, "gsh: %s at byte %zu\n",
+    (void)fprintf(stderr, "gsh: %s at byte %zu\n",
             gsh_parse_status_name(result.status), result.error_offset);
     return 2;
 }
@@ -10331,602 +11393,680 @@ static int evaluator_job_service_socket(
 static bool evaluator_job_service_available(
     const native_evaluator *evaluator);
 static gsh_trap_store *evaluator_trap_store(native_evaluator *evaluator);
-static int finish_native_evaluator(native_evaluator *evaluator,
-                                   int status);
+typedef enum {
+    NATIVE_TRAPS_PENDING,
+    NATIVE_TRAPS_EXIT,
+} native_trap_run_kind;
+static int run_native_traps(native_evaluator *evaluator, int status,
+                            native_trap_run_kind kind);
 static void enter_native_subshell_or_exit(native_evaluator *evaluator);
 
-static int run_pipeline_function(native_evaluator *parent,
-                                 gsh_native_pipeline *pipeline,
-                                 size_t command_index,
-                                 gsh_variable_store *variables,
-                                 bool *found);
-static int run_pipeline_source(native_evaluator *parent,
-                               gsh_native_pipeline *pipeline,
-                               size_t command_index,
-                               gsh_variable_store *variables);
-static int run_pipeline_fc(native_evaluator *parent,
-                           gsh_native_pipeline *pipeline,
-                           size_t command_index,
-                           gsh_variable_store *variables);
+typedef enum {
+    PIPELINE_ISOLATED_FUNCTION,
+    PIPELINE_ISOLATED_FC,
+    PIPELINE_ISOLATED_SOURCE,
+} pipeline_isolated_kind;
+
+enum {
+    GSH_EVALUATOR_SOURCE_REQUEST = 256,
+    GSH_EVALUATOR_FUNCTION_REQUEST = 257,
+    GSH_EVALUATOR_PIPELINE_CHILD_REQUEST = 258,
+    GSH_EVALUATOR_PIPELINE_EXIT_REQUEST = 259,
+    GSH_EVALUATOR_TRAP_REQUEST = 260,
+};
+
+static int run_pipeline_isolated_command(
+    native_evaluator *parent, gsh_native_pipeline *pipeline,
+    size_t command_index, gsh_variable_store *variables,
+    pipeline_isolated_kind kind, bool *handled);
+static int request_pipeline_exit(native_evaluator *evaluator, int status);
 static int evaluate_loop_control(native_evaluator *evaluator,
                                  const gsh_native_pipeline *pipeline);
 
-static int run_native_noninteractive_pipeline(
+static int noninteractive_assignment_error(int assignment_status,
+                                           const char *operation)
+{
+    if (!require(operation != NULL)) return 125;
+    if (!require(assignment_status != GSH_ASSIGNMENT_OK)) return 125;
+    perror(operation);
+    return assignment_status == GSH_ASSIGNMENT_JOURNAL_ERROR ? 125 : 1;
+}
+
+static bool noninteractive_simple_builtin_status(
+    gsh_native_pipeline *pipeline, gsh_variable_store *variables,
+    gsh_variable_journal *journal, gsh_alias_store *aliases,
+    gsh_alias_journal *alias_journal, gsh_shell_options *options,
+    int *status)
+{
+    const gsh_native_command *command;
+    int builtin_status;
+
+    if (!require(pipeline != NULL && variables != NULL)) return false;
+    if (!require(options != NULL && status != NULL)) return false;
+    if (pipeline->command_count != 1U ||
+        pipeline->commands[0].redirect_count != 0U) {
+        return false;
+    }
+    command = &pipeline->commands[0];
+    if (native_pure_builtin(command)) {
+        if (native_colon_builtin(command) && command->assignment_count != 0) {
+            int assignment_status = apply_special_builtin_assignments(
+                variables, journal, command, options);
+
+            if (assignment_status != GSH_ASSIGNMENT_OK) {
+                *status = noninteractive_assignment_error(
+                    assignment_status, "gsh: assignment");
+                return true;
+            }
+        }
+        builtin_status = run_native_pure_builtin(
+            command, &descriptor_builtin_io);
+    } else if (native_environment_builtin(command)) {
+        builtin_status = run_native_environment_builtin(
+            command, &descriptor_builtin_io);
+    } else if (native_variable_builtin(command)) {
+        int assignment_status = apply_special_builtin_assignments(
+            variables, journal, command, options);
+
+        if (assignment_status != GSH_ASSIGNMENT_OK) {
+            *status = noninteractive_assignment_error(
+                assignment_status, "gsh: assignment");
+            return true;
+        }
+        builtin_status = run_native_variable_builtin(
+            command, variables, journal, options, NULL,
+            &descriptor_builtin_io);
+    } else if (native_alias_builtin(command)) {
+        if (aliases == NULL || alias_journal == NULL) return false;
+        builtin_status = run_native_alias_builtin(
+            command, aliases, alias_journal, &descriptor_builtin_io);
+    } else {
+        return false;
+    }
+    *status = builtin_status == 125
+                  ? 125
+                  : (pipeline->negated ? (builtin_status == 0 ? 1 : 0)
+                                       : builtin_status);
+    return true;
+}
+
+static bool noninteractive_inspection_builtin_status(
+    gsh_native_pipeline *pipeline, const char *default_path,
+    gsh_variable_store *variables, gsh_variable_journal *journal,
+    gsh_alias_store *aliases, gsh_shell_options *options,
+    gsh_function_store *functions, native_evaluator *evaluator,
+    int *status)
+{
+    if (default_path == NULL || evaluator == NULL || functions == NULL) {
+        return false;
+    }
+    const gsh_native_command *command;
+    int builtin_status;
+
+    if (!require(pipeline != NULL && variables != NULL)) return false;
+    if (!require(options != NULL && status != NULL)) return false;
+    if (pipeline->command_count != 1U ||
+        pipeline->commands[0].redirect_count != 0U) {
+        return false;
+    }
+    command = &pipeline->commands[0];
+    if (native_hash_builtin(command)) {
+        const char *path = hash_command_path_value(
+            variables, command, default_path);
+
+        builtin_status = run_native_hash_builtin(
+            command, path, functions, evaluator_command_cache(evaluator),
+            hash_command_path_generation(variables, command), NULL,
+            &descriptor_builtin_io);
+    } else if (native_times_builtin(command)) {
+        int assignment_status = apply_special_builtin_assignments(
+            variables, journal, command, options);
+
+        if (assignment_status != GSH_ASSIGNMENT_OK) {
+            *status = noninteractive_assignment_error(
+                assignment_status, "gsh: times assignment");
+            return true;
+        }
+        builtin_status = run_native_times_builtin(
+            command, evaluator_times_context(evaluator),
+            &descriptor_builtin_io);
+    } else if (native_command_inspection_builtin(command)) {
+        if (aliases == NULL) return false;
+        const char *path = command_path_value(
+            variables, command, default_path);
+
+        builtin_status = run_native_command_inspection(
+            command, path, default_path, aliases, functions,
+            evaluator_command_cache(evaluator),
+            gsh_variables_path_generation(variables),
+            command_uses_persistent_path(command), NULL,
+            &descriptor_builtin_io);
+    } else {
+        return false;
+    }
+    *status = builtin_status == 125
+                  ? 125
+                  : (pipeline->negated ? (builtin_status == 0 ? 1 : 0)
+                                       : builtin_status);
+    return true;
+}
+
+static bool noninteractive_direct_status(
     gsh_native_pipeline *pipeline, const char *default_path,
     gsh_variable_store *variables, gsh_variable_journal *journal,
     gsh_alias_store *aliases, gsh_alias_journal *alias_journal,
-    const pipeline_expansion_scope *scope,
     gsh_positional_store *positionals, gsh_shell_options *options,
     gsh_function_store *functions, gsh_variable_store *scratch,
-    native_evaluator *evaluator)
+    native_evaluator *evaluator, int *status)
 {
-    int pipes[GSH_NATIVE_PIPELINE_CAP - 1][2];
-    int heredoc_pipes[GSH_NATIVE_HEREDOC_CAP][2];
-    pid_t members[GSH_NATIVE_JOB_MEMBER_CAP];
-    size_t pipe_count = pipeline->command_count - 1U;
-    size_t created_pipes = 0;
-    size_t created_heredocs = 0;
-    size_t launched = 0;
-    size_t index;
-    pid_t status_pid = -1;
-    int last_wait_status = 0;
-    bool last_status_known = false;
-
-    if (scope == NULL && evaluator_command_cache(evaluator) != NULL) {
-        for (index = 0; index < pipeline->command_count; index++) {
-            (void)cache_planned_external(
-                evaluator_command_cache(evaluator), variables,
-                &pipeline->commands[index], default_path, functions);
-        }
+    if (default_path == NULL || functions == NULL) {
+        return false;
     }
+    const gsh_native_command *command;
 
-    if (pipeline->command_count == 1 &&
-        pipeline->commands[0].argc == 0 &&
-        pipeline->commands[0].assignment_count > 0 &&
-        pipeline->commands[0].redirect_count == 0) {
+    if (!require(pipeline != NULL && variables != NULL)) return false;
+    if (!require(options != NULL && status != NULL)) return false;
+    if (pipeline->command_count != 1U) return false;
+    command = &pipeline->commands[0];
+    if (command->argc == 0 && command->assignment_count > 0 &&
+        command->redirect_count == 0) {
         int assignment_status = apply_native_assignments(
-            variables, journal, &pipeline->commands[0], options);
+            variables, journal, command, options);
 
         if (assignment_status != GSH_ASSIGNMENT_OK) {
-            perror("gsh: assignment");
-            return assignment_status == GSH_ASSIGNMENT_JOURNAL_ERROR ? 125
-                                                                     : 1;
-        }
-        {
-            int status = pipeline->commands[0]
-                                 .command_substitution_performed
-                             ? pipeline->commands[0]
-                                   .command_substitution_status
-                             : 0;
+            *status = noninteractive_assignment_error(
+                assignment_status, "gsh: assignment");
+        } else {
+            int value = command->command_substitution_performed
+                            ? command->command_substitution_status
+                            : 0;
 
-            return pipeline->negated ? (status == 0 ? 1 : 0) : status;
+            *status = pipeline->negated ? (value == 0 ? 1 : 0) : value;
         }
+        return true;
     }
-    if (pipeline->command_count == 1U && evaluator != NULL &&
-        native_loop_control_builtin(&pipeline->commands[0])) {
-        return evaluate_loop_control(evaluator, pipeline);
+    if (evaluator != NULL && native_loop_control_builtin(command)) {
+        *status = evaluate_loop_control(evaluator, pipeline);
+        return true;
     }
-    if (pipeline->command_count == 1U &&
-        native_exec_builtin(&pipeline->commands[0])) {
+    if (native_exec_builtin(command)) {
         bool builtin_failed;
-        int status = run_evaluator_exec_builtin(
-            pipeline, variables, journal, options, default_path,
-            evaluator_command_cache(evaluator), NULL, -1,
-            NULL, &builtin_failed);
 
+        *status = run_evaluator_exec_builtin(
+            pipeline, variables, journal, options, default_path,
+            evaluator_command_cache(evaluator), NULL, -1, NULL,
+            &builtin_failed);
         (void)builtin_failed;
-        return status;
+        return true;
     }
-    if (pipeline->command_count == 1U && evaluator != NULL &&
-        native_posix_stateful_builtin(&pipeline->commands[0])) {
-        return run_evaluator_posix_stateful_builtin(
-            pipeline, variables, scratch, journal,
-            positionals, options);
+    if (evaluator != NULL && native_posix_stateful_builtin(command)) {
+        if (positionals == NULL || scratch == NULL) {
+            *status = 125;
+            return true;
+        }
+        *status = run_evaluator_posix_stateful_builtin(
+            pipeline, variables, scratch, journal, positionals, options);
+        return true;
     }
-    if (pipeline->command_count == 1U && evaluator != NULL &&
-        native_job_control_builtin(&pipeline->commands[0])) {
-        return run_evaluator_job_control_builtin(
+    if (evaluator != NULL && native_job_control_builtin(command)) {
+        if (scratch == NULL) {
+            *status = 125;
+            return true;
+        }
+        *status = run_evaluator_job_control_builtin(
             pipeline, variables, scratch, options,
             evaluator_backgrounds(evaluator),
             evaluator_job_service_socket(evaluator),
             evaluator_job_service_available(evaluator));
+        return true;
     }
-    if (pipeline->command_count == 1 &&
-        native_variable_builtin(&pipeline->commands[0]) &&
-        pipeline->commands[0].redirect_count != 0) {
-        return run_evaluator_variable_builtin(pipeline, variables, journal,
-                                              options, NULL);
+    if (native_variable_builtin(command) && command->redirect_count != 0) {
+        *status = run_evaluator_variable_builtin(
+            pipeline, variables, journal, options, NULL);
+        return true;
     }
-    if (pipeline->command_count == 1 &&
-        native_colon_builtin(&pipeline->commands[0]) &&
-        pipeline->commands[0].assignment_count != 0 &&
-        pipeline->commands[0].redirect_count != 0) {
-        return run_evaluator_colon_builtin(pipeline, variables, journal,
-                                           options);
+    if (native_colon_builtin(command) && command->assignment_count != 0 &&
+        command->redirect_count != 0) {
+        *status = run_evaluator_colon_builtin(
+            pipeline, variables, journal, options);
+        return true;
     }
-    if (pipeline->command_count == 1 &&
-        pipeline->commands[0].redirect_count == 0) {
-        int builtin_status;
+    return noninteractive_simple_builtin_status(
+               pipeline, variables, journal, aliases, alias_journal,
+               options, status) ||
+           noninteractive_inspection_builtin_status(
+               pipeline, default_path, variables, journal, aliases,
+               options, functions, evaluator, status);
+}
 
-        if (native_pure_builtin(&pipeline->commands[0])) {
-            if (native_colon_builtin(&pipeline->commands[0]) &&
-                pipeline->commands[0].assignment_count != 0) {
-                int assignment_status = apply_special_builtin_assignments(
-                    variables, journal, &pipeline->commands[0], options);
+typedef struct {
+    int pipes[GSH_NATIVE_PIPELINE_CAP - 1][2];
+    int heredoc_pipes[GSH_NATIVE_HEREDOC_CAP][2];
+    pid_t members[GSH_NATIVE_JOB_MEMBER_CAP];
+    size_t pipe_count;
+    size_t created_pipes;
+    size_t created_heredocs;
+    size_t launched;
+    pid_t status_pid;
+} noninteractive_pipeline_launch;
 
-                if (assignment_status != GSH_ASSIGNMENT_OK) {
-                    perror("gsh: assignment");
-                    return assignment_status == GSH_ASSIGNMENT_JOURNAL_ERROR
-                               ? 125
-                               : 1;
-                }
-            }
-            builtin_status = run_native_pure_builtin(
-                &pipeline->commands[0], &descriptor_builtin_io);
-            return pipeline->negated ? (builtin_status == 0 ? 1 : 0)
-                                     : builtin_status;
-        }
-        if (native_environment_builtin(&pipeline->commands[0])) {
-            builtin_status = run_native_environment_builtin(
-                &pipeline->commands[0], &descriptor_builtin_io);
-            return pipeline->negated ? (builtin_status == 0 ? 1 : 0)
-                                     : builtin_status;
-        }
-        if (native_variable_builtin(&pipeline->commands[0])) {
-            int assignment_status = apply_special_builtin_assignments(
-                variables, journal, &pipeline->commands[0], options);
+static void initialize_noninteractive_launch(
+    noninteractive_pipeline_launch *launch, size_t command_count)
+{
+    if (!require(launch != NULL)) return;
+    (void)memset(launch->members, 0, sizeof(launch->members));
+    initialize_pipeline_descriptors(launch->pipes);
+    initialize_heredoc_descriptors(launch->heredoc_pipes);
+    launch->pipe_count = command_count > 0U ? command_count - 1U : 0U;
+    launch->created_pipes = 0U;
+    launch->created_heredocs = 0U;
+    launch->launched = 0U;
+    launch->status_pid = -1;
+    if (!require(command_count > 0U)) return;
+}
 
-            if (assignment_status != GSH_ASSIGNMENT_OK) {
-                perror("gsh: assignment");
-                return assignment_status == GSH_ASSIGNMENT_JOURNAL_ERROR
-                           ? 125
-                           : 1;
-            }
-            builtin_status = run_native_variable_builtin(
-                &pipeline->commands[0], variables, journal,
-                options, NULL, &descriptor_builtin_io);
-            if (builtin_status == 125) {
-                return 125;
-            }
-            return pipeline->negated ? (builtin_status == 0 ? 1 : 0)
-                                     : builtin_status;
-        }
-        if (native_alias_builtin(&pipeline->commands[0])) {
-            builtin_status = run_native_alias_builtin(
-                &pipeline->commands[0], aliases, alias_journal,
-                &descriptor_builtin_io);
-            return builtin_status == 125
-                       ? 125
-                       : (pipeline->negated
-                              ? (builtin_status == 0 ? 1 : 0)
-                              : builtin_status);
-        }
-        if (native_hash_builtin(&pipeline->commands[0])) {
-            const gsh_native_command *command = &pipeline->commands[0];
-            const char *path = hash_command_path_value(
-                variables, command, default_path);
-
-            builtin_status = run_native_hash_builtin(
-                command, path, functions,
-                evaluator_command_cache(evaluator),
-                hash_command_path_generation(variables, command), NULL,
-                &descriptor_builtin_io);
-            return builtin_status == 125
-                       ? 125
-                       : (pipeline->negated
-                              ? (builtin_status == 0 ? 1 : 0)
-                              : builtin_status);
-        }
-        if (native_times_builtin(&pipeline->commands[0])) {
-            int assignment_status = apply_special_builtin_assignments(
-                variables, journal, &pipeline->commands[0], options);
-
-            if (assignment_status != GSH_ASSIGNMENT_OK) {
-                perror("gsh: times assignment");
-                return assignment_status == GSH_ASSIGNMENT_JOURNAL_ERROR
-                           ? 125
-                           : 1;
-            }
-            builtin_status = run_native_times_builtin(
-                &pipeline->commands[0], evaluator_times_context(evaluator),
-                &descriptor_builtin_io);
-            return builtin_status == 125
-                       ? 125
-                       : (pipeline->negated
-                              ? (builtin_status == 0 ? 1 : 0)
-                              : builtin_status);
-        }
-        if (native_command_inspection_builtin(&pipeline->commands[0])) {
-            const gsh_native_command *command = &pipeline->commands[0];
-            const char *path = command_path_value(
-                variables, command, default_path);
-
-            builtin_status = run_native_command_inspection(
-                command, path, default_path, aliases, functions,
-                evaluator_command_cache(evaluator),
-                gsh_variables_path_generation(variables),
-                command_uses_persistent_path(command), NULL,
-                &descriptor_builtin_io);
-            return builtin_status == 125
-                       ? 125
-                       : (pipeline->negated
-                              ? (builtin_status == 0 ? 1 : 0)
-                              : builtin_status);
-        }
-    }
-
-    initialize_pipeline_descriptors(pipes);
-    initialize_heredoc_descriptors(heredoc_pipes);
-    for (created_heredocs = 0;
-         created_heredocs < pipeline->heredoc_count;
-         created_heredocs++) {
-        if (make_pipe(heredoc_pipes[created_heredocs], false
-                      GSH_FAULT_ARGUMENT("heredoc-pipe")) == -1) {
+static bool create_noninteractive_descriptors(
+    const gsh_native_pipeline *pipeline,
+    noninteractive_pipeline_launch *launch)
+{
+    if (!require(pipeline != NULL)) return false;
+    if (!require(launch != NULL)) return false;
+    for (launch->created_heredocs = 0;
+         launch->created_heredocs < pipeline->heredoc_count;
+         launch->created_heredocs++) {
+        if (make_pipe(launch->heredoc_pipes[launch->created_heredocs], false,
+                      GSH_FAULT_HEREDOC_PIPE) == -1) {
             perror("gsh: here-document pipe");
-            close_heredoc_descriptors(heredoc_pipes,
-                                      created_heredocs);
-            return 125;
+            close_heredoc_descriptors(launch->heredoc_pipes,
+                                      launch->created_heredocs);
+            return false;
         }
     }
-    for (created_pipes = 0; created_pipes < pipe_count; created_pipes++) {
-        if (make_pipe(pipes[created_pipes], false
-                      GSH_FAULT_ARGUMENT("pipeline-pipe")) == -1) {
+    for (launch->created_pipes = 0;
+         launch->created_pipes < launch->pipe_count;
+         launch->created_pipes++) {
+        if (make_pipe(launch->pipes[launch->created_pipes], false,
+                      GSH_FAULT_PIPELINE_PIPE) == -1) {
             perror("gsh: pipeline pipe");
-            close_pipeline_descriptors(pipes, created_pipes);
-            close_heredoc_descriptors(heredoc_pipes,
-                                      created_heredocs);
-            return 125;
+            close_pipeline_descriptors(launch->pipes,
+                                       launch->created_pipes);
+            close_heredoc_descriptors(launch->heredoc_pipes,
+                                      launch->created_heredocs);
+            return false;
         }
     }
-    for (index = 0; index < pipeline->command_count; index++) {
-        pid_t pid = fault_should_fail("pipeline-fork", EAGAIN) ? -1 : fork();
+    return true;
+}
 
-        if (pid == 0) {
-            size_t close_index;
+static void terminate_noninteractive_launch(
+    noninteractive_pipeline_launch *launch, const char *operation,
+    int error)
+{
+    size_t index;
 
-            reset_child_signals();
-            enter_native_subshell_or_exit(evaluator);
-            close_evaluator_exec_transaction(evaluator);
-            if (pipeline->commands[index].expansion_error) {
-                _exit(1);
-            }
-            if (scope != NULL &&
-                gsh_variables_apply_journal_scope_in_place(
-                    variables, scope->changes, index + 1U) == -1) {
-                child_exec_error("pipeline variable scope", errno);
-            }
-            if (index > 0 &&
-                child_duplicate_descriptor(pipes[index - 1U][0],
-                                           STDIN_FILENO) == -1) {
-                child_exec_error("pipeline input", errno);
-            }
-            if (index + 1U < pipeline->command_count &&
-                child_duplicate_descriptor(pipes[index][1],
-                                           STDOUT_FILENO) == -1) {
-                child_exec_error("pipeline output", errno);
-            }
-            child_apply_redirects(&pipeline->commands[index],
-                                  heredoc_pipes,
-                                  pipeline->heredoc_count, options);
-            for (close_index = 0; close_index < created_pipes;
-                 close_index++) {
-                close(pipes[close_index][0]);
-                close(pipes[close_index][1]);
-            }
-            close_heredoc_descriptors(heredoc_pipes,
-                                      pipeline->heredoc_count);
-            {
-                bool function_found;
-                int function_status = run_pipeline_function(
-                    evaluator, pipeline, index, variables,
-                    &function_found);
-
-                if (function_found) {
-                    _exit(finish_native_evaluator(
-                              evaluator, function_status) &
-                          255);
-                }
-            }
-            if (fault_should_fail("exec", EIO)) {
-                child_exec_error(pipeline->commands[index].argv[0], errno);
-            }
-            {
-                int builtin_status;
-
-                if (native_pure_builtin(&pipeline->commands[index])) {
-                    _exit(run_native_pure_builtin(
-                        &pipeline->commands[index], &descriptor_builtin_io));
-                }
-                if (native_posix_stateful_builtin(
-                        &pipeline->commands[index])) {
-                    _exit(child_run_posix_stateful_builtin(
-                        &pipeline->commands[index], variables,
-                        scratch, positionals, options));
-                }
-                if (native_job_control_builtin(
-                        &pipeline->commands[index])) {
-                    if (apply_native_assignments(
-                            variables, NULL, &pipeline->commands[index],
-                            options) != GSH_ASSIGNMENT_OK) {
-                        child_exec_error("job builtin assignment", errno);
-                    }
-                    if (evaluator_job_service_available(evaluator) &&
-                        native_snapshot_job_control_builtin(
-                            &pipeline->commands[index])) {
-                        builtin_status = request_reactor_job_service(
-                            evaluator_job_service_socket(evaluator),
-                            &pipeline->commands[index]);
-                    } else if (native_jobs_builtin(
-                            &pipeline->commands[index])) {
-                        builtin_status = gsh_builtin_jobs(
-                            pipeline->commands[index].argc,
-                            pipeline->commands[index].argv,
-                            evaluator_backgrounds(evaluator),
-                            &descriptor_builtin_io);
-                    } else if (native_kill_builtin(
-                                   &pipeline->commands[index])) {
-                        builtin_status = gsh_builtin_kill(
-                            pipeline->commands[index].argc,
-                            pipeline->commands[index].argv,
-                            evaluator_backgrounds(evaluator),
-                            &descriptor_builtin_io);
-                    } else {
-                        builtin_status = gsh_builtin_error(
-                            &descriptor_builtin_io,
-                            pipeline->commands[index].argv[0],
-                            "not available outside the interactive reactor");
-                    }
-                    _exit(builtin_status & 255);
-                }
-                if (native_exit_builtin(&pipeline->commands[index])) {
-                    if (apply_special_builtin_assignments(
-                            variables, NULL,
-                            &pipeline->commands[index], options) !=
-                        GSH_ASSIGNMENT_OK) {
-                        child_exec_error("exit assignment", errno);
-                    }
-                    (void)parse_exit_status(
-                        &pipeline->commands[index],
-                        evaluator_last_status(evaluator),
-                        &builtin_status);
-                    _exit(builtin_status & 255);
-                }
-                if (native_pwd_builtin(&pipeline->commands[index])) {
-                    _exit(child_run_pwd(&pipeline->commands[index],
-                                        variables));
-                }
-                if (native_cd_builtin(&pipeline->commands[index])) {
-                    if (apply_native_assignments(
-                            variables, NULL, &pipeline->commands[index],
-                            options) != GSH_ASSIGNMENT_OK) {
-                        child_exec_error("assignment", errno);
-                    }
-                    _exit(run_native_cd_builtin(
-                        &pipeline->commands[index], variables, variables,
-                        NULL,
-                        options, &descriptor_builtin_io, NULL, 0));
-                }
-                if (native_environment_builtin(
-                        &pipeline->commands[index])) {
-                    _exit(run_native_environment_builtin(
-                        &pipeline->commands[index], &descriptor_builtin_io));
-                }
-                if (native_variable_builtin(&pipeline->commands[index])) {
-                    if (apply_special_builtin_assignments(
-                            variables, NULL,
-                            &pipeline->commands[index], options) !=
-                        GSH_ASSIGNMENT_OK) {
-                        child_exec_error("assignment", errno);
-                    }
-                    _exit(run_native_variable_builtin(
-                        &pipeline->commands[index], variables, NULL,
-                        options, NULL, &descriptor_builtin_io));
-                }
-                if (native_state_builtin(
-                        &pipeline->commands[index])) {
-                    if (apply_special_builtin_assignments(
-                            variables, NULL,
-                            &pipeline->commands[index], options) !=
-                        GSH_ASSIGNMENT_OK) {
-                        child_exec_error("assignment", errno);
-                    }
-                    _exit(run_native_state_builtin(
-                        &pipeline->commands[index], variables,
-                        positionals, options, &descriptor_builtin_io));
-                }
-                if (native_fc_builtin(&pipeline->commands[index])) {
-                    int fc_status = run_pipeline_fc(
-                        evaluator, pipeline, index, variables);
-
-                    _exit(finish_native_evaluator(evaluator, fc_status) &
-                          255);
-                }
-                if (native_source_builtin(&pipeline->commands[index])) {
-                    int source_status = run_pipeline_source(
-                        evaluator, pipeline, index, variables);
-
-                    _exit(finish_native_evaluator(
-                              evaluator, source_status) &
-                          255);
-                }
-                if (native_wait_builtin(&pipeline->commands[index])) {
-                    _exit(pipeline->commands[index].argc == 1 ? 0 : 127);
-                }
-                if (native_exec_builtin(&pipeline->commands[index])) {
-                    size_t utility_index;
-
-                    if (exec_utility_index(&pipeline->commands[index],
-                                           &utility_index) == -1) {
-                        _exit(2);
-                    }
-                    if (utility_index ==
-                        pipeline->commands[index].argc) {
-                        _exit(0);
-                    }
-                    {
-                        char *environment_storage[CHILD_ENVIRONMENT_CAP];
-                        char *const *environment =
-                            child_command_environment(
-                                variables, &pipeline->commands[index],
-                                environment_storage);
-
-                        child_exec_direct(
-                            pipeline->commands[index].argv + utility_index,
-                            command_path_value(
-                                variables, &pipeline->commands[index],
-                                default_path),
-                            environment, evaluator_command_cache(evaluator),
-                            command_cache_path_generation(
-                                variables, &pipeline->commands[index]),
-                            command_uses_persistent_path(
-                                &pipeline->commands[index]));
-                    }
-                }
-                if (native_alias_builtin(&pipeline->commands[index])) {
-                    _exit(run_native_alias_builtin(
-                        &pipeline->commands[index], aliases, NULL,
-                        &descriptor_builtin_io));
-                }
-                if (native_hash_builtin(&pipeline->commands[index])) {
-                    const gsh_native_command *command =
-                        &pipeline->commands[index];
-                    const char *path = hash_command_path_value(
-                        variables, command, default_path);
-
-                    _exit(run_native_hash_builtin(
-                        command, path, functions,
-                        evaluator_command_cache(evaluator),
-                        hash_command_path_generation(variables, command),
-                        NULL, &descriptor_builtin_io));
-                }
-                if (native_times_builtin(&pipeline->commands[index])) {
-                    if (apply_special_builtin_assignments(
-                            variables, NULL,
-                            &pipeline->commands[index], options) !=
-                        GSH_ASSIGNMENT_OK) {
-                        child_exec_error("assignment", errno);
-                    }
-                    _exit(run_native_times_builtin(
-                        &pipeline->commands[index], NULL,
-                        &descriptor_builtin_io));
-                }
-                if (native_trap_builtin(&pipeline->commands[index])) {
-                    int trap_status;
-
-                    if (apply_special_builtin_assignments(
-                            variables, NULL,
-                            &pipeline->commands[index], options) !=
-                        GSH_ASSIGNMENT_OK) {
-                        child_exec_error("trap assignment", errno);
-                    }
-                    trap_status = gsh_builtin_trap(
-                        (int)pipeline->commands[index].argc,
-                        pipeline->commands[index].argv,
-                        evaluator_trap_store(evaluator),
-                        &descriptor_builtin_io);
-                    _exit(finish_native_evaluator(evaluator,
-                                                  trap_status) &
-                          255);
-                }
-                if (native_command_inspection_builtin(
-                        &pipeline->commands[index])) {
-                    const gsh_native_command *command =
-                        &pipeline->commands[index];
-                    const char *path = command_path_value(
-                        variables, command, default_path);
-
-                    _exit(run_native_command_inspection(
-                        command, path, default_path, aliases, functions,
-                        evaluator_command_cache(evaluator),
-                        gsh_variables_path_generation(variables),
-                        command_uses_persistent_path(command), NULL,
-                        &descriptor_builtin_io));
-                }
-            }
-            {
-                char *environment_storage[CHILD_ENVIRONMENT_CAP];
-                char *const *environment = child_command_environment(
-                    variables, &pipeline->commands[index],
-                    environment_storage);
-
-                child_exec_direct(
-                    pipeline->commands[index].argv,
-                    command_path_value(variables,
-                                       &pipeline->commands[index],
-                                       default_path),
-                    environment, evaluator_command_cache(evaluator),
-                    command_cache_path_generation(
-                        variables, &pipeline->commands[index]),
-                    command_uses_persistent_path(
-                        &pipeline->commands[index]));
-            }
-        }
-        if (pid == -1) {
-            int saved_errno = errno;
-            size_t terminate;
-
-            close_pipeline_descriptors(pipes, created_pipes);
-            close_heredoc_descriptors(heredoc_pipes,
-                                      created_heredocs);
-            for (terminate = 0; terminate < launched; terminate++) {
-                (void)kill(members[terminate], SIGKILL);
-            }
-            for (terminate = 0; terminate < launched; terminate++) {
-                while (waitpid(members[terminate], NULL, 0) == -1 &&
-                       errno == EINTR) {
-                }
-            }
-            errno = saved_errno;
-            perror("gsh: pipeline fork");
-            return 125;
-        }
-        members[launched++] = pid;
-        status_pid = pid;
+    if (!require(launch != NULL)) return;
+    if (!require(operation != NULL)) return;
+    close_pipeline_descriptors(launch->pipes, launch->created_pipes);
+    close_heredoc_descriptors(launch->heredoc_pipes,
+                              launch->created_heredocs);
+    for (index = 0; index < launch->launched; index++) {
+        (void)kill(launch->members[index], SIGKILL);
     }
+    for (index = 0; index < launch->launched; index++) {
+        while (waitpid(launch->members[index], NULL, 0) == -1 &&
+               errno == EINTR) {
+        }
+    }
+    errno = error;
+    perror(operation);
+}
+
+static void prepare_noninteractive_pipeline_child(
+    gsh_native_pipeline *pipeline, gsh_variable_store *variables,
+    const pipeline_expansion_scope *scope, gsh_shell_options *options,
+    native_evaluator *evaluator, noninteractive_pipeline_launch *launch,
+    size_t index)
+{
+    if (evaluator == NULL || options == NULL) {
+        return;
+    }
+    size_t close_index;
+
+    if (!require(pipeline != NULL && variables != NULL)) _exit(125);
+    if (!require(launch != NULL && index < pipeline->command_count)) {
+        _exit(125);
+    }
+    reset_child_signals();
+    enter_native_subshell_or_exit(evaluator);
+    close_evaluator_exec_transaction(evaluator);
+    if (pipeline->commands[index].expansion_error) _exit(1);
+    if (scope != NULL &&
+        gsh_variables_apply_journal_scope_in_place(
+            variables, scope->changes, index + 1U) == -1) {
+        child_exec_error("pipeline variable scope", errno);
+    }
+    if (index > 0 &&
+        child_duplicate_descriptor(launch->pipes[index - 1U][0],
+                                   STDIN_FILENO) == -1) {
+        child_exec_error("pipeline input", errno);
+    }
+    if (index + 1U < pipeline->command_count &&
+        child_duplicate_descriptor(launch->pipes[index][1],
+                                   STDOUT_FILENO) == -1) {
+        child_exec_error("pipeline output", errno);
+    }
+    child_apply_redirects(&pipeline->commands[index], launch->heredoc_pipes,
+                          pipeline->heredoc_count, options);
+    for (close_index = 0; close_index < launch->created_pipes;
+         close_index++) {
+        (void)close(launch->pipes[close_index][0]);
+        (void)close(launch->pipes[close_index][1]);
+    }
+    close_heredoc_descriptors(launch->heredoc_pipes,
+                              pipeline->heredoc_count);
+}
+
+static bool noninteractive_child_job_status(
+    const gsh_native_command *command, gsh_variable_store *variables,
+    gsh_shell_options *options, native_evaluator *evaluator, int *status)
+{
+    if (!require(command != NULL && variables != NULL)) return false;
+    if (!require(options != NULL && status != NULL)) return false;
+    if (!native_job_control_builtin(command)) return false;
+    if (apply_native_assignments(variables, NULL, command, options) !=
+        GSH_ASSIGNMENT_OK) {
+        child_exec_error("job builtin assignment", errno);
+    }
+    if (evaluator_job_service_available(evaluator) &&
+        native_snapshot_job_control_builtin(command)) {
+        *status = request_reactor_job_service(
+            evaluator_job_service_socket(evaluator), command);
+    } else if (native_jobs_builtin(command)) {
+        *status = gsh_builtin_jobs(
+            command->argc, command->argv,
+            evaluator_backgrounds(evaluator), &descriptor_builtin_io);
+    } else if (native_kill_builtin(command)) {
+        *status = gsh_builtin_kill(
+            command->argc, command->argv,
+            evaluator_backgrounds(evaluator), &descriptor_builtin_io);
+    } else {
+        *status = gsh_builtin_error(
+            &descriptor_builtin_io, command->argv[0],
+            "not available outside the interactive reactor");
+    }
+    return true;
+}
+
+static bool noninteractive_child_primary_status(
+    const gsh_native_command *command, gsh_variable_store *variables,
+    gsh_variable_store *scratch, gsh_positional_store *positionals,
+    gsh_shell_options *options, native_evaluator *evaluator, int *status)
+{
+    if (!require(command != NULL && variables != NULL)) return false;
+    if (!require(options != NULL && status != NULL)) return false;
+    if (native_pure_builtin(command)) {
+        *status = run_native_pure_builtin(command, &descriptor_builtin_io);
+    } else if (native_posix_stateful_builtin(command)) {
+        if (positionals == NULL || scratch == NULL) {
+            *status = 125;
+            return true;
+        }
+        *status = child_run_posix_stateful_builtin(
+            command, variables, scratch, positionals, options);
+    } else if (noninteractive_child_job_status(
+                   command, variables, options, evaluator, status)) {
+        return true;
+    } else if (native_exit_builtin(command)) {
+        if (apply_special_builtin_assignments(
+                variables, NULL, command, options) != GSH_ASSIGNMENT_OK) {
+            child_exec_error("exit assignment", errno);
+        }
+        (void)parse_exit_status(
+            command, evaluator_last_status(evaluator), status);
+    } else if (native_pwd_builtin(command)) {
+        *status = child_run_pwd(command, variables);
+    } else if (native_cd_builtin(command)) {
+        if (apply_native_assignments(variables, NULL, command, options) !=
+            GSH_ASSIGNMENT_OK) {
+            child_exec_error("assignment", errno);
+        }
+        *status = run_native_cd_builtin(
+            command, variables, variables, NULL, options,
+            &descriptor_builtin_io, NULL, 0);
+    } else if (native_environment_builtin(command)) {
+        *status = run_native_environment_builtin(
+            command, &descriptor_builtin_io);
+    } else {
+        return false;
+    }
+    return true;
+}
+
+static bool noninteractive_child_state_status(
+    const gsh_native_command *command, const char *default_path,
+    gsh_variable_store *variables, gsh_alias_store *aliases,
+    gsh_positional_store *positionals, gsh_shell_options *options,
+    gsh_function_store *functions, native_evaluator *evaluator, int *status)
+{
+    if (!require(command != NULL && variables != NULL)) return false;
+    if (!require(options != NULL && status != NULL)) return false;
+    if (native_variable_builtin(command)) {
+        if (apply_special_builtin_assignments(
+                variables, NULL, command, options) != GSH_ASSIGNMENT_OK) {
+            child_exec_error("assignment", errno);
+        }
+        *status = run_native_variable_builtin(
+            command, variables, NULL, options, NULL, &descriptor_builtin_io);
+    } else if (native_state_builtin(command)) {
+        if (positionals == NULL) {
+            *status = 125;
+            return true;
+        }
+        if (apply_special_builtin_assignments(
+                variables, NULL, command, options) != GSH_ASSIGNMENT_OK) {
+            child_exec_error("assignment", errno);
+        }
+        *status = run_native_state_builtin(
+            command, variables, positionals, options,
+            &descriptor_builtin_io);
+    } else if (native_wait_builtin(command)) {
+        *status = command->argc == 1U ? 0 : 127;
+    } else if (native_alias_builtin(command)) {
+        if (aliases == NULL) {
+            *status = 125;
+            return true;
+        }
+        *status = run_native_alias_builtin(
+            command, aliases, NULL, &descriptor_builtin_io);
+    } else if (native_hash_builtin(command)) {
+        if (default_path == NULL || evaluator == NULL || functions == NULL) {
+            *status = 125;
+            return true;
+        }
+        const char *path = hash_command_path_value(
+            variables, command, default_path);
+
+        *status = run_native_hash_builtin(
+            command, path, functions, evaluator_command_cache(evaluator),
+            hash_command_path_generation(variables, command), NULL,
+            &descriptor_builtin_io);
+    } else {
+        return false;
+    }
+    return true;
+}
+
+static bool noninteractive_child_inspection_status(
+    const gsh_native_command *command, const char *default_path,
+    gsh_variable_store *variables, gsh_alias_store *aliases,
+    gsh_shell_options *options, gsh_function_store *functions,
+    native_evaluator *evaluator, int *status)
+{
+    if (aliases == NULL || default_path == NULL || evaluator == NULL || functions == NULL) {
+        return false;
+    }
+    if (!require(command != NULL && variables != NULL)) return false;
+    if (!require(options != NULL && status != NULL)) return false;
+    if (native_times_builtin(command)) {
+        if (apply_special_builtin_assignments(
+                variables, NULL, command, options) != GSH_ASSIGNMENT_OK) {
+            child_exec_error("assignment", errno);
+        }
+        *status = run_native_times_builtin(
+            command, NULL, &descriptor_builtin_io);
+    } else if (native_command_inspection_builtin(command)) {
+        const char *path = command_path_value(
+            variables, command, default_path);
+
+        *status = run_native_command_inspection(
+            command, path, default_path, aliases, functions,
+            evaluator_command_cache(evaluator),
+            gsh_variables_path_generation(variables),
+            command_uses_persistent_path(command), NULL,
+            &descriptor_builtin_io);
+    } else {
+        return false;
+    }
+    return true;
+}
+
+static bool noninteractive_child_exec_status(
+    const gsh_native_command *command, const char *default_path,
+    gsh_variable_store *variables, native_evaluator *evaluator, int *status)
+{
+    if (default_path == NULL || evaluator == NULL) {
+        return false;
+    }
+    size_t utility_index;
+
+    if (!require(command != NULL && variables != NULL)) return false;
+    if (!require(status != NULL)) return false;
+    if (!native_exec_builtin(command)) return false;
+    if (exec_utility_index(command, &utility_index) == -1) {
+        *status = 2;
+        return true;
+    }
+    if (utility_index == command->argc) {
+        *status = 0;
+        return true;
+    }
+    {
+        char *environment_storage[CHILD_ENVIRONMENT_CAP];
+        char *const *environment = child_command_environment(
+            variables, command, environment_storage);
+
+        child_exec_direct(
+            command->argv + utility_index,
+            command_path_value(variables, command, default_path),
+            environment, evaluator_command_cache(evaluator),
+            command_cache_path_generation(variables, command),
+            command_uses_persistent_path(command));
+    }
+    *status = 126;
+    return true;
+}
+
+static bool noninteractive_child_leaf_status(
+    const gsh_native_command *command, const char *default_path,
+    gsh_variable_store *variables, gsh_variable_store *scratch,
+    gsh_alias_store *aliases, gsh_positional_store *positionals,
+    gsh_shell_options *options, gsh_function_store *functions,
+    native_evaluator *evaluator, int *status)
+{
+    if (default_path == NULL || evaluator == NULL) {
+        return false;
+    }
+    if (!require(command != NULL && variables != NULL)) return false;
+    if (!require(options != NULL && status != NULL)) return false;
+    return noninteractive_child_primary_status(
+               command, variables, scratch, positionals, options,
+               evaluator, status) ||
+           noninteractive_child_state_status(
+               command, default_path, variables, aliases, positionals,
+               options, functions, evaluator, status) ||
+           noninteractive_child_exec_status(
+               command, default_path, variables, evaluator, status) ||
+           noninteractive_child_inspection_status(
+               command, default_path, variables, aliases, options,
+               functions, evaluator, status);
+}
+
+static void execute_noninteractive_external(
+    const gsh_native_command *command, const char *default_path,
+    gsh_variable_store *variables, native_evaluator *evaluator)
+{
+    if (evaluator == NULL) {
+        return;
+    }
+    char *environment_storage[CHILD_ENVIRONMENT_CAP];
+    char *const *environment;
+
+    if (!require(command != NULL && variables != NULL)) _exit(125);
+    if (!require(default_path != NULL)) _exit(125);
+    environment = child_command_environment(
+        variables, command, environment_storage);
+    child_exec_direct(
+        command->argv,
+        command_path_value(variables, command, default_path), environment,
+        evaluator_command_cache(evaluator),
+        command_cache_path_generation(variables, command),
+        command_uses_persistent_path(command));
+}
+
+static bool launch_noninteractive_heredocs(
+    const gsh_native_pipeline *pipeline,
+    noninteractive_pipeline_launch *launch)
+{
+    size_t index;
+
+    if (!require(pipeline != NULL)) return false;
+    if (!require(launch != NULL)) return false;
     for (index = 0; index < pipeline->heredoc_count; index++) {
-        pid_t pid = fault_should_fail("heredoc-fork", EAGAIN) ? -1 : fork();
+        pid_t pid = gsh_fault_should_fail(GSH_FAULT_HEREDOC_FORK, EAGAIN) ? -1 : fork();
 
         if (pid == 0) {
             reset_child_signals();
-            close_pipeline_descriptors(pipes, created_pipes);
-            child_write_heredoc(pipeline, index, heredoc_pipes);
+            close_pipeline_descriptors(launch->pipes,
+                                       launch->created_pipes);
+            child_write_heredoc(pipeline, index, launch->heredoc_pipes);
         }
         if (pid == -1) {
             int saved_errno = errno;
-            size_t terminate;
 
-            close_pipeline_descriptors(pipes, created_pipes);
-            close_heredoc_descriptors(heredoc_pipes,
-                                      created_heredocs);
-            for (terminate = 0; terminate < launched; terminate++) {
-                (void)kill(members[terminate], SIGKILL);
-            }
-            for (terminate = 0; terminate < launched; terminate++) {
-                while (waitpid(members[terminate], NULL, 0) == -1 &&
-                       errno == EINTR) {
-                }
-            }
-            errno = saved_errno;
-            perror("gsh: here-document fork");
-            return 125;
+            terminate_noninteractive_launch(
+                launch, "gsh: here-document fork", saved_errno);
+            return false;
         }
-        members[launched++] = pid;
+        launch->members[launch->launched++] = pid;
     }
-    close_pipeline_descriptors(pipes, created_pipes);
-    close_heredoc_descriptors(heredoc_pipes, created_heredocs);
+    return true;
+}
 
-    for (index = 0; index < launched; index++) {
+static int wait_for_noninteractive_pipeline(
+    const gsh_native_pipeline *pipeline,
+    noninteractive_pipeline_launch *launch)
+{
+    int last_wait_status = 0;
+    bool last_status_known = false;
+    size_t index;
+
+    if (!require(pipeline != NULL)) return 125;
+    if (!require(launch != NULL)) return 125;
+    close_pipeline_descriptors(launch->pipes, launch->created_pipes);
+    close_heredoc_descriptors(launch->heredoc_pipes,
+                              launch->created_heredocs);
+    for (index = 0; index < launch->launched; index++) {
         int status;
         pid_t waited;
 
         do {
-            waited = waitpid(members[index], &status, 0);
+            waited = waitpid(launch->members[index], &status, 0);
         } while (waited == -1 && errno == EINTR);
         if (waited == -1) {
             perror("gsh: waitpid");
             return 125;
         }
-        if (members[index] == status_pid) {
+        if (launch->members[index] == launch->status_pid) {
             last_wait_status = status;
             last_status_known = true;
         }
@@ -10937,11 +12077,166 @@ static int run_native_noninteractive_pipeline(
                : 125;
 }
 
+typedef struct {
+    gsh_native_pipeline *pipeline;
+    const char *default_path;
+    gsh_variable_store *variables;
+    gsh_alias_store *aliases;
+    const pipeline_expansion_scope *scope;
+    gsh_positional_store *positionals;
+    gsh_shell_options *options;
+    gsh_function_store *functions;
+    gsh_variable_store *scratch;
+    native_evaluator *evaluator;
+    noninteractive_pipeline_launch *launch;
+} noninteractive_child_context;
+
+static gsh_native_pipeline *noninteractive_context_pipeline(
+    const noninteractive_child_context *context)
+{
+    if (!require(context != NULL)) return NULL;
+    if (!require(context->pipeline != NULL)) return NULL;
+    return context->pipeline;
+}
+
+static int run_noninteractive_pipeline_child(
+    const noninteractive_child_context *context, size_t index)
+{
+    if (!require(context != NULL && context->pipeline != NULL)) return 125;
+    if (!require(context->evaluator != NULL && context->launch != NULL)) {
+        return 125;
+    }
+    const gsh_native_command *command = &noninteractive_context_pipeline(context)->commands[index];
+    bool handled = false;
+    int status;
+
+    prepare_noninteractive_pipeline_child(
+        context->pipeline, context->variables, context->scope,
+        context->options, context->evaluator, context->launch, index);
+    status = run_pipeline_isolated_command(
+        context->evaluator, context->pipeline, index, context->variables,
+        PIPELINE_ISOLATED_FUNCTION, &handled);
+    if (handled) {
+        return status == GSH_EVALUATOR_PIPELINE_CHILD_REQUEST
+                   ? status
+                   : request_pipeline_exit(context->evaluator, status);
+    }
+    if (gsh_fault_should_fail(GSH_FAULT_EXEC, EIO)) {
+        child_exec_error(command->argv[0], errno);
+    }
+    if (noninteractive_child_leaf_status(
+            command, context->default_path, context->variables,
+            context->scratch, context->aliases, context->positionals,
+            context->options, context->functions, context->evaluator,
+            &status)) {
+        return status;
+    }
+    if (native_fc_builtin(command) || native_source_builtin(command)) {
+        pipeline_isolated_kind kind = native_fc_builtin(command)
+                                          ? PIPELINE_ISOLATED_FC
+                                          : PIPELINE_ISOLATED_SOURCE;
+
+        status = run_pipeline_isolated_command(
+            context->evaluator, context->pipeline, index,
+            context->variables, kind, &handled);
+        if (!handled) return 125;
+        return status == GSH_EVALUATOR_PIPELINE_CHILD_REQUEST
+                   ? status
+                   : request_pipeline_exit(context->evaluator, status);
+    }
+    if (native_trap_builtin(command)) {
+        if (apply_special_builtin_assignments(
+                context->variables, NULL, command, context->options) !=
+            GSH_ASSIGNMENT_OK) {
+            child_exec_error("trap assignment", errno);
+        }
+        status = gsh_builtin_trap(
+            (int)command->argc, command->argv,
+            evaluator_trap_store(context->evaluator),
+            &descriptor_builtin_io);
+        return request_pipeline_exit(context->evaluator, status);
+    }
+    execute_noninteractive_external(
+        command, context->default_path, context->variables,
+        context->evaluator);
+    return 126;
+}
+
+static int run_native_noninteractive_pipeline(
+    gsh_native_pipeline *pipeline, const char *default_path,
+    gsh_variable_store *variables, gsh_variable_journal *journal,
+    gsh_alias_store *aliases, gsh_alias_journal *alias_journal,
+    const pipeline_expansion_scope *scope,
+    gsh_positional_store *positionals, gsh_shell_options *options,
+    gsh_function_store *functions, gsh_variable_store *scratch,
+    native_evaluator *evaluator)
+{
+    if (aliases == NULL || default_path == NULL || evaluator == NULL ||
+        functions == NULL || options == NULL || pipeline == NULL ||
+        variables == NULL) {
+        return -1;
+    }
+    noninteractive_pipeline_launch launch;
+    noninteractive_child_context child_context = {
+        pipeline, default_path, variables, aliases, scope, positionals,
+        options, functions, scratch, evaluator, &launch};
+    size_t index;
+
+    if (!require(pipeline != NULL && variables != NULL)) return 125;
+    if (!require(options != NULL)) return 125;
+    initialize_noninteractive_launch(&launch, pipeline->command_count);
+
+    if (scope == NULL && evaluator_command_cache(evaluator) != NULL) {
+        for (index = 0; index < pipeline->command_count; index++) {
+            (void)cache_planned_external(
+                evaluator_command_cache(evaluator), variables,
+                &pipeline->commands[index], default_path, functions);
+        }
+    }
+
+    {
+        int direct_status;
+
+        if (noninteractive_direct_status(
+                pipeline, default_path, variables, journal, aliases,
+                alias_journal, positionals, options, functions, scratch,
+                evaluator, &direct_status)) {
+            return direct_status;
+        }
+    }
+
+    if (!create_noninteractive_descriptors(pipeline, &launch)) return 125;
+    for (index = 0; index < pipeline->command_count; index++) {
+        pid_t pid = gsh_fault_should_fail(GSH_FAULT_PIPELINE_FORK, EAGAIN) ? -1 : fork();
+
+        if (pid == 0) {
+            int child_status = run_noninteractive_pipeline_child(
+                &child_context, index);
+
+            if (child_status > 255) return child_status;
+            _exit(child_status & 255);
+        }
+        if (pid == -1) {
+            int saved_errno = errno;
+
+            terminate_noninteractive_launch(
+                &launch, "gsh: pipeline fork", saved_errno);
+            return 125;
+        }
+        launch.members[launch.launched++] = pid;
+        launch.status_pid = pid;
+    }
+    if (!launch_noninteractive_heredocs(pipeline, &launch)) return 125;
+    return wait_for_noninteractive_pipeline(pipeline, &launch);
+}
+
 typedef enum {
     NATIVE_LOOP_CONTROL_NONE,
     NATIVE_LOOP_CONTROL_BREAK,
     NATIVE_LOOP_CONTROL_CONTINUE,
 } native_loop_control;
+
+typedef struct function_evaluation_frame function_evaluation_frame;
 
 struct native_evaluator {
     const char *input;
@@ -10976,7 +12271,6 @@ struct native_evaluator {
     size_t source_depth;
     size_t dot_depth;
     size_t function_depth;
-    bool function_active[GSH_FUNCTION_CAP];
     bool returning;
     int return_status;
     bool exiting;
@@ -11020,10 +12314,70 @@ struct native_evaluator {
         GSH_NATIVE_REDIRECT_CAP];
     size_t source_request_saved_count;
     gsh_background_table *backgrounds;
+    gsh_native_variable_state expansion_variables;
+    gsh_native_substitution_state substitutions;
+    function_evaluation_frame *function_request_frame;
+    size_t function_request_root;
+    void *substitution_child_execution;
+    void *pipeline_child_request;
+    void *trap_request;
+    int pipeline_exit_status;
+    bool suppress_async_once;
 };
+
+static const gsh_parse_storage *evaluator_storage(
+    const native_evaluator *evaluator)
+{
+    if (!require(evaluator != NULL)) return NULL;
+    if (!require(evaluator->storage != NULL)) return NULL;
+    return evaluator->storage;
+}
+
+static gsh_native_pipeline *evaluator_pipeline(
+    const native_evaluator *evaluator)
+{
+    if (!require(evaluator != NULL)) return NULL;
+    if (!require(evaluator->pipeline != NULL)) return NULL;
+    return evaluator->pipeline;
+}
+
+static gsh_function_store *evaluator_functions(
+    const native_evaluator *evaluator)
+{
+    if (!require(evaluator != NULL)) return NULL;
+    if (!require(evaluator->functions != NULL)) return NULL;
+    return evaluator->functions;
+}
+
+static pipeline_expansion_scope *evaluator_pipeline_scope(
+    const native_evaluator *evaluator)
+{
+    if (!require(evaluator != NULL)) return NULL;
+    if (!require(evaluator->pipeline_scope != NULL)) return NULL;
+    return evaluator->pipeline_scope;
+}
+
+static gsh_source_workspace_stack *evaluator_source_workspaces(
+    const native_evaluator *evaluator)
+{
+    if (!require(evaluator != NULL)) return NULL;
+    if (!require(evaluator->source_workspaces != NULL)) return NULL;
+    return evaluator->source_workspaces;
+}
+
+static const gsh_native_command *evaluator_source_request_command(
+    const native_evaluator *evaluator)
+{
+    if (!require(evaluator != NULL)) return NULL;
+    if (!require(evaluator->source_request_command != NULL)) return NULL;
+    return evaluator->source_request_command;
+}
 
 static gsh_trap_store *evaluator_trap_store(native_evaluator *evaluator)
 {
+    if (evaluator == NULL) {
+        return NULL;
+    }
     return evaluator == NULL ? NULL : evaluator->traps;
 }
 
@@ -11054,7 +12408,37 @@ typedef struct {
     bool temporary_variables;
 } native_source_frame;
 
-enum { GSH_EVALUATOR_SOURCE_REQUEST = 256 };
+static gsh_source_workspace *source_frame_workspace(
+    const native_source_frame *frame)
+{
+    if (!require(frame != NULL)) return NULL;
+    if (!require(frame->workspace != NULL)) return NULL;
+    return frame->workspace;
+}
+
+typedef struct {
+    native_evaluator child;
+    native_source_frame frame;
+    gsh_background_table *backgrounds;
+    size_t root;
+} pipeline_source_evaluation;
+
+typedef enum {
+    PIPELINE_CHILD_FUNCTION,
+    PIPELINE_CHILD_SOURCE,
+} pipeline_child_kind;
+
+typedef struct pipeline_child_request {
+    pipeline_child_kind kind;
+    native_evaluator child;
+    function_evaluation_frame *function_frame;
+    pipeline_source_evaluation source;
+    gsh_background_table *backgrounds;
+    size_t root;
+    bool used;
+} pipeline_child_request;
+
+typedef struct native_trap_request native_trap_request;
 
 static bool native_preflight_node(native_evaluator *evaluator,
                                   size_t node_index, size_t depth);
@@ -11081,7 +12465,6 @@ static int read_source_descriptor(int descriptor, char *input,
                 return -1;
             }
             used += (size_t)count;
-            assert(used <= GSH_SOURCE_INPUT_CAP);
         } else if (count == 0) {
             input[used] = '\0';
             *input_length = used;
@@ -11110,7 +12493,7 @@ static int dot_open_candidate(const char *directory, size_t directory_length,
         errno = ENAMETOOLONG;
         return -1;
     } else {
-        memcpy(candidate, directory, directory_length);
+        (void)memcpy(candidate, directory, directory_length);
         offset = directory_length;
     }
     if (offset + 1U + name_length + 1U > sizeof(candidate)) {
@@ -11118,12 +12501,15 @@ static int dot_open_candidate(const char *directory, size_t directory_length,
         return -1;
     }
     candidate[offset++] = '/';
-    memcpy(candidate + offset, name, name_length + 1U);
+    (void)memcpy(candidate + offset, name, name_length + 1U);
     return open(candidate, O_RDONLY | O_CLOEXEC);
 }
 
 static int open_dot_source(const char *name, const char *path)
 {
+    if (path == NULL) {
+        return -1;
+    }
     size_t name_length;
     const char *cursor = path;
     size_t components;
@@ -11207,7 +12593,7 @@ static int concatenate_eval_source(const gsh_native_command *command,
         if (separator != 0) {
             input[used++] = ' ';
         }
-        memcpy(input + used, command->argv[argument], length);
+        (void)memcpy(input + used, command->argv[argument], length);
         used += length;
     }
     input[used] = '\0';
@@ -11221,6 +12607,10 @@ static int load_dot_source(native_evaluator *evaluator,
                            gsh_source_workspace *workspace,
                            size_t *input_length)
 {
+    if (command == NULL || workspace == NULL) return -1;
+    if (evaluator == NULL || variables == NULL) {
+        return -1;
+    }
     size_t operand = 1U;
     int descriptor;
     int source_error = 0;
@@ -11231,14 +12621,14 @@ static int load_dot_source(native_evaluator *evaluator,
         operand++;
     }
     if (command->argc - operand != 1U) {
-        fputs("gsh: .: exactly one file operand required\n", stderr);
+        (void)fputs("gsh: .: exactly one file operand required\n", stderr);
         return 2;
     }
     descriptor = open_dot_source(
         command->argv[operand],
         store_path_value(variables, evaluator->default_path));
-    if (descriptor == -1) {
-        fprintf(stderr, "gsh: .: %s: %s\n", command->argv[operand],
+    if (descriptor < 0) {
+        (void)fprintf(stderr, "gsh: .: %s: %s\n", command->argv[operand],
                 strerror(errno));
         return 1;
     }
@@ -11252,10 +12642,18 @@ static int load_dot_source(native_evaluator *evaluator,
         status = 1;
     }
     if (status != 0) {
-        fprintf(stderr, "gsh: .: %s: %s\n", command->argv[operand],
+        (void)fprintf(stderr, "gsh: .: %s: %s\n", command->argv[operand],
                 strerror(source_error));
     }
     return status;
+}
+
+static int request_pipeline_exit(native_evaluator *evaluator, int status)
+{
+    if (!require(evaluator != NULL)) return 125;
+    if (!require(status >= 0)) return 125;
+    evaluator->pipeline_exit_status = status;
+    return GSH_EVALUATOR_PIPELINE_EXIT_REQUEST;
 }
 
 static bool source_program_is_supported(
@@ -11263,6 +12661,9 @@ static bool source_program_is_supported(
     const gsh_variable_store *source_variables, const char *input,
     size_t input_length, size_t root)
 {
+    if (evaluator == NULL || input == NULL || workspace == NULL) {
+        return false;
+    }
     native_evaluator preflight = *evaluator;
     gsh_variable_store *preflight_scope = &workspace->scope_base;
 
@@ -11273,7 +12674,7 @@ static bool source_program_is_supported(
         preflight_scope == &workspace->variables) {
         return false;
     }
-    memcpy(&workspace->variables, source_variables,
+    (void)memcpy(&workspace->variables, source_variables,
            sizeof(workspace->variables));
     preflight.input = input;
     preflight.input_length = input_length;
@@ -11288,8 +12689,6 @@ static bool source_program_is_supported(
     preflight.preflight = true;
     preflight.fatal_error = false;
     preflight.source_request_active = false;
-    memset(preflight.function_active, 0,
-           sizeof(preflight.function_active));
     if (evaluator->functions != NULL &&
         storage_has_function(&workspace->storage)) {
         gsh_functions_initialize(&workspace->function_scratch);
@@ -11331,14 +12730,14 @@ static int prepare_source_request(
         &workspace->storage, &parsed_input, &parsed_length);
 
     if (parsed.status != GSH_PARSE_OK) {
-        fprintf(stderr, "gsh: %s: %s at byte %zu\n", name,
+        (void)fprintf(stderr, "gsh: %s: %s at byte %zu\n", name,
                 gsh_parse_status_name(parsed.status), parsed.error_offset);
         return 2;
     }
     if (!source_program_is_supported(
             evaluator, workspace, source_variables, parsed_input,
             parsed_length, parsed.root)) {
-        fprintf(stderr, "gsh: %s: native source unsupported\n", name);
+        (void)fprintf(stderr, "gsh: %s: native source unsupported\n", name);
         return 125;
     }
     evaluator->source_request_active = true;
@@ -11351,7 +12750,7 @@ static int prepare_source_request(
     evaluator->source_request_input_length = parsed_length;
     evaluator->source_request_root = parsed.root;
     evaluator->source_request_saved_count = saved_count;
-    memcpy(evaluator->source_request_saved, saved,
+    (void)memcpy(evaluator->source_request_saved, saved,
            saved_count * sizeof(saved[0]));
     return GSH_EVALUATOR_SOURCE_REQUEST;
 }
@@ -11362,6 +12761,10 @@ static int prepare_source_variable_view(
     const gsh_variable_store **source_variables,
     const gsh_native_command **temporary_command)
 {
+    if (command == NULL) return -1;
+    if (evaluator == NULL || source_variables == NULL || temporary_command == NULL || workspace == NULL) {
+        return -1;
+    }
     int status;
 
     *source_variables = evaluator->variables;
@@ -11370,7 +12773,7 @@ static int prepare_source_variable_view(
         command->assignment_count == 0U) {
         return 0;
     }
-    memcpy(&workspace->scope_base, evaluator->variables,
+    (void)memcpy(&workspace->scope_base, evaluator->variables,
            sizeof(workspace->scope_base));
     status = apply_native_assignments_with_attributes(
         &workspace->scope_base, NULL, command,
@@ -11389,13 +12792,16 @@ static int load_builtin_source_text(
     const gsh_variable_store *source_variables,
     gsh_source_workspace *workspace, size_t *input_length)
 {
+    if (evaluator == NULL || input_length == NULL || source_variables == NULL || workspace == NULL) {
+        return -1;
+    }
     if (native_dot_builtin(command)) {
         return load_dot_source(evaluator, command, source_variables,
                                workspace, input_length);
     }
     if (concatenate_eval_source(command, workspace->input,
                                 input_length) == -1) {
-        fprintf(stderr, "gsh: eval: %s\n", strerror(errno));
+        (void)fprintf(stderr, "gsh: eval: %s\n", strerror(errno));
         return 125;
     }
     return 0;
@@ -11406,6 +12812,10 @@ static int request_builtin_source(
     const gsh_saved_descriptor saved[GSH_NATIVE_REDIRECT_CAP],
     size_t saved_count)
 {
+    if (evaluator == NULL) return -1;
+    if (command == NULL || saved == NULL) {
+        return -1;
+    }
     gsh_source_workspace *workspace;
     const gsh_variable_store *source_variables;
     const gsh_native_command *temporary_command;
@@ -11419,13 +12829,13 @@ static int request_builtin_source(
     if (evaluator->source_workspaces == NULL ||
         evaluator->source_depth != gsh_source_workspaces_depth(
                                        evaluator->source_workspaces) ||
-        fault_should_fail("source-workspace-exhaustion", EAGAIN)) {
-        fputs("gsh: nested source workspace limit exceeded\n", stderr);
+        gsh_fault_should_fail(GSH_FAULT_SOURCE_WORKSPACE_EXHAUSTION, EAGAIN)) {
+        (void)fputs("gsh: nested source workspace limit exceeded\n", stderr);
         return 125;
     }
     workspace = gsh_source_workspace_acquire(evaluator->source_workspaces);
     if (workspace == NULL) {
-        fputs("gsh: nested source workspace limit exceeded\n", stderr);
+        (void)fputs("gsh: nested source workspace limit exceeded\n", stderr);
         return 125;
     }
     status = prepare_source_variable_view(
@@ -11454,6 +12864,10 @@ static int request_fc_source(
     const gsh_saved_descriptor saved[GSH_NATIVE_REDIRECT_CAP],
     size_t saved_count)
 {
+    if (command == NULL) return -1;
+    if (evaluator == NULL || saved == NULL) {
+        return -1;
+    }
     gsh_source_workspace *workspace;
     const gsh_variable_store *lookup = evaluator->variables;
     gsh_fc_result result;
@@ -11471,7 +12885,7 @@ static int request_fc_source(
                                  "nested source workspace limit exceeded");
     }
     if (command->assignment_count != 0) {
-        memcpy(&workspace->scope_base, evaluator->variables,
+        (void)memcpy(&workspace->scope_base, evaluator->variables,
                sizeof(workspace->scope_base));
         status = apply_native_assignments(
             &workspace->scope_base, NULL, command, &evaluator->options);
@@ -11504,7 +12918,10 @@ static int request_fc_source(
 
 static int run_evaluator_fc_builtin(native_evaluator *evaluator)
 {
-    const gsh_native_command *command = &evaluator->pipeline->commands[0];
+    if (evaluator == NULL) {
+        return -1;
+    }
+    const gsh_native_command *command = &evaluator_pipeline(evaluator)->commands[0];
     gsh_saved_descriptor saved[GSH_NATIVE_REDIRECT_CAP];
     size_t saved_count = 0;
     int status;
@@ -11521,7 +12938,7 @@ static int run_evaluator_fc_builtin(native_evaluator *evaluator)
     }
     status = request_fc_source(evaluator, command, saved, saved_count);
     if (status == GSH_EVALUATOR_SOURCE_REQUEST) {
-        evaluator->source_request_negated = evaluator->pipeline->negated;
+        evaluator->source_request_negated = evaluator_pipeline(evaluator)->negated;
         return status;
     }
     if (restore_redirect_descriptors(saved, saved_count) == -1) {
@@ -11529,7 +12946,7 @@ static int run_evaluator_fc_builtin(native_evaluator *evaluator)
         return 125;
     }
     return status == 125 ? 125
-                         : (evaluator->pipeline->negated
+                         : (evaluator_pipeline(evaluator)->negated
                                 ? (status == 0 ? 1 : 0)
                                 : status);
 }
@@ -11537,14 +12954,17 @@ static int run_evaluator_fc_builtin(native_evaluator *evaluator)
 static int run_evaluator_source_builtin(native_evaluator *evaluator,
                                         bool *builtin_failed)
 {
-    const gsh_native_command *command = &evaluator->pipeline->commands[0];
+    if (builtin_failed == NULL || evaluator == NULL) {
+        return -1;
+    }
+    const gsh_native_command *command = &evaluator_pipeline(evaluator)->commands[0];
     gsh_saved_descriptor saved[GSH_NATIVE_REDIRECT_CAP];
     size_t saved_count = 0;
     int assignment_status;
     int status;
 
     *builtin_failed = true;
-    assert(!evaluator->source_request_active);
+    if (evaluator->source_request_active) return 125;
     if (save_redirect_descriptors(command, saved, &saved_count) == -1) {
         perror("gsh: source redirection save");
         return 125;
@@ -11568,7 +12988,7 @@ static int run_evaluator_source_builtin(native_evaluator *evaluator,
                                         saved_count);
     }
     if (status == GSH_EVALUATOR_SOURCE_REQUEST) {
-        evaluator->source_request_negated = evaluator->pipeline->negated;
+        evaluator->source_request_negated = evaluator_pipeline(evaluator)->negated;
         *builtin_failed = false;
         return status;
     }
@@ -11578,21 +12998,19 @@ static int run_evaluator_source_builtin(native_evaluator *evaluator,
     }
     *builtin_failed = status != 0;
     return status == 125 ? 125
-                         : (evaluator->pipeline->negated
+                         : (evaluator_pipeline(evaluator)->negated
                                 ? (status == 0 ? 1 : 0)
                                 : status);
 }
 
 static void close_evaluator_exec_transaction(native_evaluator *evaluator)
 {
-    if (evaluator == NULL) {
-        return;
-    }
+    if (evaluator == NULL) return;
     if (evaluator->exec_outcome_fd > STDERR_FILENO) {
-        close(evaluator->exec_outcome_fd);
+        (void)close(evaluator->exec_outcome_fd);
     }
     if (evaluator->exec_descriptor_socket > STDERR_FILENO) {
-        close(evaluator->exec_descriptor_socket);
+        (void)close(evaluator->exec_descriptor_socket);
     }
     evaluator->exec_outcome_fd = -1;
     evaluator->exec_descriptor_socket = -1;
@@ -11601,35 +13019,53 @@ static void close_evaluator_exec_transaction(native_evaluator *evaluator)
 static gsh_command_cache *evaluator_command_cache(
     native_evaluator *evaluator)
 {
+    if (evaluator == NULL) {
+        return NULL;
+    }
     return evaluator == NULL ? NULL : evaluator->command_cache;
 }
 
 static const gsh_times_context *evaluator_times_context(
     native_evaluator *evaluator)
 {
+    if (evaluator == NULL) {
+        return NULL;
+    }
     return evaluator == NULL ? NULL : evaluator->times_context;
 }
 
 static int evaluator_last_status(const native_evaluator *evaluator)
 {
+    if (evaluator == NULL) {
+        return -1;
+    }
     return evaluator == NULL ? 0 : evaluator->last_status;
 }
 
 static gsh_background_table *evaluator_backgrounds(
     native_evaluator *evaluator)
 {
+    if (evaluator == NULL) {
+        return NULL;
+    }
     return evaluator == NULL ? NULL : evaluator->backgrounds;
 }
 
 static int evaluator_job_service_socket(
     const native_evaluator *evaluator)
 {
+    if (evaluator == NULL) {
+        return -1;
+    }
     return evaluator == NULL ? -1 : evaluator->job_service_socket;
 }
 
 static bool evaluator_job_service_available(
     const native_evaluator *evaluator)
 {
+    if (evaluator == NULL) {
+        return false;
+    }
     return evaluator != NULL && evaluator->job_service_available;
 }
 
@@ -11639,6 +13075,22 @@ static int native_evaluate_node(native_evaluator *evaluator,
                                 size_t node_index, size_t depth);
 static int native_evaluate_node_inner(native_evaluator *evaluator,
                                       size_t node_index, size_t depth);
+static bool source_request_is_valid(const native_evaluator *evaluator);
+static int abandon_source_request(native_evaluator *evaluator);
+static bool enter_source_frame(native_evaluator *evaluator,
+                               native_source_frame *frame, size_t *root);
+static int leave_source_frame(native_evaluator *evaluator,
+                              native_source_frame *frame, int status);
+typedef enum {
+    NATIVE_ASYNC_ERROR,
+    NATIVE_ASYNC_PARENT,
+    NATIVE_ASYNC_CHILD,
+} native_async_start;
+static native_async_start start_native_async(
+    native_evaluator *evaluator, size_t node_index,
+    native_evaluator *child, int *status);
+static bool take_substitution_child(
+    native_evaluator **evaluator, size_t *node_index, size_t *depth);
 
 static bool async_node_has_single_pipeline(const native_evaluator *evaluator,
                                            size_t node_index)
@@ -11646,32 +13098,16 @@ static bool async_node_has_single_pipeline(const native_evaluator *evaluator,
     const gsh_ast_node *node;
     size_t child;
 
-    if (node_index >= evaluator->storage->node_count) {
+    if (node_index >= evaluator_storage(evaluator)->node_count) {
         return false;
     }
-    node = &evaluator->storage->nodes[node_index];
+    node = &evaluator_storage(evaluator)->nodes[node_index];
     if (node->kind != GSH_AST_AND_OR || node->first_child == GSH_AST_NONE) {
         return false;
     }
     child = node->first_child;
-    return evaluator->storage->nodes[child].kind == GSH_AST_PIPELINE &&
-           evaluator->storage->nodes[child].next_sibling == GSH_AST_NONE;
-}
-
-static gsh_native_plan_status preflight_command_substitution(
-    void *opaque, const char *commands, size_t command_length, char *output,
-    size_t output_capacity, size_t *output_length, int *exit_status)
-{
-    (void)opaque;
-    (void)commands;
-    (void)command_length;
-    if (output_capacity == 0) {
-        return GSH_NATIVE_PLAN_LIMIT;
-    }
-    output[0] = '0';
-    *output_length = 1;
-    *exit_status = 0;
-    return GSH_NATIVE_PLAN_OK;
+    return evaluator_storage(evaluator)->nodes[child].kind == GSH_AST_PIPELINE &&
+           evaluator_storage(evaluator)->nodes[child].next_sibling == GSH_AST_NONE;
 }
 
 static gsh_native_expansion_context native_expansion_context(
@@ -11681,116 +13117,74 @@ static gsh_native_plan_status execute_command_substitution(
     void *opaque, const char *commands, size_t command_length, char *output,
     size_t output_capacity, size_t *output_length, int *exit_status);
 
-static const char *evaluator_variable_lookup(void *opaque,
-                                             const char *name,
-                                             size_t name_length,
-                                             bool *found)
+static gsh_native_plan_status assign_evaluator_variable(
+    native_evaluator *evaluator, const char *name, size_t name_length,
+    const char *value, size_t value_length)
 {
-    native_evaluator *evaluator = opaque;
-
-    return gsh_variables_lookup(evaluator->variables, name, name_length,
-                                found);
-}
-
-static gsh_native_plan_status evaluator_variable_assign(
-    void *opaque, const char *name, size_t name_length, const char *value,
-    size_t value_length)
-{
-    native_evaluator *evaluator = opaque;
+    if (evaluator == NULL) {
+        return GSH_NATIVE_PLAN_LIMIT;
+    }
     unsigned int attributes = assignment_attributes(&evaluator->options);
     int journal_status = 0;
 
     if ((!evaluator->preflight &&
-         fault_should_fail("expansion-assignment", ENOSPC)) ||
+         gsh_fault_should_fail(GSH_FAULT_EXPANSION_ASSIGNMENT, ENOSPC)) ||
         gsh_variables_set(evaluator->variables, name, name_length, value,
                           value_length, attributes, attributes) == -1) {
         journal_status = -1;
     } else if (evaluator->pipeline_scope != NULL) {
         journal_status = gsh_variable_journal_record_scoped(
-            evaluator->pipeline_scope->changes,
-            evaluator->pipeline_scope->current_scope, name, name_length,
-            value, value_length, attributes, attributes);
+            evaluator_pipeline_scope(evaluator)->changes,
+            evaluator->expansion_variables.current_scope, name,
+            name_length, value, value_length, attributes, attributes);
     } else if (evaluator->journal != NULL) {
         journal_status = gsh_variable_journal_record(
             evaluator->journal, name, name_length, value, value_length,
             attributes, attributes);
     }
-
-    if (journal_status == -1) {
-        if (!evaluator->preflight) {
-            child_write_descriptor(STDERR_FILENO,
-                                   "gsh: parameter assignment failed\n",
-                                   33);
-        }
-        evaluator->fatal_error = evaluator->pipeline_scope == NULL;
-        return errno == ENOSPC || errno == E2BIG
-                   ? GSH_NATIVE_PLAN_LIMIT
-                   : GSH_NATIVE_PLAN_ERROR;
-    }
-    return GSH_NATIVE_PLAN_OK;
-}
-
-static gsh_native_plan_status evaluator_parameter_error(
-    void *opaque, const char *name, size_t name_length, const char *message,
-    size_t message_length, bool default_message)
-{
-    native_evaluator *evaluator = opaque;
-
-    if (evaluator->preflight) {
+    if (journal_status == 0) {
         return GSH_NATIVE_PLAN_OK;
     }
-    child_write_descriptor(STDERR_FILENO, "gsh: ", 5);
-    child_write_descriptor(STDERR_FILENO, name, name_length);
-    child_write_descriptor(STDERR_FILENO, ": ", 2);
-    if (default_message) {
+    if (!evaluator->preflight) {
         child_write_descriptor(STDERR_FILENO,
-                               "parameter null or not set", 25);
-    } else {
-        child_write_descriptor(STDERR_FILENO, message, message_length);
+                               "gsh: parameter assignment failed\n", 33);
     }
-    child_write_descriptor(STDERR_FILENO, "\n", 1);
     evaluator->fatal_error = evaluator->pipeline_scope == NULL;
-    return GSH_NATIVE_PLAN_ERROR;
-}
-
-static gsh_native_plan_status evaluator_expansion_error(
-    void *opaque, const char *message, size_t message_length)
-{
-    native_evaluator *evaluator = opaque;
-
-    if (evaluator->preflight) {
-        return GSH_NATIVE_PLAN_OK;
-    }
-    child_write_descriptor(STDERR_FILENO,
-                           "gsh: arithmetic expansion: ", 27);
-    child_write_descriptor(STDERR_FILENO, message, message_length);
-    child_write_descriptor(STDERR_FILENO, "\n", 1);
-    evaluator->fatal_error = evaluator->pipeline_scope == NULL;
-    return GSH_NATIVE_PLAN_ERROR;
-}
-
-static gsh_native_plan_status evaluator_pipeline_command_begin(
-    void *opaque, size_t command_index, size_t command_count)
-{
-    native_evaluator *evaluator = opaque;
-    pipeline_expansion_scope *scope = evaluator->pipeline_scope;
-
-    if (scope == NULL || scope->command_count != command_count ||
-        command_index >= command_count || command_index >= UINT16_MAX) {
-        return GSH_NATIVE_PLAN_ERROR;
-    }
-    memcpy(evaluator->variables, scope->base,
-           sizeof(*evaluator->variables));
-    scope->current_scope = command_index + 1U;
-    return GSH_NATIVE_PLAN_OK;
+    return errno == ENOSPC || errno == E2BIG ? GSH_NATIVE_PLAN_LIMIT
+                                             : GSH_NATIVE_PLAN_ERROR;
 }
 
 static gsh_native_expansion_context native_expansion_context(
     native_evaluator *evaluator, bool execute_substitutions,
     bool *deferred_work)
 {
+    if (evaluator == NULL) {
+        return (gsh_native_expansion_context){0};
+    }
     size_t positional_count =
         gsh_positionals_count(evaluator->positionals);
+    gsh_native_variable_state *variables =
+        &evaluator->expansion_variables;
+
+    (void)memset(variables, 0, sizeof(*variables));
+    variables->mode = GSH_NATIVE_VARIABLE_LIVE;
+    variables->variables = evaluator->variables;
+    variables->journal = evaluator->journal;
+    variables->attributes = assignment_attributes(&evaluator->options);
+    variables->preflight = evaluator->preflight;
+    if (!evaluator->preflight) {
+        configure_expansion_assignment_fault(variables);
+    }
+    variables->fatal_error = &evaluator->fatal_error;
+    variables->diagnostic_io = &descriptor_builtin_io;
+    if (evaluator->pipeline_scope != NULL) {
+        variables->scope_base = evaluator_pipeline_scope(evaluator)->base;
+        variables->scope_changes = evaluator_pipeline_scope(evaluator)->changes;
+        variables->command_count =
+            evaluator_pipeline_scope(evaluator)->command_count;
+    }
+    gsh_native_substitutions_initialize(&evaluator->substitutions,
+                                        execute_substitutions);
     gsh_native_expansion_context context = {
         .last_status = evaluator->last_status,
         .shell_pid = evaluator->shell_pid,
@@ -11801,19 +13195,8 @@ static gsh_native_expansion_context native_expansion_context(
                                      : evaluator->positional_view,
         .positional_count = positional_count,
         .option_flags = evaluator->option_flags,
-        .variable_lookup = evaluator_variable_lookup,
-        .variable_assign = evaluator_variable_assign,
-        .parameter_error = evaluator_parameter_error,
-        .expansion_error = evaluator_expansion_error,
-        .variable_opaque = evaluator,
-        .command_begin = evaluator->pipeline_scope != NULL
-                             ? evaluator_pipeline_command_begin
-                             : NULL,
-        .command_opaque = evaluator,
-        .command_substitute =
-            execute_substitutions ? execute_command_substitution
-                                  : preflight_command_substitution,
-        .command_substitute_opaque = evaluator,
+        .variable_state = variables,
+        .substitutions = &evaluator->substitutions,
         .pathname_mode = execute_substitutions &&
                                  !gsh_options_enabled(
                                      &evaluator->options,
@@ -11836,6 +13219,7 @@ static gsh_native_expansion_context native_expansion_context(
 static size_t pipeline_command_count(const gsh_parse_storage *storage,
                                      size_t node_index)
 {
+    if (storage == NULL) return 0U;
     const gsh_ast_node *node;
     size_t child;
     size_t count = 0;
@@ -11858,13 +13242,220 @@ static size_t pipeline_command_count(const gsh_parse_storage *storage,
     return child == GSH_AST_NONE ? count : 0;
 }
 
-static gsh_native_plan_status plan_evaluator_pipeline(
+enum { SUBSTITUTION_SNAPSHOT_CAP = GSH_SOURCE_DEPTH_CAP + 2 };
+
+typedef struct {
+    gsh_variable_store variables;
+    gsh_variable_journal journal;
+    gsh_variable_journal scope_changes;
+    gsh_native_pipeline pipeline;
+    gsh_native_variable_state variable_state;
+    bool fatal_error;
+    bool has_journal;
+    bool has_scope_changes;
+    bool used;
+} substitution_snapshot;
+
+static substitution_snapshot *acquire_substitution_snapshot(void)
+{
+    static substitution_snapshot snapshots[SUBSTITUTION_SNAPSHOT_CAP];
+    size_t index;
+
+    for (index = 0; index < SUBSTITUTION_SNAPSHOT_CAP; index++) {
+        if (!snapshots[index].used) {
+            snapshots[index].used = true;
+            return &snapshots[index];
+        }
+    }
+    return NULL;
+}
+
+static void capture_substitution_snapshot(
+    substitution_snapshot *snapshot, native_evaluator *evaluator,
+    const gsh_native_expansion_context *context)
+{
+    if (context == NULL || evaluator == NULL || snapshot == NULL) {
+        return;
+    }
+    (void)memcpy(&snapshot->variables, evaluator->variables,
+           sizeof(snapshot->variables));
+    (void)memcpy(&snapshot->pipeline, evaluator->pipeline,
+           sizeof(snapshot->pipeline));
+    snapshot->has_journal = evaluator->journal != NULL;
+    if (snapshot->has_journal) {
+        (void)memcpy(&snapshot->journal, evaluator->journal,
+               sizeof(snapshot->journal));
+    }
+    snapshot->has_scope_changes =
+        evaluator->pipeline_scope != NULL &&
+        evaluator_pipeline_scope(evaluator)->changes != NULL;
+    if (snapshot->has_scope_changes) {
+        (void)memcpy(&snapshot->scope_changes,
+               evaluator_pipeline_scope(evaluator)->changes,
+               sizeof(snapshot->scope_changes));
+    }
+    snapshot->variable_state = *context->variable_state;
+    snapshot->fatal_error = evaluator->fatal_error;
+}
+
+static void restore_substitution_snapshot(
+    const substitution_snapshot *snapshot, native_evaluator *evaluator,
+    gsh_native_expansion_context *context)
+{
+    if (context == NULL || evaluator == NULL || snapshot == NULL) {
+        return;
+    }
+    (void)memcpy(evaluator->variables, &snapshot->variables,
+           sizeof(snapshot->variables));
+    (void)memcpy(evaluator->pipeline, &snapshot->pipeline,
+           sizeof(snapshot->pipeline));
+    if (snapshot->has_journal) {
+        (void)memcpy(evaluator->journal, &snapshot->journal,
+               sizeof(snapshot->journal));
+    }
+    if (snapshot->has_scope_changes) {
+        (void)memcpy(evaluator_pipeline_scope(evaluator)->changes,
+               &snapshot->scope_changes,
+               sizeof(snapshot->scope_changes));
+    }
+    *context->variable_state = snapshot->variable_state;
+    evaluator->fatal_error = snapshot->fatal_error;
+}
+
+static void release_substitution_snapshot(substitution_snapshot *snapshot)
+{
+    if (snapshot != NULL) {
+        (void)memset(snapshot, 0, sizeof(*snapshot));
+    }
+}
+
+typedef enum {
+    EVALUATOR_EXPAND_PIPELINE,
+    EVALUATOR_EXPAND_SCALAR,
+    EVALUATOR_EXPAND_WORDS,
+    EVALUATOR_EXPAND_REDIRECTS,
+} evaluator_expansion_kind;
+
+typedef struct {
+    evaluator_expansion_kind kind;
+    size_t node_index;
+    gsh_word_ref word;
+    const gsh_word_ref *words;
+    size_t word_count;
+    char **scalar;
+    char **expanded;
+    size_t *expanded_count;
+} evaluator_expansion_request;
+
+static gsh_native_plan_status attempt_evaluator_expansion(
+    native_evaluator *evaluator, gsh_native_expansion_context *context,
+    const evaluator_expansion_request *request)
+{
+    if (!require(evaluator != NULL && context != NULL)) {
+        return GSH_NATIVE_PLAN_UNSUPPORTED;
+    }
+    if (!require(request != NULL && evaluator->pipeline != NULL)) {
+        return GSH_NATIVE_PLAN_UNSUPPORTED;
+    }
+    if (request->kind == EVALUATOR_EXPAND_PIPELINE) {
+        return gsh_native_plan_pipeline_node_with_context(
+            evaluator->input, evaluator->storage, request->node_index,
+            context, evaluator->pipeline);
+    }
+    if (request->kind == EVALUATOR_EXPAND_SCALAR) {
+        return gsh_native_expand_scalar(
+            evaluator->input, request->word, context,
+            evaluator->pipeline, request->scalar);
+    }
+    if (request->kind == EVALUATOR_EXPAND_WORDS) {
+        return gsh_native_expand_words(
+            evaluator->input, request->words, request->word_count,
+            context, evaluator->pipeline, request->expanded,
+            request->expanded_count);
+    }
+    return request->kind == EVALUATOR_EXPAND_REDIRECTS
+               ? gsh_native_plan_redirects_with_context(
+                     evaluator->input, evaluator->storage,
+                     request->node_index, context, evaluator->pipeline)
+               : GSH_NATIVE_PLAN_UNSUPPORTED;
+}
+
+/* ── One Tagged Expansion Engine Owns Substitution Replay ───────
+ * Pipeline, scalar, word-list, and redirect expansion once duplicated the
+ * same transactional replay loop.  Their copies could restore variables or
+ * journals differently after a nested command failed.  A concrete request
+ * tag now selects the first-party expansion operation without callbacks.
+ * One bounded loop owns snapshots, substitution execution, and rollback.
+ * ─────────────────────────────────────────────────────────────── */
+static gsh_native_plan_status run_evaluator_expansion(
+    native_evaluator *evaluator, gsh_native_expansion_context *context,
+    const evaluator_expansion_request *request)
+{
+    if (!require(evaluator != NULL && context != NULL)) {
+        return GSH_NATIVE_PLAN_UNSUPPORTED;
+    }
+    if (!require(request != NULL && context->substitutions != NULL)) {
+        return GSH_NATIVE_PLAN_UNSUPPORTED;
+    }
+    substitution_snapshot *snapshot = acquire_substitution_snapshot();
+    size_t attempt;
+
+    if (snapshot == NULL) return GSH_NATIVE_PLAN_LIMIT;
+    capture_substitution_snapshot(snapshot, evaluator, context);
+    for (attempt = 0U; attempt <= GSH_NATIVE_SUBSTITUTION_CAP; attempt++) {
+        const char *commands;
+        char *output;
+        size_t command_length;
+        size_t output_capacity;
+        size_t output_length = 0U;
+        int exit_status = 125;
+        gsh_native_plan_status status;
+
+        gsh_native_substitutions_rewind(context->substitutions);
+        status = attempt_evaluator_expansion(evaluator, context, request);
+        if (status != GSH_NATIVE_PLAN_DEFERRED) {
+            release_substitution_snapshot(snapshot);
+            return status;
+        }
+        commands = gsh_native_substitution_request(
+            context->substitutions, &command_length);
+        output = gsh_native_substitution_output(
+            context->substitutions, &output_capacity);
+        if (!require(commands != NULL && output != NULL)) {
+            status = GSH_NATIVE_PLAN_ERROR;
+        } else {
+            status = execute_command_substitution(
+                evaluator, commands, command_length, output,
+                output_capacity, &output_length, &exit_status);
+            if (status == GSH_NATIVE_PLAN_OK) {
+                status = gsh_native_substitution_complete(
+                    context->substitutions, output_length, exit_status);
+            }
+        }
+        if (status != GSH_NATIVE_PLAN_OK) {
+            restore_substitution_snapshot(snapshot, evaluator, context);
+            release_substitution_snapshot(snapshot);
+            return status;
+        }
+        restore_substitution_snapshot(snapshot, evaluator, context);
+    }
+    release_substitution_snapshot(snapshot);
+    return GSH_NATIVE_PLAN_LIMIT;
+}
+
+static gsh_native_plan_status begin_evaluator_pipeline_plan(
     native_evaluator *evaluator, size_t node_index,
     bool execute_substitutions, pipeline_expansion_scope *scope,
-    bool *scoped, bool *deferred_work)
+    bool *scoped, bool *deferred_work,
+    gsh_native_expansion_context *expansion)
 {
-    gsh_native_expansion_context expansion;
-    gsh_native_plan_status status;
+    if (!require(evaluator != NULL && evaluator->storage != NULL &&
+                 scope != NULL)) {
+        return GSH_NATIVE_PLAN_UNSUPPORTED;
+    }
+    if (!require(scoped != NULL && expansion != NULL)) {
+        return GSH_NATIVE_PLAN_UNSUPPORTED;
+    }
     size_t count = pipeline_command_count(evaluator->storage, node_index);
 
     *scoped = count > 1U;
@@ -11873,41 +13464,83 @@ static gsh_native_plan_status plan_evaluator_pipeline(
             evaluator->scope_changes == NULL) {
             return GSH_NATIVE_PLAN_LIMIT;
         }
-        memcpy(evaluator->scope_base, evaluator->variables,
+        (void)memcpy(evaluator->scope_base, evaluator->variables,
                sizeof(*evaluator->scope_base));
         gsh_variable_journal_initialize(evaluator->scope_changes, 0);
         scope->base = evaluator->scope_base;
         scope->changes = evaluator->scope_changes;
         scope->command_count = count;
-        scope->current_scope = 0;
     }
     evaluator->pipeline_scope = *scoped ? scope : NULL;
     if (deferred_work != NULL) {
         *deferred_work = false;
     }
-    expansion = native_expansion_context(evaluator, execute_substitutions,
-                                         deferred_work);
-    status = gsh_native_plan_pipeline_node_with_context(
-        evaluator->input, evaluator->storage, node_index, &expansion,
-        evaluator->pipeline);
+    *expansion = native_expansion_context(evaluator, execute_substitutions,
+                                          deferred_work);
+    return GSH_NATIVE_PLAN_OK;
+}
+
+static gsh_native_plan_status finish_evaluator_pipeline_plan(
+    native_evaluator *evaluator, pipeline_expansion_scope *scope,
+    bool scoped, gsh_native_plan_status status)
+{
+    if (!require(evaluator != NULL && scope != NULL)) {
+        return GSH_NATIVE_PLAN_UNSUPPORTED;
+    }
+    if (!require(evaluator->pipeline != NULL &&
+                 evaluator->variables != NULL)) {
+        return GSH_NATIVE_PLAN_UNSUPPORTED;
+    }
     if (status == GSH_NATIVE_PLAN_OK) {
         normalize_command_invocations(evaluator->pipeline,
                                       evaluator->functions);
     }
     evaluator->pipeline_scope = NULL;
-    if (*scoped) {
-        memcpy(evaluator->variables, scope->base,
+    if (scoped) {
+        (void)memcpy(evaluator->variables, scope->base,
                sizeof(*evaluator->variables));
     }
-    if (status != GSH_NATIVE_PLAN_OK) {
-        return status;
+    return status;
+}
+
+/* ── Preflight Never Enters the Substitution Executor ───────────
+ * The old shared planner selected execution with a boolean, but its static
+ * call graph still connected preflight to the nested evaluator.  Preflight
+ * already models substitutions with bounded placeholder text and records the
+ * deferred mutation surface.  Giving that mode its own entry point preserves
+ * the conservative proof while removing an execution edge that cannot occur.
+ * ─────────────────────────────────────────────────────────────── */
+static gsh_native_plan_status plan_evaluator_pipeline_preflight(
+    native_evaluator *evaluator, size_t node_index,
+    pipeline_expansion_scope *scope, bool *scoped, bool *deferred_work)
+{
+    gsh_native_expansion_context expansion;
+    gsh_native_plan_status status;
+
+    if (!require(evaluator != NULL && scope != NULL)) {
+        return GSH_NATIVE_PLAN_UNSUPPORTED;
     }
-    return GSH_NATIVE_PLAN_OK;
+    if (!require(scoped != NULL && deferred_work != NULL)) {
+        return GSH_NATIVE_PLAN_UNSUPPORTED;
+    }
+    *scoped = false;
+    status = begin_evaluator_pipeline_plan(
+        evaluator, node_index, false, scope, scoped, deferred_work,
+        &expansion);
+    if (status != GSH_NATIVE_PLAN_OK) return status;
+    status = gsh_native_plan_pipeline_node_with_context(
+        evaluator->input, evaluator->storage, node_index, &expansion,
+        evaluator->pipeline);
+    return finish_evaluator_pipeline_plan(evaluator, scope, *scoped,
+                                          status);
 }
 
 static bool native_case_pattern(const char *input, gsh_word_ref pattern,
                                 char output[GSH_NATIVE_TEXT_CAP])
 {
+    if (input == NULL || output == NULL) {
+        return false;
+    }
     enum {
         PATTERN_QUOTE_NONE,
         PATTERN_QUOTE_SINGLE,
@@ -11983,8 +13616,11 @@ static bool native_case_pattern(const char *input, gsh_word_ref pattern,
 }
 
 static bool native_preflight_case(native_evaluator *evaluator,
-                                  const gsh_ast_node *node, size_t depth)
+                                  const gsh_ast_node *node)
 {
+    if (!require(evaluator != NULL && node != NULL)) return false;
+    if (!require(evaluator->storage != NULL &&
+                 evaluator->pipeline != NULL)) return false;
     bool deferred_work = false;
     gsh_native_expansion_context expansion =
         native_expansion_context(evaluator, false, &deferred_work);
@@ -11994,7 +13630,7 @@ static bool native_preflight_case(native_evaluator *evaluator,
     if (node->word_count != 1 ||
         gsh_native_expand_scalar(
             evaluator->input,
-            evaluator->storage->words[node->first_word], &expansion,
+            evaluator_storage(evaluator)->words[node->first_word], &expansion,
             evaluator->pipeline, &subject) != GSH_NATIVE_PLAN_OK) {
         return false;
     }
@@ -12002,7 +13638,7 @@ static bool native_preflight_case(native_evaluator *evaluator,
     item_index = node->first_child;
     while (item_index != GSH_AST_NONE) {
         const gsh_ast_node *item =
-            &evaluator->storage->nodes[item_index];
+            &evaluator_storage(evaluator)->nodes[item_index];
         size_t pattern;
 
         if (item->kind != GSH_AST_CASE_ITEM || item->word_count == 0) {
@@ -12013,15 +13649,10 @@ static bool native_preflight_case(native_evaluator *evaluator,
 
             if (!native_case_pattern(
                     evaluator->input,
-                    evaluator->storage->words[item->first_word + pattern],
+                    evaluator_storage(evaluator)->words[item->first_word + pattern],
                     pattern_text)) {
                 return false;
             }
-        }
-        if (item->first_child != GSH_AST_NONE &&
-            !native_preflight_node(evaluator, item->first_child,
-                                   depth + 1U)) {
-            return false;
         }
         item_index = item->next_sibling;
     }
@@ -12029,8 +13660,11 @@ static bool native_preflight_case(native_evaluator *evaluator,
 }
 
 static bool native_preflight_for(native_evaluator *evaluator,
-                                 const gsh_ast_node *node, size_t depth)
+                                 const gsh_ast_node *node)
 {
+    if (!require(evaluator != NULL && node != NULL)) return false;
+    if (!require(evaluator->storage != NULL &&
+                 evaluator->pipeline != NULL)) return false;
     bool deferred_work = false;
     gsh_native_expansion_context expansion =
         native_expansion_context(evaluator, false, &deferred_work);
@@ -12046,20 +13680,22 @@ static bool native_preflight_for(native_evaluator *evaluator,
     if ((node->flags & GSH_AST_FLAG_FOR_HAS_IN) != 0 &&
         gsh_native_expand_words(
             evaluator->input,
-            evaluator->storage->words + node->first_word + 1U,
+            evaluator_storage(evaluator)->words + node->first_word + 1U,
             node->word_count - 1U, &expansion, evaluator->pipeline, items,
             &item_count) != GSH_NATIVE_PLAN_OK) {
         return false;
     }
     (void)item_count;
-    return native_preflight_node(evaluator, node->first_child,
-                                 depth + 1U);
+    return true;
 }
 
 static const gsh_function_entry *evaluator_function(
     const native_evaluator *evaluator,
     const gsh_native_command *command)
 {
+    if (command == NULL || evaluator == NULL) {
+        return NULL;
+    }
     return evaluator->functions == NULL || command->argc == 0 ||
                    command->command_suppresses_functions
                ? NULL
@@ -12071,12 +13707,15 @@ static const gsh_function_entry *evaluator_function(
 static bool define_evaluator_function(native_evaluator *evaluator,
                                       size_t node_index)
 {
-    const gsh_ast_node *node = &evaluator->storage->nodes[node_index];
-    gsh_word_ref name = evaluator->storage->words[node->first_word];
+    if (evaluator == NULL) {
+        return false;
+    }
+    const gsh_ast_node *node = &evaluator_storage(evaluator)->nodes[node_index];
+    gsh_word_ref name = evaluator_storage(evaluator)->words[node->first_word];
 
     if (evaluator->functions == NULL || node->word_count != 1U ||
         (evaluator->preflight && evaluator->storage ==
-                                     &evaluator->functions->programs) ||
+                                     &evaluator_functions(evaluator)->programs) ||
         special_builtin_name(evaluator->input + name.begin,
                              name.end - name.begin)) {
         errno = EINVAL;
@@ -12086,76 +13725,12 @@ static bool define_evaluator_function(native_evaluator *evaluator,
                evaluator->functions, evaluator->function_scratch,
                evaluator->input, evaluator->input_length,
                evaluator->storage, node_index,
-               evaluator->storage == &evaluator->functions->programs) == 0;
+               evaluator->storage == &evaluator_functions(evaluator)->programs) == 0;
 }
 
 static bool preflight_evaluator_function(
     native_evaluator *evaluator, const gsh_native_command *command,
-    const gsh_function_entry *entry, size_t depth)
-{
-    const char *saved_input = evaluator->input;
-    size_t saved_input_length = evaluator->input_length;
-    const gsh_parse_storage *saved_storage = evaluator->storage;
-    gsh_positional_store *saved_positionals = evaluator->positionals;
-    size_t saved_active_loops = evaluator->active_loops;
-    native_loop_control saved_loop_control = evaluator->loop_control;
-    size_t saved_loop_levels = evaluator->loop_levels;
-    gsh_positional_store positionals;
-    const gsh_ast_node *definition;
-    size_t index = (size_t)(entry - evaluator->functions->entries);
-    bool supported;
-
-    if (depth > 128U || evaluator->function_depth ==
-                            GSH_FUNCTION_DEPTH_CAP ||
-        index >= GSH_FUNCTION_CAP) {
-        return false;
-    }
-    if (evaluator->function_active[index]) {
-        return true;
-    }
-    if (apply_native_assignments(evaluator->variables, NULL, command,
-                                 &evaluator->options) !=
-            GSH_ASSIGNMENT_OK ||
-        gsh_positionals_assign(&positionals, command->argc - 1U,
-                               command->argv + 1U) == -1) {
-        return false;
-    }
-    evaluator->input = gsh_functions_text(evaluator->functions);
-    evaluator->input_length = evaluator->functions->text_used;
-    evaluator->storage = &evaluator->functions->programs;
-    evaluator->positionals = &positionals;
-    evaluator->function_depth++;
-    evaluator->active_loops = 0;
-    evaluator->loop_control = NATIVE_LOOP_CONTROL_NONE;
-    evaluator->loop_levels = 0;
-    evaluator->function_active[index] = true;
-    definition = &evaluator->storage->nodes[entry->node_offset];
-    supported = definition->kind == GSH_AST_FUNCTION &&
-                definition->first_child != GSH_AST_NONE;
-    if (supported && definition->redirect_count != 0) {
-        bool deferred_work = false;
-        gsh_native_expansion_context expansion =
-            native_expansion_context(evaluator, false, &deferred_work);
-
-        supported = gsh_native_plan_redirects_with_context(
-                        evaluator->input, evaluator->storage,
-                        entry->node_offset, &expansion,
-                        evaluator->pipeline) == GSH_NATIVE_PLAN_OK &&
-                    !deferred_work;
-    }
-    supported = supported && native_preflight_node(
-                                 evaluator, definition->first_child, 0);
-    evaluator->function_active[index] = false;
-    evaluator->loop_levels = saved_loop_levels;
-    evaluator->loop_control = saved_loop_control;
-    evaluator->active_loops = saved_active_loops;
-    evaluator->function_depth--;
-    evaluator->positionals = saved_positionals;
-    evaluator->storage = saved_storage;
-    evaluator->input_length = saved_input_length;
-    evaluator->input = saved_input;
-    return supported;
-}
+    const gsh_function_entry *entry, size_t depth);
 
 static bool preflight_record_exec_descriptor(
     int descriptors[GSH_EXEC_DESCRIPTOR_COMMIT_CAP], size_t *count,
@@ -12163,7 +13738,8 @@ static bool preflight_record_exec_descriptor(
 {
     size_t prior;
 
-    assert(*count <= GSH_EXEC_DESCRIPTOR_COMMIT_CAP);
+    if (!require(descriptors != NULL && count != NULL)) return false;
+    if (!require(*count <= GSH_EXEC_DESCRIPTOR_COMMIT_CAP)) return false;
     for (prior = 0; prior < *count; prior++) {
         if (descriptors[prior] == descriptor) {
             return true;
@@ -12179,6 +13755,10 @@ static bool preflight_record_exec_descriptor(
 static bool preflight_record_exec_descriptors(
     native_evaluator *evaluator, const gsh_native_command *command)
 {
+    if (!require(evaluator != NULL && command != NULL)) return false;
+    if (!require(command->redirect_count <= GSH_NATIVE_REDIRECT_CAP)) {
+        return false;
+    }
     size_t redirect;
 
     for (redirect = 0; redirect < command->redirect_count; redirect++) {
@@ -12202,191 +13782,594 @@ static bool preflight_record_exec_descriptors(
     return true;
 }
 
+static bool preflight_planned_command(
+    native_evaluator *evaluator, const pipeline_expansion_scope *scope,
+    bool scoped, size_t index, size_t depth)
+{
+    if (!require(evaluator != NULL && scope != NULL)) return false;
+    if (!require(evaluator->pipeline != NULL &&
+                 index < evaluator_pipeline(evaluator)->command_count)) return false;
+    const gsh_native_command *planned =
+        &evaluator_pipeline(evaluator)->commands[index];
+    const gsh_function_entry *function =
+        evaluator_function(evaluator, planned);
+    const char *path;
+
+    if (function != NULL) {
+        return preflight_evaluator_function(evaluator, planned, function,
+                                            depth);
+    }
+    path = scoped ? scoped_command_path_value(
+                        scope, (unsigned int)index + 1U, planned,
+                        evaluator->default_path)
+                  : command_path_value(evaluator->variables, planned,
+                                       evaluator->default_path);
+    return native_planned_command_is_supported(evaluator->pipeline, index,
+                                               path) &&
+           (!native_trap_builtin(planned) || evaluator->traps != NULL);
+}
+
+static bool record_preflight_command(native_evaluator *evaluator,
+                                     const gsh_native_command *command)
+{
+    if (!require(evaluator != NULL && command != NULL)) return false;
+    if (!require(evaluator->pipeline != NULL &&
+                 command->argc <= GSH_NATIVE_ARGUMENT_CAP)) {
+        return false;
+    }
+    bool single = evaluator_pipeline(evaluator)->command_count == 1U;
+
+    if (native_state_builtin(command) &&
+        (strcmp(command->argv[0], "shift") == 0 ||
+         gsh_builtin_set_mutates_positionals(command->argc, command->argv))) {
+        evaluator->positional_mutation_possible = true;
+    }
+    if (single && native_cd_builtin(command)) {
+        evaluator->directory_mutation_possible = true;
+    }
+    if (single && native_alias_mutates(command)) {
+        evaluator->alias_mutation_possible = true;
+    }
+    if (single && native_function_mutates(command)) {
+        evaluator->function_mutation_possible = true;
+    }
+    if (single && native_exec_builtin(command)) {
+        evaluator->exec_possible = true;
+        if (!preflight_record_exec_descriptors(evaluator, command)) {
+            return false;
+        }
+    }
+    if (native_snapshot_job_control_builtin(command) ||
+        native_wait_builtin(command)) evaluator->job_service_possible = true;
+    if (single && native_source_builtin(command)) {
+        evaluator->positional_mutation_possible = true;
+        evaluator->directory_mutation_possible = true;
+        evaluator->alias_mutation_possible = true;
+        evaluator->function_mutation_possible = true;
+        evaluator->command_cache_mutation_possible = true;
+    }
+    if (single && (native_hash_builtin(command) ||
+                   native_command_inspection_builtin(command) ||
+                   command_can_populate_cache(command,
+                                              evaluator->functions))) {
+        evaluator->command_cache_mutation_possible = true;
+    }
+    return true;
+}
+
+static void record_deferred_preflight(native_evaluator *evaluator)
+{
+    if (evaluator == NULL) {
+        return;
+    }
+    evaluator->positional_mutation_possible = true;
+    evaluator->directory_mutation_possible = true;
+    evaluator->alias_mutation_possible = true;
+    evaluator->function_mutation_possible = true;
+    evaluator->command_cache_mutation_possible = true;
+}
+
+static bool native_preflight_pipeline(native_evaluator *evaluator,
+                                      size_t node_index, size_t depth)
+{
+    if (!require(evaluator != NULL && evaluator->storage != NULL)) {
+        return false;
+    }
+    if (!require(node_index < evaluator_storage(evaluator)->node_count)) return false;
+    pipeline_expansion_scope scope;
+    bool deferred_work;
+    bool scoped;
+    size_t index;
+
+    if (plan_evaluator_pipeline_preflight(
+            evaluator, node_index, &scope, &scoped,
+            &deferred_work) != GSH_NATIVE_PLAN_OK) {
+        return false;
+    }
+    if (!deferred_work) {
+        for (index = 0U; index < evaluator_pipeline(evaluator)->command_count; index++) {
+            if (!preflight_planned_command(evaluator, &scope, scoped, index,
+                                           depth)) return false;
+        }
+    }
+    for (index = 0U; index < evaluator_pipeline(evaluator)->command_count; index++) {
+        if (!record_preflight_command(
+                evaluator, &evaluator_pipeline(evaluator)->commands[index])) {
+            return false;
+        }
+    }
+    if (deferred_work) record_deferred_preflight(evaluator);
+    return true;
+}
+
+typedef struct {
+    size_t node_index;
+    size_t next_child;
+    size_t depth;
+    size_t visited;
+    size_t saved_exec_descriptor_count;
+    size_t saved_exec_protected_descriptor_count;
+    bool saved_exec_possible;
+    bool isolated_exec;
+    bool initialized;
+} preflight_walk_frame;
+
+enum {
+    PREFLIGHT_WALK_DEPTH_CAP = 129,
+    PREFLIGHT_WORKSPACE_CAP = GSH_FUNCTION_DEPTH_CAP + GSH_SOURCE_DEPTH_CAP + 2,
+};
+
+typedef struct {
+    preflight_walk_frame frames[PREFLIGHT_WALK_DEPTH_CAP];
+    bool used;
+} preflight_workspace;
+
+static preflight_workspace *acquire_preflight_workspace(void)
+{
+    static preflight_workspace workspaces[PREFLIGHT_WORKSPACE_CAP];
+    size_t index;
+
+    for (index = 0U; index < PREFLIGHT_WORKSPACE_CAP; index++) {
+        if (!workspaces[index].used) {
+            workspaces[index].used = true;
+            return &workspaces[index];
+        }
+    }
+    return NULL;
+}
+
+static void release_preflight_workspace(preflight_workspace *workspace)
+{
+    if (workspace != NULL) workspace->used = false;
+}
+
+static bool preflight_walk_kind(gsh_ast_kind kind)
+{
+    if (!require(kind >= GSH_AST_PROGRAM && kind <= GSH_AST_FUNCTION)) {
+        return false;
+    }
+    return kind == GSH_AST_PROGRAM || kind == GSH_AST_LIST ||
+           kind == GSH_AST_AND_OR || kind == GSH_AST_PIPELINE ||
+           kind == GSH_AST_SUBSHELL || kind == GSH_AST_BRACE_GROUP ||
+           kind == GSH_AST_IF || kind == GSH_AST_IF_BRANCH ||
+           kind == GSH_AST_WHILE || kind == GSH_AST_UNTIL ||
+           kind == GSH_AST_FOR || kind == GSH_AST_CASE ||
+           kind == GSH_AST_CASE_ITEM;
+}
+
+static void restore_preflight_isolation(native_evaluator *evaluator,
+                                        const preflight_walk_frame *frame)
+{
+    if (frame == NULL) return;
+    if (evaluator == NULL) {
+        return;
+    }
+    if (!frame->isolated_exec) return;
+    evaluator->exec_possible = frame->saved_exec_possible;
+    evaluator->exec_descriptor_count = frame->saved_exec_descriptor_count;
+    evaluator->exec_protected_descriptor_count =
+        frame->saved_exec_protected_descriptor_count;
+}
+
+typedef enum {
+    PREFLIGHT_FRAME_INVALID,
+    PREFLIGHT_FRAME_PIPELINE,
+    PREFLIGHT_FRAME_FUNCTION,
+    PREFLIGHT_FRAME_READY,
+} preflight_frame_action;
+
+static preflight_frame_action classify_preflight_frame(
+    native_evaluator *evaluator, preflight_walk_frame *frame)
+{
+    if (!require(evaluator != NULL && frame != NULL)) {
+        return PREFLIGHT_FRAME_INVALID;
+    }
+    if (!require(evaluator->storage != NULL)) return PREFLIGHT_FRAME_INVALID;
+    const gsh_ast_node *node;
+    const gsh_ast_node *command;
+
+    if (frame->depth > 128U || frame->node_index == GSH_AST_NONE ||
+        frame->node_index >= evaluator_storage(evaluator)->node_count) {
+        return PREFLIGHT_FRAME_INVALID;
+    }
+    node = &evaluator_storage(evaluator)->nodes[frame->node_index];
+    if (node->redirect_count != 0U && node->kind != GSH_AST_FUNCTION) {
+        return PREFLIGHT_FRAME_INVALID;
+    }
+    if (node->kind == GSH_AST_PIPELINE) {
+        if (node->first_child == GSH_AST_NONE) {
+            return PREFLIGHT_FRAME_INVALID;
+        }
+        command = &evaluator_storage(evaluator)->nodes[node->first_child];
+        if (command->next_sibling != GSH_AST_NONE ||
+            command->kind == GSH_AST_SIMPLE) {
+            return PREFLIGHT_FRAME_PIPELINE;
+        }
+    }
+    if (node->kind == GSH_AST_CASE && !native_preflight_case(evaluator, node)) {
+        return PREFLIGHT_FRAME_INVALID;
+    }
+    if (node->kind == GSH_AST_FOR && !native_preflight_for(evaluator, node)) {
+        return PREFLIGHT_FRAME_INVALID;
+    }
+    if (node->kind == GSH_AST_FUNCTION) {
+        return PREFLIGHT_FRAME_FUNCTION;
+    }
+    if (!preflight_walk_kind(node->kind) ||
+        (node->kind != GSH_AST_PROGRAM && node->kind != GSH_AST_CASE_ITEM &&
+         node->first_child == GSH_AST_NONE)) {
+        return PREFLIGHT_FRAME_INVALID;
+    }
+    frame->next_child = node->first_child;
+    frame->isolated_exec = node->kind == GSH_AST_SUBSHELL ||
+                           (node->flags & GSH_AST_FLAG_ASYNC) != 0U;
+    frame->saved_exec_possible = evaluator->exec_possible;
+    frame->saved_exec_descriptor_count = evaluator->exec_descriptor_count;
+    frame->saved_exec_protected_descriptor_count =
+        evaluator->exec_protected_descriptor_count;
+    frame->initialized = true;
+    return PREFLIGHT_FRAME_READY;
+}
+
+/* ── Preflight Traversal Has One Explicit Owner Stack ───────────
+ * AST validation used to recurse once for every compound node and again for
+ * case and for bodies.  A fixed DFS workspace now owns suspension and the
+ * subshell exec-state snapshot.  Function bodies may start a nested preflight,
+ * so workspaces come from a bounded static pool rather than the C stack.
+ * ─────────────────────────────────────────────────────────────── */
 static bool native_preflight_node(native_evaluator *evaluator,
                                   size_t node_index, size_t depth)
 {
-    const gsh_ast_node *node;
-    size_t child;
-    size_t visited = 0;
-
-    if (depth > 128 || node_index == GSH_AST_NONE ||
-        node_index >= evaluator->storage->node_count) {
+    if (!require(evaluator != NULL && evaluator->storage != NULL)) {
         return false;
     }
-    node = &evaluator->storage->nodes[node_index];
-    if (node->redirect_count != 0 && node->kind != GSH_AST_FUNCTION) {
-        return false;
-    }
-    if (node->kind == GSH_AST_PIPELINE) {
-        const gsh_ast_node *command;
-        pipeline_expansion_scope scope;
-        gsh_native_plan_status plan_status;
-        bool deferred_work;
-        bool scoped;
-        bool supported;
+    if (!require(depth <= 128U && node_index != GSH_AST_NONE)) return false;
+    preflight_workspace *workspace = acquire_preflight_workspace();
+    size_t stack_depth = 1U;
+    bool supported = workspace != NULL;
 
-        if (node->first_child == GSH_AST_NONE) {
-            return false;
-        }
-        command = &evaluator->storage->nodes[node->first_child];
-        if (command->next_sibling == GSH_AST_NONE &&
-            command->kind != GSH_AST_SIMPLE) {
-            return native_preflight_node(evaluator, node->first_child,
-                                         depth + 1U);
-        }
-        plan_status = plan_evaluator_pipeline(evaluator, node_index, false,
-                                              &scope, &scoped,
-                                              &deferred_work);
-        if (plan_status != GSH_NATIVE_PLAN_OK) {
-            return false;
-        }
-        supported = true;
-        if (!deferred_work) {
-            size_t index;
+    if (!supported) return false;
+    (void)memset(workspace->frames, 0, sizeof(workspace->frames));
+    workspace->frames[0].node_index = node_index;
+    workspace->frames[0].depth = depth;
+    while (supported && stack_depth > 0U) {
+        preflight_walk_frame *frame = &workspace->frames[stack_depth - 1U];
+        size_t child;
 
-            for (index = 0;
-                 supported && index < evaluator->pipeline->command_count;
-                 index++) {
-                const gsh_native_command *planned =
-                    &evaluator->pipeline->commands[index];
-                const gsh_function_entry *function =
-                    evaluator_function(evaluator, planned);
+        if (!frame->initialized) {
+            preflight_frame_action action =
+                classify_preflight_frame(evaluator, frame);
 
-                if (function != NULL) {
-                    supported = preflight_evaluator_function(
-                        evaluator, planned, function, depth);
-                } else {
-                    const char *path =
-                        scoped ? scoped_command_path_value(
-                                     &scope, (unsigned int)index + 1U,
-                                     planned, evaluator->default_path)
-                               : command_path_value(
-                                     evaluator->variables, planned,
-                                     evaluator->default_path);
-
-                    supported = native_planned_command_is_supported(
-                        evaluator->pipeline, index, path);
-                    if (supported && native_trap_builtin(planned) &&
-                        evaluator->traps == NULL) {
-                        supported = false;
-                    }
-                }
+            if (action == PREFLIGHT_FRAME_PIPELINE) {
+                supported = native_preflight_pipeline(
+                    evaluator, frame->node_index, frame->depth);
+            } else if (action == PREFLIGHT_FRAME_FUNCTION) {
+                evaluator->function_mutation_possible = true;
+                supported = define_evaluator_function(
+                    evaluator, frame->node_index);
+            } else if (action == PREFLIGHT_FRAME_INVALID) {
+                supported = false;
             }
+            if (!supported) break;
+            if (action != PREFLIGHT_FRAME_READY) {
+                stack_depth--;
+                continue;
+            }
+        }
+        if (frame->next_child == GSH_AST_NONE) {
+            restore_preflight_isolation(evaluator, frame);
+            stack_depth--;
+            continue;
+        }
+        child = frame->next_child;
+        if (child >= evaluator_storage(evaluator)->node_count ||
+            ++frame->visited > evaluator_storage(evaluator)->node_count ||
+            stack_depth == PREFLIGHT_WALK_DEPTH_CAP) {
+            supported = false;
+            break;
+        }
+        frame->next_child = evaluator_storage(evaluator)->nodes[child].next_sibling;
+        (void)memset(&workspace->frames[stack_depth], 0,
+               sizeof(workspace->frames[stack_depth]));
+        workspace->frames[stack_depth].node_index = child;
+        workspace->frames[stack_depth].depth =
+            frame->depth + (evaluator_storage(evaluator)->nodes[child].kind ==
+                                    GSH_AST_CASE_ITEM
+                                ? 0U
+                                : 1U);
+        stack_depth++;
+    }
+    release_preflight_workspace(workspace);
+    return supported;
+}
+
+typedef struct {
+    uint16_t entry_index;
+    uint16_t depth;
+    gsh_positional_store positionals;
+} function_preflight_task;
+
+typedef struct {
+    function_preflight_task tasks[GSH_FUNCTION_CAP];
+    bool queued[GSH_FUNCTION_CAP];
+    size_t count;
+    size_t next;
+    bool used;
+} function_preflight_workspace;
+
+static function_preflight_workspace *acquire_function_preflight_workspace(void)
+{
+    static function_preflight_workspace workspace;
+
+    if (!require(workspace.count <= GSH_FUNCTION_CAP)) return NULL;
+    if (!require(workspace.next <= workspace.count)) return NULL;
+    if (workspace.used) return NULL;
+    (void)memset(workspace.queued, 0, sizeof(workspace.queued));
+    workspace.count = 0U;
+    workspace.next = 0U;
+    workspace.used = true;
+    return &workspace;
+}
+
+static void release_function_preflight_workspace(
+    function_preflight_workspace *workspace)
+{
+    if (!require(workspace != NULL)) return;
+    if (!require(workspace->count <= GSH_FUNCTION_CAP)) return;
+    workspace->count = 0U;
+    workspace->next = 0U;
+    workspace->used = false;
+}
+
+static bool queue_function_preflight(
+    native_evaluator *evaluator, const gsh_native_command *command,
+    const gsh_function_entry *entry, size_t depth,
+    function_preflight_workspace *workspace)
+{
+    if (!require(evaluator != NULL && command != NULL && entry != NULL)) {
+        return false;
+    }
+    if (!require(workspace != NULL && evaluator->functions != NULL)) {
+        return false;
+    }
+    size_t index = (size_t)(entry - evaluator_functions(evaluator)->entries);
+    function_preflight_task *task;
+
+    if (depth > GSH_FUNCTION_DEPTH_CAP || index >= GSH_FUNCTION_CAP) {
+        return false;
+    }
+    if (workspace->queued[index]) return true;
+    if (workspace->count == GSH_FUNCTION_CAP ||
+        apply_native_assignments(evaluator->variables, NULL, command,
+                                 &evaluator->options) !=
+            GSH_ASSIGNMENT_OK) {
+        return false;
+    }
+    task = &workspace->tasks[workspace->count];
+    if (gsh_positionals_assign(&task->positionals, command->argc - 1U,
+                               command->argv + 1U) == -1) {
+        return false;
+    }
+    task->entry_index = (uint16_t)index;
+    task->depth = (uint16_t)depth;
+    workspace->queued[index] = true;
+    workspace->count++;
+    return true;
+}
+
+static bool preflight_function_command(
+    native_evaluator *evaluator, const pipeline_expansion_scope *scope,
+    bool scoped, size_t command_index, size_t depth,
+    function_preflight_workspace *workspace)
+{
+    if (!require(evaluator != NULL && scope != NULL)) return false;
+    if (!require(evaluator->pipeline != NULL && workspace != NULL)) {
+        return false;
+    }
+    const gsh_native_command *command =
+        &evaluator_pipeline(evaluator)->commands[command_index];
+    const gsh_function_entry *function =
+        evaluator_function(evaluator, command);
+    const char *path;
+
+    if (function != NULL) {
+        return queue_function_preflight(
+            evaluator, command, function, depth + 1U, workspace);
+    }
+    path = scoped ? scoped_command_path_value(
+                        scope, (unsigned int)command_index + 1U, command,
+                        evaluator->default_path)
+                  : command_path_value(evaluator->variables, command,
+                                       evaluator->default_path);
+    return native_planned_command_is_supported(
+               evaluator->pipeline, command_index, path) &&
+           (!native_trap_builtin(command) || evaluator->traps != NULL);
+}
+
+static bool preflight_function_pipeline(
+    native_evaluator *evaluator, size_t node_index, size_t depth,
+    function_preflight_workspace *workspace)
+{
+    if (!require(evaluator != NULL && workspace != NULL)) return false;
+    if (!require(evaluator->storage != NULL &&
+                 node_index < evaluator_storage(evaluator)->node_count)) return false;
+    pipeline_expansion_scope scope;
+    bool deferred_work;
+    bool scoped;
+    size_t index;
+
+    if (plan_evaluator_pipeline_preflight(
+            evaluator, node_index, &scope, &scoped,
+            &deferred_work) != GSH_NATIVE_PLAN_OK) {
+        return false;
+    }
+    if (!deferred_work) {
+        for (index = 0U; index < evaluator_pipeline(evaluator)->command_count;
+             index++) {
+            if (!preflight_function_command(
+                    evaluator, &scope, scoped, index, depth, workspace)) {
+                return false;
+            }
+        }
+    }
+    for (index = 0U; index < evaluator_pipeline(evaluator)->command_count; index++) {
+        if (!record_preflight_command(
+                evaluator, &evaluator_pipeline(evaluator)->commands[index])) {
+            return false;
+        }
+    }
+    if (deferred_work) record_deferred_preflight(evaluator);
+    return true;
+}
+
+static bool preflight_function_node(
+    native_evaluator *evaluator, size_t node_index, size_t depth,
+    function_preflight_workspace *functions)
+{
+    if (!require(evaluator != NULL && evaluator->storage != NULL)) {
+        return false;
+    }
+    if (!require(functions != NULL && node_index != GSH_AST_NONE)) {
+        return false;
+    }
+    preflight_workspace *workspace = acquire_preflight_workspace();
+    size_t stack_depth = 1U;
+    bool supported = workspace != NULL;
+
+    if (!supported) return false;
+    (void)memset(workspace->frames, 0, sizeof(workspace->frames));
+    workspace->frames[0].node_index = node_index;
+    workspace->frames[0].depth = depth;
+    while (supported && stack_depth > 0U) {
+        preflight_walk_frame *frame = &workspace->frames[stack_depth - 1U];
+        size_t child;
+
+        if (!frame->initialized) {
+            preflight_frame_action action =
+                classify_preflight_frame(evaluator, frame);
+
+            if (action == PREFLIGHT_FRAME_PIPELINE) {
+                supported = preflight_function_pipeline(
+                    evaluator, frame->node_index, frame->depth, functions);
+            } else if (action != PREFLIGHT_FRAME_READY) {
+                supported = false;
+            }
+            if (!supported) break;
+            if (action == PREFLIGHT_FRAME_PIPELINE) {
+                stack_depth--;
+                continue;
+            }
+        }
+        if (frame->next_child == GSH_AST_NONE) {
+            restore_preflight_isolation(evaluator, frame);
+            stack_depth--;
+            continue;
+        }
+        child = frame->next_child;
+        if (child >= evaluator_storage(evaluator)->node_count ||
+            ++frame->visited > evaluator_storage(evaluator)->node_count ||
+            stack_depth == PREFLIGHT_WALK_DEPTH_CAP) {
+            supported = false;
+            break;
+        }
+        frame->next_child = evaluator_storage(evaluator)->nodes[child].next_sibling;
+        (void)memset(&workspace->frames[stack_depth], 0,
+               sizeof(workspace->frames[stack_depth]));
+        workspace->frames[stack_depth].node_index = child;
+        workspace->frames[stack_depth].depth = frame->depth + 1U;
+        stack_depth++;
+    }
+    release_preflight_workspace(workspace);
+    return supported;
+}
+
+/* ── Function Preflight Uses a Reachability Worklist ────────────
+ * Re-entering the AST preflight for every function call put the verifier in
+ * the same recursive component as execution.  A fixed worklist now records
+ * each reachable function once, including its bounded positional arguments.
+ * Bodies use an independent DFS and enqueue nested calls without using the C
+ * stack; exec descriptors and mutation flags still flow into the caller.
+ * ─────────────────────────────────────────────────────────────── */
+static bool preflight_evaluator_function(
+    native_evaluator *evaluator, const gsh_native_command *command,
+    const gsh_function_entry *entry, size_t depth)
+{
+    if (!require(evaluator != NULL && command != NULL)) return false;
+    if (!require(entry != NULL && evaluator->functions != NULL)) return false;
+    const char *saved_input = evaluator->input;
+    size_t saved_input_length = evaluator->input_length;
+    const gsh_parse_storage *saved_storage = evaluator->storage;
+    gsh_positional_store *saved_positionals = evaluator->positionals;
+    size_t saved_function_depth = evaluator->function_depth;
+    function_preflight_workspace *workspace =
+        acquire_function_preflight_workspace();
+    bool supported = workspace != NULL;
+
+    if (depth > 128U) supported = false;
+    if (supported) {
+        supported = queue_function_preflight(
+            evaluator, command, entry, saved_function_depth + 1U,
+            workspace);
+    }
+    evaluator->input = gsh_functions_text(evaluator->functions);
+    evaluator->input_length = evaluator_functions(evaluator)->text_used;
+    evaluator->storage = &evaluator_functions(evaluator)->programs;
+    while (supported && workspace->next < workspace->count) {
+        function_preflight_task *task =
+            &workspace->tasks[workspace->next++];
+        const gsh_function_entry *selected =
+            &evaluator_functions(evaluator)->entries[task->entry_index];
+        const gsh_ast_node *definition =
+            &evaluator_storage(evaluator)->nodes[selected->node_offset];
+
+        evaluator->positionals = &task->positionals;
+        evaluator->function_depth = task->depth;
+        supported = definition->kind == GSH_AST_FUNCTION &&
+                    definition->first_child != GSH_AST_NONE;
+        if (supported && definition->redirect_count != 0U) {
+            bool deferred_work = false;
+            gsh_native_expansion_context expansion =
+                native_expansion_context(evaluator, false,
+                                         &deferred_work);
+
+            supported = gsh_native_plan_redirects_with_context(
+                            evaluator->input, evaluator->storage,
+                            selected->node_offset, &expansion,
+                            evaluator->pipeline) == GSH_NATIVE_PLAN_OK &&
+                        !deferred_work;
         }
         if (supported) {
-            size_t index;
-
-            for (index = 0;
-                 index < evaluator->pipeline->command_count; index++) {
-                const gsh_native_command *command =
-                    &evaluator->pipeline->commands[index];
-
-                if (native_state_builtin(command) &&
-                    (strcmp(command->argv[0], "shift") == 0 ||
-                     gsh_builtin_set_mutates_positionals(
-                         command->argc, command->argv))) {
-                    evaluator->positional_mutation_possible = true;
-                }
-                if (evaluator->pipeline->command_count == 1U &&
-                    native_cd_builtin(command)) {
-                    evaluator->directory_mutation_possible = true;
-                }
-                if (evaluator->pipeline->command_count == 1U &&
-                    native_alias_mutates(command)) {
-                    evaluator->alias_mutation_possible = true;
-                }
-                if (evaluator->pipeline->command_count == 1U &&
-                    native_function_mutates(command)) {
-                    evaluator->function_mutation_possible = true;
-                }
-                if (evaluator->pipeline->command_count == 1U &&
-                    native_exec_builtin(command)) {
-                    evaluator->exec_possible = true;
-                    supported = preflight_record_exec_descriptors(
-                        evaluator, command);
-                }
-                if (native_snapshot_job_control_builtin(command) ||
-                    native_wait_builtin(command)) {
-                    evaluator->job_service_possible = true;
-                }
-                if (evaluator->pipeline->command_count == 1U &&
-                    native_source_builtin(command)) {
-                    evaluator->positional_mutation_possible = true;
-                    evaluator->directory_mutation_possible = true;
-                    evaluator->alias_mutation_possible = true;
-                    evaluator->function_mutation_possible = true;
-                    evaluator->command_cache_mutation_possible = true;
-                }
-                if (evaluator->pipeline->command_count == 1U &&
-                    (native_hash_builtin(command) ||
-                     native_command_inspection_builtin(command) ||
-                     command_can_populate_cache(command,
-                                                evaluator->functions))) {
-                    evaluator->command_cache_mutation_possible = true;
-                }
-            }
-            if (deferred_work) {
-                evaluator->positional_mutation_possible = true;
-                evaluator->directory_mutation_possible = true;
-                evaluator->alias_mutation_possible = true;
-                evaluator->function_mutation_possible = true;
-                evaluator->command_cache_mutation_possible = true;
-            }
-        }
-        return supported;
-    }
-    if (node->kind == GSH_AST_CASE) {
-        return native_preflight_case(evaluator, node, depth);
-    }
-    if (node->kind == GSH_AST_FOR) {
-        return native_preflight_for(evaluator, node, depth);
-    }
-    if (node->kind == GSH_AST_FUNCTION) {
-        evaluator->function_mutation_possible = true;
-        return define_evaluator_function(evaluator, node_index);
-    }
-    if (node->kind == GSH_AST_SIMPLE) {
-        return false;
-    }
-    if (node->kind != GSH_AST_PROGRAM && node->kind != GSH_AST_LIST &&
-        node->kind != GSH_AST_AND_OR &&
-        node->kind != GSH_AST_SUBSHELL &&
-        node->kind != GSH_AST_BRACE_GROUP && node->kind != GSH_AST_IF &&
-        node->kind != GSH_AST_IF_BRANCH && node->kind != GSH_AST_WHILE &&
-        node->kind != GSH_AST_UNTIL) {
-        return false;
-    }
-    child = node->first_child;
-    if (node->kind != GSH_AST_PROGRAM && child == GSH_AST_NONE) {
-        return false;
-    }
-    {
-        bool saved_exec_possible = evaluator->exec_possible;
-        size_t saved_exec_descriptor_count =
-            evaluator->exec_descriptor_count;
-        size_t saved_exec_protected_descriptor_count =
-            evaluator->exec_protected_descriptor_count;
-        bool isolated_exec = node->kind == GSH_AST_SUBSHELL ||
-                             (node->flags & GSH_AST_FLAG_ASYNC) != 0;
-
-        while (child != GSH_AST_NONE) {
-            if (!native_preflight_node(evaluator, child, depth + 1U)) {
-                return false;
-            }
-            child = evaluator->storage->nodes[child].next_sibling;
-            if (++visited > evaluator->storage->node_count) {
-                return false;
-            }
-        }
-        if (isolated_exec) {
-            evaluator->exec_possible = saved_exec_possible;
-            evaluator->exec_descriptor_count =
-                saved_exec_descriptor_count;
-            evaluator->exec_protected_descriptor_count =
-                saved_exec_protected_descriptor_count;
+            supported = preflight_function_node(
+                evaluator, definition->first_child, 0U, workspace);
         }
     }
-    return true;
+    evaluator->function_depth = saved_function_depth;
+    evaluator->positionals = saved_positionals;
+    evaluator->storage = saved_storage;
+    evaluator->input_length = saved_input_length;
+    evaluator->input = saved_input;
+    if (workspace != NULL) release_function_preflight_workspace(workspace);
+    return supported;
 }
 
 typedef struct {
@@ -12401,6 +14384,10 @@ static void initialize_substitution_functions(
     native_evaluator *parent, gsh_source_workspace *workspace,
     native_evaluator *nested)
 {
+    if (workspace == NULL) return;
+    if (nested == NULL || parent == NULL) {
+        return;
+    }
     if (!storage_has_function(&workspace->storage)) {
         nested->functions = parent->functions;
         nested->function_scratch = parent->function_scratch;
@@ -12409,14 +14396,12 @@ static void initialize_substitution_functions(
     if (parent->functions == NULL) {
         gsh_functions_initialize(&workspace->functions);
     } else {
-        memcpy(&workspace->functions, parent->functions,
+        (void)memcpy(&workspace->functions, parent->functions,
                sizeof(workspace->functions));
     }
     gsh_functions_initialize(&workspace->function_scratch);
     nested->functions = &workspace->functions;
     nested->function_scratch = &workspace->function_scratch;
-    assert(nested->functions != parent->functions);
-    assert(nested->function_scratch != NULL);
 }
 
 static void initialize_substitution_evaluator(
@@ -12424,7 +14409,10 @@ static void initialize_substitution_evaluator(
     const char *input, size_t input_length, native_evaluator *nested,
     gsh_background_table *backgrounds)
 {
-    memset(nested, 0, sizeof(*nested));
+    if (backgrounds == NULL || input == NULL || nested == NULL || parent == NULL || workspace == NULL) {
+        return;
+    }
+    (void)memset(nested, 0, sizeof(*nested));
     nested->exec_outcome_fd = parent->exec_outcome_fd;
     nested->exec_descriptor_socket = parent->exec_descriptor_socket;
     nested->input = input;
@@ -12439,7 +14427,7 @@ static void initialize_substitution_evaluator(
     nested->history_exclude_newest = parent->history_exclude_newest;
     nested->positionals = parent->positionals;
     nested->options = parent->options;
-    memcpy(&workspace->variables, parent->variables,
+    (void)memcpy(&workspace->variables, parent->variables,
            sizeof(workspace->variables));
     nested->variables = &workspace->variables;
     nested->aliases = parent->aliases;
@@ -12455,8 +14443,6 @@ static void initialize_substitution_evaluator(
     gsh_background_initialize(backgrounds);
     nested->backgrounds = backgrounds;
     initialize_substitution_functions(parent, workspace, nested);
-    assert(nested->source_depth <= GSH_SOURCE_DEPTH_CAP);
-    assert(nested->variables != parent->variables);
 }
 
 static gsh_native_plan_status prepare_substitution(
@@ -12464,6 +14450,9 @@ static gsh_native_plan_status prepare_substitution(
     gsh_source_workspace *workspace, native_evaluator *nested,
     gsh_background_table *backgrounds, gsh_parse_result *parsed)
 {
+    if (backgrounds == NULL || commands == NULL || nested == NULL || parent == NULL || parsed == NULL || workspace == NULL) {
+        return GSH_NATIVE_PLAN_LIMIT;
+    }
     const char *input = commands;
     size_t input_length = command_length;
 
@@ -12480,53 +14469,11 @@ static gsh_native_plan_status prepare_substitution(
     if (!native_preflight_node(nested, parsed->root, 0)) {
         return GSH_NATIVE_PLAN_UNSUPPORTED;
     }
-    memcpy(&workspace->variables, parent->variables,
+    (void)memcpy(&workspace->variables, parent->variables,
            sizeof(workspace->variables));
     nested->preflight = false;
     nested->fatal_error = false;
-    assert(nested->storage == &workspace->storage);
-    assert(nested->source_depth == parent->source_depth + 1U);
     return GSH_NATIVE_PLAN_OK;
-}
-
-static pid_t start_substitution_child(native_evaluator *nested,
-                                      size_t root, int capture[2])
-{
-    pid_t pid;
-
-    if (make_pipe(capture, false
-                  GSH_FAULT_ARGUMENT("substitution-pipe")) == -1) {
-        perror("gsh: command substitution pipe");
-        return -1;
-    }
-    pid = fault_should_fail("substitution-fork", EAGAIN) ? -1 : fork();
-    if (pid == 0) {
-        int status;
-
-        (void)close(capture[0]);
-        reset_child_signals();
-        enter_native_subshell_or_exit(nested);
-        close_evaluator_exec_transaction(nested);
-        if (child_duplicate_descriptor(capture[1], STDOUT_FILENO) == -1) {
-            child_exec_error("command substitution output", errno);
-        }
-        if (capture[1] != STDOUT_FILENO) {
-            (void)close(capture[1]);
-        }
-        status = native_evaluate_node(nested, root, 0);
-        status = finish_native_evaluator(nested, status);
-        _exit(status & 255);
-    }
-    (void)close(capture[1]);
-    capture[1] = -1;
-    if (pid == -1) {
-        perror("gsh: command substitution fork");
-        (void)close(capture[0]);
-        capture[0] = -1;
-    }
-    assert(pid != 0);
-    assert(capture[1] == -1);
-    return pid;
 }
 
 static substitution_capture_result read_substitution_output(
@@ -12537,12 +14484,18 @@ static substitution_capture_result read_substitution_output(
     size_t attempt;
     bool complete = false;
 
+    if (descriptor < 0 || output == NULL) {
+        result.failed = true;
+        result.error = EINVAL;
+        return result;
+    }
+
     for (attempt = 0;
          attempt < GSH_NATIVE_HEREDOC_TEXT_CAP + READ_RETRY_CAP &&
          !complete;
          attempt++) {
         unsigned char bytes[4096];
-        ssize_t count = fault_should_fail("substitution-read", EIO)
+        ssize_t count = gsh_fault_should_fail(GSH_FAULT_SUBSTITUTION_READ, EIO)
                             ? -1
                             : read(descriptor, bytes, sizeof(bytes));
 
@@ -12554,7 +14507,7 @@ static substitution_capture_result read_substitution_output(
             if (result.contains_null || result.overflow) {
                 complete = true;
             } else {
-                memcpy(output + result.used, bytes, amount);
+                (void)memcpy(output + result.used, bytes, amount);
                 result.used += amount;
             }
         } else if (count == 0) {
@@ -12569,8 +14522,6 @@ static substitution_capture_result read_substitution_output(
         result.failed = true;
         result.error = EINTR;
     }
-    assert(result.used <= output_capacity);
-    assert(descriptor >= 0);
     return result;
 }
 
@@ -12579,12 +14530,15 @@ static bool wait_substitution_child(pid_t pid, int *wait_status)
     enum { WAIT_RETRY_CAP = 1024 };
     unsigned int attempt;
 
+    if (pid <= 0 || wait_status == NULL) {
+        errno = EINVAL;
+        return false;
+    }
+
     for (attempt = 0; attempt < WAIT_RETRY_CAP; attempt++) {
         pid_t waited = waitpid(pid, wait_status, 0);
 
         if (waited == pid) {
-            assert(pid > 0);
-            assert(wait_status != NULL);
             return true;
         }
         if (waited == -1 && errno == EINTR) {
@@ -12596,21 +14550,23 @@ static bool wait_substitution_child(pid_t pid, int *wait_status)
     return false;
 }
 
-static gsh_native_plan_status collect_substitution(
-    native_evaluator *nested, size_t root, char *output,
-    size_t output_capacity, size_t *output_length, int *exit_status)
+static gsh_native_plan_status finish_substitution_capture(
+    pid_t pid, int descriptor, char *output, size_t output_capacity,
+    size_t *output_length, int *exit_status)
 {
-    int capture[2] = {-1, -1};
-    int wait_status = 0;
-    pid_t pid = start_substitution_child(nested, root, capture);
-    substitution_capture_result result;
-    size_t trim;
-
-    if (pid == -1) {
+    if (!require(pid > 0 && descriptor >= 0)) {
         return GSH_NATIVE_PLAN_UNSUPPORTED;
     }
-    result = read_substitution_output(capture[0], output, output_capacity);
-    (void)close(capture[0]);
+    if (!require(output != NULL && output_length != NULL &&
+                 exit_status != NULL)) {
+        return GSH_NATIVE_PLAN_UNSUPPORTED;
+    }
+    int wait_status = 0;
+    substitution_capture_result result = read_substitution_output(
+        descriptor, output, output_capacity);
+    size_t trim;
+
+    (void)close(descriptor);
     if (result.overflow || result.contains_null || result.failed) {
         (void)kill(pid, SIGKILL);
     }
@@ -12626,7 +14582,7 @@ static gsh_native_plan_status collect_substitution(
             errno = result.error != 0 ? result.error : EIO;
             perror("gsh: command substitution read");
         } else {
-            fputs("gsh: command substitution contains a null byte\n",
+            (void)fputs("gsh: command substitution contains a null byte\n",
                   stderr);
         }
         return GSH_NATIVE_PLAN_UNSUPPORTED;
@@ -12640,62 +14596,182 @@ static gsh_native_plan_status collect_substitution(
     return GSH_NATIVE_PLAN_OK;
 }
 
+typedef struct {
+    gsh_source_workspace *workspace;
+    native_evaluator nested;
+    gsh_background_table *backgrounds;
+    size_t root;
+    bool used;
+} command_substitution_execution;
+
+static command_substitution_execution *acquire_substitution_execution(void)
+{
+    static command_substitution_execution
+        executions[SUBSTITUTION_SNAPSHOT_CAP];
+    size_t index;
+
+    for (index = 0U; index < SUBSTITUTION_SNAPSHOT_CAP; index++) {
+        if (!executions[index].used) {
+            (void)memset(&executions[index], 0, sizeof(executions[index]));
+            executions[index].used = true;
+            return &executions[index];
+        }
+    }
+    errno = ENOSPC;
+    return NULL;
+}
+
+static void release_substitution_execution(
+    command_substitution_execution *execution)
+{
+    if (!require(execution != NULL)) return;
+    if (!require(execution->used)) return;
+    (void)memset(execution, 0, sizeof(*execution));
+}
+
+static gsh_native_plan_status prepare_command_substitution(
+    native_evaluator *parent, const char *commands, size_t command_length,
+    char *output, size_t output_capacity, size_t *output_length,
+    int *exit_status, command_substitution_execution *execution,
+    bool *ready)
+{
+    if (!require(parent != NULL && commands != NULL && output != NULL)) {
+        return GSH_NATIVE_PLAN_UNSUPPORTED;
+    }
+    if (!require(output_length != NULL && exit_status != NULL &&
+                 execution != NULL && ready != NULL)) {
+        return GSH_NATIVE_PLAN_UNSUPPORTED;
+    }
+    gsh_parse_result parsed = {0};
+    gsh_native_plan_status status;
+
+    *ready = false;
+    *output_length = 0U;
+    *exit_status = 125;
+    if (output_capacity > GSH_NATIVE_HEREDOC_TEXT_CAP ||
+        parent->source_workspaces == NULL ||
+        parent->source_depth !=
+            gsh_source_workspaces_depth(parent->source_workspaces) ||
+        gsh_fault_should_fail(GSH_FAULT_SOURCE_WORKSPACE_EXHAUSTION, EAGAIN)) {
+        (void)fputs("gsh: nested source workspace limit exceeded\n", stderr);
+        return GSH_NATIVE_PLAN_LIMIT;
+    }
+    execution->workspace =
+        gsh_source_workspace_acquire(parent->source_workspaces);
+    if (execution->workspace == NULL) {
+        (void)fputs("gsh: nested source workspace limit exceeded\n", stderr);
+        return GSH_NATIVE_PLAN_LIMIT;
+    }
+    execution->backgrounds = allocate_isolated_job_table();
+    if (execution->backgrounds == NULL) {
+        (void)fputs("gsh: command substitution job state unavailable\n", stderr);
+        return GSH_NATIVE_PLAN_LIMIT;
+    }
+    status = prepare_substitution(
+        parent, commands, command_length, execution->workspace,
+        &execution->nested, execution->backgrounds, &parsed);
+    execution->root = parsed.root;
+    *ready = status == GSH_NATIVE_PLAN_OK;
+    return status;
+}
+
+static gsh_native_plan_status finish_command_substitution(
+    native_evaluator *parent, command_substitution_execution *execution,
+    gsh_native_plan_status status)
+{
+    if (!require(parent != NULL && execution != NULL)) {
+        return GSH_NATIVE_PLAN_UNSUPPORTED;
+    }
+    bool released;
+
+    if (execution->backgrounds != NULL) {
+        release_isolated_job_table(execution->backgrounds);
+    }
+    if (execution->workspace == NULL) {
+        if (execution->backgrounds != NULL ||
+            status == GSH_NATIVE_PLAN_OK) {
+            status = GSH_NATIVE_PLAN_UNSUPPORTED;
+        }
+        release_substitution_execution(execution);
+        return status;
+    }
+    released = gsh_source_workspace_release(
+        parent->source_workspaces, execution->workspace);
+    if (!released) {
+        (void)fputs("gsh: nested source workspace ownership failure\n", stderr);
+        return GSH_NATIVE_PLAN_UNSUPPORTED;
+    }
+    if (parent->source_depth !=
+        gsh_source_workspaces_depth(parent->source_workspaces)) {
+        return GSH_NATIVE_PLAN_UNSUPPORTED;
+    }
+    release_substitution_execution(execution);
+    return status;
+}
+
 static gsh_native_plan_status execute_command_substitution(
     void *opaque, const char *commands, size_t command_length, char *output,
     size_t output_capacity, size_t *output_length, int *exit_status)
 {
+    if (opaque == NULL) {
+        return GSH_NATIVE_PLAN_LIMIT;
+    }
     native_evaluator *parent = opaque;
-    gsh_source_workspace *workspace;
-    native_evaluator nested;
-    gsh_background_table *backgrounds;
-    gsh_parse_result parsed;
+    command_substitution_execution *execution;
+    int capture[2] = {-1, -1};
+    pid_t pid;
     gsh_native_plan_status status;
-    bool released;
+    bool ready = false;
 
-    if (output_length == NULL || exit_status == NULL) {
+    if (!require(parent != NULL && commands != NULL)) {
         return GSH_NATIVE_PLAN_UNSUPPORTED;
     }
-    *output_length = 0;
-    *exit_status = 125;
-    if (parent == NULL || commands == NULL || output == NULL ||
-        output_capacity > GSH_NATIVE_HEREDOC_TEXT_CAP ||
-        parent->source_workspaces == NULL ||
-        parent->source_depth !=
-            gsh_source_workspaces_depth(parent->source_workspaces) ||
-        fault_should_fail("source-workspace-exhaustion", EAGAIN)) {
-        fputs("gsh: nested source workspace limit exceeded\n", stderr);
-        return GSH_NATIVE_PLAN_LIMIT;
-    }
-    workspace = gsh_source_workspace_acquire(parent->source_workspaces);
-    if (workspace == NULL) {
-        fputs("gsh: nested source workspace limit exceeded\n", stderr);
-        return GSH_NATIVE_PLAN_LIMIT;
-    }
-    backgrounds = allocate_isolated_job_table();
-    if (backgrounds == NULL) {
-        (void)gsh_source_workspace_release(parent->source_workspaces,
-                                           workspace);
-        fputs("gsh: command substitution job state unavailable\n", stderr);
-        return GSH_NATIVE_PLAN_LIMIT;
-    }
-    status = prepare_substitution(parent, commands, command_length,
-                                  workspace, &nested, backgrounds, &parsed);
-    if (status == GSH_NATIVE_PLAN_OK) {
-        status = collect_substitution(&nested, parsed.root, output,
-                                      output_capacity, output_length,
-                                      exit_status);
-    }
-    released = gsh_source_workspace_release(parent->source_workspaces,
-                                            workspace);
-    free(backgrounds);
-    if (!released) {
-        fputs("gsh: nested source workspace ownership failure\n", stderr);
+    if (!require(output != NULL && output_length != NULL &&
+                 exit_status != NULL)) {
         return GSH_NATIVE_PLAN_UNSUPPORTED;
     }
-    assert(parent->source_depth ==
-           gsh_source_workspaces_depth(parent->source_workspaces));
-    assert(*output_length <= output_capacity);
-    return status;
+    execution = acquire_substitution_execution();
+    if (execution == NULL) return GSH_NATIVE_PLAN_LIMIT;
+    status = prepare_command_substitution(
+        parent, commands, command_length, output, output_capacity,
+        output_length, exit_status, execution, &ready);
+    if (!ready) {
+        return finish_command_substitution(parent, execution, status);
+    }
+    if (make_pipe(capture, false, GSH_FAULT_SUBSTITUTION_PIPE) == -1) {
+        perror("gsh: command substitution pipe");
+        status = GSH_NATIVE_PLAN_UNSUPPORTED;
+    } else {
+        pid = gsh_fault_should_fail(GSH_FAULT_SUBSTITUTION_FORK, EAGAIN) ? -1 : fork();
+        if (pid == 0) {
+            (void)close(capture[0]);
+            reset_child_signals();
+            enter_native_subshell_or_exit(&execution->nested);
+            close_evaluator_exec_transaction(&execution->nested);
+            if (child_duplicate_descriptor(capture[1], STDOUT_FILENO) == -1) {
+                child_exec_error("command substitution output", errno);
+            }
+            if (capture[1] != STDOUT_FILENO) (void)close(capture[1]);
+            parent->substitution_child_execution = execution;
+            return GSH_NATIVE_PLAN_DEFERRED;
+        }
+        (void)close(capture[1]);
+        if (pid == -1) {
+            perror("gsh: command substitution fork");
+            (void)close(capture[0]);
+            status = GSH_NATIVE_PLAN_UNSUPPORTED;
+        } else {
+            status = pid > 0 && capture[0] >= 0
+                         ? finish_substitution_capture(
+                               pid, capture[0], output, output_capacity,
+                               output_length, exit_status)
+                         : GSH_NATIVE_PLAN_UNSUPPORTED;
+        }
+    }
+    if (*output_length > output_capacity) {
+        status = GSH_NATIVE_PLAN_UNSUPPORTED;
+    }
+    return finish_command_substitution(parent, execution, status);
 }
 
 /* ── Exit Propagates to the Current Execution-Environment Boundary ──
@@ -12708,6 +14784,7 @@ static gsh_native_plan_status execute_command_substitution(
 static int evaluate_exit(native_evaluator *evaluator,
                          const gsh_native_command *command)
 {
+    if (evaluator == NULL) return -1;
     gsh_saved_descriptor saved[GSH_NATIVE_REDIRECT_CAP];
     size_t saved_count = 0;
     int status = 125;
@@ -12750,6 +14827,10 @@ static int evaluate_exit(native_evaluator *evaluator,
 static int evaluate_return(native_evaluator *evaluator,
                            const gsh_native_command *command)
 {
+    if (command == NULL) return -1;
+    if (evaluator == NULL) {
+        return -1;
+    }
     unsigned int status = (unsigned int)(evaluator->last_status & 255);
     const char *cursor;
 
@@ -12758,25 +14839,25 @@ static int evaluate_return(native_evaluator *evaluator,
          !command->command_regular_context) ||
         command->redirect_count != 0 ||
         (evaluator->function_depth == 0 && evaluator->dot_depth == 0)) {
-        fputs("gsh: return: invalid context or operands\n", stderr);
+        (void)fputs("gsh: return: invalid context or operands\n", stderr);
         return 1;
     }
     if (command->argc == 2U) {
         status = 0;
         cursor = command->argv[1];
         if (*cursor == '\0') {
-            fputs("gsh: return: invalid status\n", stderr);
+            (void)fputs("gsh: return: invalid status\n", stderr);
             return 1;
         }
         while (*cursor != '\0') {
             if (*cursor < '0' || *cursor > '9' || status > 25U) {
-                fputs("gsh: return: invalid status\n", stderr);
+                (void)fputs("gsh: return: invalid status\n", stderr);
                 return 1;
             }
             status = status * 10U + (unsigned int)(*cursor++ - '0');
         }
         if (status > 255U) {
-            fputs("gsh: return: invalid status\n", stderr);
+            (void)fputs("gsh: return: invalid status\n", stderr);
             return 1;
         }
     }
@@ -12788,6 +14869,9 @@ static int evaluate_return(native_evaluator *evaluator,
 static bool parse_loop_control_count(const char *text, size_t limit,
                                      size_t *result)
 {
+    if (result == NULL || text == NULL) {
+        return false;
+    }
     size_t length = strnlen(text, GSH_NATIVE_TEXT_CAP);
     size_t value = 0;
     size_t index;
@@ -12817,6 +14901,10 @@ static bool parse_loop_control_count(const char *text, size_t limit,
 static int evaluate_loop_control(native_evaluator *evaluator,
                                  const gsh_native_pipeline *pipeline)
 {
+    if (evaluator == NULL) return -1;
+    if (pipeline == NULL) {
+        return -1;
+    }
     const gsh_native_command *command = &pipeline->commands[0];
     gsh_saved_descriptor saved[GSH_NATIVE_REDIRECT_CAP];
     size_t saved_count;
@@ -12863,486 +14951,660 @@ static int evaluate_loop_control(native_evaluator *evaluator,
                                               : status);
 }
 
-static int evaluate_function(native_evaluator *evaluator,
-                             const gsh_native_command *command,
-                             const gsh_function_entry *entry,
-                             bool apply_call_redirects)
-{
-    const char *saved_input = evaluator->input;
-    size_t saved_input_length = evaluator->input_length;
-    const gsh_parse_storage *saved_storage = evaluator->storage;
-    gsh_positional_store *saved_positionals = evaluator->positionals;
-    size_t saved_active_loops = evaluator->active_loops;
-    native_loop_control saved_loop_control = evaluator->loop_control;
-    size_t saved_loop_levels = evaluator->loop_levels;
+struct function_evaluation_frame {
+    const char *saved_input;
+    size_t saved_input_length;
+    const gsh_parse_storage *saved_storage;
+    gsh_positional_store *saved_positionals;
+    size_t saved_active_loops;
+    native_loop_control saved_loop_control;
+    size_t saved_loop_levels;
     gsh_positional_store positionals;
     gsh_saved_descriptor call_saved[GSH_NATIVE_REDIRECT_CAP];
     gsh_saved_descriptor definition_saved[GSH_NATIVE_REDIRECT_CAP];
-    size_t call_saved_count = 0;
-    size_t definition_saved_count = 0;
-    const gsh_ast_node *definition;
-    int status = 125;
+    size_t call_saved_count;
+    size_t definition_saved_count;
+    bool negated;
+    bool used;
+};
 
-    if (evaluator->function_depth == GSH_FUNCTION_DEPTH_CAP) {
-        fputs("gsh: function resource limit exceeded\n", stderr);
-        return 125;
+static function_evaluation_frame *acquire_function_evaluation_frame(void)
+{
+    static function_evaluation_frame frames[GSH_FUNCTION_DEPTH_CAP];
+    size_t index;
+
+    for (index = 0U; index < GSH_FUNCTION_DEPTH_CAP; index++) {
+        if (!frames[index].used) {
+            frames[index].used = true;
+            return &frames[index];
+        }
     }
+    errno = ENOSPC;
+    return NULL;
+}
+
+static void release_function_evaluation_frame(
+    function_evaluation_frame *frame)
+{
+    if (!require(frame != NULL)) return;
+    if (!require(frame->used)) return;
+    (void)memset(frame, 0, sizeof(*frame));
+}
+
+static void initialize_function_evaluation_frame(
+    native_evaluator *evaluator, function_evaluation_frame *frame)
+{
+    if (!require(evaluator != NULL)) return;
+    if (!require(frame != NULL && frame->used)) return;
+    (void)memset(frame, 0, sizeof(*frame));
+    frame->used = true;
+    frame->saved_input = evaluator->input;
+    frame->saved_input_length = evaluator->input_length;
+    frame->saved_storage = evaluator->storage;
+    frame->saved_positionals = evaluator->positionals;
+    frame->saved_active_loops = evaluator->active_loops;
+    frame->saved_loop_control = evaluator->loop_control;
+    frame->saved_loop_levels = evaluator->loop_levels;
+}
+
+static bool prepare_function_call(
+    native_evaluator *evaluator, const gsh_native_command *command,
+    bool apply_call_redirects, function_evaluation_frame *frame,
+    int *status)
+{
+    if (!require(evaluator != NULL && command != NULL)) return false;
+    if (!require(frame != NULL && status != NULL)) return false;
+
     if (apply_call_redirects &&
-        save_redirect_descriptors(command, call_saved,
-                                  &call_saved_count) == -1) {
+        save_redirect_descriptors(command, frame->call_saved,
+                                  &frame->call_saved_count) == -1) {
         perror("gsh: function redirection save");
-        return 125;
+        *status = 125;
+        return false;
     }
     if (apply_call_redirects &&
         apply_evaluator_redirects(evaluator->pipeline, command,
                                   &evaluator->options) == -1) {
         perror("gsh: function redirection");
-        (void)restore_redirect_descriptors(call_saved, call_saved_count);
-        return 1;
+        (void)restore_redirect_descriptors(frame->call_saved,
+                                           frame->call_saved_count);
+        frame->call_saved_count = 0U;
+        *status = 1;
+        return false;
     }
     if (apply_native_assignments(evaluator->variables, evaluator->journal,
                                  command, &evaluator->options) !=
             GSH_ASSIGNMENT_OK ||
-        gsh_positionals_assign(&positionals, command->argc - 1U,
+        gsh_positionals_assign(&frame->positionals, command->argc - 1U,
                                command->argv + 1U) == -1) {
         perror("gsh: function arguments");
-        goto restore_call;
+        if (restore_redirect_descriptors(frame->call_saved,
+                                         frame->call_saved_count) == -1) {
+            perror("gsh: function redirection restore");
+        }
+        frame->call_saved_count = 0U;
+        *status = 125;
+        return false;
     }
+    return true;
+}
+
+static void enter_function_evaluation(
+    native_evaluator *evaluator, function_evaluation_frame *frame)
+{
+    if (!require(evaluator != NULL)) return;
+    if (!require(frame != NULL)) return;
     evaluator->input = gsh_functions_text(evaluator->functions);
-    evaluator->input_length = evaluator->functions->text_used;
-    evaluator->storage = &evaluator->functions->programs;
-    evaluator->positionals = &positionals;
+    evaluator->input_length = evaluator_functions(evaluator)->text_used;
+    evaluator->storage = &evaluator_functions(evaluator)->programs;
+    evaluator->positionals = &frame->positionals;
     evaluator->function_depth++;
     evaluator->active_loops = 0;
     evaluator->loop_control = NATIVE_LOOP_CONTROL_NONE;
     evaluator->loop_levels = 0;
-    definition = &evaluator->storage->nodes[entry->node_offset];
-    if (definition->redirect_count != 0) {
-        gsh_native_expansion_context expansion =
-            native_expansion_context(evaluator, true, NULL);
-        gsh_native_plan_status plan_status =
-            gsh_native_plan_redirects_with_context(
-                evaluator->input, evaluator->storage,
-                entry->node_offset, &expansion, evaluator->pipeline);
-        const gsh_native_command *redirects =
-            &evaluator->pipeline->commands[0];
+}
 
-        if (plan_status != GSH_NATIVE_PLAN_OK) {
-            status = plan_status == GSH_NATIVE_PLAN_ERROR ? 1 : 125;
-            goto leave_function;
-        }
-        if (save_redirect_descriptors(
-                redirects, definition_saved,
-                &definition_saved_count) == -1) {
-            perror("gsh: function body redirection save");
-            goto leave_function;
-        }
-        if (apply_evaluator_redirects(
-                evaluator->pipeline, redirects,
-                &evaluator->options) == -1) {
-            perror("gsh: function body redirection");
-            (void)restore_redirect_descriptors(
-                definition_saved, definition_saved_count);
-            definition_saved_count = 0;
-            status = 1;
-            goto leave_function;
-        }
-    }
-    evaluator->returning = false;
-    status = native_evaluate_node(evaluator, definition->first_child, 0);
-    if (evaluator->returning) {
-        status = evaluator->return_status;
-        evaluator->returning = false;
-    }
-    if (restore_redirect_descriptors(definition_saved,
-                                     definition_saved_count) == -1) {
+static int leave_function_evaluation(
+    native_evaluator *evaluator, function_evaluation_frame *frame,
+    int status)
+{
+    if (!require(evaluator != NULL)) return 125;
+    if (!require(frame != NULL)) return 125;
+    if (restore_redirect_descriptors(frame->definition_saved,
+                                     frame->definition_saved_count) == -1) {
         perror("gsh: function body redirection restore");
         status = 125;
     }
-leave_function:
-    evaluator->loop_levels = saved_loop_levels;
-    evaluator->loop_control = saved_loop_control;
-    evaluator->active_loops = saved_active_loops;
+    evaluator->loop_levels = frame->saved_loop_levels;
+    evaluator->loop_control = frame->saved_loop_control;
+    evaluator->active_loops = frame->saved_active_loops;
     evaluator->function_depth--;
-    evaluator->positionals = saved_positionals;
-    evaluator->storage = saved_storage;
-    evaluator->input_length = saved_input_length;
-    evaluator->input = saved_input;
-restore_call:
-    if (restore_redirect_descriptors(call_saved, call_saved_count) == -1) {
+    evaluator->positionals = frame->saved_positionals;
+    evaluator->storage = frame->saved_storage;
+    evaluator->input_length = frame->saved_input_length;
+    evaluator->input = frame->saved_input;
+    if (restore_redirect_descriptors(frame->call_saved,
+                                     frame->call_saved_count) == -1) {
         perror("gsh: function redirection restore");
         status = 125;
     }
     return status;
 }
 
-static int run_pipeline_function(native_evaluator *parent,
-                                 gsh_native_pipeline *pipeline,
-                                 size_t command_index,
-                                 gsh_variable_store *variables,
-                                 bool *found)
+static int request_evaluator_function(native_evaluator *evaluator,
+                                      const gsh_native_command *command,
+                                      const gsh_function_entry *entry,
+                                      bool apply_call_redirects,
+                                      bool negated)
 {
-    const gsh_native_command *command = &pipeline->commands[command_index];
-    const gsh_function_entry *entry =
-        parent == NULL ? NULL : evaluator_function(parent, command);
-    native_evaluator child;
-    gsh_background_table *backgrounds;
-    int status;
+    function_evaluation_frame *frame;
+    const gsh_ast_node *definition;
+    bool body_ready = true;
+    int status = 125;
 
-    *found = entry != NULL;
-    if (entry == NULL) {
-        return 127;
+    if (!require(evaluator != NULL && command != NULL)) return 125;
+    if (!require(entry != NULL)) return 125;
+    if (evaluator->function_depth >= GSH_FUNCTION_DEPTH_CAP) {
+        (void)fputs("gsh: function resource limit exceeded\n", stderr);
+        return 125;
     }
-    backgrounds = allocate_isolated_job_table();
-    if (backgrounds == NULL) return 125;
-    child = *parent;
-    child.pipeline = pipeline;
-    child.variables = variables;
-    child.journal = NULL;
-    child.alias_journal = NULL;
-    child.pipeline_scope = NULL;
-    child.tail_exec_single = false;
-    child.exec_outcome_fd = -1;
-    child.returning = false;
-    child.exiting = false;
-    child.fatal_error = false;
-    child.backgrounds = backgrounds;
-    status = evaluate_function(&child, command, entry, false);
-    free(backgrounds);
+    frame = acquire_function_evaluation_frame();
+    if (frame == NULL) return 125;
+    initialize_function_evaluation_frame(evaluator, frame);
+    if (!prepare_function_call(evaluator, command, apply_call_redirects,
+                               frame, &status)) {
+        release_function_evaluation_frame(frame);
+        return status;
+    }
+    enter_function_evaluation(evaluator, frame);
+    definition = &evaluator_storage(evaluator)->nodes[entry->node_offset];
+    if (definition->redirect_count != 0) {
+        gsh_native_expansion_context expansion =
+            native_expansion_context(evaluator, true, NULL);
+        evaluator_expansion_request request = {
+            .kind = EVALUATOR_EXPAND_REDIRECTS,
+            .node_index = entry->node_offset,
+        };
+        gsh_native_plan_status plan_status =
+            run_evaluator_expansion(evaluator, &expansion, &request);
+        const gsh_native_command *redirects =
+            &evaluator_pipeline(evaluator)->commands[0];
+
+        if (plan_status != GSH_NATIVE_PLAN_OK) {
+            status = plan_status == GSH_NATIVE_PLAN_ERROR ? 1 : 125;
+            body_ready = false;
+        } else if (save_redirect_descriptors(
+                       redirects, frame->definition_saved,
+                       &frame->definition_saved_count) == -1) {
+            perror("gsh: function body redirection save");
+            body_ready = false;
+        } else if (apply_evaluator_redirects(
+                       evaluator->pipeline, redirects,
+                       &evaluator->options) == -1) {
+            perror("gsh: function body redirection");
+            (void)restore_redirect_descriptors(
+                frame->definition_saved, frame->definition_saved_count);
+            frame->definition_saved_count = 0U;
+            status = 1;
+            body_ready = false;
+        }
+    }
+    if (body_ready) {
+        evaluator->returning = false;
+        frame->negated = negated;
+        evaluator->function_request_frame = frame;
+        evaluator->function_request_root = definition->first_child;
+        return GSH_EVALUATOR_FUNCTION_REQUEST;
+    }
+    status = leave_function_evaluation(evaluator, frame, status);
+    release_function_evaluation_frame(frame);
     return status;
 }
 
-static int native_evaluate_pipeline(native_evaluator *evaluator,
-                                    size_t node_index, size_t depth)
+static int finish_evaluator_function(
+    native_evaluator *evaluator, function_evaluation_frame *frame,
+    int status)
 {
-    const gsh_ast_node *node = &evaluator->storage->nodes[node_index];
+    if (!require(evaluator != NULL && frame != NULL)) return 125;
+    if (!require(frame->used)) return 125;
+    if (evaluator->returning) {
+        status = evaluator->return_status;
+        evaluator->returning = false;
+    }
+    status = leave_function_evaluation(evaluator, frame, status);
+    if (frame->negated && status != 125) status = status == 0 ? 1 : 0;
+    release_function_evaluation_frame(frame);
+    return status;
+}
+
+static bool evaluator_pipeline_commands_are_supported(
+    native_evaluator *evaluator, const pipeline_expansion_scope *scope,
+    bool scoped)
+{
+    if (scoped && scope == NULL) {
+        return false;
+    }
+    size_t index;
+
+    if (!require(evaluator != NULL)) return false;
+    if (!require(evaluator->pipeline != NULL)) return false;
+    for (index = 0; index < evaluator_pipeline(evaluator)->command_count; index++) {
+        const gsh_native_command *planned =
+            &evaluator_pipeline(evaluator)->commands[index];
+        const char *path;
+
+        if (evaluator_function(evaluator, planned) != NULL) continue;
+        path = scoped ? scoped_command_path_value(
+                            scope, (unsigned int)index + 1U, planned,
+                            evaluator->default_path)
+                      : command_path_value(
+                            evaluator->variables, planned,
+                            evaluator->default_path);
+        if (!native_planned_command_is_supported(evaluator->pipeline,
+                                                 index, path)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool evaluator_tail_is_external(
+    const gsh_native_command *command,
+    const gsh_function_entry *function)
+{
+    if (!require(command != NULL)) return false;
+    if (!require(command->argc <= GSH_NATIVE_ARGUMENT_CAP)) return false;
+    return command->argc != 0 && !native_pure_builtin(command) &&
+           !native_pwd_builtin(command) && !native_cd_builtin(command) &&
+           !native_environment_builtin(command) &&
+           !native_variable_builtin(command) &&
+           !native_state_builtin(command) &&
+           !native_posix_stateful_builtin(command) &&
+           !native_fc_builtin(command) &&
+           !native_job_control_builtin(command) &&
+           !native_wait_builtin(command) && !native_alias_builtin(command) &&
+           !native_hash_builtin(command) && !native_times_builtin(command) &&
+           !native_trap_builtin(command) &&
+           !native_source_builtin(command) && !native_exec_builtin(command) &&
+           !native_exit_builtin(command) &&
+           !native_command_inspection_builtin(command) &&
+           !native_return_builtin(command) &&
+           !native_loop_control_builtin(command) && function == NULL;
+}
+
+static void maybe_tail_exec_pipeline(
+    native_evaluator *evaluator, const gsh_function_entry *function)
+{
+    const gsh_native_command *tail;
+    int heredoc_descriptors[GSH_NATIVE_HEREDOC_CAP][2];
+    char *environment_storage[CHILD_ENVIRONMENT_CAP];
+    char *const *environment;
+
+    if (!require(evaluator != NULL)) return;
+    if (!require(evaluator->pipeline != NULL)) return;
+    if (!evaluator->tail_exec_single || evaluator_pipeline(evaluator)->negated ||
+        evaluator_pipeline(evaluator)->command_count != 1U ||
+        evaluator_pipeline(evaluator)->heredoc_count != 0U) {
+        return;
+    }
+    tail = &evaluator_pipeline(evaluator)->commands[0];
+    if (!evaluator_tail_is_external(tail, function)) return;
+    initialize_heredoc_descriptors(heredoc_descriptors);
+    if (tail->expansion_error) _exit(1);
+    child_apply_redirects(tail, heredoc_descriptors, 0,
+                          &evaluator->options);
+    if (gsh_fault_should_fail(GSH_FAULT_EXEC, EIO)) {
+        child_exec_error(tail->argv[0], errno);
+    }
+    environment = child_command_environment(
+        evaluator->variables, tail, environment_storage);
+    child_exec_direct(
+        tail->argv,
+        command_path_value(evaluator->variables, tail,
+                           evaluator->default_path),
+        environment, evaluator->command_cache,
+        command_cache_path_generation(evaluator->variables, tail),
+        command_uses_persistent_path(tail));
+}
+
+static pid_t evaluator_wait_target(gsh_background_table *backgrounds,
+                                   const char *text)
+{
+    char *end;
+    unsigned long number;
+
+    if (!require(backgrounds != NULL)) return -1;
+    if (!require(text != NULL)) return -1;
+    if (text[0] == '%') {
+        uint32_t job_id;
+
+        return gsh_background_resolve(backgrounds, text, &job_id) ==
+                       GSH_JOBSPEC_OK
+                   ? gsh_background_job_pid(backgrounds, job_id)
+                   : -1;
+    }
+    errno = 0;
+    number = strtoul(text, &end, 10);
+    return errno == 0 && *text != '\0' && *end == '\0' && number > 0 &&
+                   number <= (unsigned long)INT_MAX
+               ? (pid_t)number
+               : -1;
+}
+
+static size_t collect_evaluator_wait_targets(
+    native_evaluator *evaluator, const gsh_native_command *command,
+    pid_t targets[GSH_BACKGROUND_CAP])
+{
+    if (targets == NULL) {
+        return 0U;
+    }
+    size_t target_count = 0U;
+    size_t argument;
+
+    if (!require(evaluator != NULL && command != NULL)) return 0U;
+    if (!require(command->argc <= GSH_BACKGROUND_CAP)) return 0U;
+    if (command->argc == 1U) {
+        return gsh_background_snapshot(evaluator->backgrounds, targets);
+    }
+    for (argument = 1U; argument < command->argc; argument++) {
+        targets[target_count++] = evaluator_wait_target(
+            evaluator->backgrounds, command->argv[argument]);
+    }
+    return target_count;
+}
+
+static bool wait_for_evaluator_target(native_evaluator *evaluator,
+                                      pid_t target, bool *done,
+                                      int *wait_status, int *status)
+{
+    bool known;
+
+    if (!require(evaluator != NULL && done != NULL)) return false;
+    if (!require(wait_status != NULL && status != NULL)) return false;
+    known = target > 0 && gsh_background_get(
+                              evaluator->backgrounds, target, done,
+                              wait_status);
+    if (known && !*done) {
+        pid_t waited = -1;
+        size_t attempt;
+
+        for (attempt = 0; attempt < EVALUATOR_WAIT_RETRY_CAP; attempt++) {
+            int trapped_signal = gsh_traps_pending_signal(evaluator->traps);
+
+            if (trapped_signal != 0) {
+                *status = 128 + trapped_signal;
+                return false;
+            }
+            waited = waitpid(target, wait_status, 0);
+            trapped_signal = gsh_traps_pending_signal(evaluator->traps);
+            if (trapped_signal != 0) {
+                *status = 128 + trapped_signal;
+                return false;
+            }
+            if (!(waited == -1 && errno == EINTR)) break;
+        }
+        if (attempt == EVALUATOR_WAIT_RETRY_CAP) errno = EINTR;
+        if (waited == target) {
+            (void)gsh_background_record(evaluator->backgrounds, target,
+                                        *wait_status);
+            *done = true;
+        } else {
+            known = false;
+        }
+    }
+    return known;
+}
+
+static int wait_on_evaluator_backgrounds(
+    native_evaluator *evaluator, const gsh_native_command *command)
+{
+    pid_t targets[GSH_BACKGROUND_CAP];
+    size_t target_count;
+    size_t argument;
+    int status;
+
+    if (!require(evaluator != NULL)) return 125;
+    if (!require(command != NULL)) return 125;
+    status = command->argc == 1U ? 0 : 127;
+    if (evaluator->backgrounds == NULL) return status;
+    target_count = collect_evaluator_wait_targets(
+        evaluator, command, targets);
+    for (argument = 0; argument < target_count; argument++) {
+        bool done;
+        int wait_status;
+        bool known = wait_for_evaluator_target(
+            evaluator, targets[argument], &done, &wait_status, &status);
+
+        if (!known && status != 127) break;
+        if (known && done &&
+            gsh_background_consume(evaluator->backgrounds,
+                                   targets[argument], &wait_status)) {
+            if (command->argc != 1U && argument + 1U == target_count) {
+                status = wait_status_value(wait_status);
+            }
+        } else if (command->argc != 1U && argument + 1U == target_count) {
+            status = 127;
+        }
+    }
+    return status;
+}
+
+static int evaluate_pipeline_wait_builtin(native_evaluator *evaluator)
+{
+    gsh_saved_descriptor saved[GSH_NATIVE_REDIRECT_CAP];
+    size_t saved_count;
+    int status;
+
+    if (!require(evaluator != NULL)) return 125;
+    if (!require(evaluator->pipeline != NULL)) return 125;
+    const gsh_native_command *command = &evaluator_pipeline(evaluator)->commands[0];
+
+    if (save_redirect_descriptors(command, saved, &saved_count) == -1) {
+        perror("gsh: wait redirection save");
+        return 125;
+    }
+    if (apply_evaluator_redirects(evaluator->pipeline, command,
+                                  &evaluator->options) == -1) {
+        perror("gsh: wait redirection");
+        (void)restore_redirect_descriptors(saved, saved_count);
+        return 1;
+    }
+    status = evaluator->job_service_available
+                 ? request_reactor_job_service(
+                       evaluator->job_service_socket, command)
+                 : wait_on_evaluator_backgrounds(evaluator, command);
+    if (restore_redirect_descriptors(saved, saved_count) == -1) {
+        perror("gsh: wait redirection restore");
+        status = 125;
+    }
+    return evaluator_pipeline(evaluator)->negated && status != 125
+               ? (status == 0 ? 1 : 0)
+               : status;
+}
+
+static bool evaluate_pipeline_state_leaf(native_evaluator *evaluator,
+                                         int *status)
+{
+    if (!require(evaluator != NULL)) return false;
+    if (!require(evaluator->pipeline != NULL && status != NULL)) return false;
+    const gsh_native_command *command = &evaluator_pipeline(evaluator)->commands[0];
+
+    if (native_job_control_builtin(command)) {
+        *status = run_evaluator_job_control_builtin(
+            evaluator->pipeline, evaluator->variables,
+            evaluator->scope_base, &evaluator->options,
+            evaluator->backgrounds, evaluator->job_service_socket,
+            evaluator->job_service_available);
+    } else if (native_variable_builtin(command)) {
+        *status = run_evaluator_variable_builtin(
+            evaluator->pipeline, evaluator->variables, evaluator->journal,
+            &evaluator->options, evaluator->functions);
+    } else if (native_state_builtin(command)) {
+        *status = run_evaluator_state_builtin(
+            evaluator->pipeline, evaluator->variables, evaluator->journal,
+            evaluator->positionals, &evaluator->options);
+    } else if (native_cd_builtin(command)) {
+        *status = run_evaluator_cd_builtin(
+            evaluator->pipeline, evaluator->variables,
+            evaluator->scope_base, evaluator->journal, &evaluator->options,
+            NULL, 0);
+    } else if (native_alias_builtin(command)) {
+        *status = run_evaluator_alias_builtin(
+            evaluator->pipeline, evaluator->aliases,
+            evaluator->alias_journal, &evaluator->options);
+        if (*status == 125 && evaluator->alias_journal != NULL) {
+            evaluator->state_commit_invalid = true;
+        }
+    } else if (native_hash_builtin(command)) {
+        *status = run_evaluator_hash_builtin(
+            evaluator->pipeline, evaluator->variables,
+            evaluator->default_path, evaluator->functions,
+            evaluator->command_cache, &evaluator->options);
+    } else {
+        return false;
+    }
+    return true;
+}
+
+static void record_special_builtin_failure(native_evaluator *evaluator,
+                                           const gsh_native_command *command,
+                                           bool builtin_failed)
+{
+    if (!require(evaluator != NULL)) return;
+    if (!require(command != NULL)) return;
+    if (builtin_failed && !command->command_regular_context &&
+        !gsh_options_enabled(&evaluator->options, GSH_OPTION_INTERACTIVE)) {
+        evaluator->fatal_error = true;
+    }
+}
+
+static bool evaluate_pipeline_service_leaf(native_evaluator *evaluator,
+                                           int *status)
+{
+    if (!require(evaluator != NULL)) return false;
+    if (!require(evaluator->pipeline != NULL && status != NULL)) return false;
+    const gsh_native_command *command = &evaluator_pipeline(evaluator)->commands[0];
+    bool builtin_failed = false;
+
+    if (native_times_builtin(command)) {
+        *status = run_evaluator_times_builtin(
+            evaluator->pipeline, evaluator->variables, evaluator->journal,
+            &evaluator->options, evaluator->times_context, &builtin_failed);
+    } else if (native_trap_builtin(command)) {
+        *status = run_evaluator_trap_builtin(
+            evaluator->pipeline, evaluator->variables, evaluator->journal,
+            &evaluator->options, evaluator->traps, &builtin_failed);
+    } else if (native_exec_builtin(command)) {
+        *status = run_evaluator_exec_builtin(
+            evaluator->pipeline, evaluator->variables, evaluator->journal,
+            &evaluator->options, evaluator->default_path,
+            evaluator->command_cache, NULL, evaluator->exec_outcome_fd,
+            &evaluator->exec_descriptors_dirty, &builtin_failed);
+    } else {
+        return false;
+    }
+    record_special_builtin_failure(evaluator, command, builtin_failed);
+    return true;
+}
+
+static bool evaluator_status_is_fatal(native_evaluator *evaluator,
+                                      int status)
+{
+    const gsh_native_command *command;
+
+    if (!require(evaluator != NULL)) return false;
+    if (!require(evaluator->pipeline != NULL)) return false;
+    if (status != 125 || evaluator->exiting ||
+        evaluator_pipeline(evaluator)->command_count != 1U) {
+        return false;
+    }
+    command = &evaluator_pipeline(evaluator)->commands[0];
+    return native_variable_builtin(command) || native_state_builtin(command) ||
+           native_posix_stateful_builtin(command) || native_fc_builtin(command) ||
+           native_job_control_builtin(command) || native_cd_builtin(command) ||
+           native_alias_builtin(command) || native_hash_builtin(command) ||
+           native_times_builtin(command) || native_trap_builtin(command) ||
+           native_source_builtin(command) || native_exec_builtin(command) ||
+           native_exit_builtin(command) || native_loop_control_builtin(command) ||
+           (command->argc == 0 && command->assignment_count != 0);
+}
+
+static int native_evaluate_pipeline(native_evaluator *evaluator,
+                                    size_t node_index)
+{
+    if (evaluator == NULL) {
+        return -1;
+    }
+    const gsh_ast_node *node = &evaluator_storage(evaluator)->nodes[node_index];
     const gsh_ast_node *command =
-        &evaluator->storage->nodes[node->first_child];
+        &evaluator_storage(evaluator)->nodes[node->first_child];
     pipeline_expansion_scope scope;
-    bool deferred_work;
+    gsh_native_expansion_context expansion;
+    evaluator_expansion_request request = {
+        .kind = EVALUATOR_EXPAND_PIPELINE,
+        .node_index = node_index,
+    };
     bool scoped;
     int status;
     gsh_native_plan_status plan_status;
     const gsh_function_entry *function;
 
     if (command->next_sibling == GSH_AST_NONE &&
-        command->kind != GSH_AST_SIMPLE) {
-        status = native_evaluate_node(evaluator, node->first_child,
-                                      depth + 1U);
-        return (node->flags & GSH_AST_FLAG_NEGATED) != 0
-                   ? (status == 0 ? 1 : 0)
-                   : status;
+        command->kind != GSH_AST_SIMPLE) return 125;
+    scoped = false;
+    plan_status = begin_evaluator_pipeline_plan(
+        evaluator, node_index, true, &scope, &scoped, NULL, &expansion);
+    if (plan_status == GSH_NATIVE_PLAN_OK) {
+        plan_status = run_evaluator_expansion(
+            evaluator, &expansion, &request);
+        plan_status = finish_evaluator_pipeline_plan(
+            evaluator, &scope, scoped, plan_status);
     }
-    plan_status = plan_evaluator_pipeline(evaluator, node_index, true,
-                                          &scope, &scoped,
-                                          &deferred_work);
     if (plan_status != GSH_NATIVE_PLAN_OK) {
         return plan_status == GSH_NATIVE_PLAN_ERROR ? 1 : 125;
     }
-    function = evaluator->pipeline->command_count == 1U
+    function = evaluator_pipeline(evaluator)->command_count == 1U
                    ? evaluator_function(
-                         evaluator, &evaluator->pipeline->commands[0])
+                         evaluator, &evaluator_pipeline(evaluator)->commands[0])
                    : NULL;
-    if (function == NULL) {
-        size_t index;
-
-        for (index = 0; index < evaluator->pipeline->command_count;
-             index++) {
-            const gsh_native_command *planned =
-                &evaluator->pipeline->commands[index];
-            const char *path;
-
-            if (evaluator_function(evaluator, planned) != NULL) {
-                continue;
-            }
-            path = scoped ? scoped_command_path_value(
-                                &scope, (unsigned int)index + 1U,
-                                planned, evaluator->default_path)
-                          : command_path_value(
-                                evaluator->variables, planned,
-                                evaluator->default_path);
-            if (!native_planned_command_is_supported(
-                    evaluator->pipeline, index, path)) {
-                return 125;
-            }
-        }
+    if (function == NULL &&
+        !evaluator_pipeline_commands_are_supported(evaluator, &scope,
+                                                   scoped)) {
+        return 125;
     }
-    if (evaluator->tail_exec_single && !evaluator->pipeline->negated &&
-        evaluator->pipeline->command_count == 1U &&
-        evaluator->pipeline->heredoc_count == 0U) {
-        const gsh_native_command *tail = &evaluator->pipeline->commands[0];
-        if (tail->argc != 0 &&
-            !native_pure_builtin(tail) &&
-            !native_pwd_builtin(tail) && !native_cd_builtin(tail) &&
-            !native_environment_builtin(tail) &&
-            !native_variable_builtin(tail) && !native_state_builtin(tail) &&
-            !native_posix_stateful_builtin(tail) &&
-            !native_fc_builtin(tail) &&
-            !native_job_control_builtin(tail) &&
-            !native_wait_builtin(tail) && !native_alias_builtin(tail) &&
-            !native_hash_builtin(tail) &&
-            !native_times_builtin(tail) &&
-            !native_trap_builtin(tail) &&
-            !native_source_builtin(tail) &&
-            !native_exec_builtin(tail) &&
-            !native_exit_builtin(tail) &&
-            !native_command_inspection_builtin(tail) &&
-            !native_return_builtin(tail) &&
-            !native_loop_control_builtin(tail) && function == NULL) {
-            int heredoc_descriptors[GSH_NATIVE_HEREDOC_CAP][2];
-            char *environment_storage[CHILD_ENVIRONMENT_CAP];
-            char *const *environment;
-
-            initialize_heredoc_descriptors(heredoc_descriptors);
-            if (tail->expansion_error) {
-                _exit(1);
-            }
-            child_apply_redirects(tail, heredoc_descriptors, 0,
-                                  &evaluator->options);
-            if (fault_should_fail("exec", EIO)) {
-                child_exec_error(tail->argv[0], errno);
-            }
-            environment = child_command_environment(
-                evaluator->variables, tail, environment_storage);
-            child_exec_direct(
-                tail->argv,
-                command_path_value(evaluator->variables, tail,
-                                   evaluator->default_path),
-                environment, evaluator->command_cache,
-                command_cache_path_generation(evaluator->variables, tail),
-                command_uses_persistent_path(tail));
-        }
-    }
+    maybe_tail_exec_pipeline(evaluator, function);
     if (function != NULL) {
-        status = evaluate_function(
-            evaluator, &evaluator->pipeline->commands[0], function, true);
-        if (evaluator->pipeline->negated && status != 125) {
-            status = status == 0 ? 1 : 0;
-        }
-    } else if (evaluator->pipeline->command_count == 1 &&
+        status = request_evaluator_function(
+            evaluator, &evaluator_pipeline(evaluator)->commands[0], function, true,
+            evaluator_pipeline(evaluator)->negated);
+    } else if (evaluator_pipeline(evaluator)->command_count == 1 &&
                native_exit_builtin(
-                   &evaluator->pipeline->commands[0])) {
+                   &evaluator_pipeline(evaluator)->commands[0])) {
         status = evaluate_exit(
-            evaluator, &evaluator->pipeline->commands[0]);
-    } else if (evaluator->pipeline->command_count == 1 &&
+            evaluator, &evaluator_pipeline(evaluator)->commands[0]);
+    } else if (evaluator_pipeline(evaluator)->command_count == 1 &&
                native_return_builtin(
-                   &evaluator->pipeline->commands[0])) {
+                   &evaluator_pipeline(evaluator)->commands[0])) {
         status = evaluate_return(
-            evaluator, &evaluator->pipeline->commands[0]);
-        if (evaluator->pipeline->negated && status != 125) {
+            evaluator, &evaluator_pipeline(evaluator)->commands[0]);
+        if (evaluator_pipeline(evaluator)->negated && status != 125) {
             status = status == 0 ? 1 : 0;
             evaluator->return_status = status;
         }
-    } else if (evaluator->pipeline->command_count == 1 &&
-        native_wait_builtin(&evaluator->pipeline->commands[0])) {
-        const gsh_native_command *wait_command =
-            &evaluator->pipeline->commands[0];
-        gsh_saved_descriptor saved[GSH_NATIVE_REDIRECT_CAP];
-        size_t saved_count;
-
-        if (save_redirect_descriptors(wait_command, saved,
-                                      &saved_count) == -1) {
-            perror("gsh: wait redirection save");
-            status = 125;
-        } else if (apply_evaluator_redirects(
-                       evaluator->pipeline, wait_command,
-                       &evaluator->options) == -1) {
-            perror("gsh: wait redirection");
-            (void)restore_redirect_descriptors(saved, saved_count);
-            status = 1;
-        } else {
-            if (evaluator->job_service_available) {
-                status = request_reactor_job_service(
-                    evaluator->job_service_socket, wait_command);
-            } else {
-                size_t argument;
-                bool trap_interrupted = false;
-
-                status = wait_command->argc == 1 ? 0 : 127;
-                if (evaluator->backgrounds != NULL) {
-                pid_t targets[GSH_BACKGROUND_CAP];
-                size_t target_count = 0;
-
-                if (wait_command->argc == 1) {
-                    target_count = gsh_background_snapshot(
-                        evaluator->backgrounds, targets);
-                }
-                for (argument = 1; argument < wait_command->argc;
-                     argument++) {
-                    const char *text = wait_command->argv[argument];
-                    char *end;
-                    unsigned long number;
-                    pid_t target = -1;
-
-                    if (text[0] == '%') {
-                        uint32_t job_id;
-
-                        if (gsh_background_resolve(
-                                evaluator->backgrounds, text,
-                                &job_id) == GSH_JOBSPEC_OK) {
-                            target = gsh_background_job_pid(
-                                evaluator->backgrounds, job_id);
-                        }
-                    } else {
-                        errno = 0;
-                        number = strtoul(text, &end, 10);
-                        if (errno == 0 && *text != '\0' && *end == '\0' &&
-                            number > 0 &&
-                            number <= (unsigned long)INT_MAX) {
-                            target = (pid_t)number;
-                        }
-                    }
-                    targets[target_count++] = target;
-                }
-                for (argument = 0; argument < target_count; argument++) {
-                    bool done;
-                    int wait_status;
-                    bool known = targets[argument] > 0 &&
-                                 gsh_background_get(
-                                     evaluator->backgrounds,
-                                     targets[argument], &done,
-                                     &wait_status);
-
-                    if (known && !done) {
-                        pid_t waited = -1;
-                        int trapped_signal;
-
-                        for (;;) {
-                            trapped_signal = gsh_traps_pending_signal(
-                                evaluator->traps);
-                            if (trapped_signal != 0) {
-                                status = 128 + trapped_signal;
-                                trap_interrupted = true;
-                                break;
-                            }
-                            waited = waitpid(targets[argument], &wait_status,
-                                             0);
-                            trapped_signal = gsh_traps_pending_signal(
-                                evaluator->traps);
-                            if (trapped_signal != 0) {
-                                status = 128 + trapped_signal;
-                                trap_interrupted = true;
-                                break;
-                            }
-                            if (!(waited == -1 && errno == EINTR)) {
-                                break;
-                            }
-                        }
-                        if (waited == targets[argument]) {
-                            (void)gsh_background_record(
-                                evaluator->backgrounds, targets[argument],
-                                wait_status);
-                            done = true;
-                        } else if (!trap_interrupted) {
-                            known = false;
-                        }
-                    }
-                    if (trap_interrupted) {
-                        break;
-                    }
-                    if (known && done &&
-                        gsh_background_consume(evaluator->backgrounds,
-                                               targets[argument],
-                                               &wait_status)) {
-                        if (wait_command->argc != 1 &&
-                            argument + 1U == target_count) {
-                            status = wait_status_value(wait_status);
-                        }
-                    } else if (wait_command->argc != 1 &&
-                               argument + 1U == target_count) {
-                        status = 127;
-                    }
-                }
-                if (wait_command->argc == 1 && !trap_interrupted) {
-                    status = 0;
-                }
-                }
-            }
-            if (restore_redirect_descriptors(saved, saved_count) == -1) {
-                perror("gsh: wait redirection restore");
-                status = 125;
-            }
-            if (evaluator->pipeline->negated && status != 125) {
-                status = status == 0 ? 1 : 0;
-            }
-        }
-    } else if (evaluator->pipeline->command_count == 1 &&
-               native_fc_builtin(&evaluator->pipeline->commands[0])) {
+    } else if (evaluator_pipeline(evaluator)->command_count == 1 &&
+        native_wait_builtin(&evaluator_pipeline(evaluator)->commands[0])) {
+        status = evaluate_pipeline_wait_builtin(evaluator);
+    } else if (evaluator_pipeline(evaluator)->command_count == 1 &&
+               native_fc_builtin(&evaluator_pipeline(evaluator)->commands[0])) {
         status = run_evaluator_fc_builtin(evaluator);
-    } else if (evaluator->pipeline->command_count == 1 &&
-               native_job_control_builtin(
-                   &evaluator->pipeline->commands[0])) {
-        status = run_evaluator_job_control_builtin(
-            evaluator->pipeline, evaluator->variables,
-            evaluator->scope_base, &evaluator->options,
-            evaluator->backgrounds, evaluator->job_service_socket,
-            evaluator->job_service_available);
-    } else if (evaluator->pipeline->command_count == 1 &&
-               native_variable_builtin(
-                   &evaluator->pipeline->commands[0])) {
-        status = run_evaluator_variable_builtin(
-            evaluator->pipeline, evaluator->variables,
-            evaluator->journal, &evaluator->options,
-            evaluator->functions);
-    } else if (evaluator->pipeline->command_count == 1 &&
-        native_state_builtin(&evaluator->pipeline->commands[0])) {
-        status = run_evaluator_state_builtin(
-            evaluator->pipeline, evaluator->variables,
-            evaluator->journal, evaluator->positionals,
-            &evaluator->options);
-    } else if (evaluator->pipeline->command_count == 1 &&
-               native_cd_builtin(&evaluator->pipeline->commands[0])) {
-        status = run_evaluator_cd_builtin(
-            evaluator->pipeline, evaluator->variables,
-            evaluator->scope_base,
-            evaluator->journal, &evaluator->options, NULL, 0);
-    } else if (evaluator->pipeline->command_count == 1 &&
-               native_alias_builtin(&evaluator->pipeline->commands[0])) {
-        status = run_evaluator_alias_builtin(
-            evaluator->pipeline, evaluator->aliases,
-            evaluator->alias_journal, &evaluator->options);
-        if (status == 125 && evaluator->alias_journal != NULL) {
-            evaluator->state_commit_invalid = true;
-        }
-    } else if (evaluator->pipeline->command_count == 1 &&
-               native_hash_builtin(&evaluator->pipeline->commands[0])) {
-        status = run_evaluator_hash_builtin(
-            evaluator->pipeline, evaluator->variables,
-            evaluator->default_path, evaluator->functions,
-            evaluator->command_cache, &evaluator->options);
-    } else if (evaluator->pipeline->command_count == 1 &&
-               native_times_builtin(&evaluator->pipeline->commands[0])) {
-        bool builtin_failed;
-
-        status = run_evaluator_times_builtin(
-            evaluator->pipeline, evaluator->variables,
-            evaluator->journal, &evaluator->options,
-            evaluator->times_context, &builtin_failed);
-        if (builtin_failed &&
-            !evaluator->pipeline->commands[0].command_regular_context &&
-            !gsh_options_enabled(&evaluator->options,
-                                 GSH_OPTION_INTERACTIVE)) {
-            evaluator->fatal_error = true;
-        }
-    } else if (evaluator->pipeline->command_count == 1 &&
-               native_trap_builtin(&evaluator->pipeline->commands[0])) {
-        bool builtin_failed;
-
-        status = run_evaluator_trap_builtin(
-            evaluator->pipeline, evaluator->variables,
-            evaluator->journal, &evaluator->options, evaluator->traps,
-            &builtin_failed);
-        if (builtin_failed &&
-            !evaluator->pipeline->commands[0].command_regular_context &&
-            !gsh_options_enabled(&evaluator->options,
-                                 GSH_OPTION_INTERACTIVE)) {
-            evaluator->fatal_error = true;
-        }
-    } else if (evaluator->pipeline->command_count == 1 &&
+    } else if (evaluator_pipeline(evaluator)->command_count == 1 &&
+               evaluate_pipeline_state_leaf(evaluator, &status)) {
+        /* The leaf owns status and any transactional invalidation. */
+    } else if (evaluator_pipeline(evaluator)->command_count == 1 &&
                native_source_builtin(
-                   &evaluator->pipeline->commands[0])) {
+                   &evaluator_pipeline(evaluator)->commands[0])) {
         const gsh_native_command *source_command =
-            &evaluator->pipeline->commands[0];
+            &evaluator_pipeline(evaluator)->commands[0];
         bool builtin_failed;
 
         status = run_evaluator_source_builtin(evaluator,
@@ -13352,23 +15614,9 @@ static int native_evaluate_pipeline(native_evaluator *evaluator,
                                  GSH_OPTION_INTERACTIVE)) {
             evaluator->fatal_error = true;
         }
-    } else if (evaluator->pipeline->command_count == 1 &&
-               native_exec_builtin(&evaluator->pipeline->commands[0])) {
-        const gsh_native_command *exec_command =
-            &evaluator->pipeline->commands[0];
-        bool builtin_failed;
-
-        status = run_evaluator_exec_builtin(
-            evaluator->pipeline, evaluator->variables,
-            evaluator->journal, &evaluator->options,
-            evaluator->default_path, evaluator->command_cache,
-            NULL, evaluator->exec_outcome_fd,
-            &evaluator->exec_descriptors_dirty, &builtin_failed);
-        if (builtin_failed && !exec_command->command_regular_context &&
-            !gsh_options_enabled(&evaluator->options,
-                                 GSH_OPTION_INTERACTIVE)) {
-            evaluator->fatal_error = true;
-        }
+    } else if (evaluator_pipeline(evaluator)->command_count == 1 &&
+               evaluate_pipeline_service_leaf(evaluator, &status)) {
+        /* The leaf owns fatal special-builtin error propagation. */
     } else {
         status = run_native_noninteractive_pipeline(
             evaluator->pipeline, evaluator->default_path,
@@ -13378,135 +15626,113 @@ static int native_evaluate_pipeline(native_evaluator *evaluator,
             &evaluator->options, evaluator->functions,
             evaluator->scope_base, evaluator);
     }
-    if (status == 125 && !evaluator->exiting &&
-        evaluator->pipeline->command_count == 1 &&
-        (native_variable_builtin(&evaluator->pipeline->commands[0]) ||
-         native_state_builtin(&evaluator->pipeline->commands[0]) ||
-         native_posix_stateful_builtin(
-             &evaluator->pipeline->commands[0]) ||
-         native_fc_builtin(&evaluator->pipeline->commands[0]) ||
-         native_job_control_builtin(
-             &evaluator->pipeline->commands[0]) ||
-         native_cd_builtin(&evaluator->pipeline->commands[0]) ||
-         native_alias_builtin(&evaluator->pipeline->commands[0]) ||
-         native_hash_builtin(&evaluator->pipeline->commands[0]) ||
-         native_times_builtin(&evaluator->pipeline->commands[0]) ||
-         native_trap_builtin(&evaluator->pipeline->commands[0]) ||
-         native_source_builtin(&evaluator->pipeline->commands[0]) ||
-         native_exec_builtin(&evaluator->pipeline->commands[0]) ||
-         native_exit_builtin(&evaluator->pipeline->commands[0]) ||
-         native_loop_control_builtin(
-             &evaluator->pipeline->commands[0]) ||
-         (evaluator->pipeline->commands[0].argc == 0 &&
-          evaluator->pipeline->commands[0].assignment_count != 0))) {
+    if (evaluator_status_is_fatal(evaluator, status)) {
         evaluator->fatal_error = true;
     }
     return status;
 }
 
-static int native_evaluate_if(native_evaluator *evaluator,
-                              const gsh_ast_node *node, size_t depth)
+static bool native_case_item_matches(native_evaluator *evaluator,
+                                     const gsh_ast_node *item,
+                                     const char *subject,
+                                     bool fallthrough, bool *matched)
 {
-    size_t branch_index = node->first_child;
+    if (!require(evaluator != NULL && item != NULL)) return false;
+    if (!require(subject != NULL && matched != NULL)) return false;
+    size_t pattern;
 
-    while (branch_index != GSH_AST_NONE) {
-        const gsh_ast_node *branch =
-            &evaluator->storage->nodes[branch_index];
-        size_t first = branch->first_child;
-        size_t second = evaluator->storage->nodes[first].next_sibling;
+    *matched = fallthrough;
+    for (pattern = 0U; pattern < item->word_count && !*matched; pattern++) {
+        gsh_word_ref reference = evaluator_storage(evaluator)->words[
+            item->first_word + pattern];
+        char pattern_text[GSH_NATIVE_TEXT_CAP];
 
-        if (second == GSH_AST_NONE) {
-            return native_evaluate_node(evaluator, first, depth + 1U);
+        if (!native_case_pattern(evaluator->input, reference,
+                                 pattern_text)) {
+            return false;
         }
-        {
-            int condition = native_evaluate_node(evaluator, first,
-                                                 depth + 1U);
-
-            if (evaluator->exiting || evaluator->returning ||
-                evaluator->loop_levels != 0) {
-                return evaluator->exiting
-                           ? evaluator->exit_status
-                           : evaluator->returning
-                                 ? evaluator->return_status
-                                 : condition;
-            }
-            if (condition == 0) {
-                return native_evaluate_node(evaluator, second,
-                                            depth + 1U);
-            }
-        }
-        branch_index = branch->next_sibling;
+        *matched = fnmatch(pattern_text, subject, 0) == 0;
     }
-    return 0;
-}
-
-static int native_evaluate_case(native_evaluator *evaluator,
-                                const gsh_ast_node *node, size_t depth)
-{
-    gsh_native_expansion_context expansion =
-        native_expansion_context(evaluator, true, NULL);
-    char *subject;
-    size_t item_index = node->first_child;
-    bool fallthrough = false;
-    int status = 0;
-
-    if (gsh_native_expand_scalar(
-            evaluator->input,
-            evaluator->storage->words[node->first_word], &expansion,
-            evaluator->pipeline, &subject) != GSH_NATIVE_PLAN_OK) {
-        return 125;
-    }
-    while (item_index != GSH_AST_NONE) {
-        const gsh_ast_node *item =
-            &evaluator->storage->nodes[item_index];
-        bool matched = fallthrough;
-        size_t pattern;
-
-        if (!matched) {
-            for (pattern = 0; pattern < item->word_count; pattern++) {
-                gsh_word_ref reference = evaluator->storage
-                                             ->words[item->first_word +
-                                                     pattern];
-                char pattern_text[GSH_NATIVE_TEXT_CAP];
-
-                if (!native_case_pattern(evaluator->input, reference,
-                                         pattern_text)) {
-                    return 125;
-                }
-                if (fnmatch(pattern_text, subject, 0) == 0) {
-                    matched = true;
-                    break;
-                }
-            }
-        }
-        if (matched) {
-            status = item->first_child == GSH_AST_NONE
-                         ? 0
-                         : native_evaluate_node(evaluator,
-                                                item->first_child,
-                                                depth + 1U);
-            if (evaluator->exiting || evaluator->returning ||
-                evaluator->loop_levels != 0) {
-                return evaluator->exiting
-                           ? evaluator->exit_status
-                           : evaluator->returning
-                                 ? evaluator->return_status
-                                 : status;
-            }
-            if ((item->flags & GSH_AST_FLAG_CASE_FALLTHROUGH) == 0) {
-                return status;
-            }
-            fallthrough = true;
-        }
-        item_index = item->next_sibling;
-    }
-    return status;
+    return true;
 }
 
 enum { LOOP_CONTROL_NONE, LOOP_CONTROL_NEXT, LOOP_CONTROL_LEAVE };
 
+enum { FOR_ITEM_TEXT_DEPTH_CAP = 129 };
+
+typedef struct {
+    char text[FOR_ITEM_TEXT_DEPTH_CAP][GSH_NATIVE_TEXT_CAP];
+    bool used[FOR_ITEM_TEXT_DEPTH_CAP];
+} for_item_text_pool;
+
+static for_item_text_pool *process_for_item_text_pool(void)
+{
+    static for_item_text_pool pool;
+
+    return &pool;
+}
+
+static char *acquire_for_item_text(void)
+{
+    for_item_text_pool *pool = process_for_item_text_pool();
+    size_t index;
+
+    if (gsh_fault_should_fail(GSH_FAULT_FOR_ALLOCATION, ENOMEM)) {
+        return NULL;
+    }
+    for (index = 0; index < FOR_ITEM_TEXT_DEPTH_CAP; index++) {
+        if (!pool->used[index]) {
+            pool->used[index] = true;
+            return pool->text[index];
+        }
+    }
+    errno = ENOSPC;
+    return NULL;
+}
+
+static void release_for_item_text(char *text)
+{
+    for_item_text_pool *pool = process_for_item_text_pool();
+    size_t index;
+
+    if (text == NULL) {
+        return;
+    }
+    for (index = 0; index < FOR_ITEM_TEXT_DEPTH_CAP; index++) {
+        if (text == pool->text[index]) {
+            (void)memset(text, 0, GSH_NATIVE_TEXT_CAP);
+            pool->used[index] = false;
+            return;
+        }
+    }
+    errno = EINVAL;
+}
+
+static bool preserve_for_expansion_items(
+    const gsh_native_pipeline *pipeline,
+    char *items[GSH_NATIVE_ARGUMENT_CAP], size_t item_count,
+    char **item_text)
+{
+    if (!require(pipeline != NULL && items != NULL)) return false;
+    if (!require(item_text != NULL && item_count <= GSH_NATIVE_ARGUMENT_CAP)) {
+        return false;
+    }
+    size_t index;
+
+    *item_text = acquire_for_item_text();
+    if (*item_text == NULL) return false;
+    (void)memcpy(*item_text, pipeline->text, pipeline->text_used);
+    for (index = 0U; index < item_count; index++) {
+        items[index] = *item_text + (items[index] - pipeline->text);
+    }
+    return true;
+}
+
 static int consume_loop_control(native_evaluator *evaluator)
 {
+    if (evaluator == NULL) {
+        return -1;
+    }
     native_loop_control control = evaluator->loop_control;
 
     if (evaluator->loop_levels == 0) {
@@ -13522,285 +15748,1236 @@ static int consume_loop_control(native_evaluator *evaluator)
                : LOOP_CONTROL_LEAVE;
 }
 
-static int native_evaluate_for(native_evaluator *evaluator,
-                               const gsh_ast_node *node, size_t depth)
+static bool evaluator_control_status(const native_evaluator *evaluator,
+                                     size_t depth, int *status)
 {
-    gsh_word_ref name =
-        evaluator->storage->words[node->first_word];
-    char *items[GSH_NATIVE_ARGUMENT_CAP];
-    char *item_text = NULL;
-    size_t item_count;
-    size_t index;
+    if (!require(evaluator != NULL)) return true;
+    if (!require(status != NULL)) return true;
+    if (depth > 128U) {
+        *status = 125;
+        return true;
+    }
+    if (evaluator->exiting) {
+        *status = evaluator->exit_status;
+        return true;
+    }
+    if (evaluator->returning) {
+        *status = evaluator->return_status;
+        return true;
+    }
+    if (evaluator->loop_levels != 0U) {
+        *status = evaluator->last_status;
+        return true;
+    }
+    return false;
+}
+
+static bool evaluate_definition_node(native_evaluator *evaluator,
+                                     size_t node_index, int *status)
+{
+    if (!require(evaluator != NULL)) return false;
+    if (!require(status != NULL)) return false;
+    if (evaluator_storage(evaluator)->nodes[node_index].kind != GSH_AST_FUNCTION) {
+        return false;
+    }
+    if (!define_evaluator_function(evaluator, node_index)) {
+        perror("gsh: function definition");
+        *status = errno == ENOSPC ? 125 : 1;
+    } else {
+        *status = 0;
+    }
+    return true;
+}
+
+static bool static_for_pipeline_status(native_evaluator *evaluator,
+                                       const gsh_ast_node *node,
+                                       int *status)
+{
+    const gsh_ast_node *command;
+    gsh_word_ref word;
+    size_t length;
+    int direct_status;
+
+    if (!require(evaluator != NULL && node != NULL)) return false;
+    if (!require(status != NULL)) return false;
+    if (!evaluator->static_for_items || node->kind != GSH_AST_PIPELINE ||
+        node->first_child == GSH_AST_NONE) {
+        return false;
+    }
+    command = &evaluator_storage(evaluator)->nodes[node->first_child];
+    if (command->kind != GSH_AST_SIMPLE ||
+        command->next_sibling != GSH_AST_NONE || command->word_count != 1U ||
+        command->redirect_count != 0U) {
+        return false;
+    }
+    word = evaluator_storage(evaluator)->words[command->first_word];
+    length = word.end - word.begin;
+    direct_status =
+        (length == 1U && evaluator->input[word.begin] == ':') ||
+                (length == 4U &&
+                 memcmp(evaluator->input + word.begin, "true", 4) == 0)
+            ? 0
+            : 1;
+    *status = (node->flags & GSH_AST_FLAG_NEGATED) != 0
+                  ? (direct_status == 0 ? 1 : 0)
+                  : direct_status;
+    return true;
+}
+
+static void initialize_native_subshell_evaluator(
+    const native_evaluator *evaluator, native_evaluator *child)
+{
+    if (!require(evaluator != NULL)) _exit(125);
+    if (!require(child != NULL)) _exit(125);
+    *child = *evaluator;
+    enter_native_subshell_or_exit(child);
+    child->active_loops = 0;
+    child->loop_control = NATIVE_LOOP_CONTROL_NONE;
+    child->loop_levels = 0;
+    child->times_context = NULL;
+    close_evaluator_exec_transaction(child);
+}
+
+static int wait_for_native_subshell(pid_t pid)
+{
+    size_t attempt;
+
+    if (!require(pid > 0)) return 125;
+    if (!require(pid <= INT_MAX)) return 125;
+    for (attempt = 0; attempt < EVALUATOR_WAIT_RETRY_CAP; attempt++) {
+        int wait_status;
+        pid_t waited = waitpid(pid, &wait_status, 0);
+
+        if (waited == pid) return wait_status_value(wait_status);
+        if (waited == -1 && errno == EINTR) continue;
+        perror("gsh: subshell waitpid");
+        return 125;
+    }
+    errno = EINTR;
+    perror("gsh: subshell waitpid");
+    return 125;
+}
+
+static int evaluator_control_result(const native_evaluator *evaluator,
+                                    int status)
+{
+    if (!require(evaluator != NULL)) return 125;
+    if (!require(status >= 0)) return 125;
+    return evaluator->exiting
+               ? evaluator->exit_status
+               : evaluator->returning ? evaluator->return_status : status;
+}
+
+static bool sequence_child_is_selected(const gsh_ast_node *parent,
+                                       const gsh_ast_node *child,
+                                       int status)
+{
+    if (!require(parent != NULL)) return false;
+    if (!require(child != NULL)) return false;
+    if (parent->kind != GSH_AST_AND_OR) return true;
+    if (child->connector == GSH_TOKEN_AND_IF) return status == 0;
+    if (child->connector == GSH_TOKEN_OR_IF) return status != 0;
+    return true;
+}
+
+typedef struct {
+    size_t node_index;
+    size_t next_child;
+    size_t depth;
+    int status;
+} sequence_evaluation_frame;
+
+enum { SEQUENCE_EVALUATION_CAP = 129 };
+
+typedef struct {
+    sequence_evaluation_frame frames[SEQUENCE_EVALUATION_CAP];
+    size_t frame_count;
+    size_t steps;
+    bool waiting;
+} sequence_evaluation;
+
+static bool evaluator_sequence_kind(gsh_ast_kind kind)
+{
+    if (!require(kind >= GSH_AST_PROGRAM)) return false;
+    if (!require(kind <= GSH_AST_FUNCTION)) return false;
+    return kind == GSH_AST_PROGRAM || kind == GSH_AST_LIST ||
+           kind == GSH_AST_AND_OR || kind == GSH_AST_BRACE_GROUP ||
+           kind == GSH_AST_IF_BRANCH || kind == GSH_AST_CASE_ITEM;
+}
+
+/* ── Sequence Nodes Share One Bounded Runtime Walk ───────────────
+ * Program, list, and/or, and grouping nodes once consumed one C frame for
+ * every syntactic layer.  Their execution rule is the same ordered sibling
+ * walk with one connector filter.  A fixed stack now retains each cursor and
+ * status explicitly, while compound leaves keep their specialized owners.
+ * Parser depth and the 129-frame ceiling jointly bound every traversal.
+ * ─────────────────────────────────────────────────────────────── */
+static bool initialize_sequence_evaluation(
+    native_evaluator *evaluator, size_t node_index, size_t depth,
+    sequence_evaluation *evaluation)
+{
+    if (!require(evaluator != NULL && evaluator->storage != NULL)) return false;
+    if (!require(node_index < evaluator_storage(evaluator)->node_count &&
+                 depth <= 128U && evaluation != NULL)) return false;
+    (void)memset(evaluation, 0, sizeof(*evaluation));
+    evaluation->frame_count = 1U;
+    evaluation->frames[0] = (sequence_evaluation_frame){
+        node_index, evaluator_storage(evaluator)->nodes[node_index].first_child,
+        depth, 0};
+    return true;
+}
+
+static bool next_sequence_evaluation(
+    native_evaluator *evaluator, sequence_evaluation *evaluation,
+    bool completed, int *status, size_t *child_index, size_t *child_depth,
+    bool *finished)
+{
+    if (!require(evaluator != NULL && evaluation != NULL)) return false;
+    if (!require(status != NULL && child_index != NULL &&
+                 child_depth != NULL && finished != NULL)) return false;
+
+    *finished = false;
+    if (completed) {
+        if (!evaluation->waiting || evaluation->frame_count == 0U) {
+            *status = 125;
+            *finished = true;
+            return false;
+        }
+        evaluation->frames[evaluation->frame_count - 1U].status = *status;
+        evaluation->waiting = false;
+    }
+    while (evaluation->frame_count > 0U &&
+           evaluation->steps++ < 2U * GSH_PARSE_NODE_CAP) {
+        sequence_evaluation_frame *frame =
+            &evaluation->frames[evaluation->frame_count - 1U];
+        const gsh_ast_node *parent =
+            &evaluator_storage(evaluator)->nodes[frame->node_index];
+        const gsh_ast_node *child;
+
+        if (frame->next_child == GSH_AST_NONE) {
+            *status = frame->status;
+            evaluation->frame_count--;
+            if (evaluation->frame_count > 0U) {
+                evaluation->frames[evaluation->frame_count - 1U].status =
+                    *status;
+            }
+            continue;
+        }
+        *child_index = frame->next_child;
+        child = &evaluator_storage(evaluator)->nodes[*child_index];
+        frame->next_child = child->next_sibling;
+        if (!sequence_child_is_selected(parent, child, frame->status)) {
+            continue;
+        }
+        if (evaluator_sequence_kind(child->kind) &&
+            (child->flags & GSH_AST_FLAG_ASYNC) == 0U) {
+            if (evaluation->frame_count == SEQUENCE_EVALUATION_CAP) {
+                *status = 125;
+                *finished = true;
+                return false;
+            }
+            evaluation->frames[evaluation->frame_count++] =
+                (sequence_evaluation_frame){
+                    *child_index, child->first_child,
+                    frame->depth + 1U, 0};
+            continue;
+        }
+        *child_depth = frame->depth + 1U;
+        evaluation->waiting = true;
+        return true;
+    }
+    *finished = evaluation->frame_count == 0U;
+    if (!*finished) *status = 125;
+    return false;
+}
+
+static int native_evaluate_leaf(native_evaluator *evaluator,
+                                size_t node_index, size_t depth)
+{
+    const gsh_ast_node *node;
     int status = 0;
 
-    if (evaluator->static_for_items &&
-        (node->flags & GSH_AST_FLAG_FOR_HAS_IN) != 0) {
-        evaluator->active_loops++;
-        for (index = 1U; index < node->word_count; index++) {
-            gsh_word_ref item = evaluator->storage
-                                    ->words[node->first_word + index];
-            gsh_native_plan_status assignment;
-
-            assignment = evaluator_variable_assign(
-                evaluator, evaluator->input + name.begin,
-                name.end - name.begin, evaluator->input + item.begin,
-                item.end - item.begin);
-            if (assignment != GSH_NATIVE_PLAN_OK) {
-                status = assignment == GSH_NATIVE_PLAN_ERROR ? 1 : 125;
-                break;
-            }
-            status = native_evaluate_node(evaluator, node->first_child,
-                                          depth + 1U);
-            if (evaluator->fatal_error || evaluator->exiting ||
-                evaluator->returning) {
-                break;
-            }
-            if (consume_loop_control(evaluator) == LOOP_CONTROL_LEAVE) {
-                break;
-            }
-        }
-        evaluator->active_loops--;
-        return status;
+    if (!require(evaluator != NULL)) return 125;
+    if (!require(evaluator->storage != NULL &&
+                 node_index < evaluator_storage(evaluator)->node_count)) return 125;
+    if (evaluator_control_status(evaluator, depth, &status)) return status;
+    node = &evaluator_storage(evaluator)->nodes[node_index];
+    if (evaluate_definition_node(evaluator, node_index, &status)) return status;
+    if (static_for_pipeline_status(evaluator, node, &status)) return status;
+    if (node->kind == GSH_AST_PIPELINE) {
+        return native_evaluate_pipeline(evaluator, node_index);
     }
-    if ((node->flags & GSH_AST_FLAG_FOR_HAS_IN) != 0) {
-        gsh_native_expansion_context expansion =
-            native_expansion_context(evaluator, true, NULL);
-        gsh_native_plan_status expansion_status;
+    if (node->kind == GSH_AST_SUBSHELL) return 125;
+    if (node->kind == GSH_AST_IF || node->kind == GSH_AST_CASE) return 125;
+    if (node->kind == GSH_AST_FOR) return 125;
+    if (node->kind == GSH_AST_WHILE || node->kind == GSH_AST_UNTIL) return 125;
+    return evaluator_sequence_kind(node->kind) ? 125 : status;
+}
 
-        expansion_status = gsh_native_expand_words(
-            evaluator->input,
-            evaluator->storage->words + node->first_word + 1U,
-            node->word_count - 1U, &expansion, evaluator->pipeline, items,
-            &item_count);
-        if (expansion_status != GSH_NATIVE_PLAN_OK) {
-            return expansion_status == GSH_NATIVE_PLAN_ERROR ? 1 : 125;
+typedef enum {
+    NATIVE_MACHINE_NODE,
+    NATIVE_MACHINE_SEQUENCE,
+    NATIVE_MACHINE_NEGATE,
+    NATIVE_MACHINE_COMPLETE,
+    NATIVE_MACHINE_IF,
+    NATIVE_MACHINE_CASE,
+    NATIVE_MACHINE_CASE_AFTER,
+    NATIVE_MACHINE_FOR,
+    NATIVE_MACHINE_FOR_AFTER,
+    NATIVE_MACHINE_WHILE_CONDITION,
+    NATIVE_MACHINE_WHILE_BODY,
+    NATIVE_MACHINE_PIPELINE_CHILD_FINISH,
+    NATIVE_MACHINE_TRAP_FINISH,
+    NATIVE_MACHINE_FUNCTION_FINISH,
+    NATIVE_MACHINE_SOURCE_FINISH,
+} native_machine_task_kind;
+
+typedef struct {
+    native_machine_task_kind kind;
+    size_t node_index;
+    size_t depth;
+    size_t cursor;
+    size_t auxiliary;
+    unsigned int phase;
+    bool fallthrough;
+    int result_status;
+    char *text;
+    char *items[GSH_NATIVE_ARGUMENT_CAP];
+    size_t item_count;
+    size_t item_index;
+    gsh_word_ref name;
+    pipeline_child_request *pipeline_child;
+    native_trap_request *trap_request;
+    sequence_evaluation sequence;
+    function_evaluation_frame *function;
+    native_source_frame source;
+} native_machine_task;
+
+enum {
+    NATIVE_MACHINE_TASK_CAP =
+        2 * (GSH_FUNCTION_DEPTH_CAP + GSH_SOURCE_DEPTH_CAP) + 8,
+    NATIVE_MACHINE_WORKSPACE_CAP = GSH_SOURCE_DEPTH_CAP + 4,
+};
+
+typedef struct {
+    native_machine_task tasks[NATIVE_MACHINE_TASK_CAP];
+    native_evaluator children[SEQUENCE_EVALUATION_CAP];
+    size_t count;
+    size_t child_count;
+    bool used;
+} native_machine_workspace;
+
+static bool take_pipeline_child_request(
+    native_evaluator **evaluator, native_machine_workspace *workspace,
+    native_machine_task *task, bool *child_process);
+static int finish_pipeline_child_request(
+    native_evaluator *evaluator, pipeline_child_request *request,
+    int status);
+static bool take_native_trap_request(
+    native_evaluator *evaluator, native_machine_workspace *workspace,
+    native_machine_task *task);
+static int finish_native_trap_request(
+    native_evaluator *evaluator, native_trap_request *request,
+    int status);
+
+static native_machine_workspace *acquire_native_machine_workspace(
+    const native_evaluator *evaluator)
+{
+    static native_machine_workspace
+        workspaces[NATIVE_MACHINE_WORKSPACE_CAP];
+    size_t index;
+
+    if (!require(evaluator != NULL)) return NULL;
+    if (!require(evaluator->storage != NULL)) return NULL;
+    for (index = 0U; index < NATIVE_MACHINE_WORKSPACE_CAP; index++) {
+        if (!workspaces[index].used) {
+            (void)memset(&workspaces[index], 0, sizeof(workspaces[index]));
+            workspaces[index].used = true;
+            return &workspaces[index];
         }
-        if (item_count == 0) {
+    }
+    errno = ENOSPC;
+    return NULL;
+}
+
+static void release_native_machine_workspace(
+    const native_evaluator *evaluator, native_machine_workspace *workspace)
+{
+    if (!require(evaluator != NULL)) return;
+    if (!require(workspace != NULL && workspace->used)) return;
+    (void)memset(workspace, 0, sizeof(*workspace));
+}
+
+static bool push_native_machine_task(
+    native_machine_workspace *workspace, const native_machine_task *task)
+{
+    if (!require(workspace != NULL && workspace->used)) return false;
+    if (!require(task != NULL &&
+                 workspace->count <= NATIVE_MACHINE_TASK_CAP)) return false;
+    if (workspace->count == NATIVE_MACHINE_TASK_CAP) return false;
+    workspace->tasks[workspace->count++] = *task;
+    return true;
+}
+
+static native_evaluator *acquire_native_machine_child(
+    native_evaluator *evaluator, native_machine_workspace *workspace)
+{
+    if (!require(evaluator != NULL && workspace != NULL)) return NULL;
+    if (!require(workspace->child_count <= SEQUENCE_EVALUATION_CAP)) {
+        return NULL;
+    }
+    if (workspace->child_count == SEQUENCE_EVALUATION_CAP) return NULL;
+    return &workspace->children[workspace->child_count++];
+}
+
+typedef enum {
+    NATIVE_MACHINE_PROCESS_STATUS,
+    NATIVE_MACHINE_PROCESS_SWITCH,
+    NATIVE_MACHINE_PROCESS_ERROR,
+} native_machine_process_result;
+
+static native_machine_process_result start_native_machine_async(
+    native_evaluator **evaluator, native_machine_workspace *workspace,
+    native_machine_task *task, int *status, bool *child_process)
+{
+    if (!require(evaluator != NULL && *evaluator != NULL)) {
+        return NATIVE_MACHINE_PROCESS_ERROR;
+    }
+    if (!require(workspace != NULL && task != NULL && status != NULL &&
+                 child_process != NULL)) {
+        return NATIVE_MACHINE_PROCESS_ERROR;
+    }
+    native_evaluator *child = acquire_native_machine_child(
+        *evaluator, workspace);
+    native_async_start started;
+
+    if (child == NULL) {
+        *status = 125;
+        return NATIVE_MACHINE_PROCESS_ERROR;
+    }
+    started = start_native_async(
+        *evaluator, task->node_index, child, status);
+    if (started != NATIVE_ASYNC_CHILD) {
+        workspace->child_count--;
+        return started == NATIVE_ASYNC_PARENT
+                   ? NATIVE_MACHINE_PROCESS_STATUS
+                   : NATIVE_MACHINE_PROCESS_ERROR;
+    }
+    *evaluator = child;
+    (*evaluator)->suppress_async_once = true;
+    workspace->count = 0U;
+    *child_process = true;
+    return push_native_machine_task(workspace, task)
+               ? NATIVE_MACHINE_PROCESS_SWITCH
+               : NATIVE_MACHINE_PROCESS_ERROR;
+}
+
+static native_machine_process_result start_native_machine_subshell(
+    native_evaluator **evaluator, native_machine_workspace *workspace,
+    const native_machine_task *task, int *status, bool *child_process)
+{
+    if (!require(evaluator != NULL && *evaluator != NULL)) {
+        return NATIVE_MACHINE_PROCESS_ERROR;
+    }
+    if (!require(workspace != NULL && task != NULL && status != NULL &&
+                 child_process != NULL)) {
+        return NATIVE_MACHINE_PROCESS_ERROR;
+    }
+    const gsh_ast_node *node =
+        &(*evaluator)->storage->nodes[task->node_index];
+    native_evaluator *child = acquire_native_machine_child(
+        *evaluator, workspace);
+    pid_t pid;
+
+    if (child == NULL) return NATIVE_MACHINE_PROCESS_ERROR;
+    pid = gsh_fault_should_fail(GSH_FAULT_SUBSHELL_FORK, EAGAIN) ? -1 : fork();
+    if (pid == 0) {
+        native_machine_task body = {
+            .kind = NATIVE_MACHINE_NODE,
+            .node_index = node->first_child,
+            .depth = task->depth + 1U,
+        };
+
+        initialize_native_subshell_evaluator(*evaluator, child);
+        *evaluator = child;
+        workspace->count = 0U;
+        *child_process = true;
+        return push_native_machine_task(workspace, &body)
+                   ? NATIVE_MACHINE_PROCESS_SWITCH
+                   : NATIVE_MACHINE_PROCESS_ERROR;
+    }
+    if (pid == -1) {
+        workspace->child_count--;
+        perror("gsh: subshell fork");
+        *status = 125;
+        return NATIVE_MACHINE_PROCESS_ERROR;
+    }
+    *status = wait_for_native_subshell(pid);
+    workspace->child_count--;
+    return NATIVE_MACHINE_PROCESS_STATUS;
+}
+
+static int schedule_native_machine_request(
+    native_evaluator *evaluator, native_machine_workspace *workspace,
+    int *status)
+{
+    if (!require(evaluator != NULL && workspace != NULL)) return -1;
+    if (!require(status != NULL)) return -1;
+    native_machine_task finish = {0};
+    native_machine_task body = {.kind = NATIVE_MACHINE_NODE};
+
+    if (*status == GSH_EVALUATOR_FUNCTION_REQUEST) {
+        finish.kind = NATIVE_MACHINE_FUNCTION_FINISH;
+        finish.function = evaluator->function_request_frame;
+        body.node_index = evaluator->function_request_root;
+        if (finish.function == NULL) return -1;
+        evaluator->function_request_frame = NULL;
+    } else if (*status == GSH_EVALUATOR_SOURCE_REQUEST) {
+        finish.kind = NATIVE_MACHINE_SOURCE_FINISH;
+        if (!source_request_is_valid(evaluator) ||
+            !enter_source_frame(evaluator, &finish.source,
+                                &body.node_index)) {
+            *status = abandon_source_request(evaluator);
             return 0;
         }
-        item_text = fault_should_fail("for-allocation", ENOMEM)
-                        ? NULL
-                        : malloc(evaluator->pipeline->text_used);
-        if (item_text == NULL) {
-            perror("gsh: for items");
-            return 125;
+    } else {
+        return 0;
+    }
+    if (!push_native_machine_task(workspace, &finish) ||
+        !push_native_machine_task(workspace, &body)) {
+        *status = 125;
+        return -1;
+    }
+    return 1;
+}
+
+static bool complete_native_machine_node(
+    native_evaluator *evaluator, native_machine_workspace *workspace,
+    int *status)
+{
+    if (!require(evaluator != NULL && workspace != NULL)) return false;
+    if (!require(status != NULL && *status >= 0 && *status <= 255)) {
+        return false;
+    }
+    *status = run_native_traps(
+        evaluator, *status, NATIVE_TRAPS_PENDING);
+    if (*status == GSH_EVALUATOR_TRAP_REQUEST) {
+        native_machine_task task = {0};
+
+        return take_native_trap_request(evaluator, workspace, &task);
+    }
+    evaluator->last_status = *status;
+    return true;
+}
+
+static bool prepare_native_machine_case(
+    native_evaluator *evaluator, const gsh_ast_node *node,
+    native_machine_task *task, int *status)
+{
+    if (!require(evaluator != NULL && node != NULL)) return false;
+    if (!require(task != NULL && status != NULL)) return false;
+    gsh_native_expansion_context expansion =
+        native_expansion_context(evaluator, true, NULL);
+    char *subject;
+    evaluator_expansion_request request = {
+        .kind = EVALUATOR_EXPAND_SCALAR,
+        .word = evaluator_storage(evaluator)->words[node->first_word],
+        .scalar = &subject,
+    };
+    size_t length;
+
+    if (run_evaluator_expansion(evaluator, &expansion, &request) !=
+        GSH_NATIVE_PLAN_OK) {
+        *status = 125;
+        return false;
+    }
+    length = strnlen(subject, GSH_NATIVE_TEXT_CAP);
+    task->text = acquire_for_item_text();
+    if (task->text == NULL || length == GSH_NATIVE_TEXT_CAP) {
+        release_for_item_text(task->text);
+        task->text = NULL;
+        *status = 125;
+        return false;
+    }
+    (void)memcpy(task->text, subject, length + 1U);
+    task->kind = NATIVE_MACHINE_CASE;
+    task->cursor = node->first_child;
+    task->result_status = 0;
+    return true;
+}
+
+static bool run_native_machine_if(
+    native_evaluator *evaluator, native_machine_workspace *workspace,
+    native_machine_task task, int *status)
+{
+    if (!require(evaluator != NULL && workspace != NULL)) return false;
+    if (!require(status != NULL && task.kind == NATIVE_MACHINE_IF)) {
+        return false;
+    }
+    native_machine_task child = {
+        .kind = NATIVE_MACHINE_NODE,
+        .depth = task.depth + 1U,
+    };
+
+    if (task.phase != 0U) {
+        if (task.auxiliary == GSH_AST_NONE || evaluator->exiting ||
+            evaluator->returning || evaluator->loop_levels != 0U) {
+            task.kind = NATIVE_MACHINE_COMPLETE;
+            return push_native_machine_task(workspace, &task);
         }
-        memcpy(item_text, evaluator->pipeline->text,
-               evaluator->pipeline->text_used);
-        for (index = 0; index < item_count; index++) {
-            items[index] = item_text +
-                           (items[index] - evaluator->pipeline->text);
+        if (*status == 0) {
+            task.kind = NATIVE_MACHINE_COMPLETE;
+            child.node_index = task.auxiliary;
+            return push_native_machine_task(workspace, &task) &&
+                   push_native_machine_task(workspace, &child);
+        }
+    }
+    if (task.cursor == GSH_AST_NONE) {
+        *status = 0;
+        task.kind = NATIVE_MACHINE_COMPLETE;
+        return push_native_machine_task(workspace, &task);
+    }
+    {
+        const gsh_ast_node *branch =
+            &evaluator_storage(evaluator)->nodes[task.cursor];
+        size_t first = branch->first_child;
+
+        task.phase = 1U;
+        task.auxiliary = evaluator_storage(evaluator)->nodes[first].next_sibling;
+        task.cursor = branch->next_sibling;
+        child.node_index = first;
+    }
+    return push_native_machine_task(workspace, &task) &&
+           push_native_machine_task(workspace, &child);
+}
+
+static bool run_native_machine_case(
+    native_evaluator *evaluator, native_machine_workspace *workspace,
+    native_machine_task task, int *status)
+{
+    if (!require(evaluator != NULL && workspace != NULL)) return false;
+    if (!require(status != NULL && task.text != NULL)) return false;
+
+    if (task.kind == NATIVE_MACHINE_CASE_AFTER) {
+        task.result_status = *status;
+        if (evaluator->exiting || evaluator->returning ||
+            evaluator->loop_levels != 0U || !task.fallthrough) {
+            release_for_item_text(task.text);
+            task.text = NULL;
+            task.kind = NATIVE_MACHINE_COMPLETE;
+            return push_native_machine_task(workspace, &task);
+        }
+        task.kind = NATIVE_MACHINE_CASE;
+    }
+    while (task.cursor != GSH_AST_NONE) {
+        const gsh_ast_node *item =
+            &evaluator_storage(evaluator)->nodes[task.cursor];
+        bool matched;
+
+        if (!native_case_item_matches(
+                evaluator, item, task.text, task.fallthrough, &matched)) {
+            release_for_item_text(task.text);
+            *status = 125;
+            return true;
+        }
+        task.cursor = item->next_sibling;
+        if (!matched) continue;
+        task.fallthrough =
+            (item->flags & GSH_AST_FLAG_CASE_FALLTHROUGH) != 0U;
+        if (item->first_child == GSH_AST_NONE) {
+            task.result_status = 0;
+            if (task.fallthrough) continue;
+            break;
+        }
+        task.kind = NATIVE_MACHINE_CASE_AFTER;
+        {
+            native_machine_task child = {
+                .kind = NATIVE_MACHINE_NODE,
+                .node_index = item->first_child,
+                .depth = task.depth + 1U,
+            };
+
+            return push_native_machine_task(workspace, &task) &&
+                   push_native_machine_task(workspace, &child);
+        }
+    }
+    release_for_item_text(task.text);
+    *status = task.result_status;
+    task.text = NULL;
+    task.kind = NATIVE_MACHINE_COMPLETE;
+    return push_native_machine_task(workspace, &task);
+}
+
+static bool prepare_native_machine_for(
+    native_evaluator *evaluator, const gsh_ast_node *node,
+    native_machine_task *task, int *status)
+{
+    if (!require(evaluator != NULL && node != NULL)) return false;
+    if (!require(task != NULL && status != NULL)) return false;
+
+    task->kind = NATIVE_MACHINE_FOR;
+    task->name = evaluator_storage(evaluator)->words[node->first_word];
+    task->result_status = 0;
+    task->item_index = 0U;
+    if (evaluator->static_for_items &&
+        (node->flags & GSH_AST_FLAG_FOR_HAS_IN) != 0U) {
+        task->phase = 1U;
+        task->item_index = 1U;
+        task->item_count = node->word_count;
+    } else if ((node->flags & GSH_AST_FLAG_FOR_HAS_IN) != 0U) {
+        gsh_native_expansion_context expansion =
+            native_expansion_context(evaluator, true, NULL);
+        evaluator_expansion_request request = {
+            .kind = EVALUATOR_EXPAND_WORDS,
+            .words = evaluator_storage(evaluator)->words + node->first_word + 1U,
+            .word_count = node->word_count - 1U,
+            .expanded = task->items,
+            .expanded_count = &task->item_count,
+        };
+        gsh_native_plan_status expansion_status =
+            run_evaluator_expansion(evaluator, &expansion, &request);
+
+        if (expansion_status != GSH_NATIVE_PLAN_OK) {
+            *status = expansion_status == GSH_NATIVE_PLAN_ERROR ? 1 : 125;
+            return false;
+        }
+        if (task->item_count != 0U &&
+            !preserve_for_expansion_items(
+                evaluator->pipeline, task->items, task->item_count,
+                &task->text)) {
+            perror("gsh: for items");
+            *status = 125;
+            return false;
         }
     } else {
-        item_count = gsh_positionals_count(evaluator->positionals);
-        gsh_positionals_view(evaluator->positionals, items);
+        task->item_count = gsh_positionals_count(evaluator->positionals);
+        gsh_positionals_view(evaluator->positionals, task->items);
     }
     evaluator->active_loops++;
-    for (index = 0; index < item_count; index++) {
-        gsh_native_plan_status assignment = evaluator_variable_assign(
-            evaluator, evaluator->input + name.begin,
-            name.end - name.begin, items[index], strlen(items[index]));
+    return true;
+}
+
+static bool finish_native_machine_for(
+    native_evaluator *evaluator, native_machine_workspace *workspace,
+    native_machine_task *task, int *status)
+{
+    if (!require(evaluator != NULL && workspace != NULL)) return false;
+    if (!require(task != NULL && status != NULL)) return false;
+
+    evaluator->active_loops--;
+    release_for_item_text(task->text);
+    task->text = NULL;
+    *status = task->result_status;
+    task->kind = NATIVE_MACHINE_COMPLETE;
+    return push_native_machine_task(workspace, task);
+}
+
+static bool run_native_machine_for(
+    native_evaluator *evaluator, native_machine_workspace *workspace,
+    native_machine_task task, int *status)
+{
+    if (!require(evaluator != NULL && workspace != NULL)) return false;
+    if (!require(status != NULL && task.node_index <
+                                  evaluator_storage(evaluator)->node_count)) {
+        return false;
+    }
+    const gsh_ast_node *node =
+        &evaluator_storage(evaluator)->nodes[task.node_index];
+    const char *value;
+    size_t value_length;
+
+    if (task.kind == NATIVE_MACHINE_FOR_AFTER) {
+        task.result_status = *status;
+        if (evaluator->fatal_error || evaluator->exiting ||
+            evaluator->returning ||
+            consume_loop_control(evaluator) == LOOP_CONTROL_LEAVE) {
+            return finish_native_machine_for(
+                evaluator, workspace, &task, status);
+        }
+        task.kind = NATIVE_MACHINE_FOR;
+    }
+    if (task.item_index >= task.item_count) {
+        return finish_native_machine_for(
+            evaluator, workspace, &task, status);
+    }
+    if (task.phase == 1U) {
+        gsh_word_ref item = evaluator_storage(evaluator)->words[
+            node->first_word + task.item_index++];
+
+        value = evaluator->input + item.begin;
+        value_length = item.end - item.begin;
+    } else {
+        value = task.items[task.item_index++];
+        value_length = strlen(value);
+    }
+    {
+        gsh_native_plan_status assignment = assign_evaluator_variable(
+            evaluator, evaluator->input + task.name.begin,
+            task.name.end - task.name.begin, value, value_length);
 
         if (assignment != GSH_NATIVE_PLAN_OK) {
-            status = assignment == GSH_NATIVE_PLAN_ERROR ? 1 : 125;
-            break;
-        }
-        status = native_evaluate_node(evaluator, node->first_child,
-                                      depth + 1U);
-        if (evaluator->fatal_error || evaluator->exiting ||
-            evaluator->returning) {
-            break;
-        }
-        if (consume_loop_control(evaluator) == LOOP_CONTROL_LEAVE) {
-            break;
+            task.result_status =
+                assignment == GSH_NATIVE_PLAN_ERROR ? 1 : 125;
+            return finish_native_machine_for(
+                evaluator, workspace, &task, status);
         }
     }
+    task.kind = NATIVE_MACHINE_FOR_AFTER;
+    {
+        native_machine_task child = {
+            .kind = NATIVE_MACHINE_NODE,
+            .node_index = node->first_child,
+            .depth = task.depth + 1U,
+        };
+
+        return push_native_machine_task(workspace, &task) &&
+               push_native_machine_task(workspace, &child);
+    }
+}
+
+static bool finish_native_machine_while(
+    native_evaluator *evaluator, native_machine_workspace *workspace,
+    native_machine_task *task, int *status)
+{
+    if (!require(evaluator != NULL && workspace != NULL)) return false;
+    if (!require(task != NULL && status != NULL)) return false;
+
     evaluator->active_loops--;
-    free(item_text);
-    return status;
+    *status = evaluator_control_result(evaluator, task->result_status);
+    task->kind = NATIVE_MACHINE_COMPLETE;
+    return push_native_machine_task(workspace, task);
+}
+
+static bool schedule_native_machine_while_condition(
+    native_machine_workspace *workspace, native_machine_task *task,
+    const gsh_ast_node *node)
+{
+    if (!require(workspace != NULL && task != NULL)) return false;
+    if (!require(node != NULL && node->first_child != GSH_AST_NONE)) {
+        return false;
+    }
+    native_machine_task child = {
+        .kind = NATIVE_MACHINE_NODE,
+        .node_index = node->first_child,
+        .depth = task->depth + 1U,
+    };
+
+    task->kind = NATIVE_MACHINE_WHILE_CONDITION;
+    return push_native_machine_task(workspace, task) &&
+           push_native_machine_task(workspace, &child);
+}
+
+static bool run_native_machine_while(
+    native_evaluator *evaluator, native_machine_workspace *workspace,
+    native_machine_task task, int *status)
+{
+    if (!require(evaluator != NULL && workspace != NULL)) return false;
+    if (!require(status != NULL && task.node_index <
+                                  evaluator_storage(evaluator)->node_count)) {
+        return false;
+    }
+    const gsh_ast_node *node =
+        &evaluator_storage(evaluator)->nodes[task.node_index];
+    size_t condition = node->first_child;
+    size_t body = evaluator_storage(evaluator)->nodes[condition].next_sibling;
+    int control;
+
+    if (task.kind == NATIVE_MACHINE_WHILE_BODY) {
+        task.result_status = *status;
+        if (evaluator->fatal_error || evaluator->exiting ||
+            evaluator->returning) {
+            return finish_native_machine_while(
+                evaluator, workspace, &task, status);
+        }
+        control = consume_loop_control(evaluator);
+        if (control == LOOP_CONTROL_LEAVE) {
+            return finish_native_machine_while(
+                evaluator, workspace, &task, status);
+        }
+        return schedule_native_machine_while_condition(
+            workspace, &task, node);
+    }
+    if (evaluator->fatal_error || evaluator->exiting ||
+        evaluator->returning) {
+        return finish_native_machine_while(
+            evaluator, workspace, &task, status);
+    }
+    control = consume_loop_control(evaluator);
+    if (control == LOOP_CONTROL_LEAVE) {
+        task.result_status = *status;
+        return finish_native_machine_while(
+            evaluator, workspace, &task, status);
+    }
+    if (control == LOOP_CONTROL_NEXT) {
+        task.result_status = *status;
+        return schedule_native_machine_while_condition(
+            workspace, &task, node);
+    }
+    if ((node->kind == GSH_AST_WHILE && *status != 0) ||
+        (node->kind == GSH_AST_UNTIL && *status == 0)) {
+        return finish_native_machine_while(
+            evaluator, workspace, &task, status);
+    }
+    task.kind = NATIVE_MACHINE_WHILE_BODY;
+    {
+        native_machine_task child = {
+            .kind = NATIVE_MACHINE_NODE,
+            .node_index = body,
+            .depth = task.depth + 1U,
+        };
+
+        return push_native_machine_task(workspace, &task) &&
+               push_native_machine_task(workspace, &child);
+    }
+}
+
+static bool run_native_machine_sequence(
+    native_evaluator *evaluator, native_machine_workspace *workspace,
+    native_machine_task task, int *status)
+{
+    if (!require(evaluator != NULL && workspace != NULL)) return false;
+    if (!require(status != NULL &&
+                 task.kind == NATIVE_MACHINE_SEQUENCE)) return false;
+    size_t child;
+    size_t child_depth;
+    bool finished;
+    bool completed = task.sequence.waiting;
+
+    if (completed && (evaluator->fatal_error || evaluator->exiting ||
+                      evaluator->returning ||
+                      evaluator->loop_levels != 0U)) {
+        return complete_native_machine_node(evaluator, workspace, status);
+    }
+    if (!next_sequence_evaluation(
+            evaluator, &task.sequence, completed, status, &child,
+            &child_depth, &finished)) {
+        if (!finished) *status = 125;
+        return !finished ||
+               complete_native_machine_node(evaluator, workspace, status);
+    }
+    if (!push_native_machine_task(workspace, &task)) {
+        *status = 125;
+        return false;
+    }
+    task = (native_machine_task){
+        .kind = NATIVE_MACHINE_NODE,
+        .node_index = child,
+        .depth = child_depth,
+    };
+    return push_native_machine_task(workspace, &task);
+}
+
+static bool run_native_machine_continuation(
+    native_evaluator *evaluator, native_machine_workspace *workspace,
+    native_machine_task task, int *status)
+{
+    if (!require(evaluator != NULL && workspace != NULL)) return false;
+    if (!require(status != NULL && task.kind != NATIVE_MACHINE_NODE)) {
+        return false;
+    }
+
+    if (task.kind == NATIVE_MACHINE_NEGATE) {
+        *status = *status == 0 ? 1 : 0;
+        return complete_native_machine_node(evaluator, workspace, status);
+    }
+    if (task.kind == NATIVE_MACHINE_COMPLETE) {
+        return complete_native_machine_node(evaluator, workspace, status);
+    }
+    if (task.kind == NATIVE_MACHINE_IF) {
+        return run_native_machine_if(evaluator, workspace, task, status);
+    }
+    if (task.kind == NATIVE_MACHINE_CASE ||
+        task.kind == NATIVE_MACHINE_CASE_AFTER) {
+        return run_native_machine_case(evaluator, workspace, task, status);
+    }
+    if (task.kind == NATIVE_MACHINE_FOR ||
+        task.kind == NATIVE_MACHINE_FOR_AFTER) {
+        return run_native_machine_for(evaluator, workspace, task, status);
+    }
+    if (task.kind == NATIVE_MACHINE_WHILE_CONDITION ||
+        task.kind == NATIVE_MACHINE_WHILE_BODY) {
+        return run_native_machine_while(evaluator, workspace, task, status);
+    }
+    if (task.kind == NATIVE_MACHINE_PIPELINE_CHILD_FINISH) {
+        *status = finish_pipeline_child_request(
+            evaluator, task.pipeline_child, *status);
+        return true;
+    }
+    if (task.kind == NATIVE_MACHINE_TRAP_FINISH) {
+        *status = finish_native_trap_request(
+            evaluator, task.trap_request, *status);
+        if (*status != GSH_EVALUATOR_TRAP_REQUEST) {
+            evaluator->last_status = *status;
+            return true;
+        }
+        task = (native_machine_task){0};
+        return take_native_trap_request(evaluator, workspace, &task);
+    }
+    if (task.kind == NATIVE_MACHINE_FUNCTION_FINISH) {
+        *status = finish_evaluator_function(
+            evaluator, task.function, *status);
+        return complete_native_machine_node(evaluator, workspace, status);
+    }
+    if (task.kind == NATIVE_MACHINE_SOURCE_FINISH) {
+        *status = leave_source_frame(evaluator, &task.source, *status);
+        return complete_native_machine_node(evaluator, workspace, status);
+    }
+    return task.kind == NATIVE_MACHINE_SEQUENCE &&
+           run_native_machine_sequence(evaluator, workspace, task, status);
+}
+
+typedef enum {
+    NATIVE_MACHINE_STEP_STATUS,
+    NATIVE_MACHINE_STEP_SCHEDULED,
+    NATIVE_MACHINE_STEP_LEAF,
+    NATIVE_MACHINE_STEP_ERROR,
+} native_machine_step_result;
+
+static native_machine_step_result schedule_native_machine_compound(
+    native_evaluator *evaluator, native_machine_workspace *workspace,
+    native_machine_task *task, const gsh_ast_node *node, int *status)
+{
+    if (!require(evaluator != NULL && workspace != NULL)) {
+        return NATIVE_MACHINE_STEP_ERROR;
+    }
+    if (!require(task != NULL && node != NULL && status != NULL)) {
+        return NATIVE_MACHINE_STEP_ERROR;
+    }
+
+    if (node->kind == GSH_AST_CASE) {
+        if (!prepare_native_machine_case(evaluator, node, task, status)) {
+            if (evaluator->substitution_child_execution != NULL) {
+                return NATIVE_MACHINE_STEP_STATUS;
+            }
+            task->kind = NATIVE_MACHINE_COMPLETE;
+        }
+        return push_native_machine_task(workspace, task)
+                   ? NATIVE_MACHINE_STEP_SCHEDULED
+                   : NATIVE_MACHINE_STEP_ERROR;
+    }
+    if (node->kind == GSH_AST_FOR) {
+        if (!prepare_native_machine_for(evaluator, node, task, status)) {
+            if (evaluator->substitution_child_execution != NULL) {
+                return NATIVE_MACHINE_STEP_STATUS;
+            }
+            task->kind = NATIVE_MACHINE_COMPLETE;
+        }
+        return push_native_machine_task(workspace, task)
+                   ? NATIVE_MACHINE_STEP_SCHEDULED
+                   : NATIVE_MACHINE_STEP_ERROR;
+    }
+    if (node->kind == GSH_AST_WHILE || node->kind == GSH_AST_UNTIL) {
+        task->result_status = 0;
+        evaluator->active_loops++;
+        if (schedule_native_machine_while_condition(
+                workspace, task, node)) {
+            return NATIVE_MACHINE_STEP_SCHEDULED;
+        }
+        evaluator->active_loops--;
+        return NATIVE_MACHINE_STEP_ERROR;
+    }
+    if (node->kind == GSH_AST_PIPELINE &&
+        node->first_child != GSH_AST_NONE &&
+        evaluator_storage(evaluator)->nodes[node->first_child].kind != GSH_AST_SIMPLE &&
+        evaluator_storage(evaluator)->nodes[node->first_child].next_sibling ==
+            GSH_AST_NONE) {
+        native_machine_task child = {
+            .kind = NATIVE_MACHINE_NODE,
+            .node_index = node->first_child,
+            .depth = task->depth + 1U,
+        };
+        bool scheduled = true;
+
+        if ((node->flags & GSH_AST_FLAG_NEGATED) != 0U) {
+            task->kind = NATIVE_MACHINE_NEGATE;
+            scheduled = push_native_machine_task(workspace, task);
+        }
+        return scheduled && push_native_machine_task(workspace, &child)
+                   ? NATIVE_MACHINE_STEP_SCHEDULED
+                   : NATIVE_MACHINE_STEP_ERROR;
+    }
+    return NATIVE_MACHINE_STEP_LEAF;
+}
+
+static native_machine_step_result run_native_machine_node_task(
+    native_evaluator **evaluator, native_machine_workspace *workspace,
+    native_machine_task *task, int *status, bool *child_process)
+{
+    if (!require(evaluator != NULL && *evaluator != NULL)) {
+        return NATIVE_MACHINE_STEP_ERROR;
+    }
+    if (!require(workspace != NULL && task != NULL && status != NULL &&
+                 child_process != NULL)) return NATIVE_MACHINE_STEP_ERROR;
+    const gsh_ast_node *node =
+        &(*evaluator)->storage->nodes[task->node_index];
+    int control_status;
+    bool async_consumed;
+
+    if (evaluator_control_status(
+            *evaluator, task->depth, &control_status)) {
+        *status = control_status;
+        return NATIVE_MACHINE_STEP_STATUS;
+    }
+    async_consumed = (*evaluator)->suppress_async_once;
+    (*evaluator)->suppress_async_once = false;
+    if ((node->flags & GSH_AST_FLAG_ASYNC) != 0U && !async_consumed) {
+        native_machine_process_result result = start_native_machine_async(
+            evaluator, workspace, task, status, child_process);
+
+        return result == NATIVE_MACHINE_PROCESS_SWITCH
+                   ? NATIVE_MACHINE_STEP_SCHEDULED
+             : result == NATIVE_MACHINE_PROCESS_STATUS
+                   ? NATIVE_MACHINE_STEP_STATUS
+                   : NATIVE_MACHINE_STEP_ERROR;
+    }
+    if (node->kind == GSH_AST_SUBSHELL) {
+        native_machine_process_result result = start_native_machine_subshell(
+            evaluator, workspace, task, status, child_process);
+
+        return result == NATIVE_MACHINE_PROCESS_SWITCH
+                   ? NATIVE_MACHINE_STEP_SCHEDULED
+             : result == NATIVE_MACHINE_PROCESS_STATUS
+                   ? NATIVE_MACHINE_STEP_STATUS
+                   : NATIVE_MACHINE_STEP_ERROR;
+    }
+    if (evaluator_sequence_kind(node->kind)) {
+        task->kind = NATIVE_MACHINE_SEQUENCE;
+        return initialize_sequence_evaluation(
+                   *evaluator, task->node_index, task->depth,
+                   &task->sequence) &&
+                       push_native_machine_task(workspace, task)
+                   ? NATIVE_MACHINE_STEP_SCHEDULED
+                   : NATIVE_MACHINE_STEP_ERROR;
+    }
+    if (node->kind == GSH_AST_IF) {
+        task->kind = NATIVE_MACHINE_IF;
+        task->cursor = node->first_child;
+        task->phase = 0U;
+        return push_native_machine_task(workspace, task)
+                   ? NATIVE_MACHINE_STEP_SCHEDULED
+                   : NATIVE_MACHINE_STEP_ERROR;
+    }
+    native_machine_step_result result = schedule_native_machine_compound(
+        *evaluator, workspace, task, node, status);
+
+    if (result != NATIVE_MACHINE_STEP_LEAF) return result;
+    *status = native_evaluate_leaf(
+        *evaluator, task->node_index, task->depth);
+    return NATIVE_MACHINE_STEP_STATUS;
+}
+
+static bool finish_native_machine_status(
+    native_evaluator **evaluator, native_machine_workspace *workspace,
+    native_machine_task *task, int *status, bool *child_process)
+{
+    if (!require(evaluator != NULL && *evaluator != NULL)) return false;
+    if (!require(workspace != NULL && task != NULL && status != NULL &&
+                 child_process != NULL)) return false;
+
+    if (*status == GSH_EVALUATOR_PIPELINE_CHILD_REQUEST) {
+        *task = (native_machine_task){0};
+        return take_pipeline_child_request(
+            evaluator, workspace, task, child_process);
+    }
+    if (*status == GSH_EVALUATOR_PIPELINE_EXIT_REQUEST) {
+        *status = (*evaluator)->pipeline_exit_status;
+        workspace->count = 0U;
+        *child_process = true;
+        return true;
+    }
+    if ((*evaluator)->substitution_child_execution != NULL) {
+        size_t child_node = 0U;
+        size_t child_depth = 0U;
+
+        if (!take_substitution_child(
+                evaluator, &child_node, &child_depth)) return false;
+        workspace->count = 0U;
+        *task = (native_machine_task){
+            .kind = NATIVE_MACHINE_NODE,
+            .node_index = child_node,
+            .depth = child_depth,
+        };
+        *child_process = true;
+        return push_native_machine_task(workspace, task);
+    }
+    {
+        int scheduled = schedule_native_machine_request(
+            *evaluator, workspace, status);
+
+        return scheduled > 0 ||
+               (scheduled == 0 && complete_native_machine_node(
+                                      *evaluator, workspace, status));
+    }
 }
 
 static int native_evaluate_node_inner(native_evaluator *evaluator,
                                       size_t node_index, size_t depth)
 {
-    const gsh_ast_node *node = &evaluator->storage->nodes[node_index];
-    size_t child;
-    int status = 0;
+    if (!require(evaluator != NULL && evaluator->storage != NULL)) return 125;
+    if (!require(node_index < evaluator_storage(evaluator)->node_count)) return 125;
+    if (!require(depth <= 128U)) return 125;
+    native_machine_workspace *workspace =
+        acquire_native_machine_workspace(evaluator);
+    native_machine_task task = {
+        .kind = NATIVE_MACHINE_NODE,
+        .node_index = node_index,
+        .depth = depth,
+    };
+    int status = 125;
+    bool active = workspace != NULL &&
+                  push_native_machine_task(workspace, &task);
+    bool child_process = false;
+    bool exit_traps_started = false;
 
-    if (depth > 128) {
-        return 125;
-    }
-    if (evaluator->exiting) {
-        return evaluator->exit_status;
-    }
-    if (evaluator->returning) {
-        return evaluator->return_status;
-    }
-    if (evaluator->loop_levels != 0) {
-        return evaluator->last_status;
-    }
-    if (node->kind == GSH_AST_FUNCTION) {
-        if (!define_evaluator_function(evaluator, node_index)) {
-            perror("gsh: function definition");
-            return errno == ENOSPC ? 125 : 1;
-        }
-        return 0;
-    }
-    if (evaluator->static_for_items && node->kind == GSH_AST_PIPELINE &&
-        node->first_child != GSH_AST_NONE) {
-        const gsh_ast_node *command =
-            &evaluator->storage->nodes[node->first_child];
-
-        if (command->kind == GSH_AST_SIMPLE &&
-            command->next_sibling == GSH_AST_NONE &&
-            command->word_count == 1U && command->redirect_count == 0) {
-            gsh_word_ref word =
-                evaluator->storage->words[command->first_word];
-            size_t length = word.end - word.begin;
-            int direct_status =
-                (length == 1U && evaluator->input[word.begin] == ':') ||
-                        (length == 4U &&
-                         memcmp(evaluator->input + word.begin, "true", 4) ==
-                             0)
-                    ? 0
-                    : 1;
-
-            return (node->flags & GSH_AST_FLAG_NEGATED) != 0
-                       ? (direct_status == 0 ? 1 : 0)
-                       : direct_status;
-        }
-    }
-    if (node->kind == GSH_AST_PIPELINE) {
-        return native_evaluate_pipeline(evaluator, node_index, depth);
-    }
-    if (node->kind == GSH_AST_SUBSHELL) {
-        pid_t pid = fault_should_fail("subshell-fork", EAGAIN) ? -1 : fork();
-
-        if (pid == 0) {
-            native_evaluator child = *evaluator;
-            int child_status;
-
-            enter_native_subshell_or_exit(&child);
-            child.active_loops = 0;
-            child.loop_control = NATIVE_LOOP_CONTROL_NONE;
-            child.loop_levels = 0;
-            child.times_context = NULL;
-            close_evaluator_exec_transaction(&child);
-            child_status = native_evaluate_node(
-                &child, node->first_child, depth + 1U);
-            child_status = finish_native_evaluator(&child, child_status);
-            _exit(child_status & 255);
-        }
-        if (pid == -1) {
-            perror("gsh: subshell fork");
-            return 125;
-        }
-        for (;;) {
-            int wait_status;
-            pid_t waited = waitpid(pid, &wait_status, 0);
-
-            if (waited == pid) {
-                return wait_status_value(wait_status);
+    while (active) {
+        if (workspace->count == 0U) {
+            if (child_process && !exit_traps_started) {
+                status = run_native_traps(
+                    evaluator, status, NATIVE_TRAPS_EXIT);
+                exit_traps_started = true;
+                if (status == GSH_EVALUATOR_TRAP_REQUEST) {
+                    task = (native_machine_task){0};
+                    active = take_native_trap_request(
+                        evaluator, workspace, &task);
+                    continue;
+                }
             }
-            if (waited == -1 && errno == EINTR) {
-                continue;
+            active = false;
+            continue;
+        }
+        task = workspace->tasks[--workspace->count];
+        if (task.kind != NATIVE_MACHINE_NODE) {
+            active = run_native_machine_continuation(
+                evaluator, workspace, task, &status);
+            continue;
+        }
+        {
+            native_machine_step_result result = run_native_machine_node_task(
+                &evaluator, workspace, &task, &status, &child_process);
+
+            if (result == NATIVE_MACHINE_STEP_ERROR) {
+                status = 125;
+                active = false;
+            } else if (result == NATIVE_MACHINE_STEP_STATUS) {
+                active = finish_native_machine_status(
+                    &evaluator, workspace, &task, &status, &child_process);
             }
-            perror("gsh: subshell waitpid");
-            return 125;
         }
     }
-    if (node->kind == GSH_AST_IF) {
-        return native_evaluate_if(evaluator, node, depth);
+    if (child_process) {
+        release_native_machine_workspace(evaluator, workspace);
+        _exit(status & 255);
     }
-    if (node->kind == GSH_AST_CASE) {
-        return native_evaluate_case(evaluator, node, depth);
-    }
-    if (node->kind == GSH_AST_FOR) {
-        return native_evaluate_for(evaluator, node, depth);
-    }
-    if (node->kind == GSH_AST_WHILE || node->kind == GSH_AST_UNTIL) {
-        size_t condition = node->first_child;
-        size_t body = evaluator->storage->nodes[condition].next_sibling;
-        int body_status = 0;
-
-        evaluator->active_loops++;
-        for (;;) {
-            int condition_status = native_evaluate_node(
-                evaluator, condition, depth + 1U);
-            int control;
-
-            if (evaluator->fatal_error || evaluator->exiting ||
-                evaluator->returning) {
-                break;
-            }
-            control = consume_loop_control(evaluator);
-            if (control == LOOP_CONTROL_LEAVE) {
-                body_status = condition_status;
-                break;
-            }
-            if (control == LOOP_CONTROL_NEXT) {
-                body_status = condition_status;
-                continue;
-            }
-            bool selected = node->kind == GSH_AST_WHILE
-                                ? condition_status == 0
-                                : condition_status != 0;
-
-            if (!selected) {
-                break;
-            }
-            body_status = native_evaluate_node(evaluator, body, depth + 1U);
-            if (evaluator->fatal_error || evaluator->exiting ||
-                evaluator->returning) {
-                break;
-            }
-            control = consume_loop_control(evaluator);
-            if (control == LOOP_CONTROL_LEAVE) {
-                break;
-            }
-            if (control == LOOP_CONTROL_NEXT) {
-                continue;
-            }
-        }
-        evaluator->active_loops--;
-        return evaluator->exiting
-                   ? evaluator->exit_status
-                   : evaluator->returning ? evaluator->return_status
-                                          : body_status;
-    }
-    child = node->first_child;
-    while (child != GSH_AST_NONE) {
-        const gsh_ast_node *child_node =
-            &evaluator->storage->nodes[child];
-
-        if (node->kind == GSH_AST_AND_OR) {
-            if (child_node->connector == GSH_TOKEN_AND_IF && status != 0) {
-                child = child_node->next_sibling;
-                continue;
-            }
-            if (child_node->connector == GSH_TOKEN_OR_IF && status == 0) {
-                child = child_node->next_sibling;
-                continue;
-            }
-        }
-        status = native_evaluate_node(evaluator, child, depth + 1U);
-        if (evaluator->fatal_error || evaluator->exiting ||
-            evaluator->returning ||
-            evaluator->loop_levels != 0) {
-            return evaluator->exiting
-                       ? evaluator->exit_status
-                       : evaluator->returning ? evaluator->return_status
-                                              : status;
-        }
-        child = child_node->next_sibling;
-    }
+    release_native_machine_workspace(evaluator, workspace);
     return status;
 }
-
 static bool command_assigns_variable(
     const gsh_native_command *command, const char *name,
     size_t name_length)
 {
+    if (command == NULL) {
+        return false;
+    }
     size_t index;
 
     for (index = 0; index < command->assignment_count; index++) {
@@ -13820,6 +16997,9 @@ static int copy_variable_entry(gsh_variable_store *destination,
                                const gsh_variable_store *source,
                                size_t index)
 {
+    if (destination == NULL || source == NULL) {
+        return -1;
+    }
     const char *assignment;
     const char *separator;
     unsigned int attributes;
@@ -13852,6 +17032,9 @@ static int copy_selected_variables(
     gsh_variable_store *destination, const gsh_variable_store *source,
     const gsh_native_command *command, bool assigned)
 {
+    if (command == NULL || source == NULL) {
+        return -1;
+    }
     size_t index;
 
     for (index = 0; index < gsh_variables_count(source); index++) {
@@ -13886,6 +17069,9 @@ static int merge_temporary_source_variables(
     gsh_variable_store *original, const gsh_variable_store *evaluated,
     gsh_variable_store *scratch, const gsh_native_command *command)
 {
+    if (command == NULL || evaluated == NULL || original == NULL) {
+        return -1;
+    }
     bool temporary_path = command_assigns_variable(command, "PATH", 4U);
     uint64_t path_generation =
         temporary_path ? original->path_generation
@@ -13902,12 +17088,15 @@ static int merge_temporary_source_variables(
         return -1;
     }
     scratch->path_generation = path_generation;
-    memcpy(original, scratch, sizeof(*original));
+    (void)memcpy(original, scratch, sizeof(*original));
     return 0;
 }
 
 static void clear_source_request(native_evaluator *evaluator)
 {
+    if (evaluator == NULL) {
+        return;
+    }
     evaluator->source_request_active = false;
     evaluator->source_request_dot = false;
     evaluator->source_request_negated = false;
@@ -13922,12 +17111,18 @@ static void clear_source_request(native_evaluator *evaluator)
 
 static bool source_request_is_valid(const native_evaluator *evaluator)
 {
-    const gsh_source_workspace *workspace =
-        evaluator->source_request_workspace;
-    bool input_owned = workspace != NULL &&
-                       (evaluator->source_request_input == workspace->input ||
-                        evaluator->source_request_input ==
-                            workspace->alias_expansion);
+    const gsh_source_workspace *workspace;
+    bool input_owned;
+
+    if (evaluator == NULL || evaluator->storage == NULL ||
+        evaluator->pipeline == NULL) {
+        return false;
+    }
+    workspace = evaluator->source_request_workspace;
+    input_owned = workspace != NULL &&
+                  (evaluator->source_request_input == workspace->input ||
+                   evaluator->source_request_input ==
+                       workspace->alias_expansion);
 
     return evaluator->source_request_active && input_owned &&
            evaluator->source_workspaces != NULL &&
@@ -13940,12 +17135,15 @@ static bool source_request_is_valid(const native_evaluator *evaluator)
                GSH_NATIVE_REDIRECT_CAP &&
            (!evaluator->source_request_temporary_variables ||
             (evaluator->source_request_command != NULL &&
-             evaluator->source_request_command->command_regular_context &&
-             evaluator->source_request_command->assignment_count != 0U));
+             evaluator_source_request_command(evaluator)->command_regular_context &&
+             evaluator_source_request_command(evaluator)->assignment_count != 0U));
 }
 
 static int abandon_source_request(native_evaluator *evaluator)
 {
+    if (evaluator == NULL) {
+        return -1;
+    }
     gsh_source_workspace *workspace =
         evaluator->source_request_workspace;
     size_t saved_count = evaluator->source_request_saved_count <=
@@ -13961,17 +17159,25 @@ static int abandon_source_request(native_evaluator *evaluator)
     }
     if (!gsh_source_workspace_release(evaluator->source_workspaces,
                                       workspace)) {
-        fputs("gsh: source workspace ownership failure\n", stderr);
+        (void)fputs("gsh: source workspace ownership failure\n", stderr);
     }
     clear_source_request(evaluator);
     evaluator->fatal_error = true;
     return status;
 }
 
-static void enter_source_frame(native_evaluator *evaluator,
+static bool enter_source_frame(native_evaluator *evaluator,
                                native_source_frame *frame,
                                size_t *node_index)
 {
+    const gsh_parse_storage *source_storage;
+
+    if (evaluator == NULL || frame == NULL || node_index == NULL ||
+        !source_request_is_valid(evaluator) ||
+        evaluator->source_request_workspace == NULL) {
+        errno = EINVAL;
+        return false;
+    }
     frame->input = evaluator->input;
     frame->input_length = evaluator->input_length;
     frame->storage = evaluator->storage;
@@ -13988,34 +17194,42 @@ static void enter_source_frame(native_evaluator *evaluator,
     frame->negated = evaluator->source_request_negated;
     frame->temporary_variables =
         evaluator->source_request_temporary_variables;
-    memcpy(frame->saved, evaluator->source_request_saved,
+    source_storage = &source_frame_workspace(frame)->storage;
+    (void)memcpy(frame->saved, evaluator->source_request_saved,
            frame->saved_count * sizeof(frame->saved[0]));
     evaluator->input = evaluator->source_request_input;
     evaluator->input_length = evaluator->source_request_input_length;
-    evaluator->storage = &frame->workspace->storage;
-    evaluator->pipeline = &frame->workspace->pipeline;
+    evaluator->storage = source_storage;
+    evaluator->pipeline = &source_frame_workspace(frame)->pipeline;
     if (frame->temporary_variables) {
-        evaluator->variables = &frame->workspace->scope_base;
-        evaluator->scope_base = &frame->workspace->variables;
+        evaluator->variables = &source_frame_workspace(frame)->scope_base;
+        evaluator->scope_base = &source_frame_workspace(frame)->variables;
         evaluator->journal = NULL;
     }
     evaluator->source_depth++;
     evaluator->dot_depth += frame->consume_return ? 1U : 0U;
     *node_index = evaluator->source_request_root;
     clear_source_request(evaluator);
-    assert(evaluator->source_depth ==
-           gsh_source_workspaces_depth(evaluator->source_workspaces));
-    assert(*node_index < evaluator->storage->node_count);
+    if (evaluator->source_depth !=
+            gsh_source_workspaces_depth(evaluator->source_workspaces) ||
+        *node_index >= source_storage->node_count) {
+        errno = EINVAL;
+        return false;
+    }
+    return true;
 }
 
 static int leave_source_frame(native_evaluator *evaluator,
                               native_source_frame *frame, int status)
 {
+    if (evaluator == NULL || frame == NULL) {
+        return -1;
+    }
     bool merged =
         !frame->temporary_variables ||
         merge_temporary_source_variables(
             frame->variables, evaluator->variables,
-            &frame->workspace->variables, frame->temporary_command) == 0;
+            &source_frame_workspace(frame)->variables, frame->temporary_command) == 0;
     bool restored = restore_redirect_descriptors(
                         frame->saved, frame->saved_count) == 0;
     bool released = gsh_source_workspace_release(
@@ -14041,7 +17255,7 @@ static int leave_source_frame(native_evaluator *evaluator,
     evaluator->input_length = frame->input_length;
     evaluator->input = frame->input;
     if (!merged || !restored || !released) {
-        fputs(!merged
+        (void)fputs(!merged
                   ? "gsh: source variable commit failed\n"
                   : !restored
                         ? "gsh: source redirection restore failed\n"
@@ -14051,165 +17265,254 @@ static int leave_source_frame(native_evaluator *evaluator,
         status = 125;
     }
     if (released) {
-        assert(evaluator->source_depth == gsh_source_workspaces_depth(
-                                               evaluator->source_workspaces));
+        if (evaluator->source_depth != gsh_source_workspaces_depth(
+                                           evaluator->source_workspaces)) {
+            evaluator->fatal_error = true;
+            status = 125;
+        }
     }
     return status;
 }
 
-static int run_pipeline_source(native_evaluator *parent,
-                               gsh_native_pipeline *pipeline,
-                               size_t command_index,
-                               gsh_variable_store *variables)
+static int prepare_pipeline_source_evaluation(
+    native_evaluator *parent, gsh_native_pipeline *pipeline,
+    size_t command_index, gsh_variable_store *variables,
+    bool history_source, pipeline_source_evaluation *evaluation,
+    bool *ready)
 {
-    gsh_saved_descriptor no_saved_descriptors[GSH_NATIVE_REDIRECT_CAP];
-    gsh_background_table *backgrounds;
-    native_source_frame frame;
-    native_evaluator child;
+    if (!require(parent != NULL && pipeline != NULL)) return 125;
+    if (!require(variables != NULL && evaluation != NULL && ready != NULL)) {
+        return 125;
+    }
+    gsh_saved_descriptor no_saved[GSH_NATIVE_REDIRECT_CAP] = {{0}};
     const gsh_native_command *command;
-    size_t root = GSH_AST_NONE;
     int status;
 
-    if (parent == NULL || pipeline == NULL || variables == NULL ||
-        command_index >= pipeline->command_count) {
-        return 125;
-    }
-    backgrounds = allocate_isolated_job_table();
-    if (backgrounds == NULL) return 125;
-    child = *parent;
+    *ready = false;
+    (void)memset(evaluation, 0, sizeof(*evaluation));
+    evaluation->root = GSH_AST_NONE;
+    if (command_index >= pipeline->command_count) return 125;
+    evaluation->child = *parent;
     command = &pipeline->commands[command_index];
-    child.pipeline = pipeline;
-    child.variables = variables;
-    child.journal = NULL;
-    child.alias_journal = NULL;
-    child.pipeline_scope = NULL;
-    child.tail_exec_single = false;
-    child.exec_outcome_fd = -1;
-    child.exec_descriptor_socket = -1;
-    child.fatal_error = false;
-    child.returning = false;
-    child.exiting = false;
-    clear_source_request(&child);
-    child.backgrounds = backgrounds;
-    status = apply_special_builtin_assignments(
-        variables, NULL, command, &child.options);
-    if (status != GSH_ASSIGNMENT_OK) {
-        free(backgrounds);
-        return status == GSH_ASSIGNMENT_JOURNAL_ERROR ? 125 : 1;
+    evaluation->child.pipeline = pipeline;
+    evaluation->child.variables = variables;
+    evaluation->child.journal = NULL;
+    evaluation->child.alias_journal = NULL;
+    evaluation->child.pipeline_scope = NULL;
+    evaluation->child.tail_exec_single = false;
+    evaluation->child.exec_outcome_fd = -1;
+    evaluation->child.exec_descriptor_socket = -1;
+    evaluation->child.fatal_error = false;
+    clear_source_request(&evaluation->child);
+    if (!history_source) {
+        evaluation->backgrounds = allocate_isolated_job_table();
+        if (evaluation->backgrounds == NULL) return 125;
+        evaluation->child.backgrounds = evaluation->backgrounds;
+        evaluation->child.returning = false;
+        evaluation->child.exiting = false;
+        status = apply_special_builtin_assignments(
+            variables, NULL, command, &evaluation->child.options);
+    } else {
+        status = GSH_ASSIGNMENT_OK;
     }
-    status = request_builtin_source(&child, command, no_saved_descriptors, 0);
-    if (status != GSH_EVALUATOR_SOURCE_REQUEST) {
-        free(backgrounds);
-        return status;
+    if (status == GSH_ASSIGNMENT_OK) {
+        status = history_source
+                     ? request_fc_source(&evaluation->child, command,
+                                         no_saved, 0)
+                     : request_builtin_source(&evaluation->child, command,
+                                              no_saved, 0);
+    } else {
+        status = status == GSH_ASSIGNMENT_JOURNAL_ERROR ? 125 : 1;
     }
-    child.source_request_negated = false;
-    if (!source_request_is_valid(&child)) {
-        status = abandon_source_request(&child);
-        free(backgrounds);
-        return status;
+    if (status != GSH_EVALUATOR_SOURCE_REQUEST) return status;
+    evaluation->child.source_request_negated = false;
+    if (!source_request_is_valid(&evaluation->child) ||
+        !enter_source_frame(&evaluation->child, &evaluation->frame,
+                            &evaluation->root)) {
+        return abandon_source_request(&evaluation->child);
     }
-    enter_source_frame(&child, &frame, &root);
-    status = native_evaluate_node(&child, root, 0);
-    status = leave_source_frame(&child, &frame, status);
-    free(backgrounds);
+    *ready = true;
+    return 0;
+}
+
+static pipeline_child_request *acquire_pipeline_child_request(
+    const native_evaluator *evaluator)
+{
+    static pipeline_child_request requests[NATIVE_MACHINE_WORKSPACE_CAP];
+    size_t index;
+
+    if (!require(evaluator != NULL)) return NULL;
+    if (!require(evaluator->pipeline_child_request == NULL)) return NULL;
+    for (index = 0U; index < NATIVE_MACHINE_WORKSPACE_CAP; index++) {
+        if (!requests[index].used) {
+            (void)memset(&requests[index], 0, sizeof(requests[index]));
+            requests[index].used = true;
+            return &requests[index];
+        }
+    }
+    errno = ENOSPC;
+    return NULL;
+}
+
+static void release_pipeline_child_request(
+    native_evaluator *evaluator, pipeline_child_request *request)
+{
+    if (!require(evaluator != NULL && request != NULL)) return;
+    if (!require(request->used)) return;
+    (void)memset(request, 0, sizeof(*request));
+}
+
+static bool take_pipeline_child_request(
+    native_evaluator **evaluator, native_machine_workspace *workspace,
+    native_machine_task *task, bool *child_process)
+{
+    if (!require(evaluator != NULL && *evaluator != NULL)) return false;
+    if (!require(workspace != NULL && task != NULL &&
+                 child_process != NULL)) return false;
+    pipeline_child_request *request = (*evaluator)->pipeline_child_request;
+    native_machine_task body = {.kind = NATIVE_MACHINE_NODE};
+
+    if (request == NULL || !request->used) return false;
+    (*evaluator)->pipeline_child_request = NULL;
+    *evaluator = request->kind == PIPELINE_CHILD_FUNCTION
+                     ? &request->child
+                     : &request->source.child;
+    body.node_index = request->root;
+    task->kind = NATIVE_MACHINE_PIPELINE_CHILD_FINISH;
+    task->pipeline_child = request;
+    workspace->count = 0U;
+    *child_process = true;
+    return push_native_machine_task(workspace, task) &&
+           push_native_machine_task(workspace, &body);
+}
+
+static int finish_pipeline_child_request(
+    native_evaluator *evaluator, pipeline_child_request *request,
+    int status)
+{
+    if (!require(evaluator != NULL && request != NULL)) return 125;
+    if (!require(request->used)) return 125;
+
+    if (request->kind == PIPELINE_CHILD_FUNCTION) {
+        status = finish_evaluator_function(
+            evaluator, request->function_frame, status);
+        if (request->backgrounds != NULL) {
+            release_isolated_job_table(request->backgrounds);
+        }
+    } else {
+        status = leave_source_frame(
+            evaluator, &request->source.frame, status);
+        if (request->source.backgrounds != NULL) {
+            release_isolated_job_table(request->source.backgrounds);
+        }
+    }
+    release_pipeline_child_request(evaluator, request);
     return status;
 }
 
-/* ── Pipeline History Execution Stays Isolated ───────────────────
- * An fc stage must list or execute history without changing its parent.
- * The stage copies the evaluator control record and drops mutation journals
- * before resolving history. Selected text still enters the fixed source
- * workspace, so aliases, parsing, and native dispatch remain identical.
- * The process boundary discards every resulting shell-state mutation.
+/* ── Pipeline-Local Evaluation Has One Isolation Driver ─────────
+ * Functions, dot, eval, and fc once maintained parallel child evaluators
+ * whose cleanup rules could drift.  One concrete tag now selects the bounded
+ * setup while a single owner releases the isolated job state after execution.
+ * Function redirects and source frames still use their specialized owners;
+ * all mutations remain confined to the already-forked pipeline process.
  * ─────────────────────────────────────────────────────────────── */
-static int run_pipeline_fc(native_evaluator *parent,
-                           gsh_native_pipeline *pipeline,
-                           size_t command_index,
-                           gsh_variable_store *variables)
+static int request_pipeline_isolated_function(
+    native_evaluator *parent, gsh_native_pipeline *pipeline,
+    size_t command_index, gsh_variable_store *variables, bool *handled)
 {
-    gsh_saved_descriptor no_saved[GSH_NATIVE_REDIRECT_CAP];
-    native_source_frame frame;
-    native_evaluator child;
-    size_t root = GSH_AST_NONE;
+    if (!require(parent != NULL && pipeline != NULL)) return 125;
+    if (!require(variables != NULL && handled != NULL)) return 125;
+    const gsh_native_command *command = &pipeline->commands[command_index];
+    const gsh_function_entry *entry = evaluator_function(parent, command);
+    pipeline_child_request *request;
     int status;
 
-    if (parent == NULL || pipeline == NULL || variables == NULL ||
-        command_index >= pipeline->command_count) {
+    if (entry == NULL) return 127;
+    *handled = true;
+    request = acquire_pipeline_child_request(parent);
+    if (request == NULL) return 125;
+    request->kind = PIPELINE_CHILD_FUNCTION;
+    request->backgrounds = allocate_isolated_job_table();
+    if (request->backgrounds == NULL) {
+        release_pipeline_child_request(parent, request);
         return 125;
     }
-    child = *parent;
-    child.pipeline = pipeline;
-    child.variables = variables;
-    child.journal = NULL;
-    child.alias_journal = NULL;
-    child.pipeline_scope = NULL;
-    child.tail_exec_single = false;
-    child.exec_outcome_fd = -1;
-    child.exec_descriptor_socket = -1;
-    child.fatal_error = false;
-    clear_source_request(&child);
-    status = request_fc_source(
-        &child, &pipeline->commands[command_index], no_saved, 0);
-    if (status != GSH_EVALUATOR_SOURCE_REQUEST) {
-        return status;
+    request->child = *parent;
+    request->child.pipeline = pipeline;
+    request->child.variables = variables;
+    request->child.journal = NULL;
+    request->child.alias_journal = NULL;
+    request->child.pipeline_scope = NULL;
+    request->child.tail_exec_single = false;
+    request->child.exec_outcome_fd = -1;
+    request->child.returning = false;
+    request->child.exiting = false;
+    request->child.fatal_error = false;
+    request->child.backgrounds = request->backgrounds;
+    status = request_evaluator_function(
+        &request->child, command, entry, false, false);
+    if (status == GSH_EVALUATOR_FUNCTION_REQUEST) {
+        request->function_frame = request->child.function_request_frame;
+        request->root = request->child.function_request_root;
+        request->child.function_request_frame = NULL;
+        parent->pipeline_child_request = request;
+        return GSH_EVALUATOR_PIPELINE_CHILD_REQUEST;
     }
-    child.source_request_negated = false;
-    if (!source_request_is_valid(&child)) {
-        return abandon_source_request(&child);
-    }
-    enter_source_frame(&child, &frame, &root);
-    status = native_evaluate_node(&child, root, 0);
-    return leave_source_frame(&child, &frame, status);
+    release_isolated_job_table(request->backgrounds);
+    release_pipeline_child_request(parent, request);
+    return status;
 }
 
-/* ── Nested Sources Use a Fixed Continuation Stack ─────────────
- * Eval, dot, and fc execute selected text in the caller's environment while
- * invocation redirections remain active. A source request hands ownership of
- * its preallocated parser slot and saved descriptors to this bounded driver.
- * Frames unwind in strict LIFO order on success, return, or failure.
- * Source nesting never allocates and cannot exceed the fixed arena depth.
- * ────────────────────────────────────────────── */
-static int native_evaluate_node_sync(native_evaluator *evaluator,
-                                     size_t node_index, size_t depth)
+static int request_pipeline_isolated_source(
+    native_evaluator *parent, gsh_native_pipeline *pipeline,
+    size_t command_index, gsh_variable_store *variables,
+    pipeline_isolated_kind kind)
 {
-    native_source_frame frames[GSH_SOURCE_DEPTH_CAP];
-    size_t frame_count = 0;
-    size_t iterations;
-    int status = 125;
+    if (!require(parent != NULL && pipeline != NULL)) return 125;
+    if (!require(variables != NULL)) return 125;
+    pipeline_child_request *request =
+        acquire_pipeline_child_request(parent);
+    bool ready = false;
+    int status;
 
-    for (iterations = 0; iterations <= GSH_SOURCE_DEPTH_CAP;
-         iterations++) {
-        status = native_evaluate_node_inner(evaluator, node_index, depth);
-        if (status != GSH_EVALUATOR_SOURCE_REQUEST &&
-            evaluator->source_request_active) {
-            status = abandon_source_request(evaluator);
-            break;
-        }
-        if (status != GSH_EVALUATOR_SOURCE_REQUEST) {
-            break;
-        }
-        if (frame_count == GSH_SOURCE_DEPTH_CAP ||
-            !source_request_is_valid(evaluator)) {
-            status = abandon_source_request(evaluator);
-            break;
-        }
-        enter_source_frame(evaluator, &frames[frame_count++], &node_index);
-        depth = 0;
+    if (request == NULL) return 125;
+    request->kind = PIPELINE_CHILD_SOURCE;
+    status = prepare_pipeline_source_evaluation(
+        parent, pipeline, command_index, variables,
+        kind == PIPELINE_ISOLATED_FC, &request->source, &ready);
+    if (ready) {
+        request->root = request->source.root;
+        parent->pipeline_child_request = request;
+        return GSH_EVALUATOR_PIPELINE_CHILD_REQUEST;
     }
-    if (status == GSH_EVALUATOR_SOURCE_REQUEST) {
-        status = abandon_source_request(evaluator);
+    if (request->source.backgrounds != NULL) {
+        release_isolated_job_table(request->source.backgrounds);
     }
-    while (frame_count > 0) {
-        status = leave_source_frame(evaluator, &frames[--frame_count],
-                                    status);
-    }
-    if (evaluator->exiting) {
-        status = evaluator->exit_status;
-    }
-    assert(!evaluator->source_request_active);
-    assert(frame_count == 0U);
-    evaluator->last_status = status;
+    release_pipeline_child_request(parent, request);
     return status;
+}
+
+static int run_pipeline_isolated_command(
+    native_evaluator *parent, gsh_native_pipeline *pipeline,
+    size_t command_index, gsh_variable_store *variables,
+    pipeline_isolated_kind kind, bool *handled)
+{
+    if (!require(parent != NULL && pipeline != NULL)) return 125;
+    if (!require(variables != NULL && handled != NULL)) return 125;
+    *handled = false;
+    if (command_index >= pipeline->command_count) return 125;
+    if (kind == PIPELINE_ISOLATED_FUNCTION) {
+        return request_pipeline_isolated_function(
+            parent, pipeline, command_index, variables, handled);
+    }
+    if (kind != PIPELINE_ISOLATED_FC &&
+        kind != PIPELINE_ISOLATED_SOURCE) {
+        return 125;
+    }
+    *handled = true;
+    return request_pipeline_isolated_source(
+        parent, pipeline, command_index, variables, kind);
 }
 
 static bool bounded_job_command(const char *input, size_t input_length,
@@ -14237,34 +17540,41 @@ static bool bounded_job_command(const char *input, size_t input_length,
     return true;
 }
 
-static int native_evaluate_async(native_evaluator *evaluator,
-                                 size_t node_index, size_t depth)
+static native_async_start start_native_async(
+    native_evaluator *evaluator, size_t node_index,
+    native_evaluator *child, int *status)
 {
+    if (!require(evaluator != NULL && child != NULL)) {
+        return NATIVE_ASYNC_ERROR;
+    }
+    if (!require(status != NULL && evaluator->storage != NULL)) {
+        return NATIVE_ASYNC_ERROR;
+    }
     const char *command;
     size_t command_length;
     pid_t pid;
 
     if (evaluator->backgrounds == NULL ||
         !gsh_background_has_capacity(evaluator->backgrounds) ||
-        node_index >= evaluator->storage->node_count ||
+        node_index >= evaluator_storage(evaluator)->node_count ||
         !bounded_job_command(
             evaluator->input, evaluator->input_length,
-            &evaluator->storage->nodes[node_index], &command,
+            &evaluator_storage(evaluator)->nodes[node_index], &command,
             &command_length)) {
         errno = EAGAIN;
         perror("gsh: asynchronous list");
-        return 125;
+        *status = 125;
+        return NATIVE_ASYNC_ERROR;
     }
-    pid = fault_should_fail("async-fork", EAGAIN) ? -1 : fork();
+    pid = gsh_fault_should_fail(GSH_FAULT_ASYNC_FORK, EAGAIN) ? -1 : fork();
     if (pid == 0) {
         gsh_background_table *child_backgrounds;
-        native_evaluator child = *evaluator;
         int null_descriptor;
-        int status;
 
         (void)setpgid(0, 0);
         reset_child_signals();
-        enter_native_subshell_or_exit(&child);
+        *child = *evaluator;
+        enter_native_subshell_or_exit(child);
         null_descriptor = open("/dev/null", O_RDONLY);
         if (null_descriptor == -1 ||
             child_duplicate_descriptor(null_descriptor, STDIN_FILENO) ==
@@ -14272,29 +17582,28 @@ static int native_evaluate_async(native_evaluator *evaluator,
             child_exec_error("asynchronous standard input", errno);
         }
         if (null_descriptor != STDIN_FILENO) {
-            close(null_descriptor);
+            (void)close(null_descriptor);
         }
         child_backgrounds = allocate_isolated_job_table();
         if (child_backgrounds == NULL) {
             child_exec_error("asynchronous job state", errno);
         }
-        child.backgrounds = child_backgrounds;
-        child.last_background_pid = 0;
-        child.journal = NULL;
-        child.alias_journal = NULL;
-        child.active_loops = 0;
-        child.loop_control = NATIVE_LOOP_CONTROL_NONE;
-        child.loop_levels = 0;
-        child.tail_exec_single =
+        child->backgrounds = child_backgrounds;
+        child->last_background_pid = 0;
+        child->journal = NULL;
+        child->alias_journal = NULL;
+        child->active_loops = 0;
+        child->loop_control = NATIVE_LOOP_CONTROL_NONE;
+        child->loop_levels = 0;
+        child->tail_exec_single =
             async_node_has_single_pipeline(evaluator, node_index);
-        close_evaluator_exec_transaction(&child);
-        status = native_evaluate_node_sync(&child, node_index, depth);
-        status = finish_native_evaluator(&child, status);
-        _exit(status & 255);
+        close_evaluator_exec_transaction(child);
+        return NATIVE_ASYNC_CHILD;
     }
     if (pid == -1) {
         perror("gsh: asynchronous fork");
-        return 125;
+        *status = 125;
+        return NATIVE_ASYNC_ERROR;
     }
     (void)setpgid(pid, pid);
     if (gsh_background_add_job(
@@ -14308,10 +17617,12 @@ static int native_evaluate_async(native_evaluator *evaluator,
         }
         errno = saved_errno;
         perror("gsh: asynchronous registry");
-        return 125;
+        *status = 125;
+        return NATIVE_ASYNC_ERROR;
     }
     evaluator->last_background_pid = (long)pid;
-    return 0;
+    *status = 0;
+    return NATIVE_ASYNC_PARENT;
 }
 
 typedef struct {
@@ -14332,6 +17643,9 @@ static void enter_native_trap_frame(native_evaluator *evaluator,
                                     size_t input_length,
                                     native_trap_frame *frame)
 {
+    if (evaluator == NULL || frame == NULL || input == NULL || workspace == NULL) {
+        return;
+    }
     frame->input = evaluator->input;
     frame->input_length = evaluator->input_length;
     frame->storage = evaluator->storage;
@@ -14351,6 +17665,9 @@ static void enter_native_trap_frame(native_evaluator *evaluator,
 static void leave_native_trap_frame(native_evaluator *evaluator,
                                     const native_trap_frame *frame)
 {
+    if (evaluator == NULL || frame == NULL) {
+        return;
+    }
     evaluator->preflight = frame->preflight;
     evaluator->function_scratch = frame->function_scratch;
     evaluator->functions = frame->functions;
@@ -14366,17 +17683,20 @@ static bool preflight_native_trap_action(
     native_evaluator *evaluator, gsh_source_workspace *workspace,
     size_t root, const native_trap_frame *frame)
 {
+    if (evaluator == NULL || frame == NULL || workspace == NULL) {
+        return false;
+    }
     bool defines_functions = storage_has_function(&workspace->storage);
     bool supported;
 
-    memcpy(&workspace->variables, frame->variables,
+    (void)memcpy(&workspace->variables, frame->variables,
            sizeof(workspace->variables));
     evaluator->variables = &workspace->variables;
     if (defines_functions) {
         if (frame->functions == NULL) {
             gsh_functions_initialize(&workspace->functions);
         } else {
-            memcpy(&workspace->functions, frame->functions,
+            (void)memcpy(&workspace->functions, frame->functions,
                    sizeof(workspace->functions));
         }
         gsh_functions_initialize(&workspace->function_scratch);
@@ -14392,287 +17712,471 @@ static bool preflight_native_trap_action(
     return supported;
 }
 
-/* ── Trap Actions Borrow One Nested Source Frame ─────────────────
- * Trap text must be parsed when the condition arises, after later variable
- * and alias changes are visible. Copying it into the next fixed source slot
- * prevents a trap command inside the action from invalidating its own input.
- * Preflight uses workspace copies; execution then borrows the caller's state,
- * so action mutations persist while parser ownership unwinds in strict LIFO.
- * ─────────────────────────────────────────────────────────────── */
-static int evaluate_native_trap_workspace(
-    native_evaluator *evaluator, gsh_source_workspace *workspace,
-    const char *input, size_t input_length,
-    const gsh_parse_result *parsed, int prior_status)
-{
+typedef struct {
+    gsh_source_workspace *workspace;
     native_trap_frame frame;
-    int status;
+    size_t root;
+    bool entered;
+} native_trap_execution;
 
-    enter_native_trap_frame(evaluator, workspace, input, input_length,
-                            &frame);
-    evaluator->last_status = prior_status;
-    if (parsed->status != GSH_PARSE_OK) {
-        fprintf(stderr, "gsh: trap action %s at byte %zu\n",
-                gsh_parse_status_name(parsed->status),
-                parsed->error_offset);
-        evaluator->fatal_error = true;
-        status = 2;
-    } else if (!preflight_native_trap_action(
-                   evaluator, workspace, parsed->root, &frame)) {
-        fputs("gsh: trap action execution unsupported\n", stderr);
-        evaluator->fatal_error = true;
-        status = 2;
-    } else {
-        status = native_evaluate_node(evaluator, parsed->root, 0);
-    }
-    leave_native_trap_frame(evaluator, &frame);
-    return status;
+static gsh_source_workspace *trap_execution_workspace(
+    const native_trap_execution *execution)
+{
+    if (!require(execution != NULL)) return NULL;
+    if (!require(execution->workspace != NULL)) return NULL;
+    return execution->workspace;
 }
 
-static int execute_native_trap_action(native_evaluator *evaluator,
-                                      size_t condition, int prior_status)
+struct native_trap_request {
+    native_trap_execution execution;
+    native_trap_run_kind kind;
+    int prior_status;
+    int saved_exit_status;
+    bool was_exiting;
+    bool was_fatal;
+    bool used;
+};
+
+static native_trap_request *acquire_native_trap_request(
+    const native_evaluator *evaluator)
 {
-    gsh_source_workspace *workspace;
+    static native_trap_request requests[GSH_TRAP_CONDITION_CAP];
+    size_t index;
+
+    if (!require(evaluator != NULL)) return NULL;
+    if (!require(evaluator->trap_request == NULL)) return NULL;
+    for (index = 0U; index < GSH_TRAP_CONDITION_CAP; index++) {
+        if (!requests[index].used) {
+            (void)memset(&requests[index], 0, sizeof(requests[index]));
+            requests[index].used = true;
+            return &requests[index];
+        }
+    }
+    errno = ENOSPC;
+    return NULL;
+}
+
+static void release_native_trap_request(
+    native_evaluator *evaluator, native_trap_request *request)
+{
+    if (!require(evaluator != NULL && request != NULL)) return;
+    if (!require(request->used)) return;
+    (void)memset(request, 0, sizeof(*request));
+}
+
+static int prepare_native_trap_execution(
+    native_evaluator *evaluator, size_t condition, int prior_status,
+    native_trap_execution *execution, bool *ready)
+{
+    if (!require(evaluator != NULL && execution != NULL)) return 125;
+    if (!require(ready != NULL && evaluator->traps != NULL)) return 125;
     gsh_parse_result parsed;
     const char *action;
     const char *input;
     size_t action_length;
     size_t input_length;
-    int status = prior_status;
 
+    (void)memset(execution, 0, sizeof(*execution));
+    *ready = false;
     action = gsh_traps_action(evaluator->traps, condition, &action_length);
     if (action == NULL || action_length > GSH_SOURCE_INPUT_CAP ||
         evaluator->source_depth != gsh_source_workspaces_depth(
                                        evaluator->source_workspaces)) {
         if (action != NULL) {
-            fputs("gsh: trap source workspace ownership failure\n", stderr);
+            (void)fputs("gsh: trap source workspace ownership failure\n", stderr);
             evaluator->fatal_error = true;
         }
         return action == NULL ? prior_status : 125;
     }
-    workspace = fault_should_fail("trap-workspace-exhaustion", EAGAIN)
-                    ? NULL
-                    : gsh_source_workspace_acquire(
-                          evaluator->source_workspaces);
-    if (workspace == NULL) {
-        fputs("gsh: trap source workspace limit exceeded\n", stderr);
+    execution->workspace =
+        gsh_fault_should_fail(GSH_FAULT_TRAP_WORKSPACE_EXHAUSTION, EAGAIN)
+            ? NULL
+            : gsh_source_workspace_acquire(evaluator->source_workspaces);
+    if (execution->workspace == NULL) {
+        (void)fputs("gsh: trap source workspace limit exceeded\n", stderr);
         evaluator->fatal_error = true;
         return 125;
     }
-    memcpy(workspace->input, action, action_length);
-    workspace->input[action_length] = '\0';
-    input = workspace->input;
+    (void)memcpy(trap_execution_workspace(execution)->input, action, action_length);
+    trap_execution_workspace(execution)->input[action_length] = '\0';
+    input = trap_execution_workspace(execution)->input;
     input_length = action_length;
     parsed = gsh_alias_parse(
-        workspace->input, action_length, evaluator->aliases,
-        workspace->alias_expansion, GSH_ALIAS_EXPANSION_CAP,
-        &workspace->storage, &input, &input_length);
-    status = evaluate_native_trap_workspace(
-        evaluator, workspace, input, input_length, &parsed, prior_status);
-    if (!gsh_source_workspace_release(evaluator->source_workspaces,
-                                      workspace)) {
-        fputs("gsh: trap source workspace ownership failure\n", stderr);
+        trap_execution_workspace(execution)->input, action_length, evaluator->aliases,
+        trap_execution_workspace(execution)->alias_expansion, GSH_ALIAS_EXPANSION_CAP,
+        &trap_execution_workspace(execution)->storage, &input, &input_length);
+    enter_native_trap_frame(evaluator, execution->workspace, input,
+                            input_length, &execution->frame);
+    execution->entered = true;
+    evaluator->last_status = prior_status;
+    if (parsed.status != GSH_PARSE_OK) {
+        (void)fprintf(stderr, "gsh: trap action %s at byte %zu\n",
+                gsh_parse_status_name(parsed.status), parsed.error_offset);
+        evaluator->fatal_error = true;
+        return 2;
+    }
+    if (!preflight_native_trap_action(
+            evaluator, execution->workspace, parsed.root,
+            &execution->frame)) {
+        (void)fputs("gsh: trap action execution unsupported\n", stderr);
+        evaluator->fatal_error = true;
+        return 2;
+    }
+    execution->root = parsed.root;
+    *ready = true;
+    return prior_status;
+}
+
+static int finish_native_trap_execution(
+    native_evaluator *evaluator, native_trap_execution *execution,
+    int status)
+{
+    if (!require(evaluator != NULL && execution != NULL)) return 125;
+    if (!require(!execution->entered || execution->workspace != NULL)) {
+        return 125;
+    }
+    if (execution->entered) {
+        leave_native_trap_frame(evaluator, &execution->frame);
+    }
+    if (execution->workspace != NULL &&
+        !gsh_source_workspace_release(evaluator->source_workspaces,
+                                      execution->workspace)) {
+        (void)fputs("gsh: trap source workspace ownership failure\n", stderr);
         evaluator->fatal_error = true;
         status = 125;
     }
-    assert(evaluator->source_depth == gsh_source_workspaces_depth(
-                                           evaluator->source_workspaces));
-    return status;
-}
-
-static int run_pending_native_traps(native_evaluator *evaluator,
-                                    int status)
-{
-    size_t dispatched;
-
-    if (evaluator->preflight || evaluator->exiting ||
-        evaluator->exit_trap_running ||
-        !gsh_traps_have_pending(evaluator->traps)) {
-        return status;
-    }
-    for (dispatched = 0;
-         dispatched < gsh_traps_condition_count(); dispatched++) {
-        size_t condition;
-
-        if (!gsh_traps_take_pending(evaluator->traps, &condition)) {
-            break;
-        }
-        (void)execute_native_trap_action(evaluator, condition, status);
-        evaluator->last_status = status;
-        if (evaluator->fatal_error || evaluator->exiting) {
-            return evaluator->exiting ? evaluator->exit_status : 2;
-        }
+    if (evaluator->source_depth != gsh_source_workspaces_depth(
+                                       evaluator->source_workspaces)) {
+        return 125;
     }
     return status;
 }
 
-static int finish_native_evaluator(native_evaluator *evaluator,
-                                   int status)
+/* ── One Trap Driver Owns Pending and EXIT Re-entry ──────────────
+ * Pending conditions and EXIT once passed through separate wrappers around
+ * the same parsed-action evaluator.  Those wrappers obscured a recursive
+ * call-graph edge and let state restoration rules evolve independently.
+ * A concrete mode now selects bounded pending dispatch or one EXIT action;
+ * the same loop owns each nested source frame and its deterministic unwind.
+ * ─────────────────────────────────────────────────────────────── */
+static int run_native_traps(native_evaluator *evaluator, int status,
+                            native_trap_run_kind kind)
 {
-    bool was_exiting;
-    bool was_fatal;
-    int saved_exit_status;
+    if (!require(evaluator != NULL)) return 125;
+    if (!require(kind == NATIVE_TRAPS_PENDING ||
+                 kind == NATIVE_TRAPS_EXIT)) return 125;
+    native_trap_request *request;
+    size_t condition = 0U;
+    bool ready = false;
     int action_status;
 
-    if (evaluator == NULL || evaluator->traps == NULL ||
-        evaluator->exit_trap_running || evaluator->exit_trap_complete ||
-        gsh_traps_state(evaluator->traps, 0) != GSH_TRAP_ACTION) {
+    if (evaluator->traps == NULL || evaluator->exit_trap_running) {
         return status;
     }
-    was_exiting = evaluator->exiting;
-    was_fatal = evaluator->fatal_error;
-    saved_exit_status = evaluator->exit_status;
-    evaluator->exit_trap_running = true;
-    evaluator->exiting = false;
-    evaluator->fatal_error = false;
-    evaluator->last_status = status;
-    action_status = execute_native_trap_action(evaluator, 0, status);
+    if (kind == NATIVE_TRAPS_PENDING &&
+        (evaluator->preflight || evaluator->exiting ||
+         !gsh_traps_have_pending(evaluator->traps))) {
+        return status;
+    }
+    if (kind == NATIVE_TRAPS_EXIT &&
+        (evaluator->exit_trap_complete ||
+         gsh_traps_state(evaluator->traps, 0U) != GSH_TRAP_ACTION)) {
+        return status;
+    }
+    if (kind == NATIVE_TRAPS_PENDING &&
+        !gsh_traps_take_pending(evaluator->traps, &condition)) return status;
+    request = acquire_native_trap_request(evaluator);
+    if (request == NULL) return 125;
+    request->kind = kind;
+    request->prior_status = status;
+    request->was_exiting = evaluator->exiting;
+    request->was_fatal = evaluator->fatal_error;
+    request->saved_exit_status = evaluator->exit_status;
+    if (kind == NATIVE_TRAPS_EXIT) {
+        evaluator->exit_trap_running = true;
+        evaluator->exiting = false;
+        evaluator->fatal_error = false;
+        evaluator->last_status = status;
+    }
+    action_status = prepare_native_trap_execution(
+        evaluator, condition, status, &request->execution, &ready);
+    if (ready) {
+        evaluator->trap_request = request;
+        return GSH_EVALUATOR_TRAP_REQUEST;
+    }
+    action_status = finish_native_trap_execution(
+        evaluator, &request->execution, action_status);
+    if (kind == NATIVE_TRAPS_PENDING) {
+        evaluator->last_status = status;
+        release_native_trap_request(evaluator, request);
+        return evaluator->exiting ? evaluator->exit_status
+             : evaluator->fatal_error ? 2
+                                      : status;
+    }
     evaluator->exit_trap_complete = true;
     evaluator->exit_trap_running = false;
     if (evaluator->exiting) {
         status = evaluator->exit_status;
     } else if (evaluator->fatal_error && action_status != status) {
         status = action_status;
-        evaluator->exiting = was_exiting;
+        evaluator->exiting = request->was_exiting;
         evaluator->exit_status = status;
     } else {
-        evaluator->exiting = was_exiting;
-        evaluator->exit_status = saved_exit_status;
+        evaluator->exiting = request->was_exiting;
+        evaluator->exit_status = request->saved_exit_status;
     }
-    evaluator->fatal_error = was_fatal || evaluator->fatal_error;
+    evaluator->fatal_error = request->was_fatal || evaluator->fatal_error;
     evaluator->last_status = status;
+    release_native_trap_request(evaluator, request);
     return status;
+}
+
+static bool take_native_trap_request(
+    native_evaluator *evaluator, native_machine_workspace *workspace,
+    native_machine_task *task)
+{
+    if (!require(evaluator != NULL && workspace != NULL)) return false;
+    if (!require(task != NULL)) return false;
+    native_trap_request *request = evaluator->trap_request;
+    native_machine_task body = {.kind = NATIVE_MACHINE_NODE};
+
+    if (request == NULL || !request->used) return false;
+    evaluator->trap_request = NULL;
+    task->kind = NATIVE_MACHINE_TRAP_FINISH;
+    task->trap_request = request;
+    body.node_index = request->execution.root;
+    return push_native_machine_task(workspace, task) &&
+           push_native_machine_task(workspace, &body);
+}
+
+static int finish_native_trap_request(
+    native_evaluator *evaluator, native_trap_request *request,
+    int status)
+{
+    if (!require(evaluator != NULL && request != NULL)) return 125;
+    if (!require(request->used)) return 125;
+    int action_status = finish_native_trap_execution(
+        evaluator, &request->execution, status);
+    int result = request->prior_status;
+
+    if (request->kind == NATIVE_TRAPS_PENDING) {
+        evaluator->last_status = result;
+        if (evaluator->exiting) result = evaluator->exit_status;
+        else if (evaluator->fatal_error) result = 2;
+    } else {
+        evaluator->exit_trap_complete = true;
+        evaluator->exit_trap_running = false;
+        if (evaluator->exiting) {
+            result = evaluator->exit_status;
+        } else if (evaluator->fatal_error &&
+                   action_status != request->prior_status) {
+            result = action_status;
+            evaluator->exiting = request->was_exiting;
+            evaluator->exit_status = result;
+        } else {
+            evaluator->exiting = request->was_exiting;
+            evaluator->exit_status = request->saved_exit_status;
+        }
+        evaluator->fatal_error =
+            request->was_fatal || evaluator->fatal_error;
+        evaluator->last_status = result;
+    }
+    release_native_trap_request(evaluator, request);
+    return result;
+}
+
+static int evaluate_native_traps_top(native_evaluator *evaluator,
+                                     int status,
+                                     native_trap_run_kind kind)
+{
+    if (!require(evaluator != NULL)) return 125;
+    if (!require(kind == NATIVE_TRAPS_PENDING ||
+                 kind == NATIVE_TRAPS_EXIT)) return 125;
+    size_t dispatch;
+
+    for (dispatch = 0U; dispatch <= GSH_TRAP_CONDITION_CAP; dispatch++) {
+        native_trap_request *request;
+        int action_status;
+
+        status = run_native_traps(evaluator, status, kind);
+        if (status != GSH_EVALUATOR_TRAP_REQUEST) return status;
+        request = evaluator->trap_request;
+        if (request == NULL) return 125;
+        evaluator->trap_request = NULL;
+        action_status = native_evaluate_node(
+            evaluator, request->execution.root, 0U);
+        status = finish_native_trap_request(
+            evaluator, request, action_status);
+        if (kind == NATIVE_TRAPS_EXIT) return status;
+    }
+    return 125;
+}
+
+static bool take_substitution_child(
+    native_evaluator **evaluator, size_t *node_index, size_t *depth)
+{
+    if (!require(evaluator != NULL && *evaluator != NULL)) return false;
+    if (!require(node_index != NULL && depth != NULL)) return false;
+    command_substitution_execution *execution =
+        (*evaluator)->substitution_child_execution;
+
+    if (execution == NULL) return false;
+    (*evaluator)->substitution_child_execution = NULL;
+    *evaluator = &execution->nested;
+    *node_index = execution->root;
+    *depth = 0U;
+    return true;
 }
 
 static int native_evaluate_node(native_evaluator *evaluator,
                                 size_t node_index, size_t depth)
 {
-    int status;
-
-    if (evaluator->fatal_error) {
-        return 1;
+    if (!require(evaluator != NULL && evaluator->storage != NULL)) return 125;
+    if (!require(node_index < evaluator_storage(evaluator)->node_count)) return 125;
+    if (!require(evaluator_storage(evaluator)->node_count <= GSH_PARSE_NODE_CAP)) {
+        return 125;
     }
-    if (evaluator->exiting) {
-        return evaluator->exit_status;
-    }
-    status = (evaluator->storage->nodes[node_index].flags &
-              GSH_AST_FLAG_ASYNC) != 0
-                 ? native_evaluate_async(evaluator, node_index, depth)
-                 : native_evaluate_node_sync(evaluator, node_index, depth);
+    if (!require(depth <= 128U)) return 125;
+    return native_evaluate_node_inner(evaluator, node_index, depth);
+}
 
-    status = run_pending_native_traps(evaluator, status);
-    evaluator->last_status = status;
-    return status;
+static void clear_pending_native_commit(shell_state *state)
+{
+    if (!require(state != NULL)) return;
+    if (!require(state->pending_exec_descriptor_count <=
+                 GSH_EXEC_DESCRIPTOR_COMMIT_CAP)) {
+        state->pending_exec_descriptor_count = 0;
+    }
+    state->pending_directory_commit = false;
+    state->pending_positional_commit = false;
+    state->pending_alias_commit = false;
+    state->pending_function_commit = false;
+    state->pending_command_cache_commit = false;
+    state->pending_job_service = false;
+    state->pending_exec_possible = false;
+    state->pending_exec_descriptor_count = 0;
+    state->pending_exec_protected_descriptor_count = 0;
+}
+
+static bool prepare_preflight_functions(shell_state *state,
+                                        bool definitions)
+{
+    if (!require(state != NULL)) return false;
+    if (!require(state->parse_storage != NULL)) return false;
+    if (!definitions) return true;
+    if (ensure_function_state(state, true) == -1 ||
+        !gsh_functions_clone(state->function_scratch, state->functions)) {
+        state->pending_function_commit = false;
+        return false;
+    }
+    return true;
+}
+
+static void initialize_native_preflight_evaluator(
+    shell_state *state, native_evaluator *evaluator, bool definitions)
+{
+    if (!require(state != NULL)) return;
+    if (!require(evaluator != NULL)) return;
+    (void)memset(evaluator, 0, sizeof(*evaluator));
+    (void)memcpy(state->variable_scratch, state->variables,
+           sizeof(*state->variable_scratch));
+    evaluator->input = state->pending_input;
+    evaluator->input_length = state->pending_input_length;
+    evaluator->storage = state->parse_storage;
+    evaluator->pipeline = state->native_pipeline;
+    evaluator->default_path = state->default_path;
+    evaluator->last_status = state->last_status;
+    evaluator->shell_pid = (long)state->shell_pgid;
+    evaluator->last_background_pid = state->last_background_pid;
+    evaluator->parameter_zero = state->parameter_zero;
+    evaluator->history = state->history;
+    evaluator->history_exclude_newest = true;
+    evaluator->positionals = state->positionals;
+    evaluator->options = state->options;
+    evaluator->variables = state->variable_scratch;
+    evaluator->functions = definitions ? state->function_scratch
+                                       : state->functions;
+    evaluator->function_scratch = definitions ? NULL
+                                               : state->function_scratch;
+    evaluator->aliases = state->aliases;
+    evaluator->command_cache = state->command_cache;
+    evaluator->command_cache_base_generation =
+        state->command_cache_generation;
+    evaluator->scope_base = state->pipeline_variables;
+    evaluator->scope_changes = state->pipeline_changes;
+    evaluator->source_workspaces = state->source_workspaces;
+    evaluator->preflight = true;
+    evaluator->job_service_socket = -1;
+    evaluator->exec_outcome_fd = -1;
+    evaluator->exec_descriptor_socket = -1;
+    evaluator->backgrounds = &state->background_jobs;
+}
+
+static void capture_pending_native_commit(shell_state *state,
+                                          const native_evaluator *evaluator)
+{
+    if (!require(state != NULL)) return;
+    if (!require(evaluator != NULL)) return;
+    state->pending_directory_commit =
+        evaluator->directory_mutation_possible;
+    state->pending_positional_commit =
+        evaluator->positional_mutation_possible;
+    state->pending_alias_commit = evaluator->alias_mutation_possible;
+    state->pending_function_commit = evaluator->function_mutation_possible;
+    state->pending_command_cache_commit =
+        evaluator->command_cache_mutation_possible;
+    state->pending_job_service = evaluator->job_service_possible;
+    state->pending_exec_possible = evaluator->exec_possible;
+    state->pending_exec_descriptor_count = evaluator->exec_descriptor_count;
+    if (state->pending_exec_descriptor_count >
+        GSH_EXEC_DESCRIPTOR_COMMIT_CAP) {
+        state->pending_exec_descriptor_count = 0U;
+        state->pending_exec_possible = false;
+        return;
+    }
+    (void)memcpy(state->pending_exec_descriptors, evaluator->exec_descriptors,
+           evaluator->exec_descriptor_count *
+               sizeof(evaluator->exec_descriptors[0]));
+    state->pending_exec_protected_descriptor_count =
+        evaluator->exec_protected_descriptor_count;
+    if (state->pending_exec_protected_descriptor_count >
+        GSH_EXEC_DESCRIPTOR_COMMIT_CAP) {
+        state->pending_exec_protected_descriptor_count = 0U;
+        state->pending_exec_possible = false;
+        return;
+    }
+    (void)memcpy(state->pending_exec_protected_descriptors,
+           evaluator->exec_protected_descriptors,
+           evaluator->exec_protected_descriptor_count *
+               sizeof(evaluator->exec_protected_descriptors[0]));
 }
 
 static bool native_node_is_supported(shell_state *state, size_t node_index)
 {
-    native_evaluator evaluator;
-    bool definitions = storage_has_function(state->parse_storage);
+    native_evaluator evaluator = {0};
+    bool definitions;
 
-    if (definitions &&
-        (ensure_function_state(state, true) == -1 ||
-         !gsh_functions_clone(state->function_scratch,
-                              state->functions))) {
-        state->pending_function_commit = false;
-        return false;
-    }
-
-    memset(&evaluator, 0, sizeof(evaluator));
-    memcpy(state->variable_scratch, state->variables,
-           sizeof(*state->variable_scratch));
-    evaluator.input = state->pending_input;
-    evaluator.input_length = state->pending_input_length;
-    evaluator.storage = state->parse_storage;
-    evaluator.pipeline = state->native_pipeline;
-    evaluator.default_path = state->default_path;
-    evaluator.last_status = state->last_status;
-    evaluator.shell_pid = (long)state->shell_pgid;
-    evaluator.last_background_pid = state->last_background_pid;
-    evaluator.parameter_zero = state->parameter_zero;
-    evaluator.history = state->history;
-    evaluator.history_exclude_newest = true;
-    evaluator.positionals = state->positionals;
-    evaluator.options = state->options;
-    evaluator.variables = state->variable_scratch;
-    evaluator.journal = NULL;
-    evaluator.aliases = state->aliases;
-    evaluator.alias_journal = NULL;
-    evaluator.functions = definitions ? state->function_scratch
-                                      : state->functions;
-    evaluator.function_scratch = definitions ? NULL
-                                              : state->function_scratch;
-    evaluator.command_cache = state->command_cache;
-    evaluator.command_cache_base_generation =
-        state->command_cache_generation;
-    evaluator.scope_base = state->pipeline_variables;
-    evaluator.scope_changes = state->pipeline_changes;
-    evaluator.pipeline_scope = NULL;
-    evaluator.source_workspaces = state->source_workspaces;
-    evaluator.source_depth = 0;
-    evaluator.preflight = true;
-    evaluator.fatal_error = false;
-    evaluator.static_for_items = false;
-    evaluator.tail_exec_single = false;
-    evaluator.positional_mutation_possible = false;
-    evaluator.directory_mutation_possible = false;
-    evaluator.alias_mutation_possible = false;
-    evaluator.function_mutation_possible = false;
-    evaluator.command_cache_mutation_possible = false;
-    evaluator.job_service_possible = false;
-    evaluator.job_service_available = false;
-    evaluator.job_service_socket = -1;
-    evaluator.exec_possible = false;
-    evaluator.exec_descriptor_count = 0;
-    evaluator.exec_protected_descriptor_count = 0;
-    evaluator.exec_descriptors_dirty = false;
-    evaluator.state_commit_invalid = false;
-    evaluator.exec_outcome_fd = -1;
-    evaluator.exec_descriptor_socket = -1;
-    evaluator.backgrounds = &state->background_jobs;
+    if (!require(state != NULL)) return false;
+    if (!require(state->parse_storage != NULL)) return false;
+    definitions = storage_has_function(state->parse_storage);
+    if (!prepare_preflight_functions(state, definitions)) return false;
+    initialize_native_preflight_evaluator(state, &evaluator, definitions);
     state->pending_positional_commit =
-        state->parse_storage->node_count > node_index &&
+        state_parse_storage(state)->node_count > node_index &&
         native_preflight_node(&evaluator, node_index, 0);
     if (!state->pending_positional_commit) {
-        state->pending_directory_commit = false;
-        state->pending_alias_commit = false;
-        state->pending_function_commit = false;
-        state->pending_command_cache_commit = false;
-        state->pending_job_service = false;
-        state->pending_exec_possible = false;
-        state->pending_exec_descriptor_count = 0;
-        state->pending_exec_protected_descriptor_count = 0;
+        clear_pending_native_commit(state);
         return false;
     }
-    state->pending_directory_commit =
-        evaluator.directory_mutation_possible;
-    state->pending_positional_commit =
-        evaluator.positional_mutation_possible;
-    state->pending_alias_commit = evaluator.alias_mutation_possible;
-    state->pending_function_commit = evaluator.function_mutation_possible;
-    state->pending_command_cache_commit =
-        evaluator.command_cache_mutation_possible;
-    state->pending_job_service = evaluator.job_service_possible;
-    state->pending_exec_possible = evaluator.exec_possible;
-    state->pending_exec_descriptor_count =
-        evaluator.exec_descriptor_count;
-    assert(state->pending_exec_descriptor_count <=
-           GSH_EXEC_DESCRIPTOR_COMMIT_CAP);
-    memcpy(state->pending_exec_descriptors, evaluator.exec_descriptors,
-           evaluator.exec_descriptor_count *
-               sizeof(evaluator.exec_descriptors[0]));
-    state->pending_exec_protected_descriptor_count =
-        evaluator.exec_protected_descriptor_count;
-    assert(state->pending_exec_protected_descriptor_count <=
-           GSH_EXEC_DESCRIPTOR_COMMIT_CAP);
-    memcpy(state->pending_exec_protected_descriptors,
-           evaluator.exec_protected_descriptors,
-           evaluator.exec_protected_descriptor_count *
-               sizeof(evaluator.exec_protected_descriptors[0]));
+    capture_pending_native_commit(state, &evaluator);
     return true;
 }
 
 static bool native_command_is_supported(shell_state *state)
 {
+    if (state == NULL) {
+        return false;
+    }
     return native_node_is_supported(state, state->pending_parse.root);
 }
 
@@ -14680,6 +18184,9 @@ enum { GSH_REACTOR_EVALUATION_BUDGET = 16 };
 
 static bool reactor_literal_word(const char *input, gsh_word_ref word)
 {
+    if (input == NULL) {
+        return false;
+    }
     size_t offset;
 
     for (offset = word.begin; offset < word.end; offset++) {
@@ -14697,6 +18204,9 @@ static bool reactor_literal_word(const char *input, gsh_word_ref word)
 static bool reactor_word_is(const char *input, gsh_word_ref word,
                             const char *text)
 {
+    if (input == NULL || text == NULL) {
+        return false;
+    }
     size_t length = strlen(text);
 
     return word.end - word.begin == length &&
@@ -14706,6 +18216,10 @@ static bool reactor_word_is(const char *input, gsh_word_ref word,
 static bool literal_command_word_is(const char *input, gsh_word_ref word,
                                     const char *text)
 {
+    if (text == NULL) return false;
+    if (input == NULL) {
+        return false;
+    }
     enum { QUOTE_NONE, QUOTE_SINGLE, QUOTE_DOUBLE } quote = QUOTE_NONE;
     size_t expected = 0;
     size_t offset;
@@ -14783,7 +18297,7 @@ static bool fallback_mentions_protected_builtin(const char *input,
 
     if (input == NULL) return false;
     gsh_lexer_init(&lexer, input, length);
-    for (;;) {
+    for (size_t step = 0; step <= GSH_PARSE_TOKEN_CAP; step++) {
         gsh_lex_status status = gsh_lexer_next(&lexer, &token);
 
         if (status != GSH_LEX_OK || token.kind == GSH_TOKEN_EOF) break;
@@ -14803,30 +18317,100 @@ static bool fallback_mentions_protected_builtin(const char *input,
     return false;
 }
 
-static bool reactor_safe_node(shell_state *state, size_t node_index,
-                              size_t depth, size_t *budget,
-                              bool *contains_for)
+static bool reactor_for_budget(shell_state *state,
+                               const gsh_ast_node *node,
+                               size_t body_budget, size_t *budget)
 {
-    const gsh_ast_node *node;
-    size_t child;
-    size_t total = 0;
+    if (node == NULL) return false;
+    if (budget == NULL || state == NULL) {
+        return false;
+    }
+    size_t iterations;
+    size_t index;
+    size_t maximum_value_length = 0U;
+    size_t old_length = 0U;
+    size_t new_length;
+    gsh_word_ref name;
+    bool is_set;
+    unsigned int attributes;
+    bool exists;
 
-    if (depth > 32U || node_index >= state->parse_storage->node_count) {
+    if ((node->flags & GSH_AST_FLAG_FOR_HAS_IN) == 0 ||
+        node->word_count == 0U || node->first_child == GSH_AST_NONE) {
         return false;
     }
-    node = &state->parse_storage->nodes[node_index];
+    name = state_parse_storage(state)->words[node->first_word];
+    exists = gsh_variables_get_state(
+        state->variables, state->pending_input + name.begin,
+        name.end - name.begin, &is_set, &attributes);
+    if (exists && (attributes & GSH_VARIABLE_READONLY) != 0) {
+        return false;
+    }
+    for (index = 1U; index < node->word_count; index++) {
+        gsh_word_ref item =
+            state_parse_storage(state)->words[node->first_word + index];
+        size_t length = item.end - item.begin;
+
+        if (length >= GSH_NATIVE_TEXT_CAP ||
+            !reactor_literal_word(state->pending_input, item)) {
+            return false;
+        }
+        if (length > maximum_value_length) {
+            maximum_value_length = length;
+        }
+    }
+    iterations = node->word_count - 1U;
+    if (iterations != 0U) {
+        size_t name_length = name.end - name.begin;
+
+        if (exists) {
+            bool found;
+            const char *value = gsh_variables_lookup(
+                state->variables, state->pending_input + name.begin,
+                name_length, &found);
+
+            if (value == NULL) {
+                return false;
+            }
+            old_length = name_length +
+                         (is_set && found ? strlen(value) : 0U) + 2U;
+        } else if (state_variables(state)->count == GSH_VARIABLE_CAP) {
+            return false;
+        }
+        new_length = name_length + maximum_value_length + 2U;
+        if (new_length > old_length + GSH_VARIABLE_TEXT_CAP -
+                                       state_variables(state)->text_used) {
+            return false;
+        }
+        if (body_budget + 1U >
+                (GSH_REACTOR_EVALUATION_BUDGET - 1U) / iterations) {
+            return false;
+        }
+    }
+    *budget = 1U + iterations * (body_budget + 1U);
+    return *budget <= GSH_REACTOR_EVALUATION_BUDGET;
+}
+
+static bool reactor_compute_node(shell_state *state, size_t node_index,
+                                 const size_t budgets[GSH_PARSE_NODE_CAP],
+                                 const bool valid[GSH_PARSE_NODE_CAP],
+                                 const bool nested_for[GSH_PARSE_NODE_CAP],
+                                 size_t *budget, bool *contains_for)
+{
+    if (budget == NULL || budgets == NULL || contains_for == NULL || nested_for == NULL || state == NULL || valid == NULL) {
+        return false;
+    }
+    const gsh_ast_node *node = &state_parse_storage(state)->nodes[node_index];
+    size_t child;
+    size_t total = 0U;
+    size_t visited = 0U;
+
     *contains_for = false;
-    if ((node->flags & GSH_AST_FLAG_ASYNC) != 0 ||
-        node->redirect_count != 0) {
-        return false;
-    }
     if (node->kind == GSH_AST_SIMPLE) {
         gsh_word_ref word;
 
-        if (node->word_count != 1U) {
-            return false;
-        }
-        word = state->parse_storage->words[node->first_word];
+        if (node->word_count != 1U) return false;
+        word = state_parse_storage(state)->words[node->first_word];
         if (!reactor_word_is(state->pending_input, word, ":") &&
             !reactor_word_is(state->pending_input, word, "true") &&
             !reactor_word_is(state->pending_input, word, "false")) {
@@ -14835,117 +18419,111 @@ static bool reactor_safe_node(shell_state *state, size_t node_index,
         *budget = 1U;
         return true;
     }
+    child = node->first_child;
     if (node->kind == GSH_AST_PIPELINE) {
-        if (node->first_child == GSH_AST_NONE ||
-            state->parse_storage->nodes[node->first_child].next_sibling !=
-                GSH_AST_NONE) {
+        if (child == GSH_AST_NONE ||
+            child >= state_parse_storage(state)->node_count || !valid[child] ||
+            state_parse_storage(state)->nodes[child].next_sibling != GSH_AST_NONE) {
             return false;
         }
-        return reactor_safe_node(state, node->first_child, depth + 1U,
-                                 budget, contains_for);
+        *budget = budgets[child];
+        *contains_for = nested_for[child];
+        return true;
     }
     if (node->kind == GSH_AST_FOR) {
-        size_t iterations;
-        size_t body_budget;
-        bool body_contains_for;
-        size_t index;
-        size_t maximum_value_length = 0;
-        size_t old_length = 0;
-        size_t new_length;
-        gsh_word_ref name;
-        bool is_set;
-        unsigned int attributes;
-        bool exists;
-
-        if ((node->flags & GSH_AST_FLAG_FOR_HAS_IN) == 0 ||
-            node->word_count == 0 || node->first_child == GSH_AST_NONE) {
+        if (child == GSH_AST_NONE ||
+            child >= state_parse_storage(state)->node_count || !valid[child]) {
             return false;
         }
-        name = state->parse_storage->words[node->first_word];
-        exists = gsh_variables_get_state(
-            state->variables, state->pending_input + name.begin,
-            name.end - name.begin, &is_set, &attributes);
-        if (exists && (attributes & GSH_VARIABLE_READONLY) != 0) {
-            return false;
-        }
-        for (index = 1U; index < node->word_count; index++) {
-            gsh_word_ref item = state->parse_storage
-                                    ->words[node->first_word + index];
-            size_t length = item.end - item.begin;
-
-            if (length >= GSH_NATIVE_TEXT_CAP ||
-                !reactor_literal_word(state->pending_input, item)) {
-                return false;
-            }
-            if (length > maximum_value_length) {
-                maximum_value_length = length;
-            }
-        }
-        iterations = node->word_count - 1U;
-        if (iterations != 0) {
-            size_t name_length = name.end - name.begin;
-
-            if (exists) {
-                bool found;
-                const char *value = gsh_variables_lookup(
-                    state->variables, state->pending_input + name.begin,
-                    name_length, &found);
-
-                if (value == NULL) {
-                    return false;
-                }
-                old_length = name_length +
-                             (is_set && found ? strlen(value) : 0U) + 2U;
-            } else if (state->variables->count == GSH_VARIABLE_CAP) {
-                return false;
-            }
-            new_length = name_length + maximum_value_length + 2U;
-            if (new_length > old_length + GSH_VARIABLE_TEXT_CAP -
-                                           state->variables->text_used) {
-                return false;
-            }
-        }
-        if (!reactor_safe_node(state, node->first_child, depth + 1U,
-                               &body_budget, &body_contains_for)) {
-            return false;
-        }
-        if (iterations != 0 &&
-            body_budget + 1U >
-                (GSH_REACTOR_EVALUATION_BUDGET - 1U) / iterations) {
-            return false;
-        }
-        *budget = 1U + iterations * (body_budget + 1U);
         *contains_for = true;
-        (void)body_contains_for;
-        return *budget <= GSH_REACTOR_EVALUATION_BUDGET;
+        return reactor_for_budget(state, node, budgets[child], budget);
     }
     if (node->kind != GSH_AST_PROGRAM && node->kind != GSH_AST_LIST &&
         node->kind != GSH_AST_AND_OR) {
         return false;
     }
-    child = node->first_child;
-    while (child != GSH_AST_NONE) {
-        size_t child_budget;
-        bool child_contains_for;
-
-        if (!reactor_safe_node(state, child, depth + 1U, &child_budget,
-                               &child_contains_for) ||
-            child_budget > GSH_REACTOR_EVALUATION_BUDGET - total) {
+    while (child != GSH_AST_NONE && visited < state_parse_storage(state)->node_count) {
+        if (child >= state_parse_storage(state)->node_count || !valid[child] ||
+            budgets[child] > GSH_REACTOR_EVALUATION_BUDGET - total) {
             return false;
         }
-        total += child_budget;
-        *contains_for = *contains_for || child_contains_for;
-        child = state->parse_storage->nodes[child].next_sibling;
+        total += budgets[child];
+        *contains_for = *contains_for || nested_for[child];
+        child = state_parse_storage(state)->nodes[child].next_sibling;
+        visited++;
     }
+    if (child != GSH_AST_NONE) return false;
     *budget = total;
-    return total != 0;
+    return total != 0U;
+}
+
+static bool reactor_safe_node(shell_state *state, size_t node_index,
+                              size_t *budget, bool *contains_for)
+{
+    if (budget == NULL || contains_for == NULL) {
+        return false;
+    }
+    typedef struct {
+        size_t node;
+        size_t next_child;
+        size_t depth;
+        bool entered;
+    } reactor_frame;
+    static reactor_frame frames[GSH_PARSE_NODE_CAP];
+    static size_t budgets[GSH_PARSE_NODE_CAP];
+    static bool nested_for[GSH_PARSE_NODE_CAP];
+    static bool valid[GSH_PARSE_NODE_CAP];
+    size_t frame_count = 1U;
+    size_t steps;
+
+    if (node_index >= state_parse_storage(state)->node_count) return false;
+    (void)memset(valid, 0, sizeof(valid));
+    frames[0] = (reactor_frame){node_index, GSH_AST_NONE, 0U, false};
+    for (steps = 0;
+         frame_count > 0U && steps < 2U * GSH_PARSE_NODE_CAP; steps++) {
+        reactor_frame *frame = &frames[frame_count - 1U];
+        const gsh_ast_node *node = &state_parse_storage(state)->nodes[frame->node];
+
+        if (!frame->entered) {
+            if (frame->depth > 32U ||
+                (node->flags & GSH_AST_FLAG_ASYNC) != 0 ||
+                node->redirect_count != 0U) return false;
+            frame->next_child = node->first_child;
+            frame->entered = true;
+        } else if (frame->next_child != GSH_AST_NONE) {
+            size_t child = frame->next_child;
+
+            if (child >= state_parse_storage(state)->node_count ||
+                frame_count == GSH_PARSE_NODE_CAP) return false;
+            frame->next_child =
+                node->kind == GSH_AST_PIPELINE || node->kind == GSH_AST_FOR
+                    ? GSH_AST_NONE
+                    : state_parse_storage(state)->nodes[child].next_sibling;
+            frames[frame_count] = (reactor_frame){
+                child, GSH_AST_NONE, frame->depth + 1U, false};
+            frame_count++;
+        } else {
+            valid[frame->node] = reactor_compute_node(
+                state, frame->node, budgets, valid, nested_for,
+                &budgets[frame->node], &nested_for[frame->node]);
+            if (!valid[frame->node]) return false;
+            frame_count--;
+        }
+    }
+    if (frame_count != 0U || !valid[node_index]) return false;
+    *budget = budgets[node_index];
+    *contains_for = nested_for[node_index];
+    return true;
 }
 
 static void initialize_interactive_evaluator(native_evaluator *evaluator,
                                              shell_state *state,
                                              gsh_variable_store *variables)
 {
-    memset(evaluator, 0, sizeof(*evaluator));
+    if (evaluator == NULL || state == NULL || variables == NULL) {
+        return;
+    }
+    (void)memset(evaluator, 0, sizeof(*evaluator));
     evaluator->exec_outcome_fd = -1;
     evaluator->exec_descriptor_socket = -1;
     evaluator->input = state->pending_input;
@@ -14993,7 +18571,10 @@ static void managed_pipeline_child(
     const sigset_t *previous, const gsh_native_pipeline *pipeline,
     const pipeline_expansion_scope *scope)
 {
-    native_evaluator evaluator;
+    if (pipeline == NULL || previous == NULL || pty == NULL || state == NULL) {
+        return;
+    }
+    native_evaluator evaluator = {0};
     gsh_background_table *backgrounds;
     gsh_shell_options options = state->options;
     char release;
@@ -15027,6 +18608,10 @@ static void managed_pipeline_parent(shell_state *state, managed_pty *pty,
                                     int gate_write, pid_t pid,
                                     const sigset_t *previous)
 {
+    if (state == NULL || pty == NULL) return;
+    if (previous == NULL) {
+        return;
+    }
     if (pid == -1 ||
         gsh_async_repl_attach(state->async_repl,
                               state->async_dispatch_cell, pid, pid,
@@ -15054,6 +18639,9 @@ static void start_async_native_pipeline(
     shell_state *state, const gsh_native_pipeline *pipeline,
     const pipeline_expansion_scope *scope)
 {
+    if (pipeline == NULL || state == NULL) {
+        return;
+    }
     managed_pty pty = {.master = -1, .slave_hold = -1};
     int gate[2] = {-1, -1};
     sigset_t blocked;
@@ -15061,12 +18649,12 @@ static void start_async_native_pipeline(
     pid_t pid;
 
     if (!gsh_background_has_capacity(&state->background_jobs)) {
-        output_text(state, "gsh: managed job registry full\r\n");
+        (void)output_text(state, "gsh: managed job registry full\r\n");
         state->mode = MODE_EDITOR;
         return;
     }
     if (open_managed_pty(&pty) == -1 ||
-        make_pipe(gate, false GSH_FAULT_ARGUMENT("job-pipe")) == -1) {
+        make_pipe(gate, false, GSH_FAULT_JOB_PIPE) == -1) {
         output_format(state, "gsh: managed pipeline: %s\r\n",
                       strerror(errno));
         if (pty.master >= 0) {
@@ -15078,8 +18666,8 @@ static void start_async_native_pipeline(
         state->mode = MODE_EDITOR;
         return;
     }
-    sigemptyset(&blocked);
-    sigaddset(&blocked, SIGCHLD);
+    (void)sigemptyset(&blocked);
+    (void)sigaddset(&blocked, SIGCHLD);
     if (sigprocmask(SIG_BLOCK, &blocked, &previous) == -1) {
         output_format(state, "gsh: managed pipeline mask: %s\r\n",
                       strerror(errno));
@@ -15108,21 +18696,21 @@ static bool native_pipeline_node_is_wait(const shell_state *state,
     const gsh_ast_node *pipeline_node;
     const gsh_ast_node *command;
 
-    if (pipeline >= state->parse_storage->node_count) {
+    if (pipeline >= state_parse_storage(state)->node_count) {
         return false;
     }
-    pipeline_node = &state->parse_storage->nodes[pipeline];
+    pipeline_node = &state_parse_storage(state)->nodes[pipeline];
     if (pipeline_node->kind != GSH_AST_PIPELINE ||
         pipeline_node->first_child == GSH_AST_NONE ||
-        state->parse_storage->nodes[pipeline_node->first_child].next_sibling !=
+        state_parse_storage(state)->nodes[pipeline_node->first_child].next_sibling !=
             GSH_AST_NONE) {
         return false;
     }
-    command = &state->parse_storage->nodes[pipeline_node->first_child];
+    command = &state_parse_storage(state)->nodes[pipeline_node->first_child];
     return command->kind == GSH_AST_SIMPLE && command->word_count != 0 &&
            literal_command_word_is(
                state->pending_input,
-               state->parse_storage->words[command->first_word], "wait");
+               state_parse_storage(state)->words[command->first_word], "wait");
 }
 
 static bool native_list_node_is_wait(const shell_state *state,
@@ -15131,17 +18719,17 @@ static bool native_list_node_is_wait(const shell_state *state,
     const gsh_ast_node *node;
     size_t pipeline;
 
-    if (node_index >= state->parse_storage->node_count) {
+    if (node_index >= state_parse_storage(state)->node_count) {
         return false;
     }
-    node = &state->parse_storage->nodes[node_index];
+    node = &state_parse_storage(state)->nodes[node_index];
     if (node->kind != GSH_AST_AND_OR) {
         return false;
     }
     pipeline = node->first_child;
     while (pipeline != GSH_AST_NONE) {
         const gsh_ast_node *pipeline_node =
-            &state->parse_storage->nodes[pipeline];
+            &state_parse_storage(state)->nodes[pipeline];
 
         if (native_pipeline_node_is_wait(state, pipeline)) {
             return true;
@@ -15154,14 +18742,17 @@ static bool native_list_node_is_wait(const shell_state *state,
 static bool wait_pipeline_has_substitution(const shell_state *state,
                                            size_t pipeline)
 {
+    if (state == NULL) {
+        return false;
+    }
     const gsh_ast_node *pipeline_node =
-        &state->parse_storage->nodes[pipeline];
+        &state_parse_storage(state)->nodes[pipeline];
     const gsh_ast_node *command =
-        &state->parse_storage->nodes[pipeline_node->first_child];
+        &state_parse_storage(state)->nodes[pipeline_node->first_child];
     size_t word_index;
 
     for (word_index = 1U; word_index < command->word_count; word_index++) {
-        gsh_word_ref word = state->parse_storage
+        gsh_word_ref word = state_parse_storage(state)
                                 ->words[command->first_word + word_index];
         enum { WAIT_QUOTE_NONE, WAIT_QUOTE_SINGLE, WAIT_QUOTE_DOUBLE } quote =
             WAIT_QUOTE_NONE;
@@ -15201,27 +18792,27 @@ static bool wait_pipeline_has_substitution(const shell_state *state,
 
 static bool start_list_wait(shell_state *state, size_t pipeline)
 {
-    native_evaluator evaluator;
-    pipeline_expansion_scope scope;
+    native_evaluator evaluator = {0};
+    pipeline_expansion_scope scope = {0};
     gsh_native_plan_status plan_status;
-    bool deferred_work;
-    bool scoped;
+    bool deferred_work = false;
+    bool scoped = false;
 
     if (wait_pipeline_has_substitution(state, pipeline)) {
-        output_text(state,
+        (void)output_text(state,
                     "gsh: wait expansion requires isolated continuation"
                     "\r\n");
         state->last_status = 125;
         return false;
     }
     initialize_interactive_evaluator(&evaluator, state, state->variables);
-    plan_status = plan_evaluator_pipeline(&evaluator, pipeline, false, &scope,
-                                          &scoped, &deferred_work);
+    plan_status = plan_evaluator_pipeline_preflight(
+        &evaluator, pipeline, &scope, &scoped, &deferred_work);
     if (plan_status != GSH_NATIVE_PLAN_OK || deferred_work || scoped ||
-        state->native_pipeline->command_count != 1 ||
-        !native_wait_builtin(&state->native_pipeline->commands[0]) ||
-        state->native_pipeline->commands[0].assignment_count != 0 ||
-        state->native_pipeline->commands[0].redirect_count != 0) {
+        state_native_pipeline(state)->command_count != 1 ||
+        !native_wait_builtin(&state_native_pipeline(state)->commands[0]) ||
+        state_native_pipeline(state)->commands[0].assignment_count != 0 ||
+        state_native_pipeline(state)->commands[0].redirect_count != 0) {
         state->last_status = plan_status == GSH_NATIVE_PLAN_ERROR ? 1 : 125;
         return false;
     }
@@ -15230,55 +18821,93 @@ static bool start_list_wait(shell_state *state, size_t pipeline)
     return true;
 }
 
+static bool register_background_node(
+    shell_state *state, pid_t pid, const char *command,
+    size_t command_length, const sigset_t *previous)
+{
+    uint32_t job_id;
+
+    if (!require(state != NULL && command != NULL && previous != NULL)) {
+        return false;
+    }
+    if (!require(command_length < GSH_BACKGROUND_COMMAND_CAP)) return false;
+    if (pid == -1) {
+        int saved_errno = errno;
+
+        (void)sigprocmask(SIG_SETMASK, previous, NULL);
+        output_format(state, "gsh: asynchronous fork: %s\r\n",
+                      strerror(saved_errno));
+        return false;
+    }
+    (void)setpgid(pid, pid);
+    if (gsh_background_add_job(
+            &state->background_jobs, pid, pid, &pid, 1U, command,
+            command_length, GSH_JOB_ORIGIN_ASYNC_LIST, &job_id) == -1) {
+        int saved_errno = errno;
+
+        (void)kill(-pid, SIGKILL);
+        (void)kill(pid, SIGKILL);
+        (void)sigprocmask(SIG_SETMASK, previous, NULL);
+        output_format(state, "gsh: asynchronous registry: %s\r\n",
+                      strerror(saved_errno));
+        return false;
+    }
+    state->last_background_pid = (long)pid;
+    state->last_status = 0;
+    output_format(state, "[%u] %ld\r\n", job_id, (long)pid);
+    (void)sigprocmask(SIG_SETMASK, previous, NULL);
+    return true;
+}
+
 static bool start_background_node(shell_state *state, size_t node_index)
 {
+    if (state == NULL) return false;
     const char *command;
     size_t command_length;
     sigset_t blocked;
     sigset_t previous;
     pid_t pid;
-    uint32_t job_id;
 
     if (!gsh_background_has_capacity(&state->background_jobs) ||
-        node_index >= state->parse_storage->node_count ||
+        node_index >= state_parse_storage(state)->node_count ||
         !bounded_job_command(
             state->pending_input, state->pending_input_length,
-            &state->parse_storage->nodes[node_index], &command,
+            &state_parse_storage(state)->nodes[node_index], &command,
             &command_length)) {
-        output_text(state, "gsh: asynchronous registry full\r\n");
+        (void)output_text(state, "gsh: asynchronous registry full\r\n");
         return false;
     }
-    sigemptyset(&blocked);
-    sigaddset(&blocked, SIGCHLD);
+    (void)sigemptyset(&blocked);
+    (void)sigaddset(&blocked, SIGCHLD);
     if (sigprocmask(SIG_BLOCK, &blocked, &previous) == -1) {
         output_format(state, "gsh: asynchronous sigprocmask: %s\r\n",
                       strerror(errno));
         return false;
     }
-    pid = fault_should_fail("async-fork", EAGAIN) ? -1 : fork();
+    pid = gsh_fault_should_fail(GSH_FAULT_ASYNC_FORK, EAGAIN) ? -1 : fork();
     if (pid == 0) {
-        native_evaluator evaluator;
+        native_evaluator evaluator = {0};
         gsh_background_table *child_backgrounds;
         int null_descriptor;
         int status;
 
-        memset(&evaluator, 0, sizeof(evaluator));
+        (void)memset(&evaluator, 0, sizeof(evaluator));
         evaluator.exec_outcome_fd = -1;
         evaluator.exec_descriptor_socket = -1;
         (void)setpgid(0, 0);
         reset_child_signals();
         (void)sigprocmask(SIG_SETMASK, &previous, NULL);
-        close(state->tty_fd);
-        close(state->signal_pipe[0]);
-        close(state->signal_pipe[1]);
+        (void)close(state->tty_fd);
+        (void)close(state->signal_pipe[0]);
+        (void)close(state->signal_pipe[1]);
         if (state->redirection_worker_fd >= 0) {
-            close(state->redirection_worker_fd);
+            (void)close(state->redirection_worker_fd);
         }
         if (state->variable_commit_fd >= 0) {
-            close(state->variable_commit_fd);
+            (void)close(state->variable_commit_fd);
         }
         if (state->directory_commit_socket >= 0) {
-            close(state->directory_commit_socket);
+            (void)close(state->directory_commit_socket);
         }
         null_descriptor = open("/dev/null", O_RDONLY);
         if (null_descriptor == -1 ||
@@ -15287,7 +18916,7 @@ static bool start_background_node(shell_state *state, size_t node_index)
             child_exec_error("asynchronous standard input", errno);
         }
         if (null_descriptor != STDIN_FILENO) {
-            close(null_descriptor);
+            (void)close(null_descriptor);
         }
         initialize_interactive_evaluator(&evaluator, state,
                                          state->variables);
@@ -15298,47 +18927,26 @@ static bool start_background_node(shell_state *state, size_t node_index)
         evaluator.backgrounds = child_backgrounds;
         evaluator.last_background_pid = 0;
         evaluator.static_for_items = false;
+        evaluator.suppress_async_once = true;
         evaluator.tail_exec_single =
             async_node_has_single_pipeline(&evaluator, node_index);
         status = native_evaluate_node_inner(&evaluator, node_index, 0);
         _exit(status & 255);
     }
-    if (pid == -1) {
-        int saved_errno = errno;
-
-        (void)sigprocmask(SIG_SETMASK, &previous, NULL);
-        output_format(state, "gsh: asynchronous fork: %s\r\n",
-                      strerror(saved_errno));
-        return false;
-    }
-    (void)setpgid(pid, pid);
-    if (gsh_background_add_job(
-            &state->background_jobs, pid, pid, &pid, 1U,
-            command, command_length, GSH_JOB_ORIGIN_ASYNC_LIST,
-            &job_id) == -1) {
-        int saved_errno = errno;
-
-        (void)kill(-pid, SIGKILL);
-        (void)kill(pid, SIGKILL);
-        (void)sigprocmask(SIG_SETMASK, &previous, NULL);
-        output_format(state, "gsh: asynchronous registry: %s\r\n",
-                      strerror(saved_errno));
-        return false;
-    }
-    state->last_background_pid = (long)pid;
-    state->last_status = 0;
-    output_format(state, "[%u] %ld\r\n", job_id, (long)pid);
-    (void)sigprocmask(SIG_SETMASK, &previous, NULL);
-    return true;
+    return register_background_node(state, pid, command, command_length,
+                                    &previous);
 }
 
 static void continue_native_and_or(shell_state *state)
 {
+    if (state == NULL) {
+        return;
+    }
     while (state->pending_and_or_active &&
            state->pending_and_or_next != GSH_AST_NONE) {
         size_t pipeline = state->pending_and_or_next;
         const gsh_ast_node *node =
-            &state->parse_storage->nodes[pipeline];
+            &state_parse_storage(state)->nodes[pipeline];
 
         state->pending_and_or_next = node->next_sibling;
         if ((node->connector == GSH_TOKEN_AND_IF &&
@@ -15348,7 +18956,7 @@ static void continue_native_and_or(shell_state *state)
             continue;
         }
         if (!native_node_is_supported(state, pipeline)) {
-            output_text(state,
+            (void)output_text(state,
                         "gsh: native AND-OR continuation unsupported\r\n");
             state->last_status = 125;
             state->pending_and_or_active = false;
@@ -15367,7 +18975,7 @@ static void continue_native_and_or(shell_state *state)
     state->pending_and_or_active = false;
     state->pending_and_or_next = GSH_AST_NONE;
     if (state->pending_list_active) {
-        continue_native_list(state);
+        state->mode = MODE_DISPATCH;
     } else {
         state->mode = MODE_EDITOR;
         queue_prompt(state);
@@ -15376,15 +18984,18 @@ static void continue_native_and_or(shell_state *state)
 
 static void continue_native_list(shell_state *state)
 {
+    if (state == NULL) {
+        return;
+    }
     while (state->pending_list_active &&
            state->pending_list_next != GSH_AST_NONE) {
         size_t node_index = state->pending_list_next;
         const gsh_ast_node *node =
-            &state->parse_storage->nodes[node_index];
+            &state_parse_storage(state)->nodes[node_index];
 
         state->pending_list_next = node->next_sibling;
         if (!native_node_is_supported(state, node_index)) {
-            output_text(state,
+            (void)output_text(state,
                         "gsh: native asynchronous continuation unsupported"
                         "\r\n");
             state->last_status = 125;
@@ -15400,7 +19011,7 @@ static void continue_native_list(shell_state *state)
         if (native_list_node_is_wait(state, node_index)) {
             state->pending_and_or_active = true;
             state->pending_and_or_next = node->first_child;
-            continue_native_and_or(state);
+            state->mode = MODE_DISPATCH;
             return;
         }
         state->mode = MODE_DISPATCH;
@@ -15415,10 +19026,13 @@ static void continue_native_list(shell_state *state)
 
 static size_t reactor_only_child(const shell_state *state, size_t node_index)
 {
-    size_t child = state->parse_storage->nodes[node_index].first_child;
+    if (state == NULL) {
+        return 0U;
+    }
+    size_t child = state_parse_storage(state)->nodes[node_index].first_child;
 
     return child != GSH_AST_NONE &&
-                   state->parse_storage->nodes[child].next_sibling ==
+                   state_parse_storage(state)->nodes[child].next_sibling ==
                        GSH_AST_NONE
                ? child
                : GSH_AST_NONE;
@@ -15427,13 +19041,17 @@ static size_t reactor_only_child(const shell_state *state, size_t node_index)
 static bool reactor_pure_status(const shell_state *state, size_t node_index,
                                 int *status)
 {
+    if (state == NULL || status == NULL) {
+        return false;
+    }
     bool negated = false;
     const gsh_ast_node *node;
+    size_t step;
 
-    for (;;) {
+    for (step = 0; step < AST_WALK_STEP_CAP; step++) {
         size_t child;
 
-        node = &state->parse_storage->nodes[node_index];
+        node = &state_parse_storage(state)->nodes[node_index];
         if (node->kind != GSH_AST_PROGRAM && node->kind != GSH_AST_LIST &&
             node->kind != GSH_AST_AND_OR && node->kind != GSH_AST_PIPELINE) {
             break;
@@ -15448,9 +19066,10 @@ static bool reactor_pure_status(const shell_state *state, size_t node_index,
         }
         node_index = child;
     }
+    if (step == AST_WALK_STEP_CAP) return false;
     if (node->kind == GSH_AST_SIMPLE && node->word_count == 1U) {
         gsh_word_ref word =
-            state->parse_storage->words[node->first_word];
+            state_parse_storage(state)->words[node->first_word];
         int value = reactor_word_is(state->pending_input, word, "false")
                         ? 1
                         : 0;
@@ -15464,13 +19083,17 @@ static bool reactor_pure_status(const shell_state *state, size_t node_index,
 static bool reactor_reduce_for(shell_state *state, size_t node_index,
                                int *status)
 {
+    if (state == NULL) {
+        return false;
+    }
     const gsh_ast_node *node;
     size_t child;
     gsh_word_ref name;
     gsh_word_ref value;
+    size_t step;
 
-    for (;;) {
-        node = &state->parse_storage->nodes[node_index];
+    for (step = 0; step < AST_WALK_STEP_CAP; step++) {
+        node = &state_parse_storage(state)->nodes[node_index];
         if (node->kind != GSH_AST_PROGRAM && node->kind != GSH_AST_LIST &&
             node->kind != GSH_AST_AND_OR && node->kind != GSH_AST_PIPELINE) {
             break;
@@ -15485,6 +19108,7 @@ static bool reactor_reduce_for(shell_state *state, size_t node_index,
         }
         node_index = child;
     }
+    if (step == AST_WALK_STEP_CAP) return false;
     if (node->kind != GSH_AST_FOR ||
         (node->flags & GSH_AST_FLAG_FOR_HAS_IN) == 0 ||
         !reactor_pure_status(state, node->first_child, status)) {
@@ -15494,8 +19118,8 @@ static bool reactor_reduce_for(shell_state *state, size_t node_index,
         *status = 0;
         return true;
     }
-    name = state->parse_storage->words[node->first_word];
-    value = state->parse_storage->words[node->first_word +
+    name = state_parse_storage(state)->words[node->first_word];
+    value = state_parse_storage(state)->words[node->first_word +
                                         node->word_count - 1U];
     if (gsh_variables_set(state->variables,
                           state->pending_input + name.begin,
@@ -15512,13 +19136,13 @@ static bool reactor_reduce_for(shell_state *state, size_t node_index,
 
 static bool try_native_reactor_compound(shell_state *state)
 {
-    native_evaluator evaluator;
+    native_evaluator evaluator = {0};
     size_t budget;
     bool contains_for;
     int status;
 
-    if (fault_injection_active() ||
-        !reactor_safe_node(state, 0, 0, &budget, &contains_for) ||
+    if (gsh_fault_active() ||
+        !reactor_safe_node(state, 0, &budget, &contains_for) ||
         !contains_for) {
         return false;
     }
@@ -15554,24 +19178,24 @@ _Static_assert(sizeof(gsh_function_store) <= GSH_STATE_COMMIT_IO_BOUND,
                "function commit exceeds the bounded writer");
 
 static int write_commit_bytes(int descriptor, const void *source,
-                              size_t length GSH_FAULT_PARAMETER(fault))
+                              size_t length, gsh_fault_point fault)
 {
+    if (source == NULL) {
+        return -1;
+    }
     const unsigned char *cursor = source;
     size_t remaining = length;
     size_t attempts;
 
-    if (descriptor < 0 || source == NULL ||
-#ifdef GSH_FAULT_INJECTION
-        fault == NULL ||
-#endif
-        length > GSH_STATE_COMMIT_IO_BOUND) {
+    if (descriptor < 0 || source == NULL || fault <= GSH_FAULT_NONE ||
+        fault >= GSH_FAULT_COUNT || length > GSH_STATE_COMMIT_IO_BOUND) {
         errno = EINVAL;
         return -1;
     }
     for (attempts = 0;
          remaining != 0 && attempts < GSH_STATE_COMMIT_IO_BOUND;
          attempts++) {
-        ssize_t written = fault_should_fail(fault, EIO)
+        ssize_t written = gsh_fault_should_fail(fault, EIO)
                               ? -1
                               : write(descriptor, cursor, remaining);
 
@@ -15602,11 +19226,11 @@ static int write_function_commit(int descriptor,
         return 0;
     }
     gsh_functions_snapshot_header(functions, generation, &header);
-    if (fault_should_fail("function-commit-malformed", EPROTO)) {
+    if (gsh_fault_should_fail(GSH_FAULT_FUNCTION_COMMIT_MALFORMED, EPROTO)) {
         header.reserved = 1;
     }
-    if (write_commit_bytes(descriptor, &header, sizeof(header)
-                           GSH_FAULT_ARGUMENT("state-commit-write")) == -1) {
+    if (write_commit_bytes(descriptor, &header, sizeof(header),
+                           GSH_FAULT_STATE_COMMIT_WRITE) == -1) {
         return -1;
     }
     total = gsh_functions_snapshot_payload_size(&header);
@@ -15621,9 +19245,8 @@ static int write_function_commit(int descriptor,
             errno = EPROTO;
             return -1;
         }
-        if (write_commit_bytes(
-                descriptor, source, available
-                GSH_FAULT_ARGUMENT("function-commit-write")) == -1) {
+        if (write_commit_bytes(descriptor, source, available,
+                               GSH_FAULT_FUNCTION_COMMIT_WRITE) == -1) {
             return -1;
         }
         offset += available;
@@ -15642,25 +19265,28 @@ static void inject_state_commit_faults(
     command_cache_commit_header *cache_header,
     const gsh_shell_options *options, state_control_commit *control)
 {
-    if (fault_should_fail("state-commit-malformed", EPROTO)) {
+    if (cache_header == NULL || control == NULL || journal == NULL || options == NULL) {
+        return;
+    }
+    if (gsh_fault_should_fail(GSH_FAULT_STATE_COMMIT_MALFORMED, EPROTO)) {
         journal->version++;
     }
     if (positionals != NULL &&
-        fault_should_fail("positional-commit-malformed", EPROTO)) {
+        gsh_fault_should_fail(GSH_FAULT_POSITIONAL_COMMIT_MALFORMED, EPROTO)) {
         ((gsh_positional_store *)positionals)->version++;
     }
     if (alias_journal != NULL &&
-        fault_should_fail("alias-commit-malformed", EPROTO)) {
+        gsh_fault_should_fail(GSH_FAULT_ALIAS_COMMIT_MALFORMED, EPROTO)) {
         alias_journal->version++;
     }
-    if (fault_should_fail("option-commit-malformed", EPROTO)) {
+    if (gsh_fault_should_fail(GSH_FAULT_OPTION_COMMIT_MALFORMED, EPROTO)) {
         ((gsh_shell_options *)options)->enabled |= 1U << 29;
     }
     if (command_cache != NULL &&
-        fault_should_fail("command-cache-commit-malformed", EPROTO)) {
+        gsh_fault_should_fail(GSH_FAULT_COMMAND_CACHE_COMMIT_MALFORMED, EPROTO)) {
         cache_header->reserved = 1U;
     }
-    if (fault_should_fail("state-control-commit-malformed", EPROTO)) {
+    if (gsh_fault_should_fail(GSH_FAULT_STATE_CONTROL_COMMIT_MALFORMED, EPROTO)) {
         control->reserved = 1U;
     }
 }
@@ -15674,6 +19300,9 @@ static int write_variable_commit(
     const gsh_shell_options *options, bool exiting, int exit_status,
     const gsh_function_store *functions, uint64_t function_generation)
 {
+    if (journal == NULL || options == NULL) {
+        return -1;
+    }
     command_cache_commit_header cache_header = {
         GSH_COMMAND_CACHE_COMMIT_VERSION, 0,
         command_cache_generation, final_path_generation};
@@ -15701,9 +19330,8 @@ static int write_variable_commit(
                                &control);
     for (part = 0; part < GSH_STATE_COMMIT_PART_CAP; part++) {
         if (parts[part] != NULL &&
-            write_commit_bytes(
-                descriptor, parts[part], lengths[part]
-                GSH_FAULT_ARGUMENT("state-commit-write")) == -1) {
+            write_commit_bytes(descriptor, parts[part], lengths[part],
+                               GSH_FAULT_STATE_COMMIT_WRITE) == -1) {
             return -1;
         }
     }
@@ -15715,6 +19343,10 @@ static int build_exec_descriptor_commit(
     const native_evaluator *evaluator, exec_descriptor_commit *commit,
     int rights[GSH_EXEC_DESCRIPTOR_COMMIT_CAP])
 {
+    if (evaluator == NULL) return -1;
+    if (commit == NULL || rights == NULL) {
+        return -1;
+    }
     size_t index;
 
     if (evaluator->exec_descriptor_count >
@@ -15722,9 +19354,7 @@ static int build_exec_descriptor_commit(
         errno = EOVERFLOW;
         return -1;
     }
-    assert(evaluator->exec_descriptor_count <=
-           GSH_EXEC_DESCRIPTOR_COMMIT_CAP);
-    memset(commit, 0, sizeof(*commit));
+    (void)memset(commit, 0, sizeof(*commit));
     commit->version = GSH_EXEC_DESCRIPTOR_COMMIT_VERSION;
     commit->count = (uint32_t)evaluator->exec_descriptor_count;
     for (index = 0; index < evaluator->exec_descriptor_count; index++) {
@@ -15744,6 +19374,7 @@ static int build_exec_descriptor_commit(
 static int send_exec_descriptor_commit(
     int socket, const native_evaluator *evaluator)
 {
+    if (evaluator == NULL) return -1;
     exec_descriptor_commit commit;
     int rights[GSH_EXEC_DESCRIPTOR_COMMIT_CAP];
     unsigned char control[
@@ -15758,7 +19389,7 @@ static int send_exec_descriptor_commit(
     if (build_exec_descriptor_commit(evaluator, &commit, rights) == -1) {
         return -1;
     }
-    memset(&message, 0, sizeof(message));
+    (void)memset(&message, 0, sizeof(message));
     message.msg_iov = &payload;
     message.msg_iovlen = 1;
     if (commit.open_count != 0) {
@@ -15766,18 +19397,18 @@ static int send_exec_descriptor_commit(
         size_t control_size =
             CMSG_SPACE(sizeof(int) * commit.open_count);
 
-        memset(control, 0, control_size);
+        (void)memset(control, 0, control_size);
         message.msg_control = control;
         message.msg_controllen = control_size;
         header = CMSG_FIRSTHDR(&message);
         header->cmsg_level = SOL_SOCKET;
         header->cmsg_type = SCM_RIGHTS;
         header->cmsg_len = CMSG_LEN(sizeof(int) * commit.open_count);
-        memcpy(CMSG_DATA(header), rights,
+        (void)memcpy(CMSG_DATA(header), rights,
                sizeof(int) * commit.open_count);
     }
     for (attempts = 0; attempts < 16U; attempts++) {
-        ssize_t sent = fault_should_fail("exec-descriptor-send", EIO)
+        ssize_t sent = gsh_fault_should_fail(GSH_FAULT_EXEC_DESCRIPTOR_SEND, EIO)
                            ? -1
                            : sendmsg(socket, &message, 0);
 
@@ -15796,6 +19427,9 @@ static int send_exec_descriptor_commit(
 
 static void abandon_pending_list(shell_state *state)
 {
+    if (state == NULL) {
+        return;
+    }
     state->pending_list_active = false;
     state->pending_list_next = GSH_AST_NONE;
     state->pending_and_or_active = false;
@@ -15809,6 +19443,9 @@ static void abandon_pending_list(shell_state *state)
 static bool pending_exec_protects_descriptor(const shell_state *state,
                                              int descriptor)
 {
+    if (state == NULL) {
+        return false;
+    }
     size_t index;
 
     for (index = 0;
@@ -15825,6 +19462,9 @@ static int protect_exec_transaction_descriptors(
     const shell_state *state, int gate[2], int commit[2], int directory[2],
     int outcome[2], int descriptors[2], int job_service[2])
 {
+    if (commit == NULL || descriptors == NULL || directory == NULL || gate == NULL || job_service == NULL || outcome == NULL) {
+        return -1;
+    }
     int *child_descriptors[] = {
         &gate[0], &commit[1], &directory[1], &outcome[1], &descriptors[1],
         &job_service[1]};
@@ -15832,20 +19472,22 @@ static int protect_exec_transaction_descriptors(
     size_t reservation_count = 0;
     size_t index;
 
-    assert(state->pending_exec_protected_descriptor_count <=
-           GSH_EXEC_DESCRIPTOR_COMMIT_CAP);
+    if (state == NULL || state->pending_exec_protected_descriptor_count >
+                             GSH_EXEC_DESCRIPTOR_COMMIT_CAP) return -1;
     for (index = 0;
          index < sizeof(child_descriptors) / sizeof(child_descriptors[0]);
          index++) {
         int *descriptor = child_descriptors[index];
+        size_t attempt;
 
         if (*descriptor < 0 ||
             !pending_exec_protects_descriptor(state, *descriptor)) {
             continue;
         }
-        for (;;) {
+        for (attempt = 0; attempt <= GSH_EXEC_DESCRIPTOR_COMMIT_CAP;
+             attempt++) {
             int duplicate =
-                fault_should_fail("transaction-descriptor-relocation",
+                gsh_fault_should_fail(GSH_FAULT_TRANSACTION_DESCRIPTOR_RELOCATION,
                                   EMFILE)
                     ? -1
                     : fcntl(*descriptor, F_DUPFD_CLOEXEC,
@@ -15856,275 +19498,247 @@ static int protect_exec_transaction_descriptors(
                 return -1;
             }
             if (!pending_exec_protects_descriptor(state, duplicate)) {
-                close(*descriptor);
+                (void)close(*descriptor);
                 *descriptor = duplicate;
                 break;
             }
             if (reservation_count == GSH_EXEC_DESCRIPTOR_COMMIT_CAP) {
-                close(duplicate);
+                (void)close(duplicate);
                 close_exec_commit_fds(reservations, reservation_count);
                 errno = EMFILE;
                 return -1;
             }
             reservations[reservation_count++] = duplicate;
         }
+        if (attempt > GSH_EXEC_DESCRIPTOR_COMMIT_CAP) {
+            close_exec_commit_fds(reservations, reservation_count);
+            errno = EMFILE;
+            return -1;
+        }
     }
     close_exec_commit_fds(reservations, reservation_count);
     return 0;
 }
 
-static void start_native_compound(shell_state *state, size_t node_index)
-{
+typedef struct {
     int gate[2];
-    int commit[2] = {-1, -1};
-    int directory[2] = {-1, -1};
-    int exec_outcome[2] = {-1, -1};
-    int exec_descriptors[2] = {-1, -1};
-    int job_service[2] = {-1, -1};
-    managed_pty pty = {.master = -1, .slave_hold = -1};
-    bool managed = state->async_repl != NULL && state->async_repl->enabled;
-    sigset_t blocked;
+    int commit[2];
+    int directory[2];
+    int exec_outcome[2];
+    int exec_descriptors[2];
+    int job_service[2];
+    managed_pty pty;
+    bool managed;
+    bool signals_blocked;
     sigset_t previous;
     struct tms owner_times;
-    bool owner_times_valid = false;
+    bool owner_times_valid;
     pid_t pid;
+} compound_launch;
 
+static void initialize_compound_launch(compound_launch *launch,
+                                       bool managed)
+{
+    if (!require(launch != NULL)) return;
+    (void)memset(launch, 0, sizeof(*launch));
+    launch->gate[0] = launch->gate[1] = -1;
+    launch->commit[0] = launch->commit[1] = -1;
+    launch->directory[0] = launch->directory[1] = -1;
+    launch->exec_outcome[0] = launch->exec_outcome[1] = -1;
+    launch->exec_descriptors[0] = launch->exec_descriptors[1] = -1;
+    launch->job_service[0] = launch->job_service[1] = -1;
+    launch->pty.master = -1;
+    launch->pty.slave_hold = -1;
+    launch->managed = managed;
+    launch->pid = -1;
+}
+
+static void close_compound_pair(int descriptors[2])
+{
+    if (!require(descriptors != NULL)) return;
+    if (!require(descriptors[0] >= -1 && descriptors[1] >= -1)) return;
+    if (descriptors[0] >= 0) (void)close(descriptors[0]);
+    if (descriptors[1] >= 0) (void)close(descriptors[1]);
+    descriptors[0] = -1;
+    descriptors[1] = -1;
+}
+
+static void close_compound_channels(compound_launch *launch)
+{
+    if (!require(launch != NULL)) return;
+    if (!require(launch->pty.master >= -1)) return;
+    close_compound_pair(launch->gate);
+    close_compound_pair(launch->commit);
+    close_compound_pair(launch->directory);
+    close_compound_pair(launch->exec_outcome);
+    close_compound_pair(launch->exec_descriptors);
+    close_compound_pair(launch->job_service);
+    if (launch->pty.master >= 0) (void)close(launch->pty.master);
+    if (launch->pty.slave_hold >= 0) (void)close(launch->pty.slave_hold);
+    launch->pty.master = -1;
+    launch->pty.slave_hold = -1;
+}
+
+static void clear_compound_expectations(shell_state *state)
+{
+    if (!require(state != NULL)) return;
+    if (!require(state->pending_exec_descriptor_count <=
+                 GSH_EXEC_DESCRIPTOR_COMMIT_CAP)) {
+        state->pending_exec_descriptor_count = 0U;
+    }
+    state->positional_commit_expected = false;
+    state->pending_positional_commit = false;
+    state->alias_commit_expected = false;
+    state->pending_alias_commit = false;
+    state->function_commit_expected = false;
+    state->pending_function_commit = false;
+    state->command_cache_commit_expected = false;
+    state->pending_command_cache_commit = false;
+    state->directory_commit_expected = false;
+    state->pending_directory_commit = false;
+    state->pending_exec_possible = false;
+    state->pending_job_service = false;
+}
+
+static void reject_compound_start(shell_state *state,
+                                  compound_launch *launch,
+                                  const char *operation, int error)
+{
+    if (!require(state != NULL && launch != NULL)) return;
+    if (!require(operation != NULL)) return;
+    close_compound_channels(launch);
+    if (launch->signals_blocked) {
+        (void)sigprocmask(SIG_SETMASK, &launch->previous, NULL);
+        launch->signals_blocked = false;
+    }
+    clear_compound_expectations(state);
+    output_format(state, "gsh: %s: %s\r\n", operation, strerror(error));
+    abandon_pending_list(state);
+    state->mode = MODE_EDITOR;
+    queue_prompt(state);
+}
+
+static bool compound_capacity_is_available(shell_state *state)
+{
+    if (!require(state != NULL)) return false;
+    if (!require(state->mode == MODE_DISPATCH)) return false;
     if (state->current_job.active) {
-        output_text(state,
+        (void)output_text(state,
                     "gsh: this MVP supports one job at a time; use fg or wait "
                     "for it\r\n");
-        abandon_pending_list(state);
-        state->mode = MODE_EDITOR;
-        queue_prompt(state);
-        return;
-    }
-    if (!gsh_background_has_capacity(&state->background_jobs)) {
-        output_text(state, "gsh: job registry full\r\n");
-        abandon_pending_list(state);
-        state->mode = MODE_EDITOR;
-        queue_prompt(state);
-        return;
-    }
-    if (state->pending_alias_commit &&
-        ensure_alias_state(state, true) == -1) {
+    } else if (!gsh_background_has_capacity(&state->background_jobs)) {
+        (void)output_text(state, "gsh: job registry full\r\n");
+    } else if (state->pending_alias_commit &&
+               ensure_alias_state(state, true) == -1) {
         output_format(state, "gsh: alias transaction allocation: %s\r\n",
                       strerror(errno));
         state->pending_alias_commit = false;
-        abandon_pending_list(state);
-        state->mode = MODE_EDITOR;
-        queue_prompt(state);
-        return;
-    }
-    if (state->pending_function_commit &&
-        ensure_function_state(state, true) == -1) {
+    } else if (state->pending_function_commit &&
+               ensure_function_state(state, true) == -1) {
         output_format(state, "gsh: function transaction allocation: %s\r\n",
                       strerror(errno));
         state->pending_function_commit = false;
-        abandon_pending_list(state);
-        state->mode = MODE_EDITOR;
-        queue_prompt(state);
-        return;
+    } else {
+        return true;
     }
-    if (make_pipe(gate, false GSH_FAULT_ARGUMENT("evaluator-gate")) == -1) {
-        output_format(state, "gsh: evaluator gate: %s\r\n",
-                      strerror(errno));
-        abandon_pending_list(state);
-        state->mode = MODE_EDITOR;
-        queue_prompt(state);
-        return;
-    }
-    if (make_pipe(commit, false
-                  GSH_FAULT_ARGUMENT("state-commit-pipe")) == -1 ||
-        set_fd_flags(commit[0], F_GETFL, O_NONBLOCK) == -1) {
-        int saved_errno = errno;
+    abandon_pending_list(state);
+    state->mode = MODE_EDITOR;
+    queue_prompt(state);
+    return false;
+}
 
-        close(gate[0]);
-        close(gate[1]);
-        if (commit[0] >= 0) {
-            close(commit[0]);
-            close(commit[1]);
-        }
-        output_format(state, "gsh: state transaction pipe: %s\r\n",
-                      strerror(saved_errno));
-        abandon_pending_list(state);
-        state->mode = MODE_EDITOR;
-        queue_prompt(state);
-        return;
+static int create_compound_socket(int descriptors[2],
+                                  gsh_fault_point fault_point)
+{
+    if (!require(descriptors != NULL)) return -1;
+    if (!require(fault_point > GSH_FAULT_NONE &&
+                 fault_point < GSH_FAULT_COUNT)) return -1;
+    if (gsh_fault_should_fail(fault_point, EMFILE) ||
+        socketpair(AF_UNIX, SOCK_DGRAM, 0, descriptors) == -1 ||
+        set_fd_flags(descriptors[0], F_GETFL, O_NONBLOCK) == -1 ||
+        set_fd_flags(descriptors[0], F_GETFD, FD_CLOEXEC) == -1 ||
+        set_fd_flags(descriptors[1], F_GETFD, FD_CLOEXEC) == -1) {
+        return -1;
+    }
+    return 0;
+}
+
+static bool create_compound_channels(shell_state *state,
+                                     compound_launch *launch)
+{
+    if (!require(state != NULL)) return false;
+    if (!require(launch != NULL)) return false;
+    if (make_pipe(launch->gate, false, GSH_FAULT_EVALUATOR_GATE) == -1) {
+        reject_compound_start(state, launch, "evaluator gate", errno);
+        return false;
+    }
+    if (make_pipe(launch->commit, false, GSH_FAULT_STATE_COMMIT_PIPE) == -1 ||
+        set_fd_flags(launch->commit[0], F_GETFL, O_NONBLOCK) == -1) {
+        reject_compound_start(state, launch, "state transaction pipe",
+                              errno);
+        return false;
     }
     state->directory_commit_expected = state->pending_directory_commit;
     if (state->directory_commit_expected &&
-        (fault_should_fail("directory-commit-socket", EMFILE) ||
-         socketpair(AF_UNIX, SOCK_DGRAM, 0, directory) == -1 ||
-         set_fd_flags(directory[0], F_GETFL, O_NONBLOCK) == -1 ||
-         set_fd_flags(directory[0], F_GETFD, FD_CLOEXEC) == -1 ||
-         set_fd_flags(directory[1], F_GETFD, FD_CLOEXEC) == -1)) {
-        int saved_errno = errno;
-
-        close(gate[0]);
-        close(gate[1]);
-        close(commit[0]);
-        close(commit[1]);
-        if (directory[0] >= 0) {
-            close(directory[0]);
-            close(directory[1]);
-        }
-        state->directory_commit_expected = false;
-        state->pending_directory_commit = false;
-        output_format(state, "gsh: directory transaction socket: %s\r\n",
-                      strerror(saved_errno));
-        abandon_pending_list(state);
-        state->mode = MODE_EDITOR;
-        queue_prompt(state);
-        return;
+        create_compound_socket(launch->directory,
+                               GSH_FAULT_DIRECTORY_COMMIT_SOCKET) == -1) {
+        reject_compound_start(state, launch,
+                              "directory transaction socket", errno);
+        return false;
     }
     if (state->pending_exec_possible &&
-        make_pipe(exec_outcome, false
-                  GSH_FAULT_ARGUMENT("exec-outcome-pipe")) == -1) {
-        int saved_errno = errno;
-
-        close(gate[0]);
-        close(gate[1]);
-        close(commit[0]);
-        close(commit[1]);
-        if (directory[0] >= 0) {
-            close(directory[0]);
-            close(directory[1]);
-        }
-        state->pending_exec_possible = false;
-        output_format(state, "gsh: exec outcome pipe: %s\r\n",
-                      strerror(saved_errno));
-        abandon_pending_list(state);
-        state->mode = MODE_EDITOR;
-        queue_prompt(state);
-        return;
+        make_pipe(launch->exec_outcome, false,
+                  GSH_FAULT_EXEC_OUTCOME_PIPE) == -1) {
+        reject_compound_start(state, launch, "exec outcome pipe", errno);
+        return false;
     }
     if (state->pending_exec_possible &&
-        (fault_should_fail("exec-descriptor-socket", EMFILE) ||
-         socketpair(AF_UNIX, SOCK_DGRAM, 0, exec_descriptors) == -1 ||
-         set_fd_flags(exec_descriptors[0], F_GETFL, O_NONBLOCK) == -1 ||
-         set_fd_flags(exec_descriptors[0], F_GETFD, FD_CLOEXEC) == -1 ||
-         set_fd_flags(exec_descriptors[1], F_GETFD, FD_CLOEXEC) == -1)) {
-        int saved_errno = errno;
-
-        close(gate[0]);
-        close(gate[1]);
-        close(commit[0]);
-        close(commit[1]);
-        if (directory[0] >= 0) {
-            close(directory[0]);
-            close(directory[1]);
-        }
-        close(exec_outcome[0]);
-        close(exec_outcome[1]);
-        if (exec_descriptors[0] >= 0) {
-            close(exec_descriptors[0]);
-            close(exec_descriptors[1]);
-        }
-        state->pending_exec_possible = false;
-        output_format(state, "gsh: exec descriptor socket: %s\r\n",
-                      strerror(saved_errno));
-        abandon_pending_list(state);
-        state->mode = MODE_EDITOR;
-        queue_prompt(state);
-        return;
+        create_compound_socket(launch->exec_descriptors,
+                               GSH_FAULT_EXEC_DESCRIPTOR_SOCKET) == -1) {
+        reject_compound_start(state, launch, "exec descriptor socket",
+                              errno);
+        return false;
     }
     if (state->pending_job_service &&
-        (fault_should_fail("job-service-socket", EMFILE) ||
-         socketpair(AF_UNIX, SOCK_DGRAM, 0, job_service) == -1 ||
-         set_fd_flags(job_service[0], F_GETFL, O_NONBLOCK) == -1 ||
-         set_fd_flags(job_service[0], F_GETFD, FD_CLOEXEC) == -1 ||
-         set_fd_flags(job_service[1], F_GETFD, FD_CLOEXEC) == -1)) {
-        int saved_errno = errno;
-
-        close(gate[0]);
-        close(gate[1]);
-        close(commit[0]);
-        close(commit[1]);
-        if (directory[0] >= 0) {
-            close(directory[0]);
-            close(directory[1]);
-        }
-        if (exec_outcome[0] >= 0) {
-            close(exec_outcome[0]);
-            close(exec_outcome[1]);
-        }
-        if (exec_descriptors[0] >= 0) {
-            close(exec_descriptors[0]);
-            close(exec_descriptors[1]);
-        }
-        if (job_service[0] >= 0) {
-            close(job_service[0]);
-            close(job_service[1]);
-        }
-        output_format(state, "gsh: job service socket: %s\r\n",
-                      strerror(saved_errno));
-        abandon_pending_list(state);
-        state->mode = MODE_EDITOR;
-        queue_prompt(state);
-        return;
+        create_compound_socket(launch->job_service,
+                               GSH_FAULT_JOB_SERVICE_SOCKET) == -1) {
+        reject_compound_start(state, launch, "job service socket", errno);
+        return false;
     }
     if (state->pending_exec_possible &&
         protect_exec_transaction_descriptors(
-            state, gate, commit, directory, exec_outcome,
-            exec_descriptors, job_service) == -1) {
-        int saved_errno = errno;
-
-        close(gate[0]);
-        close(gate[1]);
-        close(commit[0]);
-        close(commit[1]);
-        if (directory[0] >= 0) {
-            close(directory[0]);
-            close(directory[1]);
-        }
-        close(exec_outcome[0]);
-        close(exec_outcome[1]);
-        close(exec_descriptors[0]);
-        close(exec_descriptors[1]);
-        if (job_service[0] >= 0) {
-            close(job_service[0]);
-            close(job_service[1]);
-        }
-        state->pending_exec_possible = false;
-        output_format(state, "gsh: exec descriptor protection: %s\r\n",
-                      strerror(saved_errno));
-        abandon_pending_list(state);
-        state->mode = MODE_EDITOR;
-        queue_prompt(state);
-        return;
+            state, launch->gate, launch->commit, launch->directory,
+            launch->exec_outcome, launch->exec_descriptors,
+            launch->job_service) == -1) {
+        reject_compound_start(state, launch,
+                              "exec descriptor protection", errno);
+        return false;
     }
-    sigemptyset(&blocked);
-    sigaddset(&blocked, SIGCHLD);
-    if (sigprocmask(SIG_BLOCK, &blocked, &previous) == -1) {
-        close(gate[0]);
-        close(gate[1]);
-        close(commit[0]);
-        close(commit[1]);
-        if (directory[0] >= 0) {
-            close(directory[0]);
-            close(directory[1]);
-        }
-        if (exec_outcome[0] >= 0) {
-            close(exec_outcome[0]);
-            close(exec_outcome[1]);
-        }
-        if (exec_descriptors[0] >= 0) {
-            close(exec_descriptors[0]);
-            close(exec_descriptors[1]);
-        }
-        if (job_service[0] >= 0) {
-            close(job_service[0]);
-            close(job_service[1]);
-        }
-        state->directory_commit_expected = false;
-        state->pending_directory_commit = false;
-        output_format(state, "gsh: sigprocmask: %s\r\n", strerror(errno));
-        abandon_pending_list(state);
-        state->mode = MODE_EDITOR;
-        queue_prompt(state);
-        return;
-    }
+    return true;
+}
 
+static bool block_compound_signals(shell_state *state,
+                                   compound_launch *launch)
+{
+    sigset_t blocked;
+
+    if (!require(state != NULL)) return false;
+    if (!require(launch != NULL)) return false;
+    (void)sigemptyset(&blocked);
+    (void)sigaddset(&blocked, SIGCHLD);
+    if (sigprocmask(SIG_BLOCK, &blocked, &launch->previous) == -1) {
+        reject_compound_start(state, launch, "sigprocmask", errno);
+        return false;
+    }
+    launch->signals_blocked = true;
+    return true;
+}
+
+static bool initialize_compound_commits(shell_state *state,
+                                        compound_launch *launch)
+{
+    if (!require(state != NULL)) return false;
+    if (!require(launch != NULL && launch->signals_blocked)) return false;
     gsh_variable_journal_initialize(state->variable_commit,
                                     state->variable_generation);
     state->alias_commit_expected = state->pending_alias_commit;
@@ -16134,361 +19748,372 @@ static void start_native_compound(shell_state *state, size_t node_index)
     }
     state->function_commit_expected = state->pending_function_commit;
     state->function_commit_header_complete = false;
-    memset(&state->function_commit_header, 0,
+    (void)memset(&state->function_commit_header, 0,
            sizeof(state->function_commit_header));
     state->command_cache_commit_expected =
         state->pending_command_cache_commit;
-    memset(&state->command_cache_commit_header, 0,
+    (void)memset(&state->command_cache_commit_header, 0,
            sizeof(state->command_cache_commit_header));
     state->positional_commit_expected = state->pending_positional_commit;
-    if (state->positional_commit_expected) {
-        state->positional_commit =
-            fault_should_fail("positional-commit-allocation", ENOMEM)
-                ? NULL
-                : malloc(sizeof(*state->positional_commit));
-        if (state->positional_commit == NULL) {
-            int saved_errno = errno;
+    if (!state->positional_commit_expected) return true;
+    if (gsh_fault_should_fail(GSH_FAULT_POSITIONAL_COMMIT_ALLOCATION, ENOMEM)) {
+        reject_compound_start(state, launch, "positional transaction",
+                              errno);
+        return false;
+    }
+    if (state->positionals == NULL) {
+        gsh_positionals_initialize(state->positional_commit);
+    } else {
+        (void)memcpy(state->positional_commit, state->positionals,
+               sizeof(*state->positional_commit));
+    }
+    return true;
+}
 
-            close(gate[0]);
-            close(gate[1]);
-            close(commit[0]);
-            close(commit[1]);
-            if (directory[0] >= 0) {
-                close(directory[0]);
-                close(directory[1]);
-            }
-            if (exec_outcome[0] >= 0) {
-                close(exec_outcome[0]);
-                close(exec_outcome[1]);
-            }
-            if (exec_descriptors[0] >= 0) {
-                close(exec_descriptors[0]);
-                close(exec_descriptors[1]);
-            }
-            if (job_service[0] >= 0) {
-                close(job_service[0]);
-                close(job_service[1]);
-            }
-            (void)sigprocmask(SIG_SETMASK, &previous, NULL);
-            state->positional_commit_expected = false;
-            state->pending_positional_commit = false;
-            state->alias_commit_expected = false;
-            state->pending_alias_commit = false;
-            state->function_commit_expected = false;
-            state->pending_function_commit = false;
-            state->command_cache_commit_expected = false;
-            state->pending_command_cache_commit = false;
-            state->directory_commit_expected = false;
-            state->pending_directory_commit = false;
-            output_format(state, "gsh: positional transaction: %s\r\n",
-                          strerror(saved_errno));
-            abandon_pending_list(state);
-            state->mode = MODE_EDITOR;
-            queue_prompt(state);
-            return;
-        }
-        if (state->positionals == NULL) {
-            gsh_positionals_initialize(state->positional_commit);
-        } else {
-            memcpy(state->positional_commit, state->positionals,
-                   sizeof(*state->positional_commit));
-        }
+static void close_compound_parent_ends(compound_launch *launch)
+{
+    if (!require(launch != NULL)) return;
+    if (!require(launch->gate[0] >= -1)) return;
+    if (launch->gate[1] >= 0) (void)close(launch->gate[1]);
+    if (launch->commit[0] >= 0) (void)close(launch->commit[0]);
+    if (launch->exec_outcome[0] >= 0) (void)close(launch->exec_outcome[0]);
+    if (launch->exec_descriptors[0] >= 0) {
+        (void)close(launch->exec_descriptors[0]);
     }
-    owner_times_valid = gsh_times_snapshot(&owner_times) == 0;
-    pid = managed && open_managed_pty(&pty) == -1
-              ? -1
-              : (fault_should_fail("evaluator-fork", EAGAIN) ? -1
-                                                               : fork());
-    if (pid == 0) {
-        char release;
-        native_evaluator evaluator;
-        gsh_background_table *evaluator_backgrounds;
-        gsh_times_context times_context;
-        int status;
+    if (launch->directory[0] >= 0) (void)close(launch->directory[0]);
+    if (launch->job_service[0] >= 0) (void)close(launch->job_service[0]);
+    launch->gate[1] = -1;
+    launch->commit[0] = -1;
+    launch->exec_outcome[0] = -1;
+    launch->exec_descriptors[0] = -1;
+    launch->directory[0] = -1;
+    launch->job_service[0] = -1;
+}
 
-        memset(&evaluator, 0, sizeof(evaluator));
-        close(gate[1]);
-        close(commit[0]);
-        if (exec_outcome[0] >= 0) {
-            close(exec_outcome[0]);
-        }
-        if (exec_descriptors[0] >= 0) {
-            close(exec_descriptors[0]);
-        }
-        if (directory[0] >= 0) {
-            close(directory[0]);
-        }
-        if (job_service[0] >= 0) {
-            close(job_service[0]);
-        }
-        if (managed) {
-            (void)close(pty.master);
-            if (attach_child_pty(state, &pty) == -1) {
-                child_exec_error("managed evaluator PTY", errno);
-            }
-        } else {
-            (void)setpgid(0, 0);
-        }
-        reset_child_signals();
-        (void)sigprocmask(SIG_SETMASK, &previous, NULL);
-        while (read(gate[0], &release, sizeof(release)) == -1 &&
-               errno == EINTR) {
-        }
-        close(gate[0]);
-        close_child_reactor_descriptors(state, -1);
-        evaluator.input = state->pending_input;
-        evaluator.input_length = state->pending_input_length;
-        evaluator.storage = state->parse_storage;
-        evaluator.pipeline = state->native_pipeline;
-        evaluator.default_path = state->default_path;
-        evaluator.last_status = state->last_status;
-        evaluator.shell_pid = (long)state->shell_pgid;
-        evaluator.last_background_pid = state->last_background_pid;
-        evaluator.parameter_zero = state->parameter_zero;
-        evaluator.history = state->history;
-        evaluator.history_exclude_newest = true;
-        evaluator.positionals = state->positional_commit_expected
-                                    ? state->positional_commit
-                                    : state->positionals;
-        evaluator.options = state->options;
-        evaluator.variables = state->variables;
-        evaluator.journal = state->variable_commit;
-        evaluator.aliases = state->aliases;
-        evaluator.alias_journal = state->alias_commit_expected
-                                      ? state->alias_commit
-                                      : NULL;
-        evaluator.functions = state->functions;
-        evaluator.function_scratch = state->function_scratch;
-        evaluator.command_cache = state->command_cache;
-        evaluator.command_cache_base_generation =
-            state->command_cache_generation;
-        memset(&times_context, 0, sizeof(times_context));
-        if (owner_times_valid) {
-            (void)gsh_times_rebase(&times_context, &owner_times);
-        }
-        evaluator.times_context = &times_context;
-        evaluator.scope_base = state->pipeline_variables;
-        evaluator.scope_changes = state->pipeline_changes;
-        evaluator.source_workspaces = state->source_workspaces;
-        evaluator.pipeline_scope = NULL;
-        evaluator.source_depth = 0;
-        evaluator.preflight = false;
-        evaluator.fatal_error = false;
-        evaluator.static_for_items = false;
-        evaluator.tail_exec_single = false;
-        evaluator.positional_mutation_possible = false;
-        evaluator.directory_mutation_possible = false;
-        evaluator.alias_mutation_possible = false;
-        evaluator.function_mutation_possible = false;
-        evaluator.command_cache_mutation_possible = false;
-        evaluator.job_service_available = job_service[1] >= 0;
-        evaluator.job_service_socket = job_service[1];
-        evaluator.state_commit_invalid = false;
-        evaluator.exec_outcome_fd = exec_outcome[1];
-        evaluator.exec_descriptor_socket = exec_descriptors[1];
-        evaluator.exec_descriptor_count =
-            state->pending_exec_descriptor_count;
-        memcpy(evaluator.exec_descriptors,
-               state->pending_exec_descriptors,
-               evaluator.exec_descriptor_count *
-                   sizeof(evaluator.exec_descriptors[0]));
-        evaluator_backgrounds = allocate_isolated_job_table();
-        if (evaluator_backgrounds == NULL) {
-            child_exec_error("evaluator job state", errno);
-        }
-        evaluator.backgrounds = evaluator_backgrounds;
-        status = native_evaluate_node(&evaluator, node_index, 0);
-        if (send_exec_descriptor_commit(
-                exec_descriptors[1], &evaluator) == -1) {
-            perror("gsh: exec descriptor commit");
-            status = 125;
-        }
-        if (state->directory_commit_expected &&
-            send_directory_descriptor(directory[1]) == -1) {
-            status = 125;
-        }
-        if (directory[1] >= 0) {
-            close(directory[1]);
-        }
-        if (evaluator.state_commit_invalid ||
-            write_variable_commit(
-                commit[1], state->variable_commit,
-                state->alias_commit_expected ? state->alias_commit : NULL,
-                state->positional_commit_expected
-                    ? state->positional_commit
-                    : NULL,
-                state->command_cache_commit_expected
-                    ? state->command_cache
-                    : NULL,
-                state->command_cache_generation,
-                gsh_variables_path_generation(evaluator.variables),
-                &evaluator.options, evaluator.exiting,
-                evaluator.exit_status,
-                state->function_commit_expected ? state->functions : NULL,
-                state->function_generation) == -1) {
-            status = 125;
-        }
-        close(commit[1]);
-        if (exec_outcome[1] >= 0) {
-            close(exec_outcome[1]);
-        }
-        if (exec_descriptors[1] >= 0) {
-            close(exec_descriptors[1]);
-        }
-        if (job_service[1] >= 0) {
-            close(job_service[1]);
-        }
-        _exit(status & 255);
-    }
-    close(gate[0]);
-    close(commit[1]);
-    if (exec_outcome[1] >= 0) {
-        close(exec_outcome[1]);
-    }
-    if (exec_descriptors[1] >= 0) {
-        close(exec_descriptors[1]);
-    }
-    if (directory[1] >= 0) {
-        close(directory[1]);
-    }
-    if (job_service[1] >= 0) {
-        close(job_service[1]);
-        job_service[1] = -1;
-    }
-    if (pid == -1) {
-        int saved_errno = errno;
+static void prepare_compound_child(shell_state *state,
+                                   compound_launch *launch)
+{
+    char release;
 
-        close(gate[1]);
-        close(commit[0]);
-        if (pty.master >= 0) {
-            (void)close(pty.master);
+    if (!require(state != NULL)) _exit(125);
+    if (!require(launch != NULL && launch->signals_blocked)) _exit(125);
+    if (!require(launch->gate[0] >= 0)) _exit(125);
+    close_compound_parent_ends(launch);
+    if (launch->managed) {
+        (void)close(launch->pty.master);
+        launch->pty.master = -1;
+        if (attach_child_pty(state, &launch->pty) == -1) {
+            child_exec_error("managed evaluator PTY", errno);
         }
-        if (pty.slave_hold >= 0) {
-            (void)close(pty.slave_hold);
-        }
-        if (directory[0] >= 0) {
-            close(directory[0]);
-        }
-        if (exec_outcome[0] >= 0) {
-            close(exec_outcome[0]);
-        }
-        if (exec_descriptors[0] >= 0) {
-            close(exec_descriptors[0]);
-        }
-        if (job_service[0] >= 0) {
-            close(job_service[0]);
-        }
-        free(state->positional_commit);
-        state->positional_commit = NULL;
-        state->positional_commit_expected = false;
-        state->pending_positional_commit = false;
-        state->alias_commit_expected = false;
-        state->pending_alias_commit = false;
-        state->function_commit_expected = false;
-        state->pending_function_commit = false;
-        state->command_cache_commit_expected = false;
-        state->pending_command_cache_commit = false;
-        state->directory_commit_expected = false;
-        state->pending_directory_commit = false;
-        (void)sigprocmask(SIG_SETMASK, &previous, NULL);
-        output_format(state, "gsh: evaluator fork: %s\r\n",
-                      strerror(saved_errno));
-        abandon_pending_list(state);
-        state->mode = MODE_EDITOR;
-        queue_prompt(state);
-        return;
+    } else {
+        (void)setpgid(0, 0);
     }
-
-    if (managed && pty.slave_hold >= 0) {
-        (void)close(pty.slave_hold);
-        pty.slave_hold = -1;
+    reset_child_signals();
+    (void)sigprocmask(SIG_SETMASK, &launch->previous, NULL);
+    while (read(launch->gate[0], &release, sizeof(release)) == -1 &&
+           errno == EINTR) {
     }
+    (void)close(launch->gate[0]);
+    launch->gate[0] = -1;
+    close_child_reactor_descriptors(state, -1);
+}
 
-    state->variable_commit_fd = commit[0];
-    state->job_service_socket = job_service[0];
-    state->exec_outcome_fd = exec_outcome[0];
-    state->exec_descriptor_socket = exec_descriptors[0];
-    state->directory_commit_socket = directory[0];
-    state->variable_commit_received = 0;
+static void initialize_compound_evaluator(
+    shell_state *state, compound_launch *launch,
+    native_evaluator *evaluator, gsh_times_context *times_context)
+{
+    if (!require(state != NULL && launch != NULL)) return;
+    if (!require(evaluator != NULL && times_context != NULL)) return;
+    (void)memset(evaluator, 0, sizeof(*evaluator));
+    evaluator->input = state->pending_input;
+    evaluator->input_length = state->pending_input_length;
+    evaluator->storage = state->parse_storage;
+    evaluator->pipeline = state->native_pipeline;
+    evaluator->default_path = state->default_path;
+    evaluator->last_status = state->last_status;
+    evaluator->shell_pid = (long)state->shell_pgid;
+    evaluator->last_background_pid = state->last_background_pid;
+    evaluator->parameter_zero = state->parameter_zero;
+    evaluator->history = state->history;
+    evaluator->history_exclude_newest = true;
+    evaluator->positionals = state->positional_commit_expected
+                                ? state->positional_commit
+                                : state->positionals;
+    evaluator->options = state->options;
+    evaluator->variables = state->variables;
+    evaluator->journal = state->variable_commit;
+    evaluator->aliases = state->aliases;
+    evaluator->alias_journal = state->alias_commit_expected
+                                   ? state->alias_commit
+                                   : NULL;
+    evaluator->functions = state->functions;
+    evaluator->function_scratch = state->function_scratch;
+    evaluator->command_cache = state->command_cache;
+    evaluator->command_cache_base_generation =
+        state->command_cache_generation;
+    (void)memset(times_context, 0, sizeof(*times_context));
+    if (launch->owner_times_valid) {
+        (void)gsh_times_rebase(times_context, &launch->owner_times);
+    }
+    evaluator->times_context = times_context;
+    evaluator->scope_base = state->pipeline_variables;
+    evaluator->scope_changes = state->pipeline_changes;
+    evaluator->source_workspaces = state->source_workspaces;
+    evaluator->job_service_available = launch->job_service[1] >= 0;
+    evaluator->job_service_socket = launch->job_service[1];
+    evaluator->exec_outcome_fd = launch->exec_outcome[1];
+    evaluator->exec_descriptor_socket = launch->exec_descriptors[1];
+    evaluator->exec_descriptor_count =
+        state->pending_exec_descriptor_count;
+    (void)memcpy(evaluator->exec_descriptors, state->pending_exec_descriptors,
+           evaluator->exec_descriptor_count *
+               sizeof(evaluator->exec_descriptors[0]));
+}
+
+static int commit_compound_evaluator(shell_state *state,
+                                     compound_launch *launch,
+                                     native_evaluator *evaluator,
+                                     int status)
+{
+    if (!require(state != NULL && launch != NULL)) return 125;
+    if (!require(evaluator != NULL)) return 125;
+    if (send_exec_descriptor_commit(
+            launch->exec_descriptors[1], evaluator) == -1) {
+        perror("gsh: exec descriptor commit");
+        status = 125;
+    }
+    if (state->directory_commit_expected &&
+        send_directory_descriptor(launch->directory[1]) == -1) {
+        status = 125;
+    }
+    if (launch->directory[1] >= 0) {
+        (void)close(launch->directory[1]);
+        launch->directory[1] = -1;
+    }
+    if (evaluator->state_commit_invalid ||
+        write_variable_commit(
+            launch->commit[1], state->variable_commit,
+            state->alias_commit_expected ? state->alias_commit : NULL,
+            state->positional_commit_expected ? state->positional_commit
+                                              : NULL,
+            state->command_cache_commit_expected ? state->command_cache
+                                                 : NULL,
+            state->command_cache_generation,
+            gsh_variables_path_generation(evaluator->variables),
+            &evaluator->options, evaluator->exiting,
+            evaluator->exit_status,
+            state->function_commit_expected ? state->functions : NULL,
+            state->function_generation) == -1) {
+        status = 125;
+    }
+    return status;
+}
+
+_Noreturn static void run_compound_child(shell_state *state,
+                                         compound_launch *launch,
+                                         size_t node_index)
+{
+    native_evaluator evaluator = {0};
+    gsh_background_table *backgrounds;
+    gsh_times_context times_context;
+    int status;
+
+    if (!require(state != NULL && launch != NULL)) _exit(125);
+    if (!require(node_index < state_parse_storage(state)->node_count)) _exit(125);
+    prepare_compound_child(state, launch);
+    initialize_compound_evaluator(state, launch, &evaluator, &times_context);
+    backgrounds = allocate_isolated_job_table();
+    if (backgrounds == NULL) child_exec_error("evaluator job state", errno);
+    evaluator.backgrounds = backgrounds;
+    status = native_evaluate_node(&evaluator, node_index, 0);
+    status = commit_compound_evaluator(state, launch, &evaluator, status);
+    if (launch->commit[1] >= 0) (void)close(launch->commit[1]);
+    if (launch->exec_outcome[1] >= 0) (void)close(launch->exec_outcome[1]);
+    if (launch->exec_descriptors[1] >= 0) {
+        (void)close(launch->exec_descriptors[1]);
+    }
+    if (launch->job_service[1] >= 0) (void)close(launch->job_service[1]);
+    _exit(status & 255);
+}
+
+static void close_compound_child_ends(compound_launch *launch)
+{
+    if (!require(launch != NULL)) return;
+    if (!require(launch->gate[1] >= -1)) return;
+    if (launch->gate[0] >= 0) (void)close(launch->gate[0]);
+    if (launch->commit[1] >= 0) (void)close(launch->commit[1]);
+    if (launch->exec_outcome[1] >= 0) (void)close(launch->exec_outcome[1]);
+    if (launch->exec_descriptors[1] >= 0) {
+        (void)close(launch->exec_descriptors[1]);
+    }
+    if (launch->directory[1] >= 0) (void)close(launch->directory[1]);
+    if (launch->job_service[1] >= 0) (void)close(launch->job_service[1]);
+    launch->gate[0] = -1;
+    launch->commit[1] = -1;
+    launch->exec_outcome[1] = -1;
+    launch->exec_descriptors[1] = -1;
+    launch->directory[1] = -1;
+    launch->job_service[1] = -1;
+}
+
+static void initialize_compound_parent_commit(shell_state *state,
+                                              compound_launch *launch)
+{
+    if (!require(state != NULL)) return;
+    if (!require(launch != NULL)) return;
+    state->variable_commit_fd = launch->commit[0];
+    state->job_service_socket = launch->job_service[0];
+    state->exec_outcome_fd = launch->exec_outcome[0];
+    state->exec_descriptor_socket = launch->exec_descriptors[0];
+    state->directory_commit_socket = launch->directory[0];
+    launch->commit[0] = -1;
+    launch->job_service[0] = -1;
+    launch->exec_outcome[0] = -1;
+    launch->exec_descriptors[0] = -1;
+    launch->directory[0] = -1;
+    state->variable_commit_received = 0U;
     state->variable_commit_active = true;
     state->variable_commit_eof = false;
     state->variable_commit_invalid = false;
-    memset(state->variable_commit, 0, sizeof(*state->variable_commit));
+    (void)memset(state->variable_commit, 0, sizeof(*state->variable_commit));
     if (state->alias_commit_expected) {
-        memset(state->alias_commit, 0, sizeof(*state->alias_commit));
+        (void)memset(state->alias_commit, 0, sizeof(*state->alias_commit));
     }
     if (state->function_commit_expected) {
-        memset(&state->function_commit_header, 0,
+        (void)memset(&state->function_commit_header, 0,
                sizeof(state->function_commit_header));
         state->function_commit_header_complete = false;
     }
     if (state->command_cache_commit_expected) {
-        memset(&state->command_cache_commit_header, 0,
+        (void)memset(&state->command_cache_commit_header, 0,
                sizeof(state->command_cache_commit_header));
-        memset(state->command_cache_scratch, 0,
+        (void)memset(state->command_cache_scratch, 0,
                sizeof(*state->command_cache_scratch));
     }
-    memset(&state->option_commit, 0, sizeof(state->option_commit));
-    memset(&state->control_commit, 0, sizeof(state->control_commit));
+    (void)memset(&state->option_commit, 0, sizeof(state->option_commit));
+    (void)memset(&state->control_commit, 0, sizeof(state->control_commit));
     state->committed_exit_requested = false;
     state->committed_exit_status = 0;
+}
 
-    initialize_job(&state->current_job, pid, pid, &pid, 1, true, false);
-    state->current_job.modes = state->original_modes;
-    if (managed) {
-        state->current_job.foreground = false;
-        state->current_job.silent = true;
-        if (gsh_async_repl_attach(state->async_repl,
-                                  state->async_dispatch_cell, pid, pid,
-                                  pty.master) == -1 ||
-            register_managed_job(state, state->async_dispatch_cell,
-                                 pid, pid) == -1) {
-            int saved_errno = errno;
+static void release_compound_launch(compound_launch *launch)
+{
+    if (!require(launch != NULL)) return;
+    if (!require(launch->signals_blocked)) return;
+    if (launch->gate[1] >= 0) (void)close(launch->gate[1]);
+    launch->gate[1] = -1;
+    (void)sigprocmask(SIG_SETMASK, &launch->previous, NULL);
+    launch->signals_blocked = false;
+}
 
-            (void)kill(pid, SIGKILL);
-            close(gate[1]);
-            close_variable_commit(state);
-            (void)sigprocmask(SIG_SETMASK, &previous, NULL);
-            output_format(state, "gsh: managed evaluator: %s\r\n",
-                          strerror(saved_errno));
-            gsh_async_repl_finish(state->async_repl,
-                                  state->async_dispatch_cell, 125 << 8,
-                                  false);
-            state->current_job.active = false;
-            state->mode = MODE_EDITOR;
-            abandon_pending_list(state);
-            return;
-        }
-        state->mode = MODE_EDITOR;
-        close(gate[1]);
-        (void)sigprocmask(SIG_SETMASK, &previous, NULL);
-        queue_prompt(state);
-        return;
-    }
-    (void)setpgid(pid, pid);
-    if (fault_should_fail("terminal-handoff", EIO) ||
-        tcsetattr(state->tty_fd, TCSANOW, &state->original_modes) == -1 ||
-        tcsetpgrp(state->tty_fd, pid) == -1) {
-        int saved_errno = errno;
+static bool handoff_managed_compound(shell_state *state,
+                                     compound_launch *launch)
+{
+    int error;
 
-        state->current_job.foreground = false;
-        state->current_job.silent = true;
-        (void)kill(-pid, SIGKILL);
-        (void)kill(pid, SIGKILL);
-        close(gate[1]);
+    if (!require(state != NULL)) return false;
+    if (!require(launch != NULL && launch->managed)) return false;
+    state->current_job.foreground = false;
+    state->current_job.silent = true;
+    if (gsh_async_repl_attach(state->async_repl, state->async_dispatch_cell,
+                              launch->pid, launch->pid,
+                              launch->pty.master) == -1 ||
+        register_managed_job(state, state->async_dispatch_cell,
+                             launch->pid, launch->pid) == -1) {
+        error = errno;
+        (void)kill(launch->pid, SIGKILL);
+        release_compound_launch(launch);
         close_variable_commit(state);
-        (void)sigprocmask(SIG_SETMASK, &previous, NULL);
+        output_format(state, "gsh: managed evaluator: %s\r\n",
+                      strerror(error));
+        gsh_async_repl_finish(state->async_repl,
+                              state->async_dispatch_cell, 125 << 8, false);
+        state->current_job.active = false;
+        state->mode = MODE_EDITOR;
+        abandon_pending_list(state);
+        return false;
+    }
+    launch->pty.master = -1;
+    state->mode = MODE_EDITOR;
+    release_compound_launch(launch);
+    queue_prompt(state);
+    return true;
+}
+
+static bool handoff_foreground_compound(shell_state *state,
+                                        compound_launch *launch)
+{
+    if (!require(state != NULL)) return false;
+    if (!require(launch != NULL && !launch->managed)) return false;
+    (void)setpgid(launch->pid, launch->pid);
+    if (gsh_fault_should_fail(GSH_FAULT_TERMINAL_HANDOFF, EIO) ||
+        tcsetattr(state->tty_fd, TCSANOW, &state->original_modes) == -1 ||
+        tcsetpgrp(state->tty_fd, launch->pid) == -1) {
+        int error = errno;
+
+        state->current_job.foreground = false;
+        state->current_job.silent = true;
+        (void)kill(-launch->pid, SIGKILL);
+        (void)kill(launch->pid, SIGKILL);
+        release_compound_launch(launch);
+        close_variable_commit(state);
         (void)enter_editor(state);
         output_format(state, "gsh: terminal handoff: %s\r\n",
-                      strerror(saved_errno));
+                      strerror(error));
         abandon_pending_list(state);
         queue_prompt(state);
-        return;
+        return false;
     }
     state->terminal_changed = false;
     state->mode = MODE_FOREGROUND;
-    close(gate[1]);
-    (void)sigprocmask(SIG_SETMASK, &previous, NULL);
+    release_compound_launch(launch);
+    return true;
+}
+
+static void start_native_compound(shell_state *state, size_t node_index)
+{
+    compound_launch launch;
+    bool managed;
+
+    if (!require(state != NULL)) return;
+    if (!require(state->parse_storage != NULL)) return;
+    managed = state->async_repl != NULL && state_async_repl(state)->enabled;
+    initialize_compound_launch(&launch, managed);
+    if (!compound_capacity_is_available(state) ||
+        !create_compound_channels(state, &launch) ||
+        !block_compound_signals(state, &launch)) return;
+    if (!initialize_compound_commits(state, &launch)) return;
+    launch.owner_times_valid = gsh_times_snapshot(&launch.owner_times) == 0;
+    launch.pid = managed && open_managed_pty(&launch.pty) == -1
+              ? -1
+              : (gsh_fault_should_fail(GSH_FAULT_EVALUATOR_FORK, EAGAIN) ? -1
+                                                               : fork());
+    if (launch.pid == 0) {
+        run_compound_child(state, &launch, node_index);
+    }
+    close_compound_child_ends(&launch);
+    if (launch.pid == -1) {
+        int saved_errno = errno;
+
+        reject_compound_start(state, &launch, "evaluator fork",
+                              saved_errno);
+        return;
+    }
+
+    if (managed && launch.pty.slave_hold >= 0) {
+        (void)close(launch.pty.slave_hold);
+        launch.pty.slave_hold = -1;
+    }
+
+    initialize_compound_parent_commit(state, &launch);
+    initialize_job(&state->current_job, launch.pid, launch.pid,
+                   &launch.pid, 1, true, false);
+    state->current_job.modes = state->original_modes;
+    if (managed) {
+        (void)handoff_managed_compound(state, &launch);
+        return;
+    }
+    (void)handoff_foreground_compound(state, &launch);
 }
 
 typedef struct {
@@ -16506,9 +20131,12 @@ static void initialize_native_script_session(
     gsh_trap_store *traps,
     const char *default_path)
 {
+    if (command_cache == NULL || default_path == NULL || parameter_zero == NULL || pipeline == NULL || positionals == NULL || scope_base == NULL || scope_changes == NULL || session == NULL || source_workspaces == NULL || storage == NULL || traps == NULL || variables == NULL) {
+        return;
+    }
     native_evaluator *evaluator = &session->evaluator;
 
-    memset(session, 0, sizeof(*session));
+    (void)memset(session, 0, sizeof(*session));
     evaluator->exec_outcome_fd = -1;
     evaluator->exec_descriptor_socket = -1;
     evaluator->storage = storage;
@@ -16538,6 +20166,9 @@ static gsh_parse_result parse_native_script_text(
     char *alias_expansion, size_t alias_expansion_capacity,
     const char **parsed_input, size_t *parsed_length)
 {
+    if (alias_expansion == NULL || input == NULL || parsed_input == NULL || parsed_length == NULL || session == NULL) {
+        return (gsh_parse_result){.status = GSH_PARSE_LIMIT};
+    }
     native_evaluator *evaluator = &session->evaluator;
 
     if (gsh_aliases_count(evaluator->aliases) == 0U) {
@@ -16556,6 +20187,9 @@ static gsh_parse_result parse_native_script_text(
 static bool native_parsed_script_is_empty(
     const native_script_session *session, size_t root)
 {
+    if (session == NULL) {
+        return false;
+    }
     const gsh_parse_storage *storage = session->evaluator.storage;
 
     return root < storage->node_count &&
@@ -16568,9 +20202,12 @@ static int execute_native_parsed(
     size_t root, gsh_variable_store *variables,
     gsh_variable_store *scratch)
 {
+    if (input == NULL || scratch == NULL || session == NULL || variables == NULL) {
+        return -1;
+    }
     native_evaluator *evaluator = &session->evaluator;
 
-    memcpy(scratch, variables, sizeof(*scratch));
+    (void)memcpy(scratch, variables, sizeof(*scratch));
     evaluator->input = input;
     evaluator->input_length = input_length;
     evaluator->variables = scratch;
@@ -16589,7 +20226,7 @@ static int execute_native_parsed(
     evaluator->command_cache_mutation_possible = false;
     evaluator->state_commit_invalid = false;
     if (!native_preflight_node(evaluator, root, 0)) {
-        fprintf(stderr, "gsh: native execution unsupported\n");
+        (void)fprintf(stderr, "gsh: native execution unsupported\n");
         return 2;
     }
     evaluator->variables = variables;
@@ -16604,6 +20241,9 @@ static int execute_native_script(
     gsh_variable_store *variables, gsh_variable_store *scratch,
     size_t source_offset)
 {
+    if (session == NULL) {
+        return -1;
+    }
     native_evaluator *evaluator = &session->evaluator;
     size_t offset = 0;
     size_t complete_commands;
@@ -16634,7 +20274,7 @@ static int execute_native_script(
         size_t lines;
         gsh_parse_result parsed;
 
-        memset(&parsed, 0, sizeof(parsed));
+        (void)memset(&parsed, 0, sizeof(parsed));
         for (lines = 0; lines < SIZE_MAX; lines++) {
             const char *newline = memchr(input + end, '\n',
                                          input_length - end);
@@ -16643,7 +20283,7 @@ static int execute_native_script(
                                   : (size_t)(newline - input) + 1U;
             parsed = parse_native_script_text(
                 session, input + offset, end - offset,
-                evaluator->source_workspaces->root_alias_expansion,
+                evaluator_source_workspaces(evaluator)->root_alias_expansion,
                 GSH_ALIAS_EXPANSION_CAP, &parsed_input, &parsed_length);
             if (parsed.status != GSH_PARSE_INCOMPLETE ||
                 end == input_length) {
@@ -16651,7 +20291,7 @@ static int execute_native_script(
             }
         }
         if (parsed.status != GSH_PARSE_OK) {
-            fprintf(stderr, "gsh: %s at byte %zu\n",
+            (void)fprintf(stderr, "gsh: %s at byte %zu\n",
                     gsh_parse_status_name(parsed.status),
                     source_offset + offset + parsed.error_offset);
             status = 2;
@@ -16686,48 +20326,51 @@ typedef struct {
     native_script_session session;
 } native_script_resources;
 
+typedef struct {
+    gsh_parse_storage storage;
+    gsh_native_pipeline pipeline;
+    gsh_variable_store variables;
+    gsh_variable_store scratch;
+    gsh_variable_store scope_base;
+    gsh_variable_journal scope_changes;
+    gsh_positional_store positionals;
+    gsh_command_cache command_cache;
+    gsh_source_workspace_stack source_workspaces;
+    gsh_trap_store traps;
+} native_script_storage;
+
 static void release_native_script_resources(
     native_script_resources *resources)
 {
-    free(resources->storage);
-    free(resources->pipeline);
-    free(resources->variables);
-    free(resources->scratch);
-    free(resources->scope_base);
-    free(resources->scope_changes);
-    free(resources->positionals);
-    free(resources->command_cache);
-    free(resources->source_workspaces);
-    free(resources->traps);
-    memset(resources, 0, sizeof(*resources));
+    if (resources == NULL) {
+        return;
+    }
+    (void)memset(resources, 0, sizeof(*resources));
 }
 
 static int initialize_native_script_resources(
-    native_script_resources *resources, const char *parameter_zero,
+    native_script_resources *resources, native_script_storage *storage,
+    const char *parameter_zero,
     char *const *positional_parameters, size_t positional_count)
 {
+    if (parameter_zero == NULL || resources == NULL || storage == NULL) {
+        return -1;
+    }
     size_t default_path_length;
 
-    memset(resources, 0, sizeof(*resources));
-    resources->storage = malloc(sizeof(*resources->storage));
-    resources->pipeline = malloc(sizeof(*resources->pipeline));
-    resources->variables = malloc(sizeof(*resources->variables));
-    resources->scratch = malloc(sizeof(*resources->scratch));
-    resources->scope_base = malloc(sizeof(*resources->scope_base));
-    resources->scope_changes = malloc(sizeof(*resources->scope_changes));
-    resources->positionals = malloc(sizeof(*resources->positionals));
-    resources->command_cache = malloc(sizeof(*resources->command_cache));
-    resources->source_workspaces =
-        malloc(sizeof(*resources->source_workspaces));
-    resources->traps = malloc(sizeof(*resources->traps));
-    if (resources->storage == NULL || resources->pipeline == NULL ||
-        resources->variables == NULL || resources->scratch == NULL ||
-        resources->scope_base == NULL || resources->scope_changes == NULL ||
-        resources->positionals == NULL ||
-        resources->command_cache == NULL ||
-        resources->source_workspaces == NULL ||
-        resources->traps == NULL ||
-        gsh_variables_import(resources->variables, environ) == -1 ||
+    (void)memset(resources, 0, sizeof(*resources));
+    (void)memset(storage, 0, sizeof(*storage));
+    resources->storage = &storage->storage;
+    resources->pipeline = &storage->pipeline;
+    resources->variables = &storage->variables;
+    resources->scratch = &storage->scratch;
+    resources->scope_base = &storage->scope_base;
+    resources->scope_changes = &storage->scope_changes;
+    resources->positionals = &storage->positionals;
+    resources->command_cache = &storage->command_cache;
+    resources->source_workspaces = &storage->source_workspaces;
+    resources->traps = &storage->traps;
+    if (gsh_variables_import(resources->variables, environ) == -1 ||
         gsh_positionals_assign(resources->positionals, positional_count,
                                positional_parameters) == -1 ||
         gsh_traps_initialize(resources->traps) == -1) {
@@ -16742,7 +20385,7 @@ static int initialize_native_script_resources(
         _CS_PATH, resources->default_path, sizeof(resources->default_path));
     if (default_path_length == 0 ||
         default_path_length > sizeof(resources->default_path)) {
-        memcpy(resources->default_path, "/bin:/usr/bin", 14);
+        (void)memcpy(resources->default_path, "/bin:/usr/bin", 14);
     }
     initialize_native_script_session(
         &resources->session, parameter_zero, resources->storage,
@@ -16759,11 +20402,15 @@ static int execute_native_noninteractive(
     const char *parameter_zero, char *const *positional_parameters,
     size_t positional_count)
 {
-    native_script_resources resources;
+    if (input == NULL) {
+        return -1;
+    }
+    static native_script_resources resources;
+    static native_script_storage storage;
     int status;
 
     if (initialize_native_script_resources(
-            &resources, parameter_zero, positional_parameters,
+            &resources, &storage, parameter_zero, positional_parameters,
             positional_count) == -1) {
         perror("gsh: native allocation");
         return 125;
@@ -16771,13 +20418,20 @@ static int execute_native_noninteractive(
     status = execute_native_script(
         input, input_length, &resources.session, resources.storage,
         resources.variables, resources.scratch, 0);
-    status = finish_native_evaluator(&resources.session.evaluator,
-                                     status);
+    status = evaluate_native_traps_top(
+        &resources.session.evaluator, status, NATIVE_TRAPS_EXIT);
     release_native_script_resources(&resources);
     return status;
 }
 
 enum { NATIVE_INPUT_READ_CAP = 16384 };
+
+enum {
+    NATIVE_INPUT_SLOW_CAP = 4 * GSH_SOURCE_INPUT_CAP,
+    NATIVE_INPUT_ALIAS_CAP =
+        NATIVE_INPUT_SLOW_CAP +
+        GSH_ALIAS_EXPANSION_LIMIT * (GSH_ALIAS_VALUE_CAP + 1U) + 1U,
+};
 
 enum {
     NATIVE_INPUT_EOF = 0,
@@ -16795,6 +20449,25 @@ typedef struct {
     bool buffered;
 } native_input_reader;
 
+typedef enum {
+    GSH_SOURCE_VIEW_DIRECT,
+    GSH_SOURCE_VIEW_FILE,
+} gsh_source_view_kind;
+
+typedef struct {
+    gsh_source_view_kind kind;
+    const char *memory;
+    size_t length;
+    int descriptor;
+    char *window;
+    size_t window_capacity;
+} gsh_source_view;
+
+typedef struct {
+    char source_window[NATIVE_INPUT_SLOW_CAP + 1U];
+    char alias_expansion[NATIVE_INPUT_ALIAS_CAP];
+} native_input_storage;
+
 /* ── System Resources Replace Shell Line Limits ──────────────────
  * The original fixed command buffer rejected valid long input even when the
  * host still had memory and storage. Ordinary commands retain that preallocated
@@ -16806,6 +20479,7 @@ typedef struct {
  * ─────────────────────────────────────────────────────────────── */
 typedef struct {
     char *text;
+    native_input_storage *storage;
     size_t length;
     size_t source_offset;
     const char *parsed_text;
@@ -16814,55 +20488,57 @@ typedef struct {
     int spill_descriptor;
     unsigned char spill[NATIVE_INPUT_READ_CAP];
     size_t spill_used;
-    void *source_mapping;
-    size_t source_mapping_length;
-    void *alias_mapping;
-    size_t alias_mapping_length;
+    gsh_source_view source_view;
+    char *alias_expansion;
+    size_t alias_capacity;
+    bool alias_active;
     bool collecting;
 } native_input_command;
 
-static void initialize_native_input_command(native_input_command *command,
-                                            char *text)
+static bool initialize_native_input_command(native_input_command *command,
+                                            char *text,
+                                            native_input_storage *storage)
 {
-    assert(command != NULL);
-    assert(text != NULL);
+    if (command == NULL || text == NULL || storage == NULL) return false;
     command->text = text;
+    command->storage = storage;
     command->length = 0;
     command->source_offset = 0;
     command->parsed_text = NULL;
     command->parsed_length = 0;
-    memset(&command->parsed, 0, sizeof(command->parsed));
+    (void)memset(&command->parsed, 0, sizeof(command->parsed));
     command->spill_descriptor = -1;
     command->spill_used = 0;
-    command->source_mapping = NULL;
-    command->source_mapping_length = 0;
-    command->alias_mapping = NULL;
-    command->alias_mapping_length = 0;
+    command->source_view.kind = GSH_SOURCE_VIEW_DIRECT;
+    command->source_view.memory = text;
+    command->source_view.length = 0;
+    command->source_view.descriptor = -1;
+    command->source_view.window = storage->source_window;
+    command->source_view.window_capacity = sizeof(storage->source_window);
+    command->alias_expansion = storage->alias_expansion;
+    command->alias_capacity = sizeof(storage->alias_expansion);
+    command->alias_active = false;
     command->collecting = false;
+    return true;
 }
 
 static int release_native_input_views(native_input_command *command)
 {
     int status = 0;
 
-    assert(command != NULL);
-    assert(command->source_mapping != MAP_FAILED);
-    assert(command->alias_mapping != MAP_FAILED);
-    if (command->alias_mapping != NULL) {
-        if (munmap(command->alias_mapping,
-                   command->alias_mapping_length) == -1) {
-            status = -1;
-        }
-        command->alias_mapping = NULL;
-        command->alias_mapping_length = 0;
+    if (command == NULL || command->source_view.window == NULL ||
+        command->alias_expansion == NULL) return -1;
+    if (command->alias_active) {
+        (void)memset(command->alias_expansion, 0, command->alias_capacity);
+        command->alias_active = false;
     }
-    if (command->source_mapping != NULL) {
-        if (munmap(command->source_mapping,
-                   command->source_mapping_length) == -1) {
-            status = -1;
-        }
-        command->source_mapping = NULL;
-        command->source_mapping_length = 0;
+    if (command->source_view.kind == GSH_SOURCE_VIEW_FILE) {
+        (void)memset(command->source_view.window, 0,
+               command->source_view.window_capacity);
+        command->source_view.kind = GSH_SOURCE_VIEW_DIRECT;
+        command->source_view.memory = command->text;
+        command->source_view.length = 0;
+        command->source_view.descriptor = -1;
     }
     return status;
 }
@@ -16870,20 +20546,24 @@ static int release_native_input_views(native_input_command *command)
 static int release_native_input_command(native_input_command *command)
 {
     char *text;
+    native_input_storage *storage;
     int status;
 
-    assert(command != NULL);
-    assert(command->spill_descriptor >= -1);
+    if (command == NULL || command->spill_descriptor < -1) return -1;
+    if (!require(command->text != NULL)) return -1;
+    if (!require(command->storage != NULL)) return -1;
     text = command->text;
+    storage = command->storage;
     status = release_native_input_views(command);
     if (command->spill_descriptor >= 0) {
-        memset(command->spill, 0, sizeof(command->spill));
+        (void)memset(command->spill, 0, sizeof(command->spill));
         if (close(command->spill_descriptor) == -1) {
             status = -1;
         }
     }
-    initialize_native_input_command(command, text);
-    return status;
+    return initialize_native_input_command(command, text, storage)
+               ? status
+               : -1;
 }
 
 static int write_native_input_spill(int descriptor,
@@ -16899,12 +20579,11 @@ static int write_native_input_spill(int descriptor,
     }
     for (attempts = 0; written < length && attempts < SIZE_MAX;
          attempts++) {
-        ssize_t count = fault_should_fail("input-spill-write", EIO)
+        ssize_t count = gsh_fault_should_fail(GSH_FAULT_INPUT_SPILL_WRITE, EIO)
                             ? -1
                             : write(descriptor, bytes + written,
                                     length - written);
 
-        assert(written <= length);
         if (count > 0) {
             written += (size_t)count;
         } else if (count == -1 && errno == EINTR) {
@@ -16926,16 +20605,18 @@ static int open_native_input_spill(native_input_command *command)
     char path[] = "/tmp/gsh-input-XXXXXX";
     int descriptor;
 
-    assert(command != NULL);
-    assert(command->spill_descriptor == -1);
-    assert(command->length == NONINTERACTIVE_INPUT_FAST_CAP);
-    descriptor = fault_should_fail("input-spill-open", EMFILE)
+    if (command == NULL || command->spill_descriptor != -1 ||
+        command->length != NONINTERACTIVE_INPUT_FAST_CAP) {
+        errno = EINVAL;
+        return -1;
+    }
+    descriptor = gsh_fault_should_fail(GSH_FAULT_INPUT_SPILL_OPEN, EMFILE)
                      ? -1
                      : mkstemp(path);
     if (descriptor == -1) {
         return -1;
     }
-    if (fault_should_fail("input-spill-cloexec", EIO) ||
+    if (gsh_fault_should_fail(GSH_FAULT_INPUT_SPILL_CLOEXEC, EIO) ||
         set_fd_flags(descriptor, F_GETFD, FD_CLOEXEC) == -1) {
         int saved_errno = errno;
 
@@ -16944,7 +20625,7 @@ static int open_native_input_spill(native_input_command *command)
         errno = saved_errno;
         return -1;
     }
-    if (fault_should_fail("input-spill-unlink", EIO)) {
+    if (gsh_fault_should_fail(GSH_FAULT_INPUT_SPILL_UNLINK, EIO)) {
         int saved_errno = errno;
 
         (void)unlink(path);
@@ -16970,8 +20651,10 @@ static int open_native_input_spill(native_input_command *command)
 
 static int flush_native_input_spill(native_input_command *command)
 {
-    assert(command != NULL);
-    assert(command->spill_used <= sizeof(command->spill));
+    if (command == NULL || command->spill_used > sizeof(command->spill)) {
+        errno = EINVAL;
+        return -1;
+    }
     if (command->spill_used == 0) {
         return 0;
     }
@@ -16988,10 +20671,12 @@ static int flush_native_input_spill(native_input_command *command)
 static int append_native_input_byte(native_input_command *command,
                                     unsigned char byte)
 {
-    assert(command != NULL);
-    assert(command->spill_used <= sizeof(command->spill));
-    if (command->length == SIZE_MAX) {
-        errno = EOVERFLOW;
+    if (command == NULL || command->spill_used > sizeof(command->spill)) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (command->length == NATIVE_INPUT_SLOW_CAP) {
+        errno = EFBIG;
         return -1;
     }
     if (command->spill_descriptor == -1 &&
@@ -17018,11 +20703,13 @@ static int initialize_native_input_reader(native_input_reader *reader,
 {
     off_t offset;
 
-    memset(reader, 0, sizeof(*reader));
+    if (!require(reader != NULL)) return -1;
+    if (!require(descriptor >= 0)) return -1;
+    (void)memset(reader, 0, sizeof(*reader));
     reader->descriptor = descriptor;
     reader->shares_command_input = shares_command_input;
     if (shares_command_input) {
-        int flags = fault_should_fail("input-mode", EIO)
+        int flags = gsh_fault_should_fail(GSH_FAULT_INPUT_MODE, EIO)
                         ? -1
                         : fcntl(descriptor, F_GETFL);
 
@@ -17040,6 +20727,10 @@ static int initialize_native_input_reader(native_input_reader *reader,
 static int read_native_input_byte(native_input_reader *reader,
                                   unsigned char *byte)
 {
+    if (!require(reader != NULL)) return -1;
+    if (!require(byte != NULL)) return -1;
+    if (!require(reader->next <= reader->used &&
+                 reader->used <= sizeof(reader->bytes))) return -1;
     if (reader->next < reader->used) {
         *byte = reader->bytes[reader->next++];
         return NATIVE_INPUT_BYTE;
@@ -17048,7 +20739,7 @@ static int read_native_input_byte(native_input_reader *reader,
     reader->used = 0;
     {
         size_t capacity = reader->buffered ? sizeof(reader->bytes) : 1U;
-        ssize_t count = fault_should_fail("input-read", EIO)
+        ssize_t count = gsh_fault_should_fail(GSH_FAULT_INPUT_READ, EIO)
                             ? -1
                             : read(reader->descriptor, reader->bytes,
                                    capacity);
@@ -17069,6 +20760,8 @@ static int synchronize_native_input(native_input_reader *reader)
 {
     size_t unread;
 
+    if (!require(reader != NULL)) return -1;
+    if (!require(reader->next <= reader->used)) return -1;
     if (!reader->shares_command_input || !reader->buffered) {
         return 0;
     }
@@ -17090,7 +20783,7 @@ static int resize_native_input_spill(native_input_command *command,
         errno = length > (size_t)INT64_MAX ? EFBIG : EINVAL;
         return -1;
     }
-    if (fault_should_fail("input-spill-resize", ENOSPC) ||
+    if (gsh_fault_should_fail(GSH_FAULT_INPUT_SPILL_RESIZE, ENOSPC) ||
         ftruncate(command->spill_descriptor, (off_t)length) == -1) {
         return -1;
     }
@@ -17099,24 +20792,48 @@ static int resize_native_input_spill(native_input_command *command,
 
 static int map_native_input_source(native_input_command *command)
 {
-    void *mapping;
+    size_t offset = 0;
+    size_t attempts;
 
-    assert(command != NULL);
-    assert(command->spill_descriptor >= 0);
-    assert(command->length > NONINTERACTIVE_INPUT_FAST_CAP);
+    if (command == NULL || command->spill_descriptor < 0 ||
+        command->length <= NONINTERACTIVE_INPUT_FAST_CAP) {
+        errno = EINVAL;
+        return -1;
+    }
     if (flush_native_input_spill(command) == -1 ||
         resize_native_input_spill(command, command->length) == -1) {
         return -1;
     }
-    mapping = fault_should_fail("input-map", ENOMEM)
-                  ? MAP_FAILED
-                  : mmap(NULL, command->length, PROT_READ, MAP_PRIVATE,
-                         command->spill_descriptor, 0);
-    if (mapping == MAP_FAILED) {
+    if (gsh_fault_should_fail(GSH_FAULT_INPUT_MAP, ENOMEM) ||
+        command->length >= command->source_view.window_capacity) {
+        errno = command->length >= command->source_view.window_capacity
+                    ? EFBIG
+                    : errno;
         return -1;
     }
-    command->source_mapping = mapping;
-    command->source_mapping_length = command->length;
+    for (attempts = 0;
+         offset < command->length &&
+         attempts < NATIVE_INPUT_SLOW_CAP / NATIVE_INPUT_READ_CAP + 1U;
+         attempts++) {
+        ssize_t count = pread(command->spill_descriptor,
+                              command->source_view.window + offset,
+                              command->length - offset, (off_t)offset);
+
+        if (count > 0) {
+            offset += (size_t)count;
+        } else if (count != -1 || errno != EINTR) {
+            return -1;
+        }
+    }
+    if (offset != command->length) {
+        errno = EIO;
+        return -1;
+    }
+    command->source_view.window[command->length] = '\0';
+    command->source_view.kind = GSH_SOURCE_VIEW_FILE;
+    command->source_view.memory = command->source_view.window;
+    command->source_view.length = command->length;
+    command->source_view.descriptor = command->spill_descriptor;
     return 0;
 }
 
@@ -17126,11 +20843,12 @@ static int map_native_alias_expansion(native_input_command *command)
         (size_t)GSH_ALIAS_EXPANSION_LIMIT *
         ((size_t)GSH_ALIAS_VALUE_CAP + 1U);
     size_t capacity;
-    void *mapping;
 
-    assert(command != NULL);
-    assert(command->spill_descriptor >= 0);
-    assert(command->source_mapping != NULL);
+    if (command == NULL || command->spill_descriptor < 0 ||
+        command->source_view.kind != GSH_SOURCE_VIEW_FILE) {
+        errno = EINVAL;
+        return -1;
+    }
     if (command->length > SIZE_MAX - maximum_growth - 1U) {
         errno = EOVERFLOW;
         return -1;
@@ -17139,15 +20857,12 @@ static int map_native_alias_expansion(native_input_command *command)
     if (resize_native_input_spill(command, capacity) == -1) {
         return -1;
     }
-    mapping = fault_should_fail("input-alias-map", ENOMEM)
-                  ? MAP_FAILED
-                  : mmap(NULL, capacity, PROT_READ | PROT_WRITE,
-                         MAP_PRIVATE, command->spill_descriptor, 0);
-    if (mapping == MAP_FAILED) {
+    if (gsh_fault_should_fail(GSH_FAULT_INPUT_ALIAS_MAP, ENOMEM) ||
+        capacity > command->alias_capacity) {
+        errno = capacity > command->alias_capacity ? EFBIG : errno;
         return -1;
     }
-    command->alias_mapping = mapping;
-    command->alias_mapping_length = capacity;
+    command->alias_active = true;
     return 0;
 }
 
@@ -17158,10 +20873,13 @@ static int parse_native_input_command(native_input_command *command,
     char *alias_expansion;
     size_t alias_capacity;
 
-    assert(command != NULL);
-    assert(session != NULL);
-    assert(command->source_mapping == NULL);
-    assert(command->alias_mapping == NULL);
+    if (command == NULL || session == NULL ||
+        command->source_view.kind != GSH_SOURCE_VIEW_DIRECT ||
+        command->alias_active) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (!require(session->evaluator.source_workspaces != NULL)) return -1;
     input = command->text;
     alias_expansion =
         session->evaluator.source_workspaces->root_alias_expansion;
@@ -17170,13 +20888,13 @@ static int parse_native_input_command(native_input_command *command,
         if (map_native_input_source(command) == -1) {
             return -1;
         }
-        input = command->source_mapping;
+        input = command->source_view.memory;
         if (gsh_aliases_count(session->evaluator.aliases) != 0) {
             if (map_native_alias_expansion(command) == -1) {
                 return -1;
             }
-            alias_expansion = command->alias_mapping;
-            alias_capacity = command->alias_mapping_length;
+            alias_expansion = command->alias_expansion;
+            alias_capacity = command->alias_capacity;
         }
     } else {
         command->text[command->length] = '\0';
@@ -17186,14 +20904,10 @@ static int parse_native_input_command(native_input_command *command,
     command->parsed = parse_native_script_text(
         session, input, command->length, alias_expansion, alias_capacity,
         &command->parsed_text, &command->parsed_length);
-    if (command->alias_mapping != NULL &&
-        command->parsed_text != command->alias_mapping) {
-        if (munmap(command->alias_mapping,
-                   command->alias_mapping_length) == -1) {
-            return -1;
-        }
-        command->alias_mapping = NULL;
-        command->alias_mapping_length = 0;
+    if (command->alias_active &&
+        command->parsed_text != command->alias_expansion) {
+        (void)memset(command->alias_expansion, 0, command->alias_capacity);
+        command->alias_active = false;
     }
     return 0;
 }
@@ -17201,9 +20915,9 @@ static int parse_native_input_command(native_input_command *command,
 static void begin_native_input_command(native_input_reader *reader,
                                        native_input_command *command)
 {
+    if (reader == NULL || command == NULL) return;
     if (!command->collecting) {
-        assert(command->spill_descriptor == -1);
-        assert(command->length == 0U);
+        if (command->spill_descriptor != -1 || command->length != 0U) return;
         command->source_offset = reader->source_offset;
         command->collecting = true;
     }
@@ -17213,6 +20927,8 @@ static int append_native_reader_byte(native_input_reader *reader,
                                      native_input_command *command,
                                      unsigned char byte)
 {
+    if (!require(reader != NULL)) return -1;
+    if (!require(command != NULL)) return -1;
     if (byte == '\0') {
         errno = EILSEQ;
         return -1;
@@ -17234,8 +20950,12 @@ static int read_native_input_command(
 {
     size_t scanned;
 
-    assert(command->source_mapping == NULL);
-    assert(command->alias_mapping == NULL);
+    if (reader == NULL || session == NULL || command == NULL ||
+        command->source_view.kind != GSH_SOURCE_VIEW_DIRECT ||
+        command->alias_active) {
+        errno = EINVAL;
+        return -1;
+    }
     begin_native_input_command(reader, command);
     for (scanned = 0; scanned < SIZE_MAX; scanned++) {
         unsigned char byte = 0;
@@ -17281,12 +21001,47 @@ static int read_native_input_command(
     return -1;
 }
 
+static int report_native_input_error(const char *source,
+                                     native_input_command *command,
+                                     int input_errno)
+{
+    if (!require(source != NULL && command != NULL)) return 125;
+    if (!require(input_errno != 0)) return 125;
+    (void)release_native_input_command(command);
+    errno = input_errno;
+    if (input_errno == EILSEQ) {
+        (void)fprintf(stderr, "gsh: %s contains a null byte\n", source);
+        return 2;
+    }
+    (void)fprintf(stderr, "gsh: %s: %s\n", source, strerror(input_errno));
+    return 125;
+}
+
+static int finish_native_descriptor_session(
+    native_script_resources *resources, native_input_command *command,
+    const char *source, int status)
+{
+    if (!require(resources != NULL && command != NULL)) return 125;
+    if (!require(source != NULL)) return 125;
+    if (release_native_input_command(command) == -1 && status == 0) {
+        (void)fprintf(stderr, "gsh: %s input cleanup: %s\n", source,
+                strerror(errno));
+        status = 125;
+    }
+    status = evaluate_native_traps_top(
+        &resources->session.evaluator, status, NATIVE_TRAPS_EXIT);
+    release_native_script_resources(resources);
+    return status;
+}
+
 static int execute_native_descriptor(
     int descriptor, const char *source, const char *parameter_zero,
     char *const *positional_parameters, size_t positional_count,
     bool shares_command_input)
 {
-    native_script_resources resources;
+    static native_script_resources resources;
+    static native_script_storage storage;
+    static native_input_storage input_storage;
     native_input_reader reader;
     native_input_command command;
     size_t complete_commands;
@@ -17297,16 +21052,20 @@ static int execute_native_descriptor(
         return 125;
     }
     if (initialize_native_script_resources(
-            &resources, parameter_zero, positional_parameters,
+            &resources, &storage, parameter_zero, positional_parameters,
             positional_count) == -1) {
         perror("gsh: native allocation");
         return 125;
     }
-    initialize_native_input_command(
-        &command, resources.source_workspaces->root_input);
+    if (!initialize_native_input_command(
+            &command, resources.source_workspaces->root_input,
+            &input_storage)) {
+        release_native_script_resources(&resources);
+        return 125;
+    }
     if (initialize_native_input_reader(&reader, descriptor,
                                        shares_command_input) == -1) {
-        fprintf(stderr, "gsh: %s input mode: %s\n", source,
+        (void)fprintf(stderr, "gsh: %s input mode: %s\n", source,
                 strerror(errno));
         release_native_script_resources(&resources);
         return 125;
@@ -17327,8 +21086,9 @@ static int execute_native_descriptor(
          * the same byte stream resumes without read-ahead or source loss.
          * ─────────────────────────────────────────────────────────────── */
         if (read_status == NATIVE_INPUT_INTERRUPTED) {
-            status = run_pending_native_traps(
-                &resources.session.evaluator, status);
+            status = evaluate_native_traps_top(
+                &resources.session.evaluator, status,
+                NATIVE_TRAPS_PENDING);
             if (resources.session.evaluator.fatal_error ||
                 resources.session.evaluator.exiting) {
                 break;
@@ -17338,20 +21098,12 @@ static int execute_native_descriptor(
         if (read_status == -1) {
             int input_errno = errno;
 
-            (void)release_native_input_command(&command);
-            errno = input_errno;
-            if (errno == EILSEQ) {
-                fprintf(stderr, "gsh: %s contains a null byte\n", source);
-                status = 2;
-            } else {
-                fprintf(stderr, "gsh: %s: %s\n", source,
-                        strerror(errno));
-                status = 125;
-            }
+            status = report_native_input_error(source, &command,
+                                               input_errno);
             break;
         }
         if (command.parsed.status != GSH_PARSE_OK) {
-            fprintf(stderr, "gsh: %s at byte %zu\n",
+            (void)fprintf(stderr, "gsh: %s at byte %zu\n",
                     gsh_parse_status_name(command.parsed.status),
                     command.source_offset + command.parsed.error_offset);
             status = 2;
@@ -17361,7 +21113,7 @@ static int execute_native_descriptor(
         if (native_parsed_script_is_empty(
                 &resources.session, command.parsed.root)) {
             if (release_native_input_command(&command) == -1) {
-                fprintf(stderr, "gsh: %s input cleanup: %s\n", source,
+                (void)fprintf(stderr, "gsh: %s input cleanup: %s\n", source,
                         strerror(errno));
                 status = 125;
                 break;
@@ -17369,7 +21121,7 @@ static int execute_native_descriptor(
             continue;
         }
         if (synchronize_native_input(&reader) == -1) {
-            fprintf(stderr, "gsh: %s input synchronization: %s\n",
+            (void)fprintf(stderr, "gsh: %s input synchronization: %s\n",
                     source, strerror(errno));
             status = 125;
             (void)release_native_input_command(&command);
@@ -17380,7 +21132,7 @@ static int execute_native_descriptor(
             command.parsed_length, command.parsed.root,
             resources.variables, resources.scratch);
         if (release_native_input_command(&command) == -1) {
-            fprintf(stderr, "gsh: %s input cleanup: %s\n", source,
+            (void)fprintf(stderr, "gsh: %s input cleanup: %s\n", source,
                     strerror(errno));
             status = 125;
             break;
@@ -17390,38 +21142,34 @@ static int execute_native_descriptor(
             break;
         }
     }
-    if (release_native_input_command(&command) == -1 && status == 0) {
-        fprintf(stderr, "gsh: %s input cleanup: %s\n", source,
-                strerror(errno));
-        status = 125;
-    }
-    status = finish_native_evaluator(&resources.session.evaluator,
-                                     status);
-    release_native_script_resources(&resources);
-    return status;
+    return finish_native_descriptor_session(&resources, &command, source,
+                                            status);
 }
 
 static int execute_native_file(
     const char *path, char *const *positional_parameters,
     size_t positional_count)
 {
+    if (positional_count != 0U && positional_parameters == NULL) {
+        return -1;
+    }
     int descriptor;
     int status;
 
     if (path == NULL || path[0] == '\0') {
-        fprintf(stderr, "gsh: empty command file\n");
+        (void)fprintf(stderr, "gsh: empty command file\n");
         return 2;
     }
     descriptor = open(path, O_RDONLY | O_CLOEXEC);
     if (descriptor == -1) {
-        fprintf(stderr, "gsh: %s: %s\n", path, strerror(errno));
+        (void)fprintf(stderr, "gsh: %s: %s\n", path, strerror(errno));
         return 2;
     }
     status = execute_native_descriptor(
         descriptor, path, path, positional_parameters, positional_count,
         false);
     if (close(descriptor) == -1 && status == 0) {
-        fprintf(stderr, "gsh: %s: %s\n", path, strerror(errno));
+        (void)fprintf(stderr, "gsh: %s: %s\n", path, strerror(errno));
         status = 125;
     }
     return status;
@@ -17429,6 +21177,7 @@ static int execute_native_file(
 
 static int exec_noninteractive(int argc, char **argv)
 {
+    if (argv == NULL) return -1;
     if (argc >= 3 && strcmp(argv[1], "-c") == 0) {
         const char *parameter_zero = argc >= 4 ? argv[3] : argv[0];
         char **positionals = argc >= 5 ? argv + 4 : NULL;
@@ -17461,13 +21210,21 @@ static int exec_noninteractive(int argc, char **argv)
         argc >= 3 ? (size_t)argc - 2U : 0U, true);
 }
 
+/* ── Process ABI Is Converted at the Entry Boundary ─────────────
+ * C supplies argc and argv with pointer shapes the shell cannot redefine.
+ * CANON-EXCEPTION: C-PROCESS-ABI ends at this entry adapter: option branches
+ * validate argc before indexing and pass explicit counts into bounded stores.
+ * Interactive state and storage are static, so argv is never retained there.
+ * Invocation and conformance gates exercise every accepted entry form.
+ * ─────────────────────────────────────────────────────────────── */
 int main(int argc, char **argv)
 {
-    shell_state state;
+    static shell_state state;
+    static interactive_storage storage;
     int status;
 
     (void)setlocale(LC_ALL, "");
-    initialize_fault_injection();
+    gsh_fault_initialize();
     if (argc == 2 &&
         (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0)) {
         print_usage(stdout);
@@ -17477,7 +21234,7 @@ int main(int argc, char **argv)
         strcmp(argv[2], "-c") == 0) {
         return check_native_syntax(argv[3]);
     }
-    if (fault_should_fail("shell-executable-resolution", EIO) ||
+    if (gsh_fault_should_fail(GSH_FAULT_SHELL_EXECUTABLE_RESOLUTION, EIO) ||
         initialize_shell_executable(argv[0]) == -1) {
         perror("gsh: executable resolution");
         return 125;
@@ -17495,7 +21252,7 @@ int main(int argc, char **argv)
     if (argc != 1 || !isatty(STDIN_FILENO)) {
         return exec_noninteractive(argc, argv);
     }
-    if (initialize_interactive(&state, argv[0]) == -1) {
+    if (initialize_interactive(&state, &storage, argv[0]) == -1) {
         perror("gsh: interactive initialization");
         cleanup(&state);
         return 1;

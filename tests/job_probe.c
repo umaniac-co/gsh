@@ -10,11 +10,13 @@
 
 #include <errno.h>
 #include <signal.h>
-#include <stddef.h>
 #include <unistd.h>
 
 static int write_marker(const char *marker, size_t length)
 {
+    if (marker == NULL) {
+        return -1;
+    }
     size_t offset = 0;
 
     while (offset < length) {
@@ -41,7 +43,9 @@ int main(void)
         write_marker(continued, sizeof(continued) - 1U) == -1) {
         return 1;
     }
-    for (;;) {
-        pause();
+    /* Lifecycle loop: the PTY harness terminates this stopped-process probe;
+     * only delivered signals can advance it. */
+    while (pause() == -1 && errno == EINTR) {
     }
+    return 1;
 }

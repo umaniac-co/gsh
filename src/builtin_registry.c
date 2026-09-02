@@ -103,19 +103,12 @@ const gsh_builtin_descriptor *gsh_builtin_descriptor_at(size_t index)
 
 bool gsh_builtin_regular_name(const char *name, size_t length)
 {
+    if (name == NULL) {
+        return false;
+    }
     const gsh_builtin_descriptor *descriptor =
         gsh_builtin_lookup(name, length);
 
     return descriptor != NULL && descriptor->implemented &&
            !descriptor->special;
-}
-
-bool gsh_builtin_pure_name(const char *name, size_t length)
-{
-    const gsh_builtin_descriptor *descriptor =
-        gsh_builtin_lookup(name, length);
-
-    return descriptor != NULL && descriptor->implemented &&
-           descriptor->execution_class == GSH_BUILTIN_PURE &&
-           descriptor->kind != GSH_BUILTIN_OTHER;
 }

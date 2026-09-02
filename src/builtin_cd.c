@@ -10,21 +10,22 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
-#include <stdbool.h>
-#include <stdio.h>
 #include <string.h>
 #include <unistd.h>
 
 static int cd_error(const gsh_builtin_io *io, const char *path,
                     const char *message)
 {
-    (void)io->output(io->opaque, STDERR_FILENO, "gsh: cd: ", 9);
-    if (path != NULL) {
-        (void)io->output(io->opaque, STDERR_FILENO, path, strlen(path));
-        (void)io->output(io->opaque, STDERR_FILENO, ": ", 2);
+    if (io == NULL || message == NULL) {
+        return -1;
     }
-    (void)io->output(io->opaque, STDERR_FILENO, message, strlen(message));
-    (void)io->output(io->opaque, STDERR_FILENO, "\n", 1);
+    (void)gsh_builtin_output(io, STDERR_FILENO, "gsh: cd: ", 9);
+    if (path != NULL) {
+        (void)gsh_builtin_output(io, STDERR_FILENO, path, strlen(path));
+        (void)gsh_builtin_output(io, STDERR_FILENO, ": ", 2);
+    }
+    (void)gsh_builtin_output(io, STDERR_FILENO, message, strlen(message));
+    (void)gsh_builtin_output(io, STDERR_FILENO, "\n", 1);
     return 1;
 }
 
@@ -33,6 +34,9 @@ static int set_directory_variable(
     const char *name, size_t name_length, const char *value,
     unsigned int attributes)
 {
+    if (value == NULL) {
+        return -1;
+    }
     size_t value_length = strlen(value);
 
     if (gsh_variables_set(variables, name, name_length, value,
@@ -49,6 +53,9 @@ static int set_directory_variable(
 static int rollback_directory(const gsh_builtin_io *io, int descriptor,
                               int operation_error)
 {
+    if (io == NULL) {
+        return -1;
+    }
     if (fchdir(descriptor) == -1) {
         int rollback_error = errno;
 
@@ -68,6 +75,9 @@ int gsh_builtin_cd(size_t argc, char *const argv[],
                    const gsh_builtin_io *io, char *directory,
                    size_t directory_capacity)
 {
+    if (argv == NULL || io == NULL || lookup_variables == NULL) {
+        return -1;
+    }
     const char *argument;
     const char *destination;
     char old_directory[PATH_MAX];
@@ -130,13 +140,13 @@ int gsh_builtin_cd(size_t argc, char *const argv[],
     if (directory != NULL) {
         size_t length = strlen(new_directory);
 
-        memcpy(directory, new_directory, length + 1U);
+        (void)memcpy(directory, new_directory, length + 1U);
     }
     (void)close(previous_directory);
     if (strcmp(argument, "-") == 0 &&
-        (io->output(io->opaque, STDOUT_FILENO, new_directory,
+        (gsh_builtin_output(io, STDOUT_FILENO, new_directory,
                     strlen(new_directory)) != 0 ||
-         io->output(io->opaque, STDOUT_FILENO, "\n", 1) != 0)) {
+         gsh_builtin_output(io, STDOUT_FILENO, "\n", 1) != 0)) {
         return 1;
     }
     return 0;

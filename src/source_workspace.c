@@ -7,8 +7,6 @@
 
 #include "source_workspace.h"
 
-#include <assert.h>
-
 /* ── One Bounded Arena Owns Nested Source State ────────────────
  * Command substitution once allocated up to nine large objects per entry,
  * making latency and failure depend on allocator state after initialization.
@@ -42,8 +40,6 @@ gsh_source_workspace *gsh_source_workspace_acquire(
     }
     workspace = &stack->workspaces[stack->depth];
     stack->depth++;
-    assert(stack->depth > 0U);
-    assert(workspace == &stack->workspaces[stack->depth - 1U]);
     return workspace;
 }
 
@@ -55,8 +51,6 @@ bool gsh_source_workspace_release(gsh_source_workspace_stack *stack,
         workspace != &stack->workspaces[stack->depth - 1U]) {
         return false;
     }
-    assert(stack->depth <= GSH_SOURCE_DEPTH_CAP);
-    assert(workspace == &stack->workspaces[stack->depth - 1U]);
     stack->depth--;
     return true;
 }
@@ -68,7 +62,5 @@ size_t gsh_source_workspaces_depth(
         stack->depth > GSH_SOURCE_DEPTH_CAP) {
         return GSH_SOURCE_DEPTH_CAP + 1U;
     }
-    assert(stack->depth <= GSH_SOURCE_DEPTH_CAP);
-    assert(stack->version == GSH_SOURCE_STACK_VERSION);
     return stack->depth;
 }

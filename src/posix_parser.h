@@ -23,8 +23,6 @@ typedef enum {
     GSH_PARSE_SYNTAX,
     GSH_PARSE_INCOMPLETE,
     GSH_PARSE_LIMIT,
-    GSH_PARSE_UNSUPPORTED,
-    GSH_PARSE_REWRITE,
 } gsh_parse_status;
 
 typedef enum {
@@ -98,11 +96,13 @@ typedef struct {
     gsh_word_ref words[GSH_PARSE_WORD_CAP];
     gsh_redirect redirects[GSH_PARSE_REDIRECT_CAP];
     gsh_heredoc heredocs[GSH_PARSE_REDIRECT_CAP];
+    gsh_word_ref command_words[GSH_PARSE_NODE_CAP];
     size_t token_count;
     size_t node_count;
     size_t word_count;
     size_t redirect_count;
     size_t heredoc_count;
+    size_t command_word_count;
 } gsh_parse_storage;
 
 typedef struct {
@@ -112,15 +112,8 @@ typedef struct {
     gsh_token_kind unexpected;
 } gsh_parse_result;
 
-typedef bool (*gsh_parse_command_probe_fn)(void *opaque, const char *word,
-                                           size_t length);
-
 gsh_parse_result gsh_parse(const void *input, size_t length,
                            gsh_parse_storage *storage);
-gsh_parse_result gsh_parse_command_probe(
-    const void *input, size_t length, gsh_parse_storage *storage,
-    gsh_parse_command_probe_fn probe, void *opaque,
-    gsh_word_ref *candidate);
 const char *gsh_parse_status_name(gsh_parse_status status);
 
 #endif

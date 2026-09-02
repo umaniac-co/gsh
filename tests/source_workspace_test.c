@@ -8,19 +8,16 @@
 #include "../src/source_workspace.h"
 
 #include <stdio.h>
-#include <stdlib.h>
 
 static int exercise_workspace_stack(void)
 {
-    gsh_source_workspace_stack *stack = malloc(sizeof(*stack));
+    static gsh_source_workspace_stack stack_storage;
+    gsh_source_workspace_stack *stack = &stack_storage;
     gsh_source_workspace *slots[GSH_SOURCE_DEPTH_CAP];
     size_t acquired = 0;
     size_t index;
     int failed = 0;
 
-    if (stack == NULL) {
-        return 1;
-    }
     gsh_source_workspaces_initialize(stack);
     if (gsh_source_workspaces_depth(stack) != 0U ||
         gsh_aliases_count(&stack->root_aliases) != 0U ||
@@ -54,16 +51,15 @@ static int exercise_workspace_stack(void)
         gsh_source_workspace_release(stack, slots[0])) {
         failed = 1;
     }
-    free(stack);
     return failed;
 }
 
 int main(void)
 {
     if (exercise_workspace_stack() != 0) {
-        fputs("source workspace tests failed\n", stderr);
+        (void)fputs("source workspace tests failed\n", stderr);
         return 1;
     }
-    puts("source workspace tests passed");
+    (void)puts("source workspace tests passed");
     return 0;
 }

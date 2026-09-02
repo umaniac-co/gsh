@@ -1,18 +1,37 @@
 #ifndef GSH_BUILTIN_COMMON_H
 #define GSH_BUILTIN_COMMON_H
 
-#include <stddef.h>
+#include "async_repl.h"
 
-typedef int (*gsh_builtin_output_fn)(void *opaque, int descriptor,
-                                     const char *text, size_t length);
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
+typedef enum {
+    GSH_BUILTIN_SINK_DESCRIPTORS,
+    GSH_BUILTIN_SINK_BUFFER,
+} gsh_builtin_sink_kind;
 
 typedef struct {
-    gsh_builtin_output_fn output;
-    void *opaque;
+    gsh_builtin_sink_kind kind;
+    struct {
+        int output;
+        int error;
+    } descriptors;
+    struct {
+        char *bytes;
+        size_t capacity;
+        size_t *offset;
+        size_t *length;
+        uint64_t *overloads;
+        gsh_async_repl *async_repl;
+        int async_cell;
+    } buffer;
 } gsh_builtin_io;
 
-int gsh_builtin_descriptor_output(void *opaque, int descriptor,
-                                  const char *text, size_t length);
+int gsh_builtin_output(const gsh_builtin_io *io, int descriptor,
+                       const char *text, size_t length);
+bool gsh_builtin_io_valid(const gsh_builtin_io *io);
 int gsh_builtin_error(const gsh_builtin_io *io, const char *name,
                       const char *message);
 

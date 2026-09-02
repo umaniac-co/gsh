@@ -8,7 +8,6 @@
 #include <signal.h>
 #include <stdio.h>
 #include <string.h>
-#include <sys/wait.h>
 
 int main(void)
 {
@@ -119,7 +118,7 @@ int main(void)
         !gsh_background_has_capacity(&table)) {
         return 1;
     }
-    puts("background jobs: jobspec, transitions, notification, capacity, "
+    (void)puts("background jobs: jobspec, transitions, notification, capacity, "
          "identity, completion, atomic wait-all and reuse passed");
     return 0;
 }

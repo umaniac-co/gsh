@@ -57,8 +57,10 @@ dkms.conf
 # Local build artifacts
 build/
 
-# Local development reports and evidence
-dev/
+# Local development reports and evidence. Permanent gate inputs remain tracked.
+dev/*
+!dev/quality-linux.Dockerfile
+!dev/target-manifest.tsv
 
 # maintainer knowledge and notes
 kb/

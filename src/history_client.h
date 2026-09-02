@@ -16,11 +16,14 @@ typedef struct {
     char vault_path[4096];
     char agent_path[4096];
     unsigned char *snapshot;
+    size_t snapshot_capacity;
 } gsh_history_client;
 
 int gsh_history_client_initialize(gsh_history_client *client,
                                   const char *home,
-                                  const char *program_path);
+                                  const char *program_path,
+                                  unsigned char *snapshot,
+                                  size_t snapshot_capacity);
 int gsh_history_client_status(gsh_history_client *client,
                               uint64_t reminder_min_ns,
                               uint64_t reminder_max_ns,

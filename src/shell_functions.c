@@ -8,9 +8,9 @@
 #include "shell_functions.h"
 
 #include <errno.h>
-#include <stdbool.h>
-#include <stdint.h>
 #include <string.h>
+
+#define require(condition) (condition)
 
 typedef struct {
     size_t nodes;
@@ -35,8 +35,25 @@ typedef struct {
     size_t redirect_end;
 } function_copy;
 
+static const gsh_parse_storage *copy_source(const function_copy *copy)
+{
+    if (!require(copy != NULL)) return NULL;
+    if (!require(copy->source != NULL)) return NULL;
+    return copy->source;
+}
+
+static gsh_parse_storage *copy_destination(const function_copy *copy)
+{
+    if (!require(copy != NULL)) return NULL;
+    if (!require(copy->destination != NULL)) return NULL;
+    return copy->destination;
+}
+
 static uint32_t hash_name(const char *name, size_t length)
 {
+    if (name == NULL) {
+        return 0U;
+    }
     uint32_t hash = UINT32_C(2166136261);
     size_t index;
 
@@ -51,6 +68,9 @@ static size_t find_index(const gsh_function_store *store,
                          const char *name, size_t name_length,
                          uint32_t hash)
 {
+    if (store == NULL) {
+        return 0U;
+    }
     size_t slot = hash & (GSH_FUNCTION_HASH_CAP - 1U);
     size_t probes;
     const char *text = gsh_functions_text(store);
@@ -74,9 +94,12 @@ static size_t find_index(const gsh_function_store *store,
 
 static void rebuild_hash(gsh_function_store *store)
 {
+    if (store == NULL) {
+        return;
+    }
     size_t index;
 
-    memset(store->hash_slots, 0, sizeof(store->hash_slots));
+    (void)memset(store->hash_slots, 0, sizeof(store->hash_slots));
     for (index = 0; index < store->count; index++) {
         size_t slot = store->entries[index].hash &
                       (GSH_FUNCTION_HASH_CAP - 1U);
@@ -92,6 +115,7 @@ static bool include_reference(function_measure *measure,
                               gsh_word_ref reference,
                               size_t input_length)
 {
+    if (measure == NULL) return false;
     if (reference.begin > reference.end ||
         reference.end > input_length ||
         reference.begin < measure->source_begin) {
@@ -103,16 +127,15 @@ static bool include_reference(function_measure *measure,
     return true;
 }
 
-static bool measure_node(const gsh_parse_storage *storage,
-                         size_t node_index, size_t input_length,
-                         size_t depth, function_measure *measure)
+static bool measure_single_node(const gsh_parse_storage *storage,
+                                size_t node_index, size_t input_length,
+                                function_measure *measure)
 {
+    if (storage == NULL || measure == NULL) return false;
     const gsh_ast_node *node;
     size_t index;
-    size_t child;
 
-    if (depth > GSH_PARSE_NODE_CAP ||
-        node_index >= storage->node_count ||
+    if (node_index >= storage->node_count ||
         ++measure->visited > storage->node_count) {
         return false;
     }
@@ -148,27 +171,63 @@ static bool measure_node(const gsh_parse_storage *storage,
             return false;
         }
     }
-    child = node->first_child;
-    while (child != GSH_AST_NONE) {
-        size_t next;
-
-        if (child >= storage->node_count) {
-            return false;
-        }
-        next = storage->nodes[child].next_sibling;
-        if (!measure_node(storage, child, input_length, depth + 1U,
-                          measure)) {
-            return false;
-        }
-        child = next;
-    }
     return true;
+}
+
+static bool measure_node(const gsh_parse_storage *storage,
+                         size_t node_index, size_t input_length,
+                         function_measure *measure)
+{
+    if (measure == NULL || storage == NULL) {
+        return false;
+    }
+    typedef struct {
+        size_t node;
+        size_t next_child;
+        bool entered;
+    } measure_frame;
+    static measure_frame frames[GSH_PARSE_NODE_CAP];
+    size_t frame_count = 1U;
+    size_t steps;
+
+    frames[0] = (measure_frame){node_index, GSH_AST_NONE, false};
+    for (steps = 0;
+         frame_count > 0U && steps < 2U * GSH_PARSE_NODE_CAP; steps++) {
+        measure_frame *frame = &frames[frame_count - 1U];
+
+        if (!frame->entered) {
+            if (!measure_single_node(storage, frame->node, input_length,
+                                     measure)) {
+                return false;
+            }
+            frame->next_child = storage->nodes[frame->node].first_child;
+            frame->entered = true;
+        } else if (frame->next_child != GSH_AST_NONE) {
+            size_t child = frame->next_child;
+
+            if (child >= storage->node_count ||
+                frame_count == GSH_PARSE_NODE_CAP) {
+                return false;
+            }
+            frame->next_child = storage->nodes[child].next_sibling;
+            frames[frame_count] =
+                (measure_frame){child, GSH_AST_NONE, false};
+            frame_count++;
+        } else {
+            frame_count--;
+        }
+    }
+    return frame_count == 0U;
 }
 
 static bool adjust_reference(const function_copy *copy,
                              gsh_word_ref source,
                              gsh_word_ref *destination)
 {
+    if (copy == NULL) return false;
+    if (destination == NULL) {
+        return false;
+    }
     if (source.begin < copy->source_begin ||
         source.end > copy->source_end || source.begin > source.end) {
         return false;
@@ -180,23 +239,20 @@ static bool adjust_reference(const function_copy *copy,
     return true;
 }
 
-static size_t copy_node(function_copy *copy, size_t source_index,
-                        size_t depth)
+static size_t copy_single_node(function_copy *copy, size_t source_index)
 {
     const gsh_ast_node *source;
     gsh_ast_node *destination;
     size_t destination_index;
     size_t index;
-    size_t child;
 
-    if (depth > GSH_PARSE_NODE_CAP ||
-        source_index >= copy->source->node_count ||
+    if (source_index >= copy_source(copy)->node_count ||
         copy->next_node == copy->node_end) {
         return GSH_AST_NONE;
     }
-    source = &copy->source->nodes[source_index];
+    source = &copy_source(copy)->nodes[source_index];
     destination_index = copy->next_node++;
-    destination = &copy->destination->nodes[destination_index];
+    destination = &copy_destination(copy)->nodes[destination_index];
     *destination = *source;
     destination->first_child = GSH_AST_NONE;
     destination->last_child = GSH_AST_NONE;
@@ -214,16 +270,16 @@ static size_t copy_node(function_copy *copy, size_t source_index,
     }
     for (index = 0; index < source->word_count; index++) {
         if (!adjust_reference(
-                copy, copy->source->words[source->first_word + index],
-                &copy->destination->words[copy->next_word++])) {
+                copy, copy_source(copy)->words[source->first_word + index],
+                &copy_destination(copy)->words[copy->next_word++])) {
             return GSH_AST_NONE;
         }
     }
     for (index = 0; index < source->redirect_count; index++) {
         const gsh_redirect *source_redirect =
-            &copy->source->redirects[source->first_redirect + index];
+            &copy_source(copy)->redirects[source->first_redirect + index];
         gsh_redirect *destination_redirect =
-            &copy->destination->redirects[copy->next_redirect++];
+            &copy_destination(copy)->redirects[copy->next_redirect++];
 
         *destination_redirect = *source_redirect;
         if (!adjust_reference(copy, source_redirect->target,
@@ -233,24 +289,118 @@ static size_t copy_node(function_copy *copy, size_t source_index,
             return GSH_AST_NONE;
         }
     }
-    child = source->first_child;
-    while (child != GSH_AST_NONE) {
-        size_t next = copy->source->nodes[child].next_sibling;
-        size_t copied = copy_node(copy, child, depth + 1U);
-
-        if (copied == GSH_AST_NONE) {
-            return GSH_AST_NONE;
-        }
-        if (destination->first_child == GSH_AST_NONE) {
-            destination->first_child = copied;
-        } else {
-            copy->destination->nodes[destination->last_child].next_sibling =
-                copied;
-        }
-        destination->last_child = copied;
-        child = next;
-    }
     return destination_index;
+}
+
+static size_t copy_node(function_copy *copy, size_t source_index)
+{
+    if (copy == NULL) {
+        return 0U;
+    }
+    typedef struct {
+        size_t source;
+        size_t destination;
+        size_t next_child;
+    } copy_frame;
+    static copy_frame frames[GSH_PARSE_NODE_CAP];
+    size_t root = copy_single_node(copy, source_index);
+    size_t frame_count = 1U;
+    size_t steps;
+
+    if (root == GSH_AST_NONE) {
+        return GSH_AST_NONE;
+    }
+    frames[0] = (copy_frame){
+        source_index, root, copy_source(copy)->nodes[source_index].first_child};
+    for (steps = 0;
+         frame_count > 0U && steps < 2U * GSH_PARSE_NODE_CAP; steps++) {
+        copy_frame *frame = &frames[frame_count - 1U];
+
+        if (frame->next_child == GSH_AST_NONE) {
+            frame_count--;
+        } else {
+            gsh_ast_node *parent =
+                &copy_destination(copy)->nodes[frame->destination];
+            size_t child = frame->next_child;
+            size_t copied;
+
+            if (child >= copy_source(copy)->node_count ||
+                frame_count == GSH_PARSE_NODE_CAP) {
+                return GSH_AST_NONE;
+            }
+            frame->next_child = copy_source(copy)->nodes[child].next_sibling;
+            copied = copy_single_node(copy, child);
+            if (copied == GSH_AST_NONE) {
+                return GSH_AST_NONE;
+            }
+            if (parent->first_child == GSH_AST_NONE) {
+                parent->first_child = copied;
+            } else {
+                copy_destination(copy)->nodes[parent->last_child].next_sibling =
+                    copied;
+            }
+            parent->last_child = copied;
+            frames[frame_count] = (copy_frame){
+                child, copied, copy_source(copy)->nodes[child].first_child};
+            frame_count++;
+        }
+    }
+    return frame_count == 0U ? root : GSH_AST_NONE;
+}
+
+static int commit_function_allocation(
+    gsh_function_store *store, const gsh_function_entry *allocation,
+    const function_copy *copy, size_t existing)
+{
+    gsh_function_entry *entry;
+
+    if (!require(store != NULL && allocation != NULL && copy != NULL)) {
+        return -1;
+    }
+    if (!require(existing == GSH_FUNCTION_CAP || existing < store->count)) {
+        return -1;
+    }
+    entry = existing == GSH_FUNCTION_CAP
+                ? &store->entries[store->count++]
+                : &store->entries[existing];
+    *entry = *allocation;
+    if (allocation->source_offset + allocation->source_capacity >
+        store->text_used) {
+        store->text_used = allocation->source_offset +
+                           allocation->source_capacity;
+    }
+    if (copy->next_node > store->programs.node_count) {
+        store->programs.node_count = copy->next_node;
+    }
+    if (copy->next_word > store->programs.word_count) {
+        store->programs.word_count = copy->next_word;
+    }
+    if (copy->next_redirect > store->programs.redirect_count) {
+        store->programs.redirect_count = copy->next_redirect;
+    }
+    rebuild_hash(store);
+    return 0;
+}
+
+static void initialize_function_copy(
+    function_copy *copy, gsh_function_store *store,
+    const gsh_parse_storage *storage, const function_measure *measure,
+    const gsh_function_entry *allocation)
+{
+    if (!require(copy != NULL && store != NULL && storage != NULL)) return;
+    if (!require(measure != NULL && allocation != NULL)) return;
+    copy->source = storage;
+    copy->source_begin = measure->source_begin;
+    copy->source_end = measure->source_end;
+    copy->destination = &store->programs;
+    copy->destination_source = allocation->source_offset;
+    copy->next_node = allocation->node_offset;
+    copy->next_word = allocation->word_offset;
+    copy->next_redirect = allocation->redirect_offset;
+    copy->node_end = allocation->node_offset + allocation->node_capacity;
+    copy->word_end = allocation->word_offset + allocation->word_capacity;
+    copy->redirect_end = allocation->redirect_offset +
+                         allocation->redirect_capacity;
 }
 
 static int set_once(gsh_function_store *store, const char *input,
@@ -258,12 +408,15 @@ static int set_once(gsh_function_store *store, const char *input,
                     const gsh_parse_storage *storage,
                     size_t function_node, bool preserve_active_programs)
 {
+    if (storage == NULL) return -1;
+    if (input == NULL || store == NULL) {
+        return -1;
+    }
     const gsh_ast_node *node;
     gsh_word_ref name;
     function_measure measure = {0};
     function_copy copy;
     gsh_function_entry allocation;
-    gsh_function_entry *entry;
     size_t source_length;
     size_t existing;
     size_t copied;
@@ -288,7 +441,7 @@ static int set_once(gsh_function_store *store, const char *input,
     }
     measure.source_begin = node->begin;
     measure.source_end = node->end;
-    if (!measure_node(storage, function_node, input_length, 0, &measure)) {
+    if (!measure_node(storage, function_node, input_length, &measure)) {
         errno = EINVAL;
         return -1;
     }
@@ -316,7 +469,7 @@ static int set_once(gsh_function_store *store, const char *input,
             errno = ENOSPC;
             return -1;
         }
-        memset(&allocation, 0, sizeof(allocation));
+        (void)memset(&allocation, 0, sizeof(allocation));
         allocation.source_offset = store->text_used;
         allocation.source_capacity = (uint32_t)source_length;
         allocation.node_offset = (uint32_t)store->programs.node_count;
@@ -328,54 +481,25 @@ static int set_once(gsh_function_store *store, const char *input,
         allocation.redirect_capacity = (uint32_t)measure.redirects;
     }
     allocation.source_length = (uint32_t)source_length;
-    memmove((char *)store->programs.tokens + allocation.source_offset,
+    (void)memmove((char *)store->programs.tokens + allocation.source_offset,
             input + measure.source_begin, source_length);
-    copy.source = storage;
-    copy.source_begin = measure.source_begin;
-    copy.source_end = measure.source_end;
-    copy.destination = &store->programs;
-    copy.destination_source = allocation.source_offset;
-    copy.next_node = allocation.node_offset;
-    copy.next_word = allocation.word_offset;
-    copy.next_redirect = allocation.redirect_offset;
-    copy.node_end = allocation.node_offset + allocation.node_capacity;
-    copy.word_end = allocation.word_offset + allocation.word_capacity;
-    copy.redirect_end = allocation.redirect_offset +
-                        allocation.redirect_capacity;
-    copied = copy_node(&copy, function_node, 0);
+    initialize_function_copy(&copy, store, storage, &measure, &allocation);
+    copied = copy_node(&copy, function_node);
     if (copied == GSH_AST_NONE || copied != allocation.node_offset) {
         errno = EINVAL;
         return -1;
     }
     allocation.hash = hash;
     allocation.name_length = (uint16_t)(name.end - name.begin);
-    if (existing == GSH_FUNCTION_CAP) {
-        entry = &store->entries[store->count++];
-    } else {
-        entry = &store->entries[existing];
-    }
-    *entry = allocation;
-    if (allocation.source_offset + allocation.source_capacity >
-        store->text_used) {
-        store->text_used = allocation.source_offset +
-                           allocation.source_capacity;
-    }
-    if (copy.next_node > store->programs.node_count) {
-        store->programs.node_count = copy.next_node;
-    }
-    if (copy.next_word > store->programs.word_count) {
-        store->programs.word_count = copy.next_word;
-    }
-    if (copy.next_redirect > store->programs.redirect_count) {
-        store->programs.redirect_count = copy.next_redirect;
-    }
-    rebuild_hash(store);
-    return 0;
+    return commit_function_allocation(store, &allocation, &copy, existing);
 }
 
 static int compact(gsh_function_store *store,
                    gsh_function_store *scratch)
 {
+    if (scratch == NULL || store == NULL) {
+        return -1;
+    }
     size_t index;
     size_t old_count = store->count;
     const char *text = gsh_functions_text(store);
@@ -387,25 +511,25 @@ static int compact(gsh_function_store *store,
             return -1;
         }
     }
-    memcpy(store->entries, scratch->entries,
+    (void)memcpy(store->entries, scratch->entries,
            scratch->count * sizeof(store->entries[0]));
     if (old_count > scratch->count) {
-        memset(store->entries + scratch->count, 0,
+        (void)memset(store->entries + scratch->count, 0,
                (old_count - scratch->count) * sizeof(store->entries[0]));
     }
-    memcpy(store->hash_slots, scratch->hash_slots,
+    (void)memcpy(store->hash_slots, scratch->hash_slots,
            sizeof(store->hash_slots));
     store->count = scratch->count;
     store->text_used = scratch->text_used;
-    memcpy(store->programs.tokens, scratch->programs.tokens,
+    (void)memcpy(store->programs.tokens, scratch->programs.tokens,
            scratch->text_used);
-    memcpy(store->programs.nodes, scratch->programs.nodes,
+    (void)memcpy(store->programs.nodes, scratch->programs.nodes,
            scratch->programs.node_count *
                sizeof(store->programs.nodes[0]));
-    memcpy(store->programs.words, scratch->programs.words,
+    (void)memcpy(store->programs.words, scratch->programs.words,
            scratch->programs.word_count *
                sizeof(store->programs.words[0]));
-    memcpy(store->programs.redirects, scratch->programs.redirects,
+    (void)memcpy(store->programs.redirects, scratch->programs.redirects,
            scratch->programs.redirect_count *
                sizeof(store->programs.redirects[0]));
     store->programs.token_count = 0;
@@ -418,8 +542,11 @@ static int compact(gsh_function_store *store,
 
 void gsh_functions_initialize(gsh_function_store *store)
 {
-    memset(store->entries, 0, sizeof(store->entries));
-    memset(store->hash_slots, 0, sizeof(store->hash_slots));
+    if (store == NULL) {
+        return;
+    }
+    (void)memset(store->entries, 0, sizeof(store->entries));
+    (void)memset(store->hash_slots, 0, sizeof(store->hash_slots));
     store->count = 0;
     store->text_used = 0;
     store->programs.token_count = 0;
@@ -485,7 +612,7 @@ int gsh_functions_unset(gsh_function_store *store,
     if (index != store->count) {
         store->entries[index] = store->entries[store->count];
     }
-    memset(&store->entries[store->count], 0,
+    (void)memset(&store->entries[store->count], 0,
            sizeof(store->entries[store->count]));
     rebuild_hash(store);
     return 0;
@@ -493,11 +620,17 @@ int gsh_functions_unset(gsh_function_store *store,
 
 size_t gsh_functions_count(const gsh_function_store *store)
 {
+    if (store == NULL) {
+        return 0U;
+    }
     return store == NULL ? 0 : store->count;
 }
 
 const char *gsh_functions_text(const gsh_function_store *store)
 {
+    if (store == NULL) {
+        return NULL;
+    }
     return (const char *)store->programs.tokens;
 }
 
@@ -505,6 +638,9 @@ void gsh_functions_snapshot_header(
     const gsh_function_store *store, uint64_t base_generation,
     gsh_function_snapshot_header *header)
 {
+    if (header == NULL || store == NULL) {
+        return;
+    }
     header->version = GSH_FUNCTION_SNAPSHOT_VERSION;
     header->count = store->count;
     header->text_used = store->text_used;
@@ -518,6 +654,9 @@ void gsh_functions_snapshot_header(
 bool gsh_functions_snapshot_header_valid(
     const gsh_function_snapshot_header *header)
 {
+    if (header == NULL) {
+        return false;
+    }
     return header != NULL &&
            header->version == GSH_FUNCTION_SNAPSHOT_VERSION &&
            header->reserved == 0 && header->count <= GSH_FUNCTION_CAP &&
@@ -545,6 +684,9 @@ static const void *snapshot_section_source(
     const gsh_function_snapshot_header *header, size_t offset,
     size_t *available)
 {
+    if (available == NULL || header == NULL || store == NULL) {
+        return NULL;
+    }
     const void *sections[] = {
         store->entries, store->programs.tokens, store->programs.nodes,
         store->programs.words, store->programs.redirects};
@@ -588,12 +730,16 @@ void *gsh_functions_snapshot_destination(
     const gsh_function_snapshot_header *header, size_t offset,
     size_t *available)
 {
+    if (available == NULL || header == NULL || store == NULL) {
+        return NULL;
+    }
     return (void *)gsh_functions_snapshot_source(store, header, offset,
                                                   available);
 }
 
 static bool function_name_is_valid(const char *name, size_t length)
 {
+    if (name == NULL) return false;
     size_t index;
 
     if (length == 0 || !((name[0] >= 'A' && name[0] <= 'Z') ||
@@ -615,26 +761,32 @@ static bool function_name_is_valid(const char *name, size_t length)
 static bool reference_in_function(const gsh_function_entry *entry,
                                   gsh_word_ref reference)
 {
+    if (entry == NULL) {
+        return false;
+    }
     size_t end = (size_t)entry->source_offset + entry->source_length;
 
     return reference.begin <= reference.end &&
            reference.begin >= entry->source_offset && reference.end <= end;
 }
 
-static bool validate_snapshot_node(const gsh_function_store *store,
-                                   const gsh_function_entry *entry,
-                                   size_t node_index, size_t depth,
-                                   size_t *visited)
+static bool validate_snapshot_single_node(const gsh_function_store *store,
+                                          const gsh_function_entry *entry,
+                                          size_t node_index,
+                                          size_t *visited)
 {
+    if (visited == NULL) return false;
+    if (entry == NULL || store == NULL) {
+        return false;
+    }
     const gsh_ast_node *node;
     size_t node_end = (size_t)entry->node_offset + entry->node_capacity;
     size_t word_end = (size_t)entry->word_offset + entry->word_capacity;
     size_t redirect_end = (size_t)entry->redirect_offset +
                           entry->redirect_capacity;
-    size_t child;
     size_t index;
 
-    if (depth > entry->node_capacity || node_index < entry->node_offset ||
+    if (node_index < entry->node_offset ||
         node_index >= node_end || ++*visited > entry->node_capacity) {
         return false;
     }
@@ -665,27 +817,68 @@ static bool validate_snapshot_node(const gsh_function_store *store,
             return false;
         }
     }
-    child = node->first_child;
-    while (child != GSH_AST_NONE) {
-        size_t next;
-
-        if (child < entry->node_offset || child >= node_end) {
-            return false;
-        }
-        next = store->programs.nodes[child].next_sibling;
-        if (!validate_snapshot_node(store, entry, child, depth + 1U,
-                                    visited) ||
-            (next != GSH_AST_NONE &&
-             (next < entry->node_offset || next >= node_end))) {
-            return false;
-        }
-        child = next;
-    }
     return true;
+}
+
+static bool validate_snapshot_node(const gsh_function_store *store,
+                                   const gsh_function_entry *entry,
+                                   size_t node_index, size_t *visited)
+{
+    if (entry == NULL || store == NULL || visited == NULL) {
+        return false;
+    }
+    typedef struct {
+        size_t node;
+        size_t next_child;
+        bool entered;
+    } validation_frame;
+    static validation_frame frames[GSH_PARSE_NODE_CAP];
+    size_t node_end = (size_t)entry->node_offset + entry->node_capacity;
+    size_t frame_count = 1U;
+    size_t steps;
+
+    frames[0] = (validation_frame){node_index, GSH_AST_NONE, false};
+    for (steps = 0;
+         frame_count > 0U && steps < 2U * GSH_PARSE_NODE_CAP; steps++) {
+        validation_frame *frame = &frames[frame_count - 1U];
+
+        if (!frame->entered) {
+            if (!validate_snapshot_single_node(store, entry, frame->node,
+                                               visited)) {
+                return false;
+            }
+            frame->next_child =
+                store->programs.nodes[frame->node].first_child;
+            frame->entered = true;
+        } else if (frame->next_child != GSH_AST_NONE) {
+            size_t child = frame->next_child;
+            size_t next;
+
+            if (child < entry->node_offset || child >= node_end ||
+                frame_count == GSH_PARSE_NODE_CAP) {
+                return false;
+            }
+            next = store->programs.nodes[child].next_sibling;
+            if (next != GSH_AST_NONE &&
+                (next < entry->node_offset || next >= node_end)) {
+                return false;
+            }
+            frame->next_child = next;
+            frames[frame_count] =
+                (validation_frame){child, GSH_AST_NONE, false};
+            frame_count++;
+        } else {
+            frame_count--;
+        }
+    }
+    return frame_count == 0U;
 }
 
 static bool validate_snapshot_store(const gsh_function_store *store)
 {
+    if (store == NULL) {
+        return false;
+    }
     const char *text = gsh_functions_text(store);
     size_t index;
 
@@ -716,7 +909,7 @@ static bool validate_snapshot_store(const gsh_function_store *store)
                                     entry->name_length) ||
             entry->hash != hash_name(text + entry->source_offset,
                                      entry->name_length) ||
-            !validate_snapshot_node(store, entry, entry->node_offset, 0,
+            !validate_snapshot_node(store, entry, entry->node_offset,
                                     &visited)) {
             return false;
         }
@@ -791,7 +984,7 @@ bool gsh_functions_clone(gsh_function_store *destination,
         if (from == NULL || to == NULL || amount == 0) {
             return false;
         }
-        memcpy(to, from, amount);
+        (void)memcpy(to, from, amount);
         offset += amount;
     }
     return gsh_functions_snapshot_finalize(destination, &header);

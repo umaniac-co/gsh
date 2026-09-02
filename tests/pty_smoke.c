@@ -14,25 +14,22 @@
 #include "../src/source_workspace.h"
 #include "benchmark_report.h"
 
+#include <dirent.h> /* CANON-INCLUDE: linux */
 #include <errno.h>
-#include <dirent.h>
 #include <fcntl.h>
-#include <limits.h>
+#include <limits.h> /* CANON-INCLUDE: linux */
 #include <locale.h>
 #include <poll.h>
-#include <signal.h>
-#include <stdbool.h>
-#include <stdint.h>
+#include <signal.h> /* CANON-INCLUDE: macos */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h> /* CANON-INCLUDE: linux */
+#include <sys/stat.h> /* CANON-INCLUDE: linux */
+#include <sys/wait.h> /* CANON-INCLUDE: linux */
 #include <sys/ioctl.h>
-#include <sys/resource.h>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <sys/wait.h>
 #include <termios.h>
-#include <time.h>
+#include <time.h> /* CANON-INCLUDE: linux */
 #include <unistd.h>
 
 #if defined(__APPLE__)
@@ -50,6 +47,9 @@ enum {
     BENCH_MEMORY_SAMPLES = 20,
     BENCH_MEMORY_WORKLOADS = 26,
     BENCH_LATENCY_WORKLOADS = 36,
+    PTY_DESCRIPTOR_CLOSE_PASS_CAP = 1024,
+    PTY_WAIT_ATTEMPT_CAP = 65536,
+    PTY_DRAIN_ATTEMPT_CAP = CAPTURE_CAP,
 };
 
 _Static_assert((size_t)BENCH_STARTUP_SAMPLES <=
@@ -64,6 +64,15 @@ _Static_assert((size_t)BENCH_EXEC_SAMPLES <=
 _Static_assert((size_t)BENCH_MEMORY_SAMPLES <=
                    (size_t)BENCHMARK_REPORT_SAMPLE_CAP,
                "memory samples must fit the CSV schema");
+
+static bool require(bool condition)
+{
+    if (!condition) {
+        errno = EINVAL;
+        return false;
+    }
+    return true;
+}
 
 static int configure_utf8_locale(void)
 {
@@ -97,8 +106,9 @@ static int close_inherited_descriptors(void)
 {
 #if defined(__APPLE__)
     struct proc_fdinfo descriptors[64];
+    size_t pass;
 
-    for (;;) {
+    for (pass = 0; pass < PTY_DESCRIPTOR_CLOSE_PASS_CAP; pass++) {
         int bytes = proc_pidinfo(getpid(), PROC_PIDLISTFDS, 0, descriptors,
                                  (int)sizeof(descriptors));
         int count;
@@ -113,7 +123,7 @@ static int close_inherited_descriptors(void)
             int descriptor = descriptors[index].proc_fd;
 
             if (descriptor > STDERR_FILENO) {
-                close(descriptor);
+                (void)close(descriptor);
                 closed = true;
             }
         }
@@ -121,15 +131,14 @@ static int close_inherited_descriptors(void)
             return 0;
         }
     }
+    errno = EMFILE;
+    return -1;
 #elif defined(__linux__)
     struct dirent *entry;
     DIR *directory = opendir("/proc/self/fd");
     int directory_fd;
     int failed = 0;
 
-    if (directory == NULL) {
-        return -1;
-    }
     directory_fd = dirfd(directory);
     while ((entry = readdir(directory)) != NULL) {
         char *end;
@@ -163,7 +172,7 @@ static bool linux_is_translated(void)
         return false;
     }
     count = read(descriptor, contents, sizeof(contents) - 1U);
-    close(descriptor);
+    (void)close(descriptor);
     if (count <= 0) {
         return false;
     }
@@ -201,6 +210,9 @@ static const unsigned char *find_bytes(const unsigned char *haystack,
                                        size_t haystack_length,
                                        const char *needle)
 {
+    if (needle == NULL) {
+        return NULL;
+    }
     size_t needle_length = strlen(needle);
     size_t index;
 
@@ -217,17 +229,22 @@ static const unsigned char *find_bytes(const unsigned char *haystack,
 
 static bool capture_contains(const pty_session *session, const char *text)
 {
+    if (session == NULL || text == NULL) {
+        return false;
+    }
     return find_bytes(session->capture, session->capture_length, text) != NULL;
 }
 
 static void dump_capture(const pty_session *session)
 {
-    if (session->capture_length == 0) {
+    if (session == NULL) return;
+    if (session->capture_length == 0 ||
+        session->capture_length > sizeof(session->capture)) {
         return;
     }
-    fputs("pty capture follows:\n", stderr);
+    (void)fputs("pty capture follows:\n", stderr);
     (void)fwrite(session->capture, 1, session->capture_length, stderr);
-    fputc('\n', stderr);
+    (void)fputc('\n', stderr);
 }
 
 static int set_nonblocking(int fd)
@@ -240,217 +257,248 @@ static int set_nonblocking(int fd)
     return 0;
 }
 
+static int copy_slave_name(pty_session *session, int master,
+                           char slave_name[256])
+{
+    const char *name;
+    size_t length;
+
+    if (!require(session != NULL) || !require(master >= 0)) {
+        return -1;
+    }
+    name = ptsname(master);
+    if (name == NULL) return -1;
+    length = strlen(name) + 1U;
+    if (length > sizeof(session->slave_name)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    (void)memcpy(slave_name, name, length);
+    (void)memcpy(session->slave_name, name, length);
+    return 0;
+}
+
+static int apply_harness_limit(const char *name, int resource,
+                               bool invalid_is_error)
+{
+    if (name == NULL) {
+        return -1;
+    }
+    const char *limit_text = getenv(name);
+    struct rlimit limit;
+    char *end;
+    unsigned long value;
+
+    if (!require(name != NULL) || !require(resource >= 0)) {
+        return -1;
+    }
+    if (limit_text == NULL || limit_text[0] == '\0') {
+        return 0;
+    }
+    value = strtoul(limit_text, &end, 10);
+    if (*end != '\0' || value == 0 || getrlimit(resource, &limit) == -1) {
+        return invalid_is_error ? -1 : 0;
+    }
+    limit.rlim_cur = (rlim_t)value;
+    if (limit.rlim_cur > limit.rlim_max) {
+        limit.rlim_cur = limit.rlim_max;
+    }
+    if (setrlimit(resource, &limit) == -1 && invalid_is_error) {
+        return -1;
+    }
+    return 0;
+}
+
+static int configure_child_limits(void)
+{
+    if (!require(RLIMIT_NOFILE >= 0) || !require(RLIMIT_DATA >= 0)) {
+        return -1;
+    }
+    if (apply_harness_limit("GSH_HARNESS_NOFILE", RLIMIT_NOFILE, true) ==
+            -1 ||
+        apply_harness_limit("GSH_HARNESS_DATA", RLIMIT_DATA, true) == -1) {
+        return -1;
+    }
+#ifdef RLIMIT_NPROC
+    (void)apply_harness_limit("GSH_HARNESS_NPROC", RLIMIT_NPROC, false);
+#endif
+    return 0;
+}
+
+static void configure_child_environment(shell_kind kind)
+{
+    const char *managed;
+    const char *history;
+    const char *repl;
+
+    if (!require(kind >= SHELL_GSH) || !require(kind <= SHELL_ZSH)) {
+        return;
+    }
+    (void)setenv("PATH", "/usr/bin:/bin", 1);
+    (void)setenv("TERM", "xterm-256color", 1);
+    (void)setenv("PS1", "gsh$ ", 1);
+    (void)setenv("PS2", "GSH_MORE> ", 1);
+    (void)setenv("PROMPT", "gsh$ ", 1);
+    (void)setenv("RPROMPT", "", 1);
+    if (kind != SHELL_GSH) {
+        return;
+    }
+    managed = getenv("GSH_HARNESS_MANAGED");
+    history = getenv("GSH_HARNESS_HISTORY");
+    repl = getenv("GSH_HARNESS_REPL");
+    if (history != NULL && strcmp(history, "1") == 0) {
+        (void)unsetenv("GSH_HISTORY");
+    } else {
+        (void)setenv("GSH_HISTORY", "off", 1);
+    }
+    if (repl != NULL) {
+        (void)setenv("GSH_REPL", repl, 1);
+    } else if (managed != NULL && strcmp(managed, "1") == 0) {
+        (void)unsetenv("GSH_REPL");
+    } else {
+        (void)setenv("GSH_REPL", "classic", 1);
+    }
+}
+
+static void execute_session_child(int master, int mode_write,
+                                  const char *slave_name,
+                                  const char *executable,
+                                  const char *directory, shell_kind kind)
+{
+    if (executable == NULL) {
+        return;
+    }
+    struct winsize size;
+    struct termios initial_modes;
+    int slave;
+
+    if (!require(master >= 0) || !require(mode_write >= 0)) {
+        _exit(119);
+    }
+    (void)close(master);
+    if (setsid() == -1 || (slave = open(slave_name, O_RDWR)) == -1) {
+        _exit(121);
+    }
+    (void)memset(&size, 0, sizeof(size));
+    size.ws_row = 24;
+    size.ws_col = 80;
+    if (ioctl(slave, TIOCSWINSZ, &size) == -1 ||
+        tcgetattr(slave, &initial_modes) == -1 ||
+        write(mode_write, &initial_modes, sizeof(initial_modes)) !=
+            (ssize_t)sizeof(initial_modes)) {
+        _exit(123);
+    }
+    (void)close(mode_write);
+#ifdef TIOCSCTTY
+    if (ioctl(slave, TIOCSCTTY, 0) == -1 && errno != EINVAL) {
+        _exit(124);
+    }
+#endif
+    if (dup2(slave, STDIN_FILENO) == -1 ||
+        dup2(slave, STDOUT_FILENO) == -1 ||
+        dup2(slave, STDERR_FILENO) == -1) {
+        _exit(125);
+    }
+    if (slave > STDERR_FILENO) {
+        (void)close(slave);
+    }
+    if (tcsetpgrp(STDIN_FILENO, getpgrp()) == -1 || chdir(directory) == -1) {
+        _exit(126);
+    }
+    configure_child_environment(kind);
+    if (configure_child_limits() == -1) {
+        _exit(127);
+    }
+    if (kind == SHELL_BASH) {
+        execl(executable, executable, "--noprofile", "--norc", "-i",
+              (char *)NULL);
+    } else if (kind == SHELL_ZSH) {
+        execl(executable, executable, "-f", (char *)NULL);
+    } else {
+        execl(executable, executable, (char *)NULL);
+    }
+    _exit(127);
+}
+
+static int read_initial_modes(int descriptor, struct termios *modes)
+{
+    size_t offset = 0;
+
+    if (!require(descriptor >= 0) || !require(modes != NULL)) {
+        return -1;
+    }
+    while (offset < sizeof(*modes)) {
+        ssize_t count = read(descriptor, (unsigned char *)modes + offset,
+                             sizeof(*modes) - offset);
+
+        if (count > 0) {
+            offset += (size_t)count;
+        } else if (count != -1 || errno != EINTR) {
+            break;
+        }
+    }
+    (void)close(descriptor);
+    return offset == sizeof(*modes) ? 0 : -1;
+}
+
+static int fail_session_start(pid_t pid, int master, int saved_errno)
+{
+    if (!require(pid > 0) || !require(master >= 0)) {
+        return -1;
+    }
+    (void)kill(pid, SIGKILL);
+    (void)waitpid(pid, NULL, 0);
+    (void)close(master);
+    errno = saved_errno;
+    return -1;
+}
+
 static int start_session(pty_session *session, const char *executable,
                          const char *directory, shell_kind kind)
 {
+    if (session == NULL) return -1;
     char slave_name[256];
-    const char *name;
     int mode_pipe[2];
     int master;
     pid_t pid;
 
-    memset(session, 0, sizeof(*session));
+    (void)memset(session, 0, sizeof(*session));
     session->master = -1;
+    if (directory == NULL || executable == NULL) return -1;
     master = posix_openpt(O_RDWR | O_NOCTTY);
-    if (master == -1 || grantpt(master) == -1 || unlockpt(master) == -1) {
-        if (master >= 0) {
-            close(master);
-        }
+    if (!require(master >= 0)) return -1;
+    if (grantpt(master) == -1 || unlockpt(master) == -1) {
+        (void)close(master);
         return -1;
     }
-    name = ptsname(master);
-    if (name == NULL || strlen(name) + 1U > sizeof(slave_name)) {
-        close(master);
-        errno = ENAMETOOLONG;
+    if (copy_slave_name(session, master, slave_name) == -1) {
+        (void)close(master);
         return -1;
     }
-    memcpy(slave_name, name, strlen(name) + 1U);
-    memcpy(session->slave_name, slave_name, strlen(slave_name) + 1U);
     if (pipe(mode_pipe) == -1) {
-        close(master);
+        (void)close(master);
         return -1;
     }
     pid = fork();
     if (pid == 0) {
-        struct winsize size;
-        struct termios initial_modes;
-        int slave;
-
-        close(mode_pipe[0]);
-        close(master);
-        if (setsid() == -1) {
-            _exit(120);
-        }
-        slave = open(slave_name, O_RDWR);
-        if (slave == -1) {
-            _exit(121);
-        }
-        memset(&size, 0, sizeof(size));
-        size.ws_row = 24;
-        size.ws_col = 80;
-        if (ioctl(slave, TIOCSWINSZ, &size) == -1) {
-            _exit(122);
-        }
-        if (tcgetattr(slave, &initial_modes) == -1 ||
-            write(mode_pipe[1], &initial_modes, sizeof(initial_modes)) !=
-                (ssize_t)sizeof(initial_modes)) {
-            _exit(123);
-        }
-        close(mode_pipe[1]);
-#ifdef TIOCSCTTY
-        if (ioctl(slave, TIOCSCTTY, 0) == -1 && errno != EINVAL) {
-            _exit(124);
-        }
-#endif
-        if (dup2(slave, STDIN_FILENO) == -1 ||
-            dup2(slave, STDOUT_FILENO) == -1 ||
-            dup2(slave, STDERR_FILENO) == -1) {
-            _exit(125);
-        }
-        if (slave > STDERR_FILENO) {
-            close(slave);
-        }
-        if (tcsetpgrp(STDIN_FILENO, getpgrp()) == -1 ||
-            chdir(directory) == -1) {
-            _exit(126);
-        }
-        (void)setenv("PATH", "/usr/bin:/bin", 1);
-        (void)setenv("TERM", "xterm-256color", 1);
-        (void)setenv("PS1", "gsh$ ", 1);
-        (void)setenv("PS2", "GSH_MORE> ", 1);
-        (void)setenv("PROMPT", "gsh$ ", 1);
-        (void)setenv("RPROMPT", "", 1);
-        if (kind == SHELL_GSH) {
-            const char *managed = getenv("GSH_HARNESS_MANAGED");
-            const char *history = getenv("GSH_HARNESS_HISTORY");
-            const char *repl = getenv("GSH_HARNESS_REPL");
-
-            if (history != NULL && strcmp(history, "1") == 0) {
-                (void)unsetenv("GSH_HISTORY");
-            } else {
-                (void)setenv("GSH_HISTORY", "off", 1);
-            }
-            if (repl != NULL) {
-                (void)setenv("GSH_REPL", repl, 1);
-            } else if (managed != NULL && strcmp(managed, "1") == 0) {
-                (void)unsetenv("GSH_REPL");
-            } else {
-                (void)setenv("GSH_REPL", "classic", 1);
-            }
-        }
-        {
-            const char *limit_text = getenv("GSH_HARNESS_NOFILE");
-
-            if (limit_text != NULL && limit_text[0] != '\0') {
-                char *end;
-                unsigned long value = strtoul(limit_text, &end, 10);
-                struct rlimit limit;
-
-                if (*end != '\0' || value == 0 ||
-                    getrlimit(RLIMIT_NOFILE, &limit) == -1) {
-                    _exit(127);
-                }
-                limit.rlim_cur = (rlim_t)value;
-                if (limit.rlim_cur > limit.rlim_max) {
-                    limit.rlim_cur = limit.rlim_max;
-                }
-                if (setrlimit(RLIMIT_NOFILE, &limit) == -1) {
-                    _exit(127);
-                }
-            }
-        }
-#ifdef RLIMIT_NPROC
-        {
-            const char *limit_text = getenv("GSH_HARNESS_NPROC");
-
-            if (limit_text != NULL && limit_text[0] != '\0') {
-                char *end;
-                unsigned long value = strtoul(limit_text, &end, 10);
-                struct rlimit limit;
-
-                if (*end == '\0' && value > 0 &&
-                    getrlimit(RLIMIT_NPROC, &limit) == 0) {
-                    limit.rlim_cur = (rlim_t)value;
-                    if (limit.rlim_cur > limit.rlim_max) {
-                        limit.rlim_cur = limit.rlim_max;
-                    }
-                    (void)setrlimit(RLIMIT_NPROC, &limit);
-                }
-            }
-        }
-#endif
-        {
-            const char *limit_text = getenv("GSH_HARNESS_DATA");
-
-            if (limit_text != NULL && limit_text[0] != '\0') {
-                char *end;
-                unsigned long value = strtoul(limit_text, &end, 10);
-                struct rlimit limit;
-
-                if (*end != '\0' || value == 0 ||
-                    getrlimit(RLIMIT_DATA, &limit) == -1) {
-                    _exit(127);
-                }
-                limit.rlim_cur = (rlim_t)value;
-                if (limit.rlim_cur > limit.rlim_max) {
-                    limit.rlim_cur = limit.rlim_max;
-                }
-                if (setrlimit(RLIMIT_DATA, &limit) == -1) {
-                    _exit(127);
-                }
-            }
-        }
-        if (kind == SHELL_BASH) {
-            execl(executable, executable, "--noprofile", "--norc", "-i",
-                  (char *)NULL);
-        } else if (kind == SHELL_ZSH) {
-            execl(executable, executable, "-f", (char *)NULL);
-        } else {
-            execl(executable, executable, (char *)NULL);
-        }
-        _exit(127);
+        (void)close(mode_pipe[0]);
+        execute_session_child(master, mode_pipe[1], slave_name, executable,
+                              directory, kind);
     }
-    close(mode_pipe[1]);
+    (void)close(mode_pipe[1]);
     if (pid == -1) {
-        close(mode_pipe[0]);
-        close(master);
+        (void)close(mode_pipe[0]);
+        (void)close(master);
         return -1;
     }
-    {
-        size_t offset = 0;
-
-        while (offset < sizeof(session->initial_modes)) {
-            ssize_t count = read(mode_pipe[0],
-                                 (unsigned char *)&session->initial_modes +
-                                     offset,
-                                 sizeof(session->initial_modes) - offset);
-
-            if (count > 0) {
-                offset += (size_t)count;
-            } else if (count == -1 && errno == EINTR) {
-                continue;
-            } else {
-                break;
-            }
-        }
-        close(mode_pipe[0]);
-        if (offset != sizeof(session->initial_modes)) {
-            (void)kill(pid, SIGKILL);
-            (void)waitpid(pid, NULL, 0);
-            close(master);
-            errno = EIO;
-            return -1;
-        }
-        session->initial_modes_valid = true;
+    if (read_initial_modes(mode_pipe[0], &session->initial_modes) == -1) {
+        return fail_session_start(pid, master, EIO);
     }
+    session->initial_modes_valid = true;
     if (set_nonblocking(master) == -1) {
         int saved_errno = errno;
 
-        (void)kill(pid, SIGKILL);
-        (void)waitpid(pid, NULL, 0);
-        close(master);
-        errno = saved_errno;
-        return -1;
+        return fail_session_start(pid, master, saved_errno);
     }
     session->pid = pid;
     session->master = master;
@@ -461,8 +509,12 @@ static int start_managed_session(pty_session *session,
                                  const char *executable,
                                  const char *directory)
 {
+    if (session == NULL) return -1;
     int result;
 
+    (void)memset(session, 0, sizeof(*session));
+    session->master = -1;
+    if (directory == NULL || executable == NULL) return -1;
     if (setenv("GSH_HARNESS_MANAGED", "1", 1) == -1 ||
         setenv("GSH_HARNESS_REPL", "async", 1) == -1) {
         return -1;
@@ -476,9 +528,13 @@ static int start_managed_session(pty_session *session,
 static int wait_for_output(pty_session *session, const char *marker,
                            int timeout_ms)
 {
+    if (marker == NULL || session == NULL) {
+        return -1;
+    }
     uint64_t deadline = monotonic_ns() + (uint64_t)timeout_ms * 1000000ULL;
+    size_t attempt;
 
-    for (;;) {
+    for (attempt = 0; attempt < PTY_WAIT_ATTEMPT_CAP; attempt++) {
         struct pollfd descriptor;
         const unsigned char *found;
         uint64_t now;
@@ -528,6 +584,8 @@ static int wait_for_output(pty_session *session, const char *marker,
         errno = EIO;
         return -1;
     }
+    errno = EAGAIN;
+    return -1;
 }
 
 static int consume_through(pty_session *session, const char *marker,
@@ -541,7 +599,7 @@ static int consume_through(pty_session *session, const char *marker,
     }
     found = find_bytes(session->capture, session->capture_length, marker);
     consumed = (size_t)(found - session->capture) + strlen(marker);
-    memmove(session->capture, session->capture + consumed,
+    (void)memmove(session->capture, session->capture + consumed,
             session->capture_length - consumed);
     session->capture_length -= consumed;
     return 0;
@@ -549,6 +607,9 @@ static int consume_through(pty_session *session, const char *marker,
 
 static int send_bytes(pty_session *session, const char *bytes, size_t length)
 {
+    if (bytes == NULL || session == NULL) {
+        return -1;
+    }
     size_t offset = 0;
 
     while (offset < length) {
@@ -575,12 +636,18 @@ static int send_bytes(pty_session *session, const char *bytes, size_t length)
 
 static int send_text(pty_session *session, const char *text)
 {
+    if (session == NULL || text == NULL) {
+        return -1;
+    }
     return send_bytes(session, text, strlen(text));
 }
 
 static bool terminal_modes_match(const struct termios *left,
                                  const struct termios *right)
 {
+    if (left == NULL || right == NULL) {
+        return false;
+    }
     return left->c_iflag == right->c_iflag &&
            left->c_oflag == right->c_oflag &&
            left->c_cflag == right->c_cflag &&
@@ -592,6 +659,7 @@ static bool terminal_modes_match(const struct termios *left,
 
 static bool terminal_was_restored(const pty_session *session)
 {
+    if (session == NULL) return false;
     struct termios final_modes;
     int slave;
     bool restored;
@@ -602,11 +670,11 @@ static bool terminal_was_restored(const pty_session *session)
     slave = open(session->slave_name, O_RDWR | O_NOCTTY);
     if (slave == -1 || tcgetattr(slave, &final_modes) == -1) {
         if (slave >= 0) {
-            close(slave);
+            (void)close(slave);
         }
         return false;
     }
-    close(slave);
+    (void)close(slave);
     restored = terminal_modes_match(&session->initial_modes, &final_modes);
     return restored;
 }
@@ -614,6 +682,9 @@ static bool terminal_was_restored(const pty_session *session)
 static int resize_session(const pty_session *session, unsigned short rows,
                           unsigned short columns)
 {
+    if (session == NULL) {
+        return -1;
+    }
     struct winsize size;
     int slave = open(session->slave_name, O_RDWR | O_NOCTTY);
     int result;
@@ -621,16 +692,47 @@ static int resize_session(const pty_session *session, unsigned short rows,
     if (slave == -1) {
         return -1;
     }
-    memset(&size, 0, sizeof(size));
+    (void)memset(&size, 0, sizeof(size));
     size.ws_row = rows;
     size.ws_col = columns;
     result = ioctl(slave, TIOCSWINSZ, &size);
-    close(slave);
+    (void)close(slave);
     return result;
+}
+
+static bool wait_for_session_children(const pid_t children[256],
+                                      int child_count)
+{
+    uint64_t deadline;
+    bool alive = true;
+
+    if (children == NULL) return false;
+    if (child_count <= 0) return true;
+    deadline = monotonic_ns() + 1000000000ULL;
+    while (alive && monotonic_ns() < deadline) {
+        int index;
+
+        alive = false;
+        for (index = 0; index < child_count; index++) {
+            if (kill(children[index], 0) == 0 || errno != ESRCH) alive = true;
+        }
+        if (alive) (void)poll(NULL, 0, 10);
+    }
+    if (!alive) return true;
+    for (int index = 0; index < child_count; index++) {
+        if (kill(children[index], 0) == 0 || errno != ESRCH) {
+            (void)fprintf(stderr,
+                          "pty stop: child %ld survived shutdown\n",
+                          (long)children[index]);
+            (void)kill(children[index], SIGKILL);
+        }
+    }
+    return false;
 }
 
 static int stop_session(pty_session *session)
 {
+    if (session == NULL) return -1;
     pid_t children[256];
     int child_count;
     uint64_t deadline;
@@ -643,7 +745,7 @@ static int stop_session(pty_session *session)
         session->pid, children, sizeof(children) / sizeof(children[0]));
     (void)send_text(session, "exit 0\r");
     deadline = monotonic_ns() + 2000000000ULL;
-    for (;;) {
+    for (size_t attempt = 0; attempt < PTY_WAIT_ATTEMPT_CAP; attempt++) {
         pid_t result = waitpid(session->pid, &status, WNOHANG);
 
         if (result == session->pid) {
@@ -654,7 +756,7 @@ static int stop_session(pty_session *session)
             break;
         }
         if (monotonic_ns() >= deadline) {
-            fprintf(stderr, "pty stop: shell exit deadline exceeded\n");
+            (void)fprintf(stderr, "pty stop: shell exit deadline exceeded\n");
             (void)kill(session->pid, SIGKILL);
             (void)waitpid(session->pid, &status, 0);
             status = -1;
@@ -672,41 +774,12 @@ static int stop_session(pty_session *session)
             }
         }
     }
-    if (child_count > 0) {
-        bool alive = true;
-
-        deadline = monotonic_ns() + 1000000000ULL;
-        while (alive && monotonic_ns() < deadline) {
-            int index;
-
-            alive = false;
-            for (index = 0; index < child_count; index++) {
-                if (kill(children[index], 0) == 0 || errno != ESRCH) {
-                    alive = true;
-                }
-            }
-            if (alive) {
-                (void)poll(NULL, 0, 10);
-            }
-        }
-        if (alive) {
-            int index;
-
-            for (index = 0; index < child_count; index++) {
-                if (kill(children[index], 0) == 0 || errno != ESRCH) {
-                    fprintf(stderr, "pty stop: child %ld survived shutdown\n",
-                            (long)children[index]);
-                    (void)kill(children[index], SIGKILL);
-                }
-            }
-            status = -1;
-        }
-    }
+    if (!wait_for_session_children(children, child_count)) status = -1;
     if (!terminal_was_restored(session)) {
-        fprintf(stderr, "pty stop: terminal modes were not restored\n");
+        (void)fprintf(stderr, "pty stop: terminal modes were not restored\n");
         status = -1;
     }
-    close(session->master);
+    (void)close(session->master);
     session->master = -1;
     session->pid = -1;
     return status != -1 && WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 0
@@ -716,6 +789,9 @@ static int stop_session(pty_session *session)
 static int wait_session_result(pty_session *session, int *result_status,
                                int timeout_ms)
 {
+    if (result_status == NULL || session == NULL) {
+        return -1;
+    }
     uint64_t deadline = monotonic_ns() + (uint64_t)timeout_ms * 1000000ULL;
     int status = 0;
 
@@ -725,7 +801,8 @@ static int wait_session_result(pty_session *session, int *result_status,
         if (result == session->pid) {
             bool restored = terminal_was_restored(session);
 
-            for (;;) {
+            for (size_t attempt = 0; attempt < PTY_DRAIN_ATTEMPT_CAP;
+                 attempt++) {
                 ssize_t count;
 
                 if (session->capture_length == sizeof(session->capture)) {
@@ -744,7 +821,7 @@ static int wait_session_result(pty_session *session, int *result_status,
                 }
             }
 
-            close(session->master);
+            (void)close(session->master);
             session->master = -1;
             session->pid = -1;
             *result_status = status;
@@ -773,7 +850,7 @@ static int wait_session_result(pty_session *session, int *result_status,
     }
     (void)kill(session->pid, SIGKILL);
     (void)waitpid(session->pid, NULL, 0);
-    close(session->master);
+    (void)close(session->master);
     session->master = -1;
     session->pid = -1;
     return -1;
@@ -788,7 +865,7 @@ static int wait_session_exit(pty_session *session, int expected_status,
         WIFEXITED(status) && WEXITSTATUS(status) == expected_status) {
         return 0;
     }
-    fprintf(stderr,
+    (void)fprintf(stderr,
             "pty harness: exit mismatch expected=%d exited=%d actual=%d\n",
             expected_status, WIFEXITED(status) ? 1 : 0,
             WIFEXITED(status) ? WEXITSTATUS(status) : -1);
@@ -798,6 +875,9 @@ static int wait_session_exit(pty_session *session, int expected_status,
 static int wait_for_diagnostics(pty_session *session, const char *first,
                                 const char *second)
 {
+    if (session == NULL) {
+        return -1;
+    }
     uint64_t deadline = monotonic_ns() + 2000000000ULL;
 
     while (monotonic_ns() < deadline) {
@@ -820,6 +900,9 @@ static int wait_for_diagnostics(pty_session *session, const char *first,
 
 static int write_text_file(const char *path, const char *text, mode_t mode)
 {
+    if (path == NULL || text == NULL) {
+        return -1;
+    }
     size_t length = strlen(text);
     size_t offset = 0;
     size_t attempts;
@@ -861,6 +944,41 @@ static void remove_fixture(const char *root)
         (void)rmdir(path);
     }
     (void)rmdir(root);
+}
+
+/* ── Session Owners Replace Cleanup Jumps ───────────────────────
+ * PTY scenarios once jumped to local labels after any failed interaction,
+ * which obscured whether a child and its terminal were always reclaimed.
+ * These small owners make the cleanup contract callable from every early
+ * return and preserve the original status if shutdown also reports failure.
+ * Flat and populated fixtures remain separate, explicit policies.
+ * ─────────────────────────────────────────────────────────────── */
+static int finish_session_directory(pty_session *session,
+                                    const char *directory, int failed)
+{
+    if (session == NULL) return -1;
+    if (directory == NULL) {
+        return -1;
+    }
+    if (session->pid > 0 && stop_session(session) == -1) {
+        failed = 1;
+    }
+    (void)rmdir(directory);
+    return failed;
+}
+
+static int finish_session_tree(pty_session *session, const char *directory,
+                               int failed)
+{
+    if (session == NULL) return -1;
+    if (directory == NULL) {
+        return -1;
+    }
+    if (session->pid > 0 && stop_session(session) == -1) {
+        failed = 1;
+    }
+    remove_fixture(directory);
+    return failed;
 }
 
 static int write_history_config(const char *home)
@@ -965,7 +1083,7 @@ static bool history_vault_is_encrypted(const char *home)
         carry = total < sizeof(plaintext) - 1U
                     ? total
                     : sizeof(plaintext) - 1U;
-        memmove(bytes, bytes + total - carry, carry);
+        (void)memmove(bytes, bytes + total - carry, carry);
     }
     (void)close(descriptor);
     return encrypted;
@@ -1030,6 +1148,9 @@ static int exercise_history_editor(pty_session *session)
 
 static int shutdown_history_agent(pty_session *session)
 {
+    if (session == NULL) {
+        return -1;
+    }
     return send_bytes(session, "\025", 1) == -1 ||
                    send_text(session, "history shutdown\r") == -1 ||
                    consume_through(session, "history agent stopped",
@@ -1068,6 +1189,14 @@ static int verify_fresh_agent_unlock(pty_session *session)
     return 0;
 }
 
+static int history_session_failure(pty_session *session, const char *stage)
+{
+    if (!require(session != NULL && stage != NULL)) return -1;
+    (void)fprintf(stderr, "pty smoke: history %s failed\n", stage);
+    dump_capture(session);
+    return -1;
+}
+
 static int run_initial_history_session(const char *executable,
                                        const char *home)
 {
@@ -1077,18 +1206,22 @@ static int run_initial_history_session(const char *executable,
     if (start_session(&session, executable, home, SHELL_GSH) == -1) {
         return -1;
     }
-    if (create_history_vault(&session) == -1 ||
-        exercise_history_editor(&session) == -1 ||
-        send_bytes(&session, "\025", 1) == -1 ||
-        consume_through(&session, "History reminder", 5000) == -1 ||
-        send_text(&session, "wrong history passphrase\r") == -1 ||
-        consume_through(&session, "history remains unlocked",
-                        TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "History reminder", 5000) == -1 ||
-        send_text(&session, "history test passphrase\r") == -1 ||
-        consume_through(&session, "passphrase remembered",
-                        TEST_TIMEOUT_MS) == -1) {
-        failed = -1;
+    if (create_history_vault(&session) == -1) {
+        failed = history_session_failure(&session, "vault creation");
+    } else if (exercise_history_editor(&session) == -1) {
+        failed = history_session_failure(&session, "editor exercise");
+    } else if (send_bytes(&session, "\025", 1) == -1 ||
+               consume_through(&session, "History reminder", 5000) == -1) {
+        failed = history_session_failure(&session, "reminder");
+    } else if (send_text(&session, "wrong history passphrase\r") == -1 ||
+               consume_through(&session, "history remains unlocked",
+                               TEST_TIMEOUT_MS) == -1) {
+        failed = history_session_failure(&session, "wrong passphrase");
+    } else if (consume_through(&session, "History reminder", 5000) == -1 ||
+               send_text(&session, "history test passphrase\r") == -1 ||
+               consume_through(&session, "passphrase remembered",
+                               TEST_TIMEOUT_MS) == -1) {
+        failed = history_session_failure(&session, "reminder refresh");
     }
     if (stop_session(&session) == -1) {
         failed = -1;
@@ -1106,7 +1239,7 @@ static int run_reused_history_session(const char *executable,
         return -1;
     }
     if (verify_unlocked_reuse(&session) == -1) {
-        failed = -1;
+        failed = history_session_failure(&session, "unlocked reuse");
     }
     if (stop_session(&session) == -1) {
         failed = -1;
@@ -1124,7 +1257,7 @@ static int run_fresh_history_session(const char *executable,
         return -1;
     }
     if (verify_fresh_agent_unlock(&session) == -1) {
-        failed = -1;
+        failed = history_session_failure(&session, "fresh unlock");
     }
     if (stop_session(&session) == -1) {
         failed = -1;
@@ -1141,7 +1274,7 @@ static int history_flow(const char *executable)
 
     saved_home[0] = '\0';
     if (current_home != NULL && strlen(current_home) < sizeof(saved_home)) {
-        memcpy(saved_home, current_home, strlen(current_home) + 1U);
+        (void)memcpy(saved_home, current_home, strlen(current_home) + 1U);
     }
     if (mkdtemp(home) == NULL || write_history_config(home) == -1 ||
         setenv("HOME", home, 1) == -1 ||
@@ -1181,20 +1314,20 @@ static int ordinary_flow(const char *executable)
     int failed = 0;
 
     if (strlen(executable) + 1U > sizeof(probe)) {
-        fprintf(stderr, "pty smoke: probe path is too long\n");
+        (void)fprintf(stderr, "pty smoke: probe path is too long\n");
         return 1;
     }
-    memcpy(probe, executable, strlen(executable) + 1U);
+    (void)memcpy(probe, executable, strlen(executable) + 1U);
     separator = strrchr(probe, '/');
     if (separator == NULL ||
         (size_t)(separator - probe) + sizeof("/job-probe") > sizeof(probe)) {
-        fprintf(stderr, "pty smoke: cannot derive job probe path\n");
+        (void)fprintf(stderr, "pty smoke: cannot derive job probe path\n");
         return 1;
     }
-    memcpy(separator, "/job-probe", sizeof("/job-probe"));
+    (void)memcpy(separator, "/job-probe", sizeof("/job-probe"));
     if (snprintf(command, sizeof(command), "%s\r", probe) >=
         (int)sizeof(command)) {
-        fprintf(stderr, "pty smoke: probe command is too long\n");
+        (void)fprintf(stderr, "pty smoke: probe command is too long\n");
         return 1;
     }
 
@@ -1319,12 +1452,12 @@ static int ordinary_flow(const char *executable)
         failed = 1;
     }
     if (!failed && process_child_count(session.pid) != 1) {
-        fprintf(stderr,
+        (void)fprintf(stderr,
                 "pty smoke: completed pipelines left child processes\n");
         failed = 1;
     }
     if (stop_session(&session) == -1) {
-        fprintf(stderr, "pty smoke: ordinary shell did not exit cleanly\n");
+        (void)fprintf(stderr, "pty smoke: ordinary shell did not exit cleanly\n");
         failed = 1;
     }
     remove_fixture(fixture);
@@ -1333,9 +1466,12 @@ static int ordinary_flow(const char *executable)
 
 static int job_flow_failure(pty_session *session, const char *stage)
 {
+    if (session == NULL || stage == NULL) {
+        return -1;
+    }
     int saved_errno = errno;
 
-    fprintf(stderr, "pty jobs: %s: %s\n", stage, strerror(saved_errno));
+    (void)fprintf(stderr, "pty jobs: %s: %s\n", stage, strerror(saved_errno));
     dump_capture(session);
     errno = saved_errno;
     return -1;
@@ -1344,6 +1480,9 @@ static int job_flow_failure(pty_session *session, const char *stage)
 static int job_expect(pty_session *session, const char *marker,
                       const char *stage)
 {
+    if (stage == NULL) {
+        return -1;
+    }
     if (consume_through(session, marker, JOB_TRANSITION_TIMEOUT_MS) == -1) {
         return job_flow_failure(session, stage);
     }
@@ -1353,6 +1492,9 @@ static int job_expect(pty_session *session, const char *marker,
 static int job_observe(pty_session *session, const char *marker,
                        const char *stage)
 {
+    if (stage == NULL) {
+        return -1;
+    }
     if (wait_for_output(session, marker, JOB_TRANSITION_TIMEOUT_MS) == -1) {
         return job_flow_failure(session, stage);
     }
@@ -1362,6 +1504,9 @@ static int job_observe(pty_session *session, const char *marker,
 static int job_send(pty_session *session, const char *command,
                     const char *stage)
 {
+    if (stage == NULL) {
+        return -1;
+    }
     if (send_text(session, command) == -1) {
         return job_flow_failure(session, stage);
     }
@@ -1371,6 +1516,9 @@ static int job_send(pty_session *session, const char *command,
 static int job_start_stopped(pty_session *session, const char *command,
                              const char *job_marker)
 {
+    if (command == NULL || job_marker == NULL || session == NULL) {
+        return -1;
+    }
     return job_send(session, command, "launch stopped probe") == -1 ||
                    job_expect(session, job_marker, "observe job id") == -1 ||
                    job_expect(session, "GSH_PROBE_READY",
@@ -1423,6 +1571,9 @@ static int job_foreground_second(pty_session *session, const char *command)
 
 static int job_finish_background(pty_session *session)
 {
+    if (session == NULL) {
+        return -1;
+    }
     return job_send(
                session,
                "kill %1; wait %1; printf 'GSH_WAIT=%s\\n' \"$?\"\r",
@@ -1445,20 +1596,20 @@ static int job_service_control_flow(const char *executable)
     int failed = 0;
 
     if (strlen(executable) + 1U > sizeof(probe)) {
-        fprintf(stderr, "pty jobs: probe path is too long\n");
+        (void)fprintf(stderr, "pty jobs: probe path is too long\n");
         return 1;
     }
-    memcpy(probe, executable, strlen(executable) + 1U);
+    (void)memcpy(probe, executable, strlen(executable) + 1U);
     separator = strrchr(probe, '/');
     if (separator == NULL ||
         (size_t)(separator - probe) + sizeof("/job-probe") > sizeof(probe)) {
-        fprintf(stderr, "pty jobs: cannot derive job probe path\n");
+        (void)fprintf(stderr, "pty jobs: cannot derive job probe path\n");
         return 1;
     }
-    memcpy(separator, "/job-probe", sizeof("/job-probe"));
+    (void)memcpy(separator, "/job-probe", sizeof("/job-probe"));
     if (snprintf(command, sizeof(command), "%s &\r", probe) >=
         (int)sizeof(command)) {
-        fprintf(stderr, "pty jobs: probe command is too long\n");
+        (void)fprintf(stderr, "pty jobs: probe command is too long\n");
         return 1;
     }
 
@@ -1476,7 +1627,7 @@ static int job_service_control_flow(const char *executable)
         failed = 1;
     }
     if (!failed && process_child_count(session.pid) != 1) {
-        fprintf(stderr, "pty jobs: child process leaked\n");
+        (void)fprintf(stderr, "pty jobs: child process leaked\n");
         failed = 1;
     }
     if (stop_session(&session) == -1) failed = 1;
@@ -1619,6 +1770,9 @@ static int managed_repl_concurrency(pty_session *session)
 
 static int managed_repl_prompt_state(pty_session *session)
 {
+    if (session == NULL) {
+        return -1;
+    }
     static const char command[] =
         "/bin/sh -c 'sleep .3; printf PROMPT_STATE_DONE'\r";
 
@@ -1644,6 +1798,9 @@ static int managed_repl_prompt_state(pty_session *session)
 
 static int managed_repl_terminal_outcomes(pty_session *session)
 {
+    if (session == NULL) {
+        return -1;
+    }
     session->capture_length = 0;
     if (send_text(session, "/bin/sh -c 'sleep .2; exit 7'\r") == -1 ||
         wait_for_output(session, "gsh* ",
@@ -1762,6 +1919,9 @@ static int managed_repl_focus(pty_session *session)
 
 static int managed_repl_private_input_autofocus(pty_session *session)
 {
+    if (session == NULL) {
+        return -1;
+    }
     static const char command[] =
         "/bin/sh -c 'sleep .2; stty -echo; echo PRIVATE_INPUT; read x; "
         "stty echo; echo PRIVATE_ACCEPTED'\r";
@@ -1795,6 +1955,9 @@ static int managed_repl_private_input_autofocus(pty_session *session)
 
 static int managed_repl_fullscreen_focus(pty_session *session)
 {
+    if (session == NULL) {
+        return -1;
+    }
     static const char command[] =
         "/bin/sh -c 'trap \"\" WINCH; saved=$(/bin/stty -g); "
         "/bin/stty -echo -icanon min 1 time 0; "
@@ -1951,6 +2114,9 @@ static int managed_repl_saturation(pty_session *session)
 
 static int managed_repl_toggle(pty_session *session)
 {
+    if (session == NULL) {
+        return -1;
+    }
     uint64_t start;
 
     session->capture_length = 0;
@@ -2058,7 +2224,7 @@ static int managed_async_repl_flow(const char *executable)
         failed = 1;
     }
     if (stop_session(&session) == -1) {
-        fprintf(stderr, "pty managed: shell did not exit cleanly\n");
+        (void)fprintf(stderr, "pty managed: shell did not exit cleanly\n");
         failed = 1;
     }
     {
@@ -2067,7 +2233,7 @@ static int managed_async_repl_flow(const char *executable)
         if (snprintf(config_path, sizeof(config_path), "%s/.gshrc", fixture) >=
                 (int)sizeof(config_path) ||
             access(config_path, F_OK) == 0 || errno != ENOENT) {
-            fprintf(stderr, "pty managed: /async modified configuration\n");
+            (void)fprintf(stderr, "pty managed: /async modified configuration\n");
             failed = 1;
         }
     }
@@ -2266,11 +2432,11 @@ static int variable_builtin_flow(const char *executable)
         failed = 1;
     }
     if (!failed && process_child_count(session.pid) != 1) {
-        fprintf(stderr, "pty variables: command left child processes\n");
+        (void)fprintf(stderr, "pty variables: command left child processes\n");
         failed = 1;
     }
     if (stop_session(&session) == -1) {
-        fprintf(stderr, "pty variables: shell did not exit cleanly\n");
+        (void)fprintf(stderr, "pty variables: shell did not exit cleanly\n");
         failed = 1;
     }
     (void)rmdir(fixture);
@@ -2340,11 +2506,11 @@ static int alias_builtin_flow(const char *executable)
         failed = 1;
     }
     if (!failed && process_child_count(session.pid) != 1) {
-        fprintf(stderr, "pty alias: command left child processes\n");
+        (void)fprintf(stderr, "pty alias: command left child processes\n");
         failed = 1;
     }
     if (stop_session(&session) == -1) {
-        fprintf(stderr, "pty alias: shell did not exit cleanly\n");
+        (void)fprintf(stderr, "pty alias: shell did not exit cleanly\n");
         failed = 1;
     }
     remove_fixture(fixture);
@@ -2420,7 +2586,7 @@ static int command_hash_flow(const char *executable)
         failed = 1;
     }
     if (!failed && process_child_count(session.pid) != 1) {
-        fprintf(stderr, "pty hash: command left child processes\n");
+        (void)fprintf(stderr, "pty hash: command left child processes\n");
         failed = 1;
     }
     if (stop_session(&session) == -1) {
@@ -2491,7 +2657,7 @@ static int times_builtin_flow(const char *executable)
         failed = 1;
     }
     if (!failed && process_child_count(session.pid) != 1) {
-        fprintf(stderr, "pty times: command left child processes\n");
+        (void)fprintf(stderr, "pty times: command left child processes\n");
         failed = 1;
     }
     if (stop_session(&session) == -1) {
@@ -2740,8 +2906,11 @@ static int interactive_enoexec_flow(const char *executable)
         write_enoexec_fixture(fixture, script) == -1 ||
         start_session(&session, executable, fixture, SHELL_GSH) == -1) {
         perror("pty ENOEXEC: setup");
-        failed = 1;
-        goto done;
+        if (script[0] != '\0') {
+            (void)unlink(script);
+        }
+        (void)rmdir(fixture);
+        return 1;
     }
     if (consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "./probe interactive\r") == -1 ||
@@ -2761,10 +2930,27 @@ static int interactive_enoexec_flow(const char *executable)
     if (stop_session(&session) == -1) {
         failed = 1;
     }
-done:
     if (script[0] != '\0') {
         (void)unlink(script);
     }
+    (void)rmdir(fixture);
+    return failed;
+}
+
+static int finish_source_fixture(const char *fixture, const char *state_path,
+                                 const char *exit_path,
+                                 const char *managed_path,
+                                 const char *child_path, int failed)
+{
+    if (state_path == NULL || exit_path == NULL || managed_path == NULL ||
+        child_path == NULL) return -1;
+    if (fixture == NULL) {
+        return -1;
+    }
+    if (state_path[0] != '\0') (void)unlink(state_path);
+    if (exit_path[0] != '\0') (void)unlink(exit_path);
+    if (managed_path[0] != '\0') (void)unlink(managed_path);
+    if (child_path[0] != '\0') (void)rmdir(child_path);
     (void)rmdir(fixture);
     return failed;
 }
@@ -2867,7 +3053,7 @@ static int interactive_source_state_case(const char *executable,
         failed = 1;
     }
     if (!failed && process_child_count(session.pid) != 1) {
-        fprintf(stderr, "pty source: state flow left child processes\n");
+        (void)fprintf(stderr, "pty source: state flow left child processes\n");
         failed = 1;
     }
     if (stop_session(&session) == -1) {
@@ -2929,7 +3115,7 @@ static int interactive_exit_case(const char *executable,
           consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1)) ||
         send_text(&session, command) == -1 ||
         wait_session_exit(&session, expected_status, TEST_TIMEOUT_MS) == -1) {
-        fprintf(stderr, "pty source: exit case failed status=%d\n",
+        (void)fprintf(stderr, "pty source: exit case failed status=%d\n",
                 expected_status);
         dump_capture(&session);
         return 1;
@@ -2939,6 +3125,9 @@ static int interactive_exit_case(const char *executable,
 
 static int interactive_source_flow(const char *executable)
 {
+    if (executable == NULL) {
+        return -1;
+    }
     static const char state_source[] =
         "GSH_DOT_VALUE=committed\n"
         "set -- dot-one 'dot two'\n"
@@ -2971,8 +3160,8 @@ static int interactive_source_flow(const char *executable)
         write_text_file(managed_path, "GSH_MANAGED_DOT=committed\n",
                         0600) == -1) {
         perror("pty source: fixture");
-        failed = 1;
-        goto done;
+        return finish_source_fixture(fixture, state_path, exit_path,
+                                     managed_path, child_path, 1);
     }
     failed |= interactive_source_state_case(executable, fixture);
     failed |= interactive_managed_source_case(executable, fixture);
@@ -2991,21 +3180,8 @@ static int interactive_source_flow(const char *executable)
     failed |= interactive_exit_case(
         executable, fixture, true, NULL, "eval 'exit 24'\r", 24);
 
-done:
-    if (state_path[0] != '\0') {
-        (void)unlink(state_path);
-    }
-    if (exit_path[0] != '\0') {
-        (void)unlink(exit_path);
-    }
-    if (managed_path[0] != '\0') {
-        (void)unlink(managed_path);
-    }
-    if (child_path[0] != '\0') {
-        (void)rmdir(child_path);
-    }
-    (void)rmdir(fixture);
-    return failed;
+    return finish_source_fixture(fixture, state_path, exit_path,
+                                 managed_path, child_path, failed);
 }
 
 static int function_builtin_flow(const char *executable)
@@ -3065,11 +3241,11 @@ static int function_builtin_flow(const char *executable)
         failed = 1;
     }
     if (!failed && process_child_count(session.pid) != 1) {
-        fprintf(stderr, "pty function: command left child processes\n");
+        (void)fprintf(stderr, "pty function: command left child processes\n");
         failed = 1;
     }
     if (stop_session(&session) == -1) {
-        fprintf(stderr, "pty function: shell did not exit cleanly\n");
+        (void)fprintf(stderr, "pty function: shell did not exit cleanly\n");
         failed = 1;
     }
     remove_fixture(fixture);
@@ -3089,7 +3265,7 @@ static int deferred_pattern_flow(const char *executable)
         perror("pty pattern: fixture");
         return 1;
     }
-    memset(subject, '0', sizeof(subject) - 2U);
+    (void)memset(subject, '0', sizeof(subject) - 2U);
     subject[sizeof(subject) - 2U] = 'z';
     subject[sizeof(subject) - 1U] = '\0';
     fixture_length = strlen(fixture);
@@ -3097,8 +3273,8 @@ static int deferred_pattern_flow(const char *executable)
         (void)rmdir(fixture);
         return 1;
     }
-    memset(directory_value, '@', 12000U);
-    memcpy(directory_value + 12000U, fixture, fixture_length + 1U);
+    (void)memset(directory_value, '@', 12000U);
+    (void)memcpy(directory_value + 12000U, fixture, fixture_length + 1U);
     if (setenv("GSH_PTY_PATTERN_LONG", subject, 1) == -1 ||
         setenv("GSH_PTY_PATTERN_CD", directory_value, 1) == -1 ||
         start_session(&session, executable, "/tmp", SHELL_GSH) == -1) {
@@ -3153,8 +3329,7 @@ static int asynchronous_list_flow(const char *executable)
     }
     if (consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1) {
         perror("pty async: base prompt");
-        failed = 1;
-        goto done;
+        return finish_session_directory(&session, fixture, 1);
     }
 
     prompt_start = monotonic_ns();
@@ -3162,8 +3337,7 @@ static int asynchronous_list_flow(const char *executable)
         consume_through(&session, "] ", TEST_TIMEOUT_MS) == -1 ||
         consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1) {
         perror("pty async: nonblocking launch");
-        failed = 1;
-        goto done;
+        return finish_session_directory(&session, fixture, 1);
     }
     prompt_duration = monotonic_ns() - prompt_start;
     if (prompt_duration >= 700000000ULL ||
@@ -3243,20 +3417,14 @@ static int asynchronous_list_flow(const char *executable)
         consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1) {
         perror("pty async: semantics");
         dump_capture(&session);
-        failed = 1;
-        goto done;
+        return finish_session_directory(&session, fixture, 1);
     }
     if (process_child_count(session.pid) != 1) {
-        fprintf(stderr, "pty async: completed jobs left child processes\n");
+        (void)fprintf(stderr, "pty async: completed jobs left child processes\n");
         failed = 1;
     }
 
-done:
-    if (stop_session(&session) == -1) {
-        failed = 1;
-    }
-    (void)rmdir(fixture);
-    return failed;
+    return finish_session_directory(&session, fixture, failed);
 }
 
 static int async_redirection_flow(const char *executable)
@@ -3305,7 +3473,7 @@ static int async_redirection_flow(const char *executable)
         failed = 1;
     }
     if (!failed && process_child_count(session.pid) != 1) {
-        fprintf(stderr, "pty redirection: worker was not recovered\n");
+        (void)fprintf(stderr, "pty redirection: worker was not recovered\n");
         failed = 1;
     }
     if (stop_session(&session) == -1) {
@@ -3338,12 +3506,12 @@ static int worker_fault_case(const char *executable, const char *fault,
         send_bytes(&session, "\025", 1) == -1 ||
         consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         wait_for_diagnostics(&session, "worker=off", counter) == -1) {
-        fprintf(stderr, "pty fault: worker case failed: %s\n", fault);
+        (void)fprintf(stderr, "pty fault: worker case failed: %s\n", fault);
         dump_capture(&session);
         failed = 1;
     }
     if (stop_session(&session) == -1) {
-        fprintf(stderr, "pty fault: worker cleanup failed: %s\n", fault);
+        (void)fprintf(stderr, "pty fault: worker cleanup failed: %s\n", fault);
         failed = 1;
     }
     (void)rmdir(fixture);
@@ -3369,7 +3537,7 @@ static int worker_surviving_fault_case(const char *executable,
     (void)unsetenv("GSH_FAULT");
     if (consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         wait_for_diagnostics(&session, "worker=on", counter) == -1) {
-        fprintf(stderr, "pty fault: surviving case failed: %s\n", fault);
+        (void)fprintf(stderr, "pty fault: surviving case failed: %s\n", fault);
         dump_capture(&session);
         failed = 1;
     }
@@ -3400,12 +3568,12 @@ static int command_fault_case(const char *executable, const char *fault,
         consume_through(&session, diagnostic, TEST_TIMEOUT_MS) == -1 ||
         consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         wait_for_diagnostics(&session, "job=idle", NULL) == -1) {
-        fprintf(stderr, "pty fault: command case failed: %s\n", fault);
+        (void)fprintf(stderr, "pty fault: command case failed: %s\n", fault);
         dump_capture(&session);
         failed = 1;
     }
     if (stop_session(&session) == -1) {
-        fprintf(stderr, "pty fault: command cleanup failed: %s\n", fault);
+        (void)fprintf(stderr, "pty fault: command cleanup failed: %s\n", fault);
         failed = 1;
     }
     (void)rmdir(fixture);
@@ -3439,7 +3607,7 @@ static int positional_commit_fault_case(const char *executable,
         consume_through(&session, "<1|before>\r\n",
                         TEST_TIMEOUT_MS) == -1 ||
         consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1) {
-        fprintf(stderr, "pty fault: positional case failed: %s\n", fault);
+        (void)fprintf(stderr, "pty fault: positional case failed: %s\n", fault);
         dump_capture(&session);
         failed = 1;
     }
@@ -3481,7 +3649,7 @@ static int directory_commit_fault_case(const char *executable,
         consume_through(&session, "GSH_DIRECTORY_ROLLED_BACK",
                         TEST_TIMEOUT_MS) == -1 ||
         consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1) {
-        fprintf(stderr, "pty fault: directory case failed: %s\n", fault);
+        (void)fprintf(stderr, "pty fault: directory case failed: %s\n", fault);
         dump_capture(&session);
         failed = 1;
     }
@@ -3525,7 +3693,7 @@ static int alias_commit_fault_case(const char *executable)
         consume_through(&session, "alias is not defined", TEST_TIMEOUT_MS) ==
             -1 ||
         consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1) {
-        fprintf(stderr, "pty fault: alias commit rollback failed\n");
+        (void)fprintf(stderr, "pty fault: alias commit rollback failed\n");
         dump_capture(&session);
         failed = 1;
     }
@@ -3564,7 +3732,7 @@ static int command_cache_commit_fault_case(const char *executable)
         consume_through(&session, "sh=/bin/sh\r\n", TEST_TIMEOUT_MS) ==
             -1 ||
         consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1) {
-        fprintf(stderr, "pty fault: command cache rollback failed\n");
+        (void)fprintf(stderr, "pty fault: command cache rollback failed\n");
         dump_capture(&session);
         failed = 1;
     }
@@ -3607,7 +3775,7 @@ static int function_commit_fault_case(const char *executable,
         consume_through(&session, "command not found", TEST_TIMEOUT_MS) ==
             -1 ||
         consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1) {
-        fprintf(stderr, "pty fault: function commit rollback failed: %s\n",
+        (void)fprintf(stderr, "pty fault: function commit rollback failed: %s\n",
                 fault);
         dump_capture(&session);
         failed = 1;
@@ -3622,6 +3790,9 @@ static int function_commit_fault_case(const char *executable,
 static int heredoc_fault_case(const char *executable, const char *fault,
                               const char *diagnostic)
 {
+    if (diagnostic == NULL || executable == NULL || fault == NULL) {
+        return -1;
+    }
     return command_fault_case(executable, fault,
                               "/bin/cat <<EOF\rvalue\rEOF\r",
                               diagnostic);
@@ -3642,7 +3813,7 @@ static int fatal_fault_case(const char *executable, const char *fault)
     }
     (void)unsetenv("GSH_FAULT");
     if (wait_session_exit(&session, 1, TEST_TIMEOUT_MS) == -1) {
-        fprintf(stderr, "pty fault: fatal case failed: %s\n", fault);
+        (void)fprintf(stderr, "pty fault: fatal case failed: %s\n", fault);
         failed = 1;
     }
     (void)rmdir(fixture);
@@ -3651,6 +3822,9 @@ static int fatal_fault_case(const char *executable, const char *fault)
 
 static int wait_fault_child(pid_t pid, int *status)
 {
+    if (status == NULL) {
+        return -1;
+    }
     uint64_t deadline = monotonic_ns() + 2000000000ULL;
     size_t attempts;
 
@@ -3673,27 +3847,72 @@ static int wait_fault_child(pid_t pid, int *status)
     return -1;
 }
 
+static int open_scratch_descriptor(void)
+{
+    char path[] = "/tmp/gsh-pty-scratch-XXXXXX";
+    int descriptor = mkstemp(path);
+
+    if (descriptor == -1) {
+        return -1;
+    }
+    if (unlink(path) == -1) {
+        int saved = errno;
+
+        (void)close(descriptor);
+        errno = saved;
+        return -1;
+    }
+    return descriptor;
+}
+
+static size_t read_scratch_descriptor(int descriptor, char *output,
+                                      size_t capacity)
+{
+    size_t length = 0;
+    size_t attempts;
+
+    if (descriptor < 0 || output == NULL || capacity == 0U ||
+        lseek(descriptor, 0, SEEK_SET) == (off_t)-1) {
+        return 0U;
+    }
+    for (attempts = 0; length < capacity && attempts <= capacity;
+         attempts++) {
+        ssize_t count = read(descriptor, output + length,
+                             capacity - length);
+
+        if (count > 0) {
+            length += (size_t)count;
+        } else if (count == 0) {
+            break;
+        } else if (errno != EINTR) {
+            return 0U;
+        }
+    }
+    return length;
+}
+
 static int noninteractive_fault_case(const char *executable,
                                      const char *fault,
                                      const char *command, int expected,
                                      const char *diagnostic)
 {
-    FILE *capture = tmpfile();
+    if (command == NULL || executable == NULL || fault == NULL) {
+        return -1;
+    }
+    int capture = open_scratch_descriptor();
     char output[4096];
     size_t length = 0;
     int status = 0;
     pid_t pid;
 
-    if (capture == NULL) {
+    if (capture == -1) {
         return 1;
     }
     pid = fork();
     if (pid == 0) {
-        int descriptor = fileno(capture);
-
         if (setenv("GSH_FAULT", fault, 1) == -1 ||
-            dup2(descriptor, STDOUT_FILENO) == -1 ||
-            dup2(descriptor, STDERR_FILENO) == -1) {
+            dup2(capture, STDOUT_FILENO) == -1 ||
+            dup2(capture, STDERR_FILENO) == -1) {
             _exit(126);
         }
         execl(executable, executable, "--native-only", "-c", command,
@@ -3701,36 +3920,32 @@ static int noninteractive_fault_case(const char *executable,
         _exit(127);
     }
     if (pid == -1 || wait_fault_child(pid, &status) == -1) {
-        (void)fclose(capture);
+        (void)close(capture);
         return 1;
     }
-    if (fseek(capture, 0, SEEK_SET) == 0) {
-        length = fread(output, 1, sizeof(output), capture);
-    }
-    (void)fclose(capture);
+    length = read_scratch_descriptor(capture, output, sizeof(output));
+    (void)close(capture);
     if (!WIFEXITED(status) || WEXITSTATUS(status) != expected ||
         find_bytes((const unsigned char *)output, length, diagnostic) == NULL) {
-        fprintf(stderr, "pty fault: non-interactive case failed: %s\n",
+        (void)fprintf(stderr, "pty fault: non-interactive case failed: %s\n",
                 fault);
         return 1;
     }
     return 0;
 }
 
-static int prepare_noninteractive_fault_input(FILE *input)
+static int prepare_noninteractive_fault_input(int descriptor)
 {
     static const char prefix[] = "alias fault_line=':'\nfault_line #";
     unsigned char bytes[4096];
     size_t written = 0;
     size_t attempts;
-    int descriptor;
 
-    if (input == NULL || (descriptor = fileno(input)) < 0 ||
-        write(descriptor, prefix, sizeof(prefix) - 1U) !=
+    if (descriptor < 0 || write(descriptor, prefix, sizeof(prefix) - 1U) !=
             (ssize_t)(sizeof(prefix) - 1U)) {
         return -1;
     }
-    memset(bytes, 'x', sizeof(bytes));
+    (void)memset(bytes, 'x', sizeof(bytes));
     for (attempts = 0;
          written < GSH_SOURCE_INPUT_CAP && attempts < SIZE_MAX;
          attempts++) {
@@ -3759,48 +3974,49 @@ static int noninteractive_input_fault_case(const char *executable,
                                            const char *fault,
                                            const char *diagnostic)
 {
-    FILE *input = tmpfile();
-    FILE *capture = tmpfile();
+    if (executable == NULL || fault == NULL) {
+        return -1;
+    }
+    int input = open_scratch_descriptor();
+    int capture = open_scratch_descriptor();
     char output[4096];
     size_t length = 0;
     int status = 0;
     pid_t pid;
 
-    if (input == NULL || capture == NULL ||
+    if (input == -1 || capture == -1 ||
         prepare_noninteractive_fault_input(input) == -1) {
-        if (input != NULL) {
-            (void)fclose(input);
+        if (input != -1) {
+            (void)close(input);
         }
-        if (capture != NULL) {
-            (void)fclose(capture);
+        if (capture != -1) {
+            (void)close(capture);
         }
         return 1;
     }
     pid = fork();
     if (pid == 0) {
         if (setenv("GSH_FAULT", fault, 1) == -1 ||
-            dup2(fileno(input), STDIN_FILENO) == -1 ||
-            dup2(fileno(capture), STDOUT_FILENO) == -1 ||
-            dup2(fileno(capture), STDERR_FILENO) == -1) {
+            dup2(input, STDIN_FILENO) == -1 ||
+            dup2(capture, STDOUT_FILENO) == -1 ||
+            dup2(capture, STDERR_FILENO) == -1) {
             _exit(126);
         }
         execl(executable, executable, "-s", (char *)NULL);
         _exit(127);
     }
     if (pid == -1 || wait_fault_child(pid, &status) == -1) {
-        (void)fclose(input);
-        (void)fclose(capture);
+        (void)close(input);
+        (void)close(capture);
         return 1;
     }
-    if (fseek(capture, 0, SEEK_SET) == 0) {
-        length = fread(output, 1, sizeof(output), capture);
-    }
-    (void)fclose(input);
-    (void)fclose(capture);
+    length = read_scratch_descriptor(capture, output, sizeof(output));
+    (void)close(input);
+    (void)close(capture);
     if (!WIFEXITED(status) || WEXITSTATUS(status) != 125 ||
         find_bytes((const unsigned char *)output, length, diagnostic) ==
             NULL) {
-        fprintf(stderr, "pty fault: non-interactive input failed: %s\n",
+        (void)fprintf(stderr, "pty fault: non-interactive input failed: %s\n",
                 fault);
         return 1;
     }
@@ -3809,6 +4025,9 @@ static int noninteractive_input_fault_case(const char *executable,
 
 static int enoexec_fault_case(const char *executable)
 {
+    if (executable == NULL) {
+        return -1;
+    }
     char fixture[] = "/tmp/gsh-fault-enoexec-XXXXXX";
     char script[PATH_MAX] = {0};
     char command[PATH_MAX + 4U];
@@ -3833,6 +4052,9 @@ static int enoexec_fault_case(const char *executable)
 
 static int fault_injection_flow(const char *executable)
 {
+    if (executable == NULL) {
+        return -1;
+    }
     static const struct {
         const char *name;
         const char *counter;
@@ -4074,7 +4296,7 @@ static int fault_injection_flow(const char *executable)
         failed |= fatal_fault_case(executable, fatal_cases[index]);
     }
     if (!failed) {
-        puts("pty fault: 88 deterministic boundary failures passed");
+        (void)puts("pty fault: 88 deterministic boundary failures passed");
     }
     return failed;
 }
@@ -4082,6 +4304,9 @@ static int fault_injection_flow(const char *executable)
 static unsigned long diagnostic_counter(const pty_session *session,
                                         const char *name, bool *found)
 {
+    if (found == NULL || name == NULL || session == NULL) {
+        return -1;
+    }
     const unsigned char *position =
         find_bytes(session->capture, session->capture_length, name);
     unsigned long value = 0;
@@ -4147,7 +4372,7 @@ static int descriptor_exhaustion_case(const char *executable)
         send_text(&session, "/usr/bin/true\r") == -1 ||
         consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         wait_for_diagnostics(&session, "job=idle", NULL) == -1) {
-        fprintf(stderr, "pty resource: descriptor recovery failed\n");
+        (void)fprintf(stderr, "pty resource: descriptor recovery failed\n");
         dump_capture(&session);
         failed = 1;
     }
@@ -4168,7 +4393,7 @@ static int bounded_input_case(const char *executable)
     size_t signal_count;
     int failed = 0;
 
-    memset(input, 'a', sizeof(input));
+    (void)memset(input, 'a', sizeof(input));
     if (mkdtemp(fixture) == NULL ||
         start_session(&session, executable, fixture, SHELL_GSH) == -1) {
         perror("pty resource: input setup");
@@ -4182,41 +4407,36 @@ static int bounded_input_case(const char *executable)
         consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1) {
         perror("pty resource: bounded line failed");
         dump_capture(&session);
-        failed = 1;
-        goto done;
+        return finish_session_directory(&session, fixture, 1);
     }
 
     session.capture_length = 0;
     if (send_text(&session, "rt\r") == -1 ||
         wait_for_output(&session, "reactor cycles=", TEST_TIMEOUT_MS) == -1 ||
         wait_for_output(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1) {
-        failed = 1;
-        goto done;
+        return finish_session_directory(&session, fixture, 1);
     }
     overloads = diagnostic_counter(&session, "overloads=", &found);
     if (!found || overloads < 1) {
-        fprintf(stderr, "pty resource: line overload was not recorded\n");
-        failed = 1;
-        goto done;
+        (void)fprintf(stderr, "pty resource: line overload was not recorded\n");
+        return finish_session_directory(&session, fixture, 1);
     }
 
     session.capture_length = 0;
     if (send_text(&session, "kept") == -1 ||
         consume_through(&session, "kept", TEST_TIMEOUT_MS) == -1) {
-        failed = 1;
-        goto done;
+        return finish_session_directory(&session, fixture, 1);
     }
     for (signal_count = 0; signal_count < 10000; signal_count++) {
         if (kill(session.pid, SIGWINCH) == -1 && errno != ESRCH) {
-            failed = 1;
-            goto done;
+            return finish_session_directory(&session, fixture, 1);
         }
     }
     if (consume_through(&session, "\033[2K", TEST_TIMEOUT_MS) == -1 ||
         consume_through(&session, "kept", TEST_TIMEOUT_MS) == -1 ||
         send_bytes(&session, "\025", 1) == -1 ||
         consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1) {
-        fprintf(stderr, "pty resource: signal storm corrupted the editor\n");
+        (void)fprintf(stderr, "pty resource: signal storm corrupted the editor\n");
         failed = 1;
     }
     if (!failed &&
@@ -4232,18 +4452,13 @@ static int bounded_input_case(const char *executable)
          consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
          send_text(&session, "/usr/bin/true\r") == -1 ||
          consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1)) {
-        fprintf(stderr,
+        (void)fprintf(stderr,
                 "pty resource: multiline input recovery failed\n");
         dump_capture(&session);
         failed = 1;
     }
 
-done:
-    if (stop_session(&session) == -1) {
-        failed = 1;
-    }
-    (void)rmdir(fixture);
-    return failed;
+    return finish_session_directory(&session, fixture, failed);
 }
 
 static int initialization_exhaustion_case(const char *executable)
@@ -4263,22 +4478,22 @@ static int initialization_exhaustion_case(const char *executable)
     }
     (void)unsetenv("GSH_HARNESS_NOFILE");
     if (wait_session_result(&session, &status, TEST_TIMEOUT_MS) == -1) {
-        fprintf(stderr,
+        (void)fprintf(stderr,
                 "pty resource: initialization exhaustion did not restore "
                 "the terminal\n");
         failed = 1;
     } else if (WIFEXITED(status) && WEXITSTATUS(status) == 1) {
-        puts("pty resource: initialization RLIMIT_NOFILE=enforced");
+        (void)puts("pty resource: initialization RLIMIT_NOFILE=enforced");
     } else if (capture_contains(&session,
                                 "error while loading shared libraries") ||
                capture_contains(&session, "rosetta error:")) {
-        puts("pty resource: initialization "
+        (void)puts("pty resource: initialization "
              "RLIMIT_NOFILE=unsupported-pre-exec");
     } else if (linux_is_translated()) {
-        puts("pty resource: initialization "
+        (void)puts("pty resource: initialization "
              "RLIMIT_NOFILE=unsupported-emulated");
     } else {
-        fprintf(stderr,
+        (void)fprintf(stderr,
                 "pty resource: initialization limit ended unexpectedly\n");
         dump_capture(&session);
         failed = 1;
@@ -4305,38 +4520,33 @@ static int process_exhaustion_case(const char *executable)
     }
     (void)unsetenv("GSH_HARNESS_NPROC");
     if (consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1) {
-        failed = 1;
-        goto done;
+        return finish_session_directory(&session, fixture, 1);
     }
     session.capture_length = 0;
     if (send_text(&session, "/usr/bin/true\r") == -1 ||
         wait_for_output(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1) {
-        failed = 1;
-        goto done;
+        return finish_session_directory(&session, fixture, 1);
     }
     enforced = capture_contains(&session, "gsh: fork:");
     if (wait_for_diagnostics(&session, "job=idle", NULL) == -1) {
-        failed = 1;
-        goto done;
+        return finish_session_directory(&session, fixture, 1);
     }
-    printf("pty resource: RLIMIT_NPROC=%s\n",
+    (void)printf("pty resource: RLIMIT_NPROC=%s\n",
            enforced ? "enforced" : "unsupported-or-unenforced");
 
-done:
-    if (stop_session(&session) == -1) {
-        failed = 1;
-    }
-    (void)rmdir(fixture);
-    return failed;
+    return finish_session_directory(&session, fixture, failed);
 #else
     (void)executable;
-    puts("pty resource: RLIMIT_NPROC=unsupported");
+    (void)puts("pty resource: RLIMIT_NPROC=unsupported");
     return 0;
 #endif
 }
 
 static int data_exhaustion_case(const char *executable)
 {
+    if (executable == NULL) {
+        return -1;
+    }
     char fixture[] = "/tmp/gsh-resource-data-XXXXXX";
     char restore[64];
     pty_session session;
@@ -4346,7 +4556,7 @@ static int data_exhaustion_case(const char *executable)
 
     if (linux_is_translated()) {
         (void)executable;
-        puts("pty resource: RLIMIT_DATA=unsupported-emulated");
+        (void)puts("pty resource: RLIMIT_DATA=unsupported-emulated");
         return 0;
     }
     if (getrlimit(RLIMIT_DATA, &original) == -1) {
@@ -4367,26 +4577,23 @@ static int data_exhaustion_case(const char *executable)
         return 1;
     }
     if (consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1) {
-        failed = 1;
-        goto done;
+        return finish_session_directory(&session, fixture, 1);
     }
     session.capture_length = 0;
     if (send_text(&session, "ulimit -S -d 1024\r") == -1 ||
         wait_for_output(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1) {
-        fprintf(stderr, "pty resource: data limit setup failed\n");
-        failed = 1;
-        goto done;
+        (void)fprintf(stderr, "pty resource: data limit setup failed\n");
+        return finish_session_directory(&session, fixture, 1);
     }
     if (capture_contains(&session, "gsh: ulimit:")) {
-        puts("pty resource: RLIMIT_DATA=unsupported");
-        goto done;
+        (void)puts("pty resource: RLIMIT_DATA=unsupported");
+        return finish_session_directory(&session, fixture, 0);
     }
     session.capture_length = 0;
     if (send_text(&session, "/usr/bin/true\r") == -1 ||
         wait_for_output(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1) {
-        fprintf(stderr, "pty resource: data exhaustion was not contained\n");
-        failed = 1;
-        goto done;
+        (void)fprintf(stderr, "pty resource: data exhaustion was not contained\n");
+        return finish_session_directory(&session, fixture, 1);
     }
     enforced = capture_contains(&session, "Cannot allocate memory") ||
                capture_contains(&session, "cannot allocate memory") ||
@@ -4398,19 +4605,13 @@ static int data_exhaustion_case(const char *executable)
         send_text(&session, "/usr/bin/true\r") == -1 ||
         consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         wait_for_diagnostics(&session, "job=idle", NULL) == -1) {
-        fprintf(stderr, "pty resource: data recovery failed\n");
-        failed = 1;
-        goto done;
+        (void)fprintf(stderr, "pty resource: data recovery failed\n");
+        return finish_session_directory(&session, fixture, 1);
     }
-    printf("pty resource: RLIMIT_DATA=%s\n",
+    (void)printf("pty resource: RLIMIT_DATA=%s\n",
            enforced ? "enforced" : "unsupported-or-unenforced");
 
-done:
-    if (session.pid > 0 && stop_session(&session) == -1) {
-        failed = 1;
-    }
-    (void)rmdir(fixture);
-    return failed;
+    return finish_session_directory(&session, fixture, failed);
 }
 
 static int variable_journal_exhaustion_case(const char *executable)
@@ -4461,7 +4662,7 @@ static int variable_journal_exhaustion_case(const char *executable)
         send_text(&session, "set +a\r") == -1 ||
         consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         process_child_count(session.pid) != 1) {
-        fprintf(stderr, "pty resource: variable journal recovery failed\n");
+        (void)fprintf(stderr, "pty resource: variable journal recovery failed\n");
         dump_capture(&session);
         failed = 1;
     }
@@ -4514,7 +4715,7 @@ static int arithmetic_journal_exhaustion_case(const char *executable)
             -1 ||
         consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         process_child_count(session.pid) != 1) {
-        fprintf(stderr,
+        (void)fprintf(stderr,
                 "pty resource: arithmetic journal recovery failed\n");
         dump_capture(&session);
         failed = 1;
@@ -4573,7 +4774,7 @@ static int alias_store_exhaustion_case(const char *executable)
         send_text(&session, "gsh_recovered\r") == -1 ||
         consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         process_child_count(session.pid) != 1) {
-        fprintf(stderr, "pty resource: alias store recovery failed\n");
+        (void)fprintf(stderr, "pty resource: alias store recovery failed\n");
         dump_capture(&session);
         failed = 1;
     }
@@ -4639,7 +4840,7 @@ static int alias_journal_exhaustion_case(const char *executable)
         send_text(&session, "gsh_atomic_recovery\r") == -1 ||
         consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         process_child_count(session.pid) != 1) {
-        fprintf(stderr, "pty resource: alias journal rollback failed\n");
+        (void)fprintf(stderr, "pty resource: alias journal rollback failed\n");
         dump_capture(&session);
         failed = 1;
     }
@@ -4648,6 +4849,19 @@ static int alias_journal_exhaustion_case(const char *executable)
     }
     (void)rmdir(fixture);
     return failed;
+}
+
+static int finish_function_resource(pty_session *session,
+                                    const char *fixture, int failed)
+{
+    if (fixture == NULL || session == NULL) {
+        return -1;
+    }
+    if (failed) {
+        (void)fprintf(stderr, "pty resource: function recovery failed\n");
+        dump_capture(session);
+    }
+    return finish_session_directory(session, fixture, failed);
 }
 
 static int function_resource_exhaustion_case(const char *executable)
@@ -4666,8 +4880,7 @@ static int function_resource_exhaustion_case(const char *executable)
         return 1;
     }
     if (consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1) {
-        failed = 1;
-        goto done;
+        return finish_function_resource(&session, fixture, 1);
     }
     for (index = 0; index < 128U; index++) {
         if (snprintf(command, sizeof(command),
@@ -4675,16 +4888,14 @@ static int function_resource_exhaustion_case(const char *executable)
                 (int)sizeof(command) ||
             send_text(&session, command) == -1 ||
             consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1) {
-            failed = 1;
-            goto done;
+            return finish_function_resource(&session, fixture, 1);
         }
     }
     if (send_text(&session, "gsh_resource_fn_over() { :; }\r") == -1 ||
         consume_through(&session, "function definition: No space",
                         TEST_TIMEOUT_MS) == -1 ||
         consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1) {
-        failed = 1;
-        goto done;
+        return finish_function_resource(&session, fixture, 1);
     }
     for (index = 0; index < 2U; index++) {
         size_t name;
@@ -4695,8 +4906,7 @@ static int function_resource_exhaustion_case(const char *executable)
                                   " gsh_resource_fn_%03zu", name);
 
             if (length < 0 || (size_t)length >= sizeof(command) - used) {
-                failed = 1;
-                goto done;
+                return finish_function_resource(&session, fixture, 1);
             }
             used += (size_t)length;
         }
@@ -4704,8 +4914,7 @@ static int function_resource_exhaustion_case(const char *executable)
         command[used] = '\0';
         if (send_text(&session, command) == -1 ||
             consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1) {
-            failed = 1;
-            goto done;
+            return finish_function_resource(&session, fixture, 1);
         }
     }
     if (send_text(&session, "gsh_resource_recovered() { :; }\r") == -1 ||
@@ -4724,20 +4933,14 @@ static int function_resource_exhaustion_case(const char *executable)
         failed = 1;
     }
 
-done:
-    if (failed) {
-        fprintf(stderr, "pty resource: function recovery failed\n");
-        dump_capture(&session);
-    }
-    if (stop_session(&session) == -1) {
-        failed = 1;
-    }
-    (void)rmdir(fixture);
-    return failed;
+    return finish_function_resource(&session, fixture, failed);
 }
 
 static int resource_exhaustion_flow(const char *executable)
 {
+    if (executable == NULL) {
+        return -1;
+    }
     int failed = 0;
 
     failed |= descriptor_exhaustion_case(executable);
@@ -4751,7 +4954,7 @@ static int resource_exhaustion_flow(const char *executable)
     failed |= alias_journal_exhaustion_case(executable);
     failed |= function_resource_exhaustion_case(executable);
     if (!failed) {
-        puts("pty resource: descriptor, input, process, data, variable, "
+        (void)puts("pty resource: descriptor, input, process, data, variable, "
              "arithmetic, alias, and function limits recovered");
     }
     return failed;
@@ -4785,7 +4988,7 @@ static int process_fd_count(pid_t pid)
             count++;
         }
     }
-    closedir(directory);
+    (void)closedir(directory);
     return count;
 #else
     (void)pid;
@@ -4821,7 +5024,7 @@ static int process_child_pids(pid_t pid, pid_t *children, size_t capacity)
         return -1;
     }
     length = read(descriptor, contents, sizeof(contents) - 1U);
-    close(descriptor);
+    (void)close(descriptor);
     if (length < 0) {
         return -1;
     }
@@ -4895,7 +5098,7 @@ static int64_t process_rss_bytes(pid_t pid)
         return -1;
     }
     count = read(fd, contents, sizeof(contents) - 1U);
-    close(fd);
+    (void)close(fd);
     if (count <= 0) {
         return -1;
     }
@@ -4934,6 +5137,9 @@ typedef struct {
 
 static int process_memory_bytes(pid_t pid, process_memory *memory)
 {
+    if (memory == NULL) {
+        return -1;
+    }
 #if defined(__APPLE__)
     struct rusage_info_v4 information;
 
@@ -4963,7 +5169,7 @@ static int process_memory_bytes(pid_t pid, process_memory *memory)
         return -1;
     }
     count = read(descriptor, contents, sizeof(contents) - 1U);
-    close(descriptor);
+    (void)close(descriptor);
     if (count <= 0) {
         return -1;
     }
@@ -4992,38 +5198,63 @@ static int process_memory_bytes(pid_t pid, process_memory *memory)
 #endif
 }
 
-static int64_t process_tree_memory_bytes_at(pid_t pid, unsigned int depth)
-{
-    process_memory memory;
-    pid_t children[256];
-    int child_count;
-    int64_t total;
-    int index;
-
-    if (depth == 8 || process_memory_bytes(pid, &memory) == -1 ||
-        memory.current > INT64_MAX) {
-        return -1;
-    }
-    total = (int64_t)memory.current;
-    child_count = process_child_pids(
-        pid, children, sizeof(children) / sizeof(children[0]));
-    if (child_count < 0) {
-        return depth == 0 ? -1 : total;
-    }
-    for (index = 0; index < child_count; index++) {
-        int64_t child = process_tree_memory_bytes_at(children[index],
-                                                     depth + 1U);
-
-        if (child >= 0 && child <= INT64_MAX - total) {
-            total += child;
-        }
-    }
-    return total;
-}
-
 static int64_t process_tree_memory_bytes(pid_t pid)
 {
-    return process_tree_memory_bytes_at(pid, 0);
+    enum { PROCESS_TREE_CAP = 2048, PROCESS_TREE_DEPTH_CAP = 8 };
+    pid_t pending[PROCESS_TREE_CAP];
+    unsigned char depths[PROCESS_TREE_CAP];
+    size_t read_index = 0U;
+    size_t write_index = 1U;
+    int64_t total = 0;
+    size_t steps;
+
+    pending[0] = pid;
+    depths[0] = 0U;
+    for (steps = 0; read_index < write_index && steps < PROCESS_TREE_CAP;
+         steps++) {
+        process_memory memory;
+        pid_t children[256];
+        unsigned int depth = depths[read_index];
+        pid_t current = pending[read_index++];
+        int child_count;
+        int index;
+
+        if (depth == PROCESS_TREE_DEPTH_CAP ||
+            process_memory_bytes(current, &memory) == -1 ||
+            memory.current > INT64_MAX) {
+            if (depth == 0U) {
+                return -1;
+            }
+            continue;
+        }
+        if ((int64_t)memory.current > INT64_MAX - total) {
+            errno = EOVERFLOW;
+            return -1;
+        }
+        total += (int64_t)memory.current;
+        child_count = process_child_pids(
+            current, children, sizeof(children) / sizeof(children[0]));
+        if (child_count < 0) {
+            if (depth == 0U) {
+                return -1;
+            }
+            continue;
+        }
+        if ((size_t)child_count > PROCESS_TREE_CAP - write_index) {
+            errno = ENOSPC;
+            return -1;
+        }
+        for (index = 0; index < child_count; index++) {
+            pending[write_index] = children[index];
+            depths[write_index] = (unsigned char)(depth + 1U);
+            write_index++;
+        }
+    }
+    if (read_index != write_index) {
+        errno = ENOSPC;
+        return -1;
+    }
+    return total;
 }
 
 static int soak_iteration(pty_session *session)
@@ -5105,14 +5336,7 @@ static int soak_iteration(pty_session *session)
     return 0;
 }
 
-static int soak_flow(const char *executable, unsigned long seconds)
-{
-    char fixture[] = "/tmp/gsh-soak-XXXXXX";
-    pty_session session;
-    uint64_t deadline;
-    uint64_t iterations = 0;
-    unsigned long reactor_cycles;
-    unsigned long misses;
+typedef struct {
     int64_t initial_rss;
     int64_t maximum_rss;
     int64_t final_rss;
@@ -5122,8 +5346,145 @@ static int soak_flow(const char *executable, unsigned long seconds)
     int initial_children;
     int maximum_children;
     int final_children;
+} soak_metrics;
+
+static int initialize_soak_metrics(const pty_session *session,
+                                   soak_metrics *metrics)
+{
+    if (!require(session != NULL) || !require(metrics != NULL)) {
+        return -1;
+    }
+    metrics->initial_rss = process_rss_bytes(session->pid);
+    metrics->initial_fds = process_fd_count(session->pid);
+    metrics->initial_children = process_child_count(session->pid);
+    if (metrics->initial_rss < 0 || metrics->initial_fds < 0 ||
+        metrics->initial_children < 0) {
+        return -1;
+    }
+    metrics->maximum_rss = metrics->initial_rss;
+    metrics->maximum_fds = metrics->initial_fds;
+    metrics->maximum_children = metrics->initial_children;
+    return 0;
+}
+
+static int sample_soak_metrics(const pty_session *session,
+                               soak_metrics *metrics)
+{
+    if (!require(session != NULL) || !require(metrics != NULL)) {
+        return -1;
+    }
+    int64_t rss = process_rss_bytes(session->pid);
+    int descriptors = process_fd_count(session->pid);
+    int children = process_child_count(session->pid);
+
+    if (rss < 0 || descriptors < 0 || children < 0) {
+        return -1;
+    }
+    if (rss > metrics->maximum_rss) {
+        metrics->maximum_rss = rss;
+    }
+    if (descriptors > metrics->maximum_fds) {
+        metrics->maximum_fds = descriptors;
+    }
+    if (children > metrics->maximum_children) {
+        metrics->maximum_children = children;
+    }
+    return 0;
+}
+
+static int run_soak_iterations(pty_session *session, unsigned long seconds,
+                               soak_metrics *metrics, uint64_t *iterations)
+{
+    if (!require(session != NULL) || !require(metrics != NULL) ||
+        !require(iterations != NULL) || !require(seconds <= 86400U)) {
+        return -1;
+    }
+    uint64_t deadline = monotonic_ns() + (uint64_t)seconds * 1000000000ULL;
+
+    while (monotonic_ns() < deadline) {
+        if (soak_iteration(session) == -1) {
+            perror("pty soak: iteration");
+            dump_capture(session);
+            return -1;
+        }
+        (*iterations)++;
+        if (sample_soak_metrics(session, metrics) == -1) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int read_soak_diagnostics(pty_session *session,
+                                 unsigned long *reactor_cycles,
+                                 unsigned long *misses)
+{
     bool found;
-    int failed = 0;
+
+    if (!require(session != NULL) || !require(reactor_cycles != NULL) ||
+        !require(misses != NULL)) {
+        return -1;
+    }
+    session->capture_length = 0;
+    if (send_text(session, "rt\r") == -1 ||
+        wait_for_output(session, "reactor cycles=", TEST_TIMEOUT_MS) == -1 ||
+        wait_for_output(session, "gsh$ ", TEST_TIMEOUT_MS) == -1) {
+        return -1;
+    }
+    *reactor_cycles = diagnostic_counter(session, "cycles=", &found);
+    if (!found) {
+        return -1;
+    }
+    *misses = diagnostic_counter(session, "misses=", &found);
+    return found ? 0 : -1;
+}
+
+static int finish_soak_metrics(const pty_session *session,
+                               soak_metrics *metrics)
+{
+    if (!require(session != NULL) || !require(metrics != NULL)) {
+        return -1;
+    }
+    metrics->final_rss = process_rss_bytes(session->pid);
+    metrics->final_fds = process_fd_count(session->pid);
+    metrics->final_children = process_child_count(session->pid);
+    if (metrics->final_rss < 0 || metrics->final_fds < 0 ||
+        metrics->final_fds > metrics->initial_fds + 1 ||
+        metrics->final_rss > metrics->initial_rss + 4 * 1024 * 1024 ||
+        metrics->final_children < 0 ||
+        metrics->final_children > metrics->initial_children) {
+        return -1;
+    }
+    return 0;
+}
+
+static void report_soak(unsigned long seconds, uint64_t iterations,
+                        unsigned long reactor_cycles, unsigned long misses,
+                        const soak_metrics *metrics)
+{
+    if (!require(metrics != NULL) || !require(seconds > 0U)) {
+        return;
+    }
+    (void)printf("pty soak: seconds=%lu iterations=%llu reactor_cycles=%lu "
+           "misses=%lu rss_initial=%lld rss_max=%lld rss_final=%lld "
+           "fds_initial=%d fds_max=%d fds_final=%d "
+           "children_initial=%d children_max=%d children_final=%d\n",
+           seconds, (unsigned long long)iterations, reactor_cycles, misses,
+           (long long)metrics->initial_rss, (long long)metrics->maximum_rss,
+           (long long)metrics->final_rss, metrics->initial_fds,
+           metrics->maximum_fds, metrics->final_fds,
+           metrics->initial_children, metrics->maximum_children,
+           metrics->final_children);
+}
+
+static int soak_flow(const char *executable, unsigned long seconds)
+{
+    char fixture[] = "/tmp/gsh-soak-XXXXXX";
+    pty_session session;
+    uint64_t iterations = 0;
+    unsigned long reactor_cycles;
+    unsigned long misses;
+    soak_metrics metrics;
 
     if (seconds == 0 || seconds > 86400 ||
         unsetenv("GSH_SOAK_STATE") == -1 ||
@@ -5137,115 +5498,49 @@ static int soak_flow(const char *executable, unsigned long seconds)
     if (consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         wait_for_diagnostics(&session, "busy=0", "job=idle") == -1) {
         perror("pty soak: initial prompt");
-        failed = 1;
-        goto done;
+        return finish_session_tree(&session, fixture, 1);
     }
     if (soak_iteration(&session) == -1) {
         perror("pty soak: warm-up iteration");
         dump_capture(&session);
-        failed = 1;
-        goto done;
+        return finish_session_tree(&session, fixture, 1);
     }
 
-    initial_rss = process_rss_bytes(session.pid);
-    initial_fds = process_fd_count(session.pid);
-    initial_children = process_child_count(session.pid);
-    if (initial_rss < 0 || initial_fds < 0 || initial_children < 0) {
-        fprintf(stderr, "pty soak: platform process metrics unavailable\n");
-        failed = 1;
-        goto done;
+    if (initialize_soak_metrics(&session, &metrics) == -1) {
+        (void)fprintf(stderr, "pty soak: platform process metrics unavailable\n");
+        return finish_session_tree(&session, fixture, 1);
     }
-    maximum_rss = initial_rss;
-    maximum_fds = initial_fds;
-    maximum_children = initial_children;
-    deadline = monotonic_ns() + (uint64_t)seconds * 1000000000ULL;
-    while (monotonic_ns() < deadline) {
-        int64_t rss;
-        int descriptors;
-        int children;
-
-        if (soak_iteration(&session) == -1) {
-            perror("pty soak: iteration");
-            dump_capture(&session);
-            failed = 1;
-            goto done;
-        }
-        iterations++;
-        rss = process_rss_bytes(session.pid);
-        descriptors = process_fd_count(session.pid);
-        children = process_child_count(session.pid);
-        if (rss < 0 || descriptors < 0 || children < 0) {
-            failed = 1;
-            goto done;
-        }
-        if (rss > maximum_rss) {
-            maximum_rss = rss;
-        }
-        if (descriptors > maximum_fds) {
-            maximum_fds = descriptors;
-        }
-        if (children > maximum_children) {
-            maximum_children = children;
-        }
+    if (run_soak_iterations(&session, seconds, &metrics, &iterations) == -1 ||
+        read_soak_diagnostics(&session, &reactor_cycles, &misses) == -1) {
+        return finish_session_tree(&session, fixture, 1);
     }
-
-    session.capture_length = 0;
-    if (send_text(&session, "rt\r") == -1 ||
-        wait_for_output(&session, "reactor cycles=", TEST_TIMEOUT_MS) == -1 ||
-        wait_for_output(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1) {
-        failed = 1;
-        goto done;
-    }
-    reactor_cycles = diagnostic_counter(&session, "cycles=", &found);
-    if (!found) {
-        failed = 1;
-        goto done;
-    }
-    misses = diagnostic_counter(&session, "misses=", &found);
-    if (!found) {
-        failed = 1;
-        goto done;
-    }
-    final_rss = process_rss_bytes(session.pid);
-    final_fds = process_fd_count(session.pid);
-    final_children = process_child_count(session.pid);
-    if (final_rss < 0 || final_fds < 0 || final_fds > initial_fds + 1 ||
-        final_rss > initial_rss + 4 * 1024 * 1024 ||
-        final_children < 0 || final_children > initial_children) {
-        fprintf(stderr,
+    if (finish_soak_metrics(&session, &metrics) == -1) {
+        (void)fprintf(stderr,
                 "pty soak: resource growth exceeded bounds "
                 "rss_initial=%lld rss_max=%lld rss_final=%lld "
                 "fds_initial=%d fds_max=%d fds_final=%d "
                 "children_initial=%d children_max=%d children_final=%d\n",
-                (long long)initial_rss, (long long)maximum_rss,
-                (long long)final_rss, initial_fds, maximum_fds, final_fds,
-                initial_children, maximum_children, final_children);
-        failed = 1;
-        goto done;
+                (long long)metrics.initial_rss,
+                (long long)metrics.maximum_rss,
+                (long long)metrics.final_rss, metrics.initial_fds,
+                metrics.maximum_fds, metrics.final_fds,
+                metrics.initial_children, metrics.maximum_children,
+                metrics.final_children);
+        return finish_session_tree(&session, fixture, 1);
     }
-    printf("pty soak: seconds=%lu iterations=%llu reactor_cycles=%lu "
-           "misses=%lu rss_initial=%lld rss_max=%lld rss_final=%lld "
-           "fds_initial=%d fds_max=%d fds_final=%d "
-           "children_initial=%d children_max=%d children_final=%d\n",
-           seconds, (unsigned long long)iterations, reactor_cycles, misses,
-           (long long)initial_rss, (long long)maximum_rss,
-           (long long)final_rss, initial_fds, maximum_fds, final_fds,
-           initial_children, maximum_children, final_children);
-
-done:
-    if (stop_session(&session) == -1) {
-        failed = 1;
-    }
-    remove_fixture(fixture);
-    return failed;
+    report_soak(seconds, iterations, reactor_cycles, misses, &metrics);
+    return finish_session_tree(&session, fixture, 0);
 }
 
 static void discard_ready_output(pty_session *session)
 {
+    if (session == NULL) {
+        return;
+    }
     unsigned char discard[4096];
 
     session->capture_length = 0;
-    for (;;) {
+    for (size_t attempt = 0; attempt < PTY_DRAIN_ATTEMPT_CAP; attempt++) {
         ssize_t count = read(session->master, discard, sizeof(discard));
 
         if (count > 0 || (count == -1 && errno == EINTR)) {
@@ -5290,6 +5585,7 @@ static int start_benchmark_session(pty_session *session,
                                    const shell_spec *spec,
                                    const char *directory, bool stabilize)
 {
+    if (spec == NULL) return -1;
     if (start_session(session, spec->executable, directory, spec->kind) == -1 ||
         consume_through(session, spec->prompt, TEST_TIMEOUT_MS) == -1) {
         return -1;
@@ -5308,6 +5604,10 @@ static int benchmark_prompt_command(
     uint64_t samples[BENCH_SHELLS][BENCH_EXEC_SAMPLES],
     const char *setup, const char *command, const char *label)
 {
+    if (specs == NULL) return -1;
+    if (label == NULL || samples == NULL || sessions == NULL) {
+        return -1;
+    }
     size_t sample;
     size_t offset;
 
@@ -5321,7 +5621,7 @@ static int benchmark_prompt_command(
                 (send_text(&sessions[shell], setup) == -1 ||
                  consume_through(&sessions[shell], specs[shell].prompt,
                                  TEST_TIMEOUT_MS) == -1)) {
-                fprintf(stderr, "pty benchmark: %s %s setup failed\n",
+                (void)fprintf(stderr, "pty benchmark: %s %s setup failed\n",
                         specs[shell].name, label);
                 return -1;
             }
@@ -5330,7 +5630,7 @@ static int benchmark_prompt_command(
             if (send_text(&sessions[shell], command) == -1 ||
                 consume_through(&sessions[shell], specs[shell].prompt,
                                 TEST_TIMEOUT_MS) == -1) {
-                fprintf(stderr, "pty benchmark: %s %s sample failed\n",
+                (void)fprintf(stderr, "pty benchmark: %s %s sample failed\n",
                         specs[shell].name, label);
                 return -1;
             }
@@ -5346,6 +5646,10 @@ static int benchmark_synchronized_prompt_command(
     uint64_t samples[BENCH_SHELLS][BENCH_EXEC_SAMPLES],
     const char *setup, const char *command, const char *label)
 {
+    if (specs == NULL) return -1;
+    if (label == NULL || samples == NULL || sessions == NULL) {
+        return -1;
+    }
     static const char marker[] = "__GSH_BENCH_SYNC__";
     size_t sample;
     size_t offset;
@@ -5361,7 +5665,7 @@ static int benchmark_synchronized_prompt_command(
                                 TEST_TIMEOUT_MS) == -1 ||
                 consume_through(&sessions[shell], specs[shell].prompt,
                                 TEST_TIMEOUT_MS) == -1) {
-                fprintf(stderr, "pty benchmark: %s %s setup failed\n",
+                (void)fprintf(stderr, "pty benchmark: %s %s setup failed\n",
                         specs[shell].name, label);
                 return -1;
             }
@@ -5370,7 +5674,7 @@ static int benchmark_synchronized_prompt_command(
             if (send_text(&sessions[shell], command) == -1 ||
                 consume_through(&sessions[shell], specs[shell].prompt,
                                 TEST_TIMEOUT_MS) == -1) {
-                fprintf(stderr, "pty benchmark: %s %s sample failed\n",
+                (void)fprintf(stderr, "pty benchmark: %s %s sample failed\n",
                         specs[shell].name, label);
                 return -1;
             }
@@ -5383,6 +5687,7 @@ static int benchmark_synchronized_prompt_command(
 static size_t paired_win_count(const uint64_t *candidate,
                                const uint64_t *peer, size_t count)
 {
+    if (candidate == NULL || peer == NULL) return 0U;
     size_t wins = 0;
     size_t index;
 
@@ -5398,6 +5703,9 @@ static int direct_builtin_performance_gate(
     uint64_t test_samples[BENCH_SHELLS][BENCH_EXEC_SAMPLES],
     size_t *bash_wins_result, size_t *zsh_wins_result)
 {
+    if (echo_samples == NULL || printf_samples == NULL || test_samples == NULL) {
+        return -1;
+    }
     size_t bash_wins =
         paired_win_count(echo_samples[0], echo_samples[1],
                          BENCH_EXEC_SAMPLES) +
@@ -5421,7 +5729,7 @@ static int direct_builtin_performance_gate(
     *bash_wins_result = bash_wins;
     *zsh_wins_result = zsh_wins;
     if (bash_wins * 2U <= total || zsh_wins * 2U <= total) {
-        fprintf(stderr,
+        (void)fprintf(stderr,
                 "pty benchmark: direct builtins did not clear the >50%% "
                 "paired-win gate\n");
         return -1;
@@ -5501,6 +5809,10 @@ static int wait_for_output_sampling_tree(pty_session *session,
                                          const char *marker,
                                          uint64_t *peak)
 {
+    if (peak == NULL) return -1;
+    if (session == NULL) {
+        return -1;
+    }
     uint64_t deadline = monotonic_ns() +
                         (uint64_t)TEST_TIMEOUT_MS * 1000000ULL;
 
@@ -5681,6 +5993,7 @@ static int memory_benchmark(const shell_spec specs[BENCH_SHELLS],
                             size_t workload_count,
                             benchmark_memory *results)
 {
+    if (specs == NULL) return -1;
     size_t workload;
     size_t sample;
     size_t offset;
@@ -5691,7 +6004,7 @@ static int memory_benchmark(const shell_spec specs[BENCH_SHELLS],
         return -1;
     }
     workload_end = workload_begin + workload_count;
-    memset(results, 0, sizeof(*results));
+    (void)memset(results, 0, sizeof(*results));
     for (sample = 0; sample < BENCH_MEMORY_SAMPLES; sample++) {
         for (offset = 0; offset < BENCH_SHELLS; offset++) {
             size_t shell = (sample + offset) % BENCH_SHELLS;
@@ -5699,7 +6012,7 @@ static int memory_benchmark(const shell_spec specs[BENCH_SHELLS],
             if (measure_idle_memory_sample(
                     &specs[shell], directory, &results->idle[shell][sample],
                     &results->idle_tree[shell][sample]) == -1) {
-                fprintf(stderr, "pty benchmark: %s idle memory failed\n",
+                (void)fprintf(stderr, "pty benchmark: %s idle memory failed\n",
                         specs[shell].name);
                 return -1;
             }
@@ -5752,6 +6065,7 @@ static int write_latency_report(
     const benchmark_latency_metric *metrics,
     size_t metric_count)
 {
+    if (specs == NULL) return -1;
     size_t metric;
     size_t shell;
 
@@ -5784,6 +6098,9 @@ static int write_memory_metric(benchmark_report *report,
                                const char *measurement,
                                const uint64_t samples[BENCH_MEMORY_SAMPLES])
 {
+    if (measurement == NULL || test == NULL) {
+        return -1;
+    }
     if (report == NULL || spec == NULL || samples == NULL) {
         errno = EINVAL;
         return -1;
@@ -5799,6 +6116,7 @@ static int write_memory_report(benchmark_report *report,
                                const benchmark_memory *results,
                                size_t workload_begin, size_t workload_count)
 {
+    if (specs == NULL) return -1;
     size_t workload_end;
     size_t shell;
     size_t workload;
@@ -5842,14 +6160,23 @@ static int write_memory_report(benchmark_report *report,
     return 0;
 }
 
-static int latency_benchmark(const char *gsh, const char *bash,
-                             const char *zsh, const char *output_path)
+static int finish_benchmark_sessions(
+    pty_session sessions[BENCH_SHELLS], bool started[BENCH_SHELLS],
+    int failed)
 {
-    shell_spec specs[BENCH_SHELLS] = {
-        {"gsh", gsh, "gsh$ ", SHELL_GSH},
-        {"bash", bash, "gsh$ ", SHELL_BASH},
-        {"zsh", zsh, "gsh$ ", SHELL_ZSH},
-    };
+    if (started == NULL || sessions == NULL) return -1;
+    size_t shell;
+
+    for (shell = 0; shell < BENCH_SHELLS; shell++) {
+        if (started[shell] && stop_session(&sessions[shell]) == -1) {
+            failed = 1;
+        }
+        started[shell] = false;
+    }
+    return failed;
+}
+
+typedef struct {
     uint64_t startup[BENCH_SHELLS][BENCH_STARTUP_SAMPLES];
     uint64_t key[BENCH_SHELLS][BENCH_KEY_SAMPLES];
     uint64_t execution[BENCH_SHELLS][BENCH_EXEC_SAMPLES];
@@ -5886,44 +6213,52 @@ static int latency_benchmark(const char *gsh, const char *bash,
     uint64_t alias_definition[BENCH_SHELLS][BENCH_EXEC_SAMPLES];
     uint64_t alias_expansion[BENCH_SHELLS][BENCH_EXEC_SAMPLES];
     uint64_t unalias_command[BENCH_SHELLS][BENCH_EXEC_SAMPLES];
-    pty_session sessions[BENCH_SHELLS];
-    bool started[BENCH_SHELLS] = {false, false, false};
-    benchmark_memory memory_results;
-    benchmark_report report;
-    char directory[4096];
-    size_t bash_wins;
-    size_t zsh_wins;
-    size_t sample;
-    size_t offset;
-    int failed = 0;
+} benchmark_latency;
 
-    if (getcwd(directory, sizeof(directory)) == NULL ||
-        setenv("GSH_BENCH_VALUE", "value", 1) == -1 ||
-        setenv("GSH_BENCH_PATTERN", "abcabc", 1) == -1 ||
-        setenv("GSH_BENCH_PATTERN_MULTI", "abacadTAIL", 1) == -1) {
-        perror("pty benchmark: current directory");
-        return 1;
+static int prepare_benchmark_shells(const shell_spec specs[BENCH_SHELLS],
+                                    const char *directory)
+{
+    size_t shell;
+
+    if (!require(specs != NULL) || !require(directory != NULL)) {
+        return -1;
     }
-    for (offset = 0; offset < BENCH_SHELLS; offset++) {
-        if (access(specs[offset].executable, X_OK) == -1) {
-            fprintf(stderr, "pty benchmark: %s is not executable: %s\n",
-                    specs[offset].name, specs[offset].executable);
-            return 1;
+    for (shell = 0; shell < BENCH_SHELLS; shell++) {
+        size_t sample;
+
+        if (access(specs[shell].executable, X_OK) == -1) {
+            (void)fprintf(stderr, "pty benchmark: %s is not executable: %s\n",
+                    specs[shell].name, specs[shell].executable);
+            return -1;
         }
-        for (sample = 0; sample < 8; sample++) {
+        for (sample = 0; sample < 8U; sample++) {
             pty_session warm;
 
-            if (start_benchmark_session(&warm, &specs[offset], directory,
+            if (start_benchmark_session(&warm, &specs[shell], directory,
                                         false) == -1 ||
                 stop_session(&warm) == -1) {
-                fprintf(stderr, "pty benchmark: %s warmup failed\n",
-                        specs[offset].name);
-                return 1;
+                (void)fprintf(stderr, "pty benchmark: %s warmup failed\n",
+                        specs[shell].name);
+                return -1;
             }
         }
     }
+    return 0;
+}
 
+static int measure_benchmark_startup(const shell_spec specs[BENCH_SHELLS],
+                                     const char *directory,
+                                     benchmark_latency *latency)
+{
+    size_t sample;
+
+    if (!require(specs != NULL) || !require(directory != NULL) ||
+        !require(latency != NULL)) {
+        return -1;
+    }
     for (sample = 0; sample < BENCH_STARTUP_SAMPLES; sample++) {
+        size_t offset;
+
         for (offset = 0; offset < BENCH_SHELLS; offset++) {
             size_t shell = (sample + offset) % BENCH_SHELLS;
             pty_session fresh;
@@ -5931,54 +6266,80 @@ static int latency_benchmark(const char *gsh, const char *bash,
 
             if (start_benchmark_session(&fresh, &specs[shell], directory,
                                         false) == -1) {
-                fprintf(stderr, "pty benchmark: %s startup failed\n",
-                        specs[shell].name);
-                return 1;
+                return -1;
             }
-            startup[shell][sample] = monotonic_ns() - start;
+            latency->startup[shell][sample] = monotonic_ns() - start;
             if (stop_session(&fresh) == -1) {
-                fprintf(stderr, "pty benchmark: %s shutdown failed\n",
-                        specs[shell].name);
-                return 1;
+                return -1;
             }
         }
     }
+    return 0;
+}
 
-    for (offset = 0; offset < BENCH_SHELLS; offset++) {
-        memset(&sessions[offset], 0, sizeof(sessions[offset]));
-        sessions[offset].master = -1;
-        if (start_benchmark_session(&sessions[offset], &specs[offset],
-                                    directory, true) == -1) {
-            fprintf(stderr, "pty benchmark: %s session failed\n",
-                    specs[offset].name);
-            failed = 1;
-            goto done;
-        }
-        started[offset] = true;
+static int open_benchmark_sessions(pty_session sessions[BENCH_SHELLS],
+                                   bool started[BENCH_SHELLS],
+                                   const shell_spec specs[BENCH_SHELLS],
+                                   const char *directory)
+{
+    size_t shell;
+
+    if (!require(sessions != NULL) || !require(started != NULL) ||
+        !require(specs != NULL) || !require(directory != NULL)) {
+        return -1;
     }
+    for (shell = 0; shell < BENCH_SHELLS; shell++) {
+        (void)memset(&sessions[shell], 0, sizeof(sessions[shell]));
+        sessions[shell].master = -1;
+        if (start_benchmark_session(&sessions[shell], &specs[shell],
+                                    directory, true) == -1) {
+            return -1;
+        }
+        started[shell] = true;
+    }
+    return 0;
+}
 
+static int warm_benchmark_builtins(pty_session sessions[BENCH_SHELLS],
+                                   const shell_spec specs[BENCH_SHELLS])
+{
+    size_t sample;
+
+    if (!require(sessions != NULL) || !require(specs != NULL)) {
+        return -1;
+    }
     for (sample = 0; sample < 8U; sample++) {
-        for (offset = 0; offset < BENCH_SHELLS; offset++) {
-            if (send_text(&sessions[offset],
+        size_t shell;
+
+        for (shell = 0; shell < BENCH_SHELLS; shell++) {
+            if (send_text(&sessions[shell],
                           "echo GSH_BUILTIN\rprintf '%s\\n' "
                           "GSH_BUILTIN\rtest x = x\r") == -1 ||
-                consume_through(&sessions[offset], specs[offset].prompt,
+                consume_through(&sessions[shell], specs[shell].prompt,
                                 TEST_TIMEOUT_MS) == -1 ||
-                consume_through(&sessions[offset], specs[offset].prompt,
+                consume_through(&sessions[shell], specs[shell].prompt,
                                 TEST_TIMEOUT_MS) == -1 ||
-                consume_through(&sessions[offset], specs[offset].prompt,
+                consume_through(&sessions[shell], specs[shell].prompt,
                                 TEST_TIMEOUT_MS) == -1) {
-                fprintf(stderr,
-                        "pty benchmark: %s direct builtin warmup failed\n",
-                        specs[offset].name);
-                failed = 1;
-                goto done;
+                return -1;
             }
-            discard_ready_output(&sessions[offset]);
+            discard_ready_output(&sessions[shell]);
         }
     }
+    return 0;
+}
 
+static int measure_benchmark_keys(pty_session sessions[BENCH_SHELLS],
+                                  benchmark_latency *latency)
+{
+    size_t sample;
+
+    if (!require(sessions != NULL) || !require(latency != NULL)) {
+        return -1;
+    }
     for (sample = 0; sample < BENCH_KEY_SAMPLES; sample++) {
+        size_t offset;
+
         for (offset = 0; offset < BENCH_SHELLS; offset++) {
             size_t shell = (sample + offset) % BENCH_SHELLS;
             uint64_t start;
@@ -5988,282 +6349,430 @@ static int latency_benchmark(const char *gsh, const char *bash,
             if (send_text(&sessions[shell], "x") == -1 ||
                 consume_through(&sessions[shell], "x", TEST_TIMEOUT_MS) ==
                     -1) {
-                fprintf(stderr, "pty benchmark: %s key sample failed\n",
-                        specs[shell].name);
-                failed = 1;
-                goto done;
+                return -1;
             }
-            key[shell][sample] = monotonic_ns() - start;
+            latency->key[shell][sample] = monotonic_ns() - start;
             if (send_bytes(&sessions[shell], "\025", 1) == -1) {
-                failed = 1;
-                goto done;
+                return -1;
             }
         }
     }
+    return 0;
+}
 
-    if (benchmark_prompt_command(sessions, specs, execution, NULL,
-                                 "/usr/bin/true\r", "external true") ==
+static int benchmark_command_group_one(
+    pty_session sessions[BENCH_SHELLS],
+    const shell_spec specs[BENCH_SHELLS], benchmark_latency *latency)
+{
+    if (!require(sessions != NULL) || !require(specs != NULL) ||
+        !require(latency != NULL)) {
+        return -1;
+    }
+    if (benchmark_prompt_command(sessions, specs, latency->execution, NULL,
+                                 "/usr/bin/true\r", "external true") == -1 ||
+        benchmark_prompt_command(sessions, specs, latency->direct_echo, NULL,
+                                 "echo GSH_BUILTIN\r",
+                                 "direct echo builtin") == -1 ||
+        benchmark_prompt_command(sessions, specs, latency->direct_printf, NULL,
+                                 "printf '%s\\n' GSH_BUILTIN\r",
+                                 "direct printf builtin") == -1 ||
+        benchmark_prompt_command(sessions, specs, latency->direct_test, NULL,
+                                 "test x = x\r", "direct test builtin") ==
             -1 ||
-        benchmark_prompt_command(
-            sessions, specs, direct_echo, NULL, "echo GSH_BUILTIN\r",
-            "direct echo builtin") == -1 ||
-        benchmark_prompt_command(
-            sessions, specs, direct_printf, NULL,
-            "printf '%s\\n' GSH_BUILTIN\r",
-            "direct printf builtin") == -1 ||
-        benchmark_prompt_command(
-            sessions, specs, direct_test, NULL, "test x = x\r",
-            "direct test builtin") == -1 ||
-        benchmark_prompt_command(
-            sessions, specs, lookup, "GSH_BENCH_VALUE=value\r",
-            ": \"${GSH_BENCH_VALUE}\"\r", "variable lookup") == -1 ||
-        benchmark_prompt_command(
-            sessions, specs, command_lookup, NULL,
-            "command -v true\r", "command lookup") == -1 ||
-        benchmark_prompt_command(
-            sessions, specs, command_path_cache, "hash sh\r",
-            "command -v sh\r", "cached command path lookup") == -1 ||
-        benchmark_prompt_command(sessions, specs, assignment, NULL,
+        benchmark_prompt_command(sessions, specs, latency->lookup,
+                                 "GSH_BENCH_VALUE=value\r",
+                                 ": \"${GSH_BENCH_VALUE}\"\r",
+                                 "variable lookup") == -1 ||
+        benchmark_prompt_command(sessions, specs, latency->command_lookup,
+                                 NULL, "command -v true\r",
+                                 "command lookup") == -1 ||
+        benchmark_prompt_command(sessions, specs,
+                                 latency->command_path_cache, "hash sh\r",
+                                 "command -v sh\r",
+                                 "cached command path lookup") == -1 ||
+        benchmark_prompt_command(sessions, specs, latency->assignment, NULL,
                                  "GSH_BENCH_ASSIGN=value\r",
                                  "variable assignment") == -1 ||
         benchmark_prompt_command(
-            sessions, specs, assign_default, "GSH_BENCH_DEFAULT=\r",
-            ": \"${GSH_BENCH_DEFAULT:=value}\"\r",
+            sessions, specs, latency->assign_default,
+            "GSH_BENCH_DEFAULT=\r", ": \"${GSH_BENCH_DEFAULT:=value}\"\r",
             "assign-default expansion") == -1 ||
         benchmark_prompt_command(
-            sessions, specs, arithmetic_assignment,
-            "GSH_BENCH_ARITH=1\r",
-            ": \"$((GSH_BENCH_ARITH += 1))\"\r",
+            sessions, specs, latency->arithmetic_assignment,
+            "GSH_BENCH_ARITH=1\r", ": \"$((GSH_BENCH_ARITH += 1))\"\r",
             "arithmetic assignment") == -1 ||
         benchmark_prompt_command(
-            sessions, specs, pipeline_assignment, "GSH_BENCH_PIPE=\r",
+            sessions, specs, latency->pipeline_assignment,
+            "GSH_BENCH_PIPE=\r",
             ": \"${GSH_BENCH_PIPE:=value}\" | /usr/bin/true\r",
-            "pipeline scoped assignment") == -1 ||
-        benchmark_prompt_command(sessions, specs, resource_limit, NULL,
-                                 "ulimit -S -n\r", "ulimit soft nofile") ==
-            -1 ||
-        benchmark_prompt_command(sessions, specs, creation_mask, NULL,
-                                 "umask\r", "umask report") ==
-            -1 ||
-        benchmark_prompt_command(sessions, specs, process_times, NULL,
-                                 "times\r", "process times") == -1 ||
+            "pipeline scoped assignment") == -1) {
+        return -1;
+    }
+    return 0;
+}
+
+static int benchmark_command_group_two(
+    pty_session sessions[BENCH_SHELLS],
+    const shell_spec specs[BENCH_SHELLS], benchmark_latency *latency)
+{
+    if (!require(sessions != NULL) || !require(specs != NULL) ||
+        !require(latency != NULL)) {
+        return -1;
+    }
+    if (benchmark_prompt_command(sessions, specs, latency->resource_limit,
+                                 NULL, "ulimit -S -n\r",
+                                 "ulimit soft nofile") == -1 ||
+        benchmark_prompt_command(sessions, specs, latency->creation_mask,
+                                 NULL, "umask\r", "umask report") == -1 ||
+        benchmark_prompt_command(sessions, specs, latency->process_times,
+                                 NULL, "times\r", "process times") == -1 ||
         benchmark_prompt_command(
-            sessions, specs, exec_descriptor, "exec 9>&-\r",
+            sessions, specs, latency->exec_descriptor, "exec 9>&-\r",
             "exec 9>/dev/null\r", "exec descriptor commit") == -1 ||
         benchmark_prompt_command(
-            sessions, specs, export_assignment, NULL,
+            sessions, specs, latency->export_assignment, NULL,
             "export GSH_BENCH_EXPORT=value\r", "export assignment") == -1 ||
         benchmark_prompt_command(
-            sessions, specs, unset_variable,
+            sessions, specs, latency->unset_variable,
             "GSH_BENCH_UNSET=value\r", "unset GSH_BENCH_UNSET\r",
             "unset variable") == -1 ||
         benchmark_prompt_command(
-            sessions, specs, readonly_existing,
+            sessions, specs, latency->readonly_existing,
             "readonly GSH_BENCH_READONLY\r",
             "readonly GSH_BENCH_READONLY\r", "readonly existing") == -1 ||
         benchmark_prompt_command(
-            sessions, specs, for_explicit, NULL,
+            sessions, specs, latency->for_explicit, NULL,
             "for GSH_BENCH_ITEM in a b c; do :; done\r",
             "for explicit items") == -1 ||
+        benchmark_prompt_command(sessions, specs, latency->set_positionals,
+                                 NULL, "set -- a b c\r",
+                                 "set positional parameters") == -1 ||
         benchmark_prompt_command(
-            sessions, specs, set_positionals, NULL,
-            "set -- a b c\r", "set positional parameters") == -1 ||
-        benchmark_prompt_command(
-            sessions, specs, shift_positionals, "set -- a b c\r",
+            sessions, specs, latency->shift_positionals, "set -- a b c\r",
             "shift\r", "shift positional parameters") == -1 ||
-        benchmark_prompt_command(
-            sessions, specs, set_options, "set +aCfu\r", "set -aCfu\r",
-            "set shell options") == -1 ||
-        benchmark_prompt_command(
-            sessions, specs, allexport_assignment,
-            "set +Cfu -a\r",
+        benchmark_prompt_command(sessions, specs, latency->set_options,
+                                 "set +aCfu\r", "set -aCfu\r",
+                                 "set shell options") == -1) {
+        return -1;
+    }
+    return 0;
+}
+
+static int benchmark_command_group_three(
+    pty_session sessions[BENCH_SHELLS],
+    const shell_spec specs[BENCH_SHELLS], benchmark_latency *latency)
+{
+    if (!require(sessions != NULL) || !require(specs != NULL) ||
+        !require(latency != NULL)) {
+        return -1;
+    }
+    if (benchmark_prompt_command(
+            sessions, specs, latency->allexport_assignment, "set +Cfu -a\r",
             "GSH_BENCH_ASSIGN=value\r", "allexport assignment") == -1 ||
         benchmark_prompt_command(
-            sessions, specs, nounset_lookup,
-            "set +aCf -u\r",
-            ": \"${GSH_BENCH_VALUE}\"\r", "nounset defined lookup") ==
-            -1 ||
+            sessions, specs, latency->nounset_lookup, "set +aCf -u\r",
+            ": \"${GSH_BENCH_VALUE}\"\r", "nounset defined lookup") == -1 ||
         benchmark_prompt_command(
-            sessions, specs, pattern_removal,
-            NULL,
+            sessions, specs, latency->pattern_removal, NULL,
             ": \"${GSH_BENCH_PATTERN##*b}\"\r",
             "parameter pattern removal") == -1 ||
         benchmark_prompt_command(
-            sessions, specs, pattern_multistar,
-            NULL,
+            sessions, specs, latency->pattern_multistar, NULL,
             ": \"${GSH_BENCH_PATTERN_MULTI#*a*d}\"\r",
             "parameter multi-star removal") == -1 ||
         benchmark_prompt_command(
-            sessions, specs, noglob_expansion,
-            "set +aCu -f\r",
-            "/usr/bin/printf '' /dev/n[uo]ll\r",
-            "noglob expansion") == -1 ||
+            sessions, specs, latency->noglob_expansion, "set +aCu -f\r",
+            "/usr/bin/printf '' /dev/n[uo]ll\r", "noglob expansion") == -1 ||
         benchmark_prompt_command(
-            sessions, specs, noclobber_redirection,
-            "set +afu -C\r",
-            ": >/dev/null\r", "noclobber nonregular redirection") ==
-            -1 ||
+            sessions, specs, latency->noclobber_redirection, "set +afu -C\r",
+            ": >/dev/null\r", "noclobber nonregular redirection") == -1 ||
         benchmark_prompt_command(
-            sessions, specs, alias_definition,
+            sessions, specs, latency->alias_definition,
             "alias GSH_BENCH_ALIAS=:\r",
-            "alias GSH_BENCH_ALIAS=true\r", "alias definition update") ==
-            -1 ||
+            "alias GSH_BENCH_ALIAS=true\r", "alias definition update") == -1 ||
         benchmark_prompt_command(
-            sessions, specs, alias_expansion,
+            sessions, specs, latency->alias_expansion,
             "alias GSH_BENCH_ALIAS=:\r", "GSH_BENCH_ALIAS\r",
             "alias lookup expansion") == -1 ||
         benchmark_prompt_command(
-            sessions, specs, unalias_command,
+            sessions, specs, latency->unalias_command,
             "alias GSH_BENCH_ALIAS=:\r", "unalias GSH_BENCH_ALIAS\r",
-            "unalias definition") ==
-            -1) {
-        failed = 1;
-        goto done;
+            "unalias definition") == -1) {
+        return -1;
     }
-    for (offset = 0; offset < BENCH_SHELLS; offset++) {
-        if (stop_session(&sessions[offset]) == -1) {
-            failed = 1;
-            goto done;
+    return 0;
+}
+
+static int restart_benchmark_sessions(
+    pty_session sessions[BENCH_SHELLS], bool started[BENCH_SHELLS],
+    const shell_spec specs[BENCH_SHELLS], const char *directory)
+{
+    size_t shell;
+
+    if (!require(sessions != NULL) || !require(started != NULL) ||
+        !require(specs != NULL) || !require(directory != NULL)) {
+        return -1;
+    }
+    for (shell = 0; shell < BENCH_SHELLS; shell++) {
+        if (stop_session(&sessions[shell]) == -1) {
+            return -1;
         }
-        started[offset] = false;
-        if (start_benchmark_session(&sessions[offset], &specs[offset],
+        started[shell] = false;
+        if (start_benchmark_session(&sessions[shell], &specs[shell],
                                     directory, true) == -1) {
-            failed = 1;
-            goto done;
+            return -1;
         }
-        started[offset] = true;
+        started[shell] = true;
     }
-    if (
-        benchmark_synchronized_prompt_command(
-            sessions, specs, async_launch,
+    return 0;
+}
+
+static int benchmark_async_commands(
+    pty_session sessions[BENCH_SHELLS],
+    const shell_spec specs[BENCH_SHELLS], benchmark_latency *latency)
+{
+    if (!require(sessions != NULL) || !require(specs != NULL) ||
+        !require(latency != NULL)) {
+        return -1;
+    }
+    if (benchmark_synchronized_prompt_command(
+            sessions, specs, latency->async_launch,
             "wait; /usr/bin/printf __GSH_BENCH_SYNC__\r", ": &\r",
             "asynchronous builtin launch") == -1 ||
         benchmark_synchronized_prompt_command(
-            sessions, specs, async_external_launch,
+            sessions, specs, latency->async_external_launch,
             "wait; /usr/bin/printf __GSH_BENCH_SYNC__\r",
             "/bin/sleep 0.05 &\r",
             "asynchronous held external launch") == -1 ||
         benchmark_synchronized_prompt_command(
-            sessions, specs, wait_completed,
+            sessions, specs, latency->wait_completed,
             "wait; : & /bin/sleep 0.01; "
             "/usr/bin/printf __GSH_BENCH_SYNC__\r",
-            "wait\r",
-            "wait completed job") ==
-            -1) {
-        failed = 1;
-        goto done;
+            "wait\r", "wait completed job") == -1) {
+        return -1;
+    }
+    return 0;
+}
+
+static int write_latency_group_one(
+    benchmark_report *report, const shell_spec specs[BENCH_SHELLS],
+    const benchmark_latency *latency)
+{
+    if (!require(report != NULL) || !require(specs != NULL) ||
+        !require(latency != NULL)) {
+        return -1;
+    }
+    const benchmark_latency_metric metrics[] = {
+        {"startup-to-base-prompt", &latency->startup[0][0],
+         BENCH_STARTUP_SAMPLES},
+        {"idle-key-to-output", &latency->key[0][0], BENCH_KEY_SAMPLES},
+        {"true-enter-to-prompt", &latency->execution[0][0],
+         BENCH_EXEC_SAMPLES},
+        {"direct-echo", &latency->direct_echo[0][0], BENCH_EXEC_SAMPLES},
+        {"direct-printf", &latency->direct_printf[0][0], BENCH_EXEC_SAMPLES},
+        {"direct-test", &latency->direct_test[0][0], BENCH_EXEC_SAMPLES},
+        {"variable-lookup", &latency->lookup[0][0], BENCH_EXEC_SAMPLES},
+        {"command-lookup", &latency->command_lookup[0][0],
+         BENCH_EXEC_SAMPLES},
+        {"command-path-cache", &latency->command_path_cache[0][0],
+         BENCH_EXEC_SAMPLES},
+        {"variable-assignment", &latency->assignment[0][0],
+         BENCH_EXEC_SAMPLES},
+        {"parameter-assign-default", &latency->assign_default[0][0],
+         BENCH_EXEC_SAMPLES},
+        {"arithmetic-assignment", &latency->arithmetic_assignment[0][0],
+         BENCH_EXEC_SAMPLES},
+    };
+
+    return write_latency_report(report, specs, metrics,
+                                sizeof(metrics) / sizeof(metrics[0]));
+}
+
+static int write_latency_group_two(
+    benchmark_report *report, const shell_spec specs[BENCH_SHELLS],
+    const benchmark_latency *latency)
+{
+    if (!require(report != NULL) || !require(specs != NULL) ||
+        !require(latency != NULL)) {
+        return -1;
+    }
+    const benchmark_latency_metric metrics[] = {
+        {"pipeline-scoped-assignment", &latency->pipeline_assignment[0][0],
+         BENCH_EXEC_SAMPLES},
+        {"ulimit-soft-nofile", &latency->resource_limit[0][0],
+         BENCH_EXEC_SAMPLES},
+        {"umask-report", &latency->creation_mask[0][0], BENCH_EXEC_SAMPLES},
+        {"process-times", &latency->process_times[0][0], BENCH_EXEC_SAMPLES},
+        {"exec-descriptor-commit", &latency->exec_descriptor[0][0],
+         BENCH_EXEC_SAMPLES},
+        {"export-assignment", &latency->export_assignment[0][0],
+         BENCH_EXEC_SAMPLES},
+        {"unset-variable", &latency->unset_variable[0][0],
+         BENCH_EXEC_SAMPLES},
+        {"readonly-existing", &latency->readonly_existing[0][0],
+         BENCH_EXEC_SAMPLES},
+        {"for-explicit", &latency->for_explicit[0][0], BENCH_EXEC_SAMPLES},
+        {"set-positionals", &latency->set_positionals[0][0],
+         BENCH_EXEC_SAMPLES},
+        {"shift-positionals", &latency->shift_positionals[0][0],
+         BENCH_EXEC_SAMPLES},
+        {"set-options", &latency->set_options[0][0], BENCH_EXEC_SAMPLES},
+    };
+
+    return write_latency_report(report, specs, metrics,
+                                sizeof(metrics) / sizeof(metrics[0]));
+}
+
+static int write_latency_group_three(
+    benchmark_report *report, const shell_spec specs[BENCH_SHELLS],
+    const benchmark_latency *latency)
+{
+    if (!require(report != NULL) || !require(specs != NULL) ||
+        !require(latency != NULL)) {
+        return -1;
+    }
+    const benchmark_latency_metric metrics[] = {
+        {"allexport-assignment", &latency->allexport_assignment[0][0],
+         BENCH_EXEC_SAMPLES},
+        {"nounset-defined-lookup", &latency->nounset_lookup[0][0],
+         BENCH_EXEC_SAMPLES},
+        {"parameter-pattern-removal", &latency->pattern_removal[0][0],
+         BENCH_EXEC_SAMPLES},
+        {"parameter-pattern-multistar", &latency->pattern_multistar[0][0],
+         BENCH_EXEC_SAMPLES},
+        {"noglob-expansion", &latency->noglob_expansion[0][0],
+         BENCH_EXEC_SAMPLES},
+        {"noclobber-redirection", &latency->noclobber_redirection[0][0],
+         BENCH_EXEC_SAMPLES},
+        {"async-builtin-launch", &latency->async_launch[0][0],
+         BENCH_EXEC_SAMPLES},
+        {"async-external-held-launch", &latency->async_external_launch[0][0],
+         BENCH_EXEC_SAMPLES},
+        {"wait-completed", &latency->wait_completed[0][0],
+         BENCH_EXEC_SAMPLES},
+        {"alias-definition-update", &latency->alias_definition[0][0],
+         BENCH_EXEC_SAMPLES},
+        {"alias-lookup-expansion", &latency->alias_expansion[0][0],
+         BENCH_EXEC_SAMPLES},
+        {"unalias-definition", &latency->unalias_command[0][0],
+         BENCH_EXEC_SAMPLES},
+    };
+
+    return write_latency_report(report, specs, metrics,
+                                sizeof(metrics) / sizeof(metrics[0]));
+}
+
+static int commit_latency_report(
+    const char *output_path, const shell_spec specs[BENCH_SHELLS],
+    const benchmark_latency *latency, const benchmark_memory *memory_results,
+    size_t bash_wins, size_t zsh_wins)
+{
+    benchmark_report report;
+
+    if (!require(output_path != NULL) || !require(specs != NULL) ||
+        !require(latency != NULL) || !require(memory_results != NULL)) {
+        return -1;
+    }
+    if (benchmark_report_open(&report, output_path) == -1 ||
+        write_latency_group_one(&report, specs, latency) == -1 ||
+        write_latency_group_two(&report, specs, latency) == -1 ||
+        write_latency_group_three(&report, specs, latency) == -1 ||
+        benchmark_report_write_gate(
+            &report, "direct-builtins", specs[0].name,
+            benchmark_shell_version(&specs[0]), specs[0].executable,
+            specs[1].name, bash_wins, 3U * BENCH_EXEC_SAMPLES) == -1 ||
+        benchmark_report_write_gate(
+            &report, "direct-builtins", specs[0].name,
+            benchmark_shell_version(&specs[0]), specs[0].executable,
+            specs[2].name, zsh_wins, 3U * BENCH_EXEC_SAMPLES) == -1 ||
+        write_memory_report(&report, specs, memory_results, 0,
+                            BENCH_MEMORY_WORKLOADS) == -1 ||
+        benchmark_report_commit(&report) == -1) {
+        perror("pty benchmark: CSV report");
+        benchmark_report_abort(&report);
+        return -1;
+    }
+    return 0;
+}
+
+static int latency_benchmark(const char *gsh, const char *bash,
+                             const char *zsh, const char *output_path)
+{
+    if (bash == NULL || gsh == NULL || zsh == NULL) {
+        return -1;
+    }
+    shell_spec specs[BENCH_SHELLS] = {
+        {"gsh", gsh, "gsh$ ", SHELL_GSH},
+        {"bash", bash, "gsh$ ", SHELL_BASH},
+        {"zsh", zsh, "gsh$ ", SHELL_ZSH},
+    };
+    static benchmark_latency latency;
+    pty_session sessions[BENCH_SHELLS];
+    bool started[BENCH_SHELLS] = {false, false, false};
+    benchmark_memory memory_results;
+    char directory[4096];
+    size_t bash_wins;
+    size_t zsh_wins;
+
+    if (getcwd(directory, sizeof(directory)) == NULL ||
+        setenv("GSH_BENCH_VALUE", "value", 1) == -1 ||
+        setenv("GSH_BENCH_PATTERN", "abcabc", 1) == -1 ||
+        setenv("GSH_BENCH_PATTERN_MULTI", "abacadTAIL", 1) == -1) {
+        perror("pty benchmark: current directory");
+        return 1;
+    }
+    if (prepare_benchmark_shells(specs, directory) == -1 ||
+        measure_benchmark_startup(specs, directory, &latency) == -1) {
+        return 1;
+    }
+    if (open_benchmark_sessions(sessions, started, specs, directory) == -1 ||
+        warm_benchmark_builtins(sessions, specs) == -1 ||
+        measure_benchmark_keys(sessions, &latency) == -1) {
+        return finish_benchmark_sessions(sessions, started, 1);
     }
 
-done:
-    for (offset = 0; offset < BENCH_SHELLS; offset++) {
-        if (started[offset] && stop_session(&sessions[offset]) == -1) {
-            failed = 1;
-        }
+    if (benchmark_command_group_one(sessions, specs, &latency) == -1 ||
+        benchmark_command_group_two(sessions, specs, &latency) == -1 ||
+        benchmark_command_group_three(sessions, specs, &latency) == -1) {
+        return finish_benchmark_sessions(sessions, started, 1);
     }
-    if (failed) {
+    if (restart_benchmark_sessions(sessions, started, specs, directory) == -1 ||
+        benchmark_async_commands(sessions, specs, &latency) == -1) {
+        return finish_benchmark_sessions(sessions, started, 1);
+    }
+
+    if (finish_benchmark_sessions(sessions, started, 0) != 0) {
         return 1;
     }
     if (direct_builtin_performance_gate(
-            direct_echo, direct_printf, direct_test, &bash_wins,
+            latency.direct_echo, latency.direct_printf, latency.direct_test,
+            &bash_wins,
             &zsh_wins) == -1 ||
         memory_benchmark(specs, directory, 0, BENCH_MEMORY_WORKLOADS,
                          &memory_results) == -1) {
         return 1;
     }
-    {
-        const benchmark_latency_metric metrics[BENCH_LATENCY_WORKLOADS] = {
-            {"startup-to-base-prompt", &startup[0][0],
-             BENCH_STARTUP_SAMPLES},
-            {"idle-key-to-output", &key[0][0], BENCH_KEY_SAMPLES},
-            {"true-enter-to-prompt", &execution[0][0], BENCH_EXEC_SAMPLES},
-            {"direct-echo", &direct_echo[0][0], BENCH_EXEC_SAMPLES},
-            {"direct-printf", &direct_printf[0][0], BENCH_EXEC_SAMPLES},
-            {"direct-test", &direct_test[0][0], BENCH_EXEC_SAMPLES},
-            {"variable-lookup", &lookup[0][0], BENCH_EXEC_SAMPLES},
-            {"command-lookup", &command_lookup[0][0], BENCH_EXEC_SAMPLES},
-            {"command-path-cache", &command_path_cache[0][0],
-             BENCH_EXEC_SAMPLES},
-            {"variable-assignment", &assignment[0][0], BENCH_EXEC_SAMPLES},
-            {"parameter-assign-default", &assign_default[0][0],
-             BENCH_EXEC_SAMPLES},
-            {"arithmetic-assignment", &arithmetic_assignment[0][0],
-             BENCH_EXEC_SAMPLES},
-            {"pipeline-scoped-assignment", &pipeline_assignment[0][0],
-             BENCH_EXEC_SAMPLES},
-            {"ulimit-soft-nofile", &resource_limit[0][0],
-             BENCH_EXEC_SAMPLES},
-            {"umask-report", &creation_mask[0][0], BENCH_EXEC_SAMPLES},
-            {"process-times", &process_times[0][0], BENCH_EXEC_SAMPLES},
-            {"exec-descriptor-commit", &exec_descriptor[0][0],
-             BENCH_EXEC_SAMPLES},
-            {"export-assignment", &export_assignment[0][0],
-             BENCH_EXEC_SAMPLES},
-            {"unset-variable", &unset_variable[0][0], BENCH_EXEC_SAMPLES},
-            {"readonly-existing", &readonly_existing[0][0],
-             BENCH_EXEC_SAMPLES},
-            {"for-explicit", &for_explicit[0][0], BENCH_EXEC_SAMPLES},
-            {"set-positionals", &set_positionals[0][0], BENCH_EXEC_SAMPLES},
-            {"shift-positionals", &shift_positionals[0][0],
-             BENCH_EXEC_SAMPLES},
-            {"set-options", &set_options[0][0], BENCH_EXEC_SAMPLES},
-            {"allexport-assignment", &allexport_assignment[0][0],
-             BENCH_EXEC_SAMPLES},
-            {"nounset-defined-lookup", &nounset_lookup[0][0],
-             BENCH_EXEC_SAMPLES},
-            {"parameter-pattern-removal", &pattern_removal[0][0],
-             BENCH_EXEC_SAMPLES},
-            {"parameter-pattern-multistar", &pattern_multistar[0][0],
-             BENCH_EXEC_SAMPLES},
-            {"noglob-expansion", &noglob_expansion[0][0],
-             BENCH_EXEC_SAMPLES},
-            {"noclobber-redirection", &noclobber_redirection[0][0],
-             BENCH_EXEC_SAMPLES},
-            {"async-builtin-launch", &async_launch[0][0],
-             BENCH_EXEC_SAMPLES},
-            {"async-external-held-launch", &async_external_launch[0][0],
-             BENCH_EXEC_SAMPLES},
-            {"wait-completed", &wait_completed[0][0], BENCH_EXEC_SAMPLES},
-            {"alias-definition-update", &alias_definition[0][0],
-             BENCH_EXEC_SAMPLES},
-            {"alias-lookup-expansion", &alias_expansion[0][0],
-             BENCH_EXEC_SAMPLES},
-            {"unalias-definition", &unalias_command[0][0],
-             BENCH_EXEC_SAMPLES},
-        };
-
-        if (benchmark_report_open(&report, output_path) == -1 ||
-            write_latency_report(&report, specs, metrics,
-                                 BENCH_LATENCY_WORKLOADS) == -1 ||
-            benchmark_report_write_gate(
-                &report, "direct-builtins", specs[0].name,
-                benchmark_shell_version(&specs[0]), specs[0].executable,
-                specs[1].name, bash_wins, 3U * BENCH_EXEC_SAMPLES) == -1 ||
-            benchmark_report_write_gate(
-                &report, "direct-builtins", specs[0].name,
-                benchmark_shell_version(&specs[0]), specs[0].executable,
-                specs[2].name, zsh_wins, 3U * BENCH_EXEC_SAMPLES) == -1 ||
-            write_memory_report(&report, specs, &memory_results, 0,
-                                BENCH_MEMORY_WORKLOADS) == -1 ||
-            benchmark_report_commit(&report) == -1) {
-            perror("pty benchmark: CSV report");
-            benchmark_report_abort(&report);
-            return 1;
-        }
+    if (commit_latency_report(output_path, specs, &latency, &memory_results,
+                              bash_wins, zsh_wins) == -1) {
+        return 1;
     }
-    printf("benchmark: pass | latency=%d | memory=%d+startup | rows=%zu\n",
+    (void)printf("benchmark: pass | latency=%d | memory=%d+startup | rows=%zu\n",
            BENCH_LATENCY_WORKLOADS, BENCH_MEMORY_WORKLOADS,
            (size_t)BENCH_LATENCY_WORKLOADS * BENCH_SHELLS +
                (2U + 5U * BENCH_MEMORY_WORKLOADS) * BENCH_SHELLS + 2U);
-    printf("direct-builtins: pass | bash=%zu/%u | zsh=%zu/%u\n",
+    (void)printf("direct-builtins: pass | bash=%zu/%u | zsh=%zu/%u\n",
            bash_wins, 3U * BENCH_EXEC_SAMPLES, zsh_wins,
            3U * BENCH_EXEC_SAMPLES);
-    printf("csv: %s\n", output_path);
+    (void)printf("csv: %s\n", output_path);
     return 0;
 }
 
 static int alias_benchmark(const char *gsh, const char *bash,
                            const char *zsh, const char *output_path)
 {
+    if (bash == NULL || gsh == NULL || zsh == NULL) {
+        return -1;
+    }
     shell_spec specs[BENCH_SHELLS] = {
         {"gsh", gsh, "gsh$ ", SHELL_GSH},
         {"bash", bash, "gsh$ ", SHELL_BASH},
@@ -6287,8 +6796,7 @@ static int alias_benchmark(const char *gsh, const char *bash,
         if (access(specs[shell].executable, X_OK) == -1 ||
             start_benchmark_session(&sessions[shell], &specs[shell],
                                     directory, true) == -1) {
-            failed = 1;
-            goto done;
+            return finish_benchmark_sessions(sessions, started, 1);
         }
         started[shell] = true;
     }
@@ -6304,12 +6812,7 @@ static int alias_benchmark(const char *gsh, const char *bash,
             "unalias GSH_BENCH_ALIAS\r", "unalias definition") == -1) {
         failed = 1;
     }
-done:
-    for (shell = 0; shell < BENCH_SHELLS; shell++) {
-        if (started[shell] && stop_session(&sessions[shell]) == -1) {
-            failed = 1;
-        }
-    }
+    failed = finish_benchmark_sessions(sessions, started, failed);
     if (failed) {
         return 1;
     }
@@ -6336,14 +6839,17 @@ done:
             return 1;
         }
     }
-    printf("alias benchmark: pass | latency=3 | memory=3+startup | rows=%u\n",
+    (void)printf("alias benchmark: pass | latency=3 | memory=3+startup | rows=%u\n",
            3U * BENCH_SHELLS + (2U + 5U * 3U) * BENCH_SHELLS);
-    printf("csv: %s\n", output_path);
+    (void)printf("csv: %s\n", output_path);
     return 0;
 }
 
 static uint64_t pty_fuzz_next(uint64_t *state)
 {
+    if (state == NULL) {
+        return 0U;
+    }
     uint64_t value = *state;
 
     value ^= value >> 12;
@@ -6353,49 +6859,157 @@ static uint64_t pty_fuzz_next(uint64_t *state)
     return value * 0x2545f4914f6cdd1dULL;
 }
 
+static const char *const pty_fuzz_semantic_commands[] = {
+    ": \"${GSH_FUZZ_PIPE:=left}\" | /usr/bin/true\r",
+    "/usr/bin/printf x | /usr/bin/tr x y\r",
+    "if /usr/bin/true; then : \"${GSH_FUZZ_STATE:=value}\"; fi\r",
+    ": \"$(/usr/bin/printf nested)\"\r",
+    "GSH_FUZZ_ASSIGN=value\r",
+    "alias GSH_FUZZ_ALIAS=/usr/bin/true\r",
+    "GSH_FUZZ_ALIAS\r",
+    "unalias GSH_FUZZ_ALIAS\r",
+    "if /usr/bin/true; then alias GSH_FUZZ_COMPOUND=/usr/bin/true; fi\r",
+    ": \"${GSH_FUZZ_ERROR:?expected}\" | /usr/bin/true\r",
+    "ulimit -S -n\r",
+    "umask -S\r",
+    "export GSH_FUZZ_EXPORT=value\r",
+    "readonly GSH_FUZZ_READONLY\r",
+    "export GSH_FUZZ_QUOTE=\"a'b\"; export -p >/dev/null\r",
+    "GSH_FUZZ_UNSET=value; unset GSH_FUZZ_UNSET\r",
+    "unset GSH_FUZZ_MISSING\r",
+    "for GSH_FUZZ_ITEM in a 'b c' ''; do :; done\r",
+    "for GSH_FUZZ_OUTER in a b; do "
+    "for GSH_FUZZ_INNER in 1 2; do :; done; done\r",
+    "set -- a 'b c' ''; shift\r",
+    "if /usr/bin/true; then set -- x y; shift 0; fi\r",
+    "set -aCfu; GSH_FUZZ_AUTO=value; "
+    ": \"${GSH_FUZZ_KNOWN:=known}\"; set +aCfu\r",
+    "GSH_FUZZ_DEFINED=value; set -u; "
+    ": \"$GSH_FUZZ_DEFINED\"; set +u\r",
+    "unset GSH_FUZZ_DEFAULT; set -u; "
+    ": \"${GSH_FUZZ_DEFAULT:=value}\"; set +u\r",
+    "GSH_FUZZ_ARITH=010; : \"$((GSH_FUZZ_ARITH += 1))\"; "
+    "/bin/test \"$GSH_FUZZ_ARITH\" = 9\r",
+    "GSH_FUZZ_ARITH=1; : \"$((0 && (GSH_FUZZ_ARITH = 2)))\"; "
+    "/bin/test \"$GSH_FUZZ_ARITH\" = 1\r",
+    "GSH_FUZZ_COLON=value :\r",
+    "if /usr/bin/true; then cd .; fi\r",
+    "set -f; /usr/bin/printf '%s' /dev/n[uo]ll; set +f\r",
+    "set -C; /usr/bin/printf x >/dev/null; set +C\r",
+    "/usr/bin/true &\r",
+    "wait \"$!\"\r",
+};
+
+static int send_fuzz_semantic_seed(pty_session *session, uint64_t *state)
+{
+    size_t count = sizeof(pty_fuzz_semantic_commands) /
+                   sizeof(pty_fuzz_semantic_commands[0]);
+    const char *command;
+
+    if (!require(session != NULL) || !require(state != NULL)) {
+        return -1;
+    }
+    command = pty_fuzz_semantic_commands[
+        (size_t)(pty_fuzz_next(state) % count)];
+    if (send_text(session, command) == -1 ||
+        consume_through(session, "gsh$ ", TEST_TIMEOUT_MS) == -1) {
+        return -1;
+    }
+    return 0;
+}
+
+static void generate_fuzz_bytes(unsigned char bytes[512], size_t length,
+                                uint64_t *state)
+{
+    size_t offset;
+
+    if (!require(bytes != NULL) || !require(state != NULL) ||
+        !require(length <= 512U)) {
+        return;
+    }
+    for (offset = 0; offset < length; offset++) {
+        uint64_t choice = pty_fuzz_next(state);
+
+        switch (choice & 15U) {
+        case 0:
+            bytes[offset] = 0;
+            break;
+        case 1:
+            bytes[offset] = 0x08U;
+            break;
+        case 2:
+            bytes[offset] = 0x0cU;
+            break;
+        case 3:
+            bytes[offset] = 0x15U;
+            break;
+        case 4:
+            bytes[offset] = 0x1bU;
+            break;
+        case 5:
+        case 6:
+            bytes[offset] =
+                (unsigned char)(0x80U + (choice >> 8U) % 0x80U);
+            break;
+        default:
+            bytes[offset] =
+                (unsigned char)(0x20U + (choice >> 8U) % 0x5fU);
+            if (bytes[offset] == '^') {
+                bytes[offset] = '_';
+            }
+            break;
+        }
+    }
+}
+
+static int run_pty_fuzz_case(pty_session *session, unsigned char bytes[512],
+                             uint64_t *state, unsigned long index)
+{
+    size_t length;
+
+    if (!require(session != NULL) || !require(bytes != NULL) ||
+        !require(state != NULL) || !require(index <= 1000000U)) {
+        return -1;
+    }
+    if ((index & 7U) == 0 && send_fuzz_semantic_seed(session, state) == -1) {
+        return -1;
+    }
+    length = (size_t)(pty_fuzz_next(state) % 512U);
+    generate_fuzz_bytes(bytes, length, state);
+    if (send_bytes(session, (const char *)bytes, length) == -1 ||
+        ((pty_fuzz_next(state) & 7U) == 0 &&
+         kill(session->pid, SIGWINCH) == -1) ||
+        send_bytes(session, "\003", 1) == -1 ||
+        consume_through(session, "^C", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(session, "gsh$ ", TEST_TIMEOUT_MS) == -1) {
+        return -1;
+    }
+    return 0;
+}
+
+static int report_pty_fuzz_resources(const pty_session *session,
+                                     unsigned long cases, int initial_fds,
+                                     int initial_children)
+{
+    if (!require(session != NULL) || !require(cases > 0U)) {
+        return -1;
+    }
+    int final_fds = process_fd_count(session->pid);
+    int final_children = process_child_count(session->pid);
+
+    if (final_fds < 0 || final_fds > initial_fds + 1 ||
+        final_children < 0 || final_children > initial_children) {
+        return -1;
+    }
+    (void)printf("pty byte fuzz: cases=%lu seed=0x6a09e667f3bcc909 "
+           "fds_initial=%d fds_final=%d children_initial=%d "
+           "children_final=%d passed\n",
+           cases, initial_fds, final_fds, initial_children, final_children);
+    return 0;
+}
+
 static int pty_byte_fuzz(const char *executable, unsigned long cases)
 {
-    static const char *const semantic_commands[] = {
-        ": \"${GSH_FUZZ_PIPE:=left}\" | /usr/bin/true\r",
-        "/usr/bin/printf x | /usr/bin/tr x y\r",
-        "if /usr/bin/true; then : \"${GSH_FUZZ_STATE:=value}\"; fi\r",
-        ": \"$(/usr/bin/printf nested)\"\r",
-        "GSH_FUZZ_ASSIGN=value\r",
-        "alias GSH_FUZZ_ALIAS=/usr/bin/true\r",
-        "GSH_FUZZ_ALIAS\r",
-        "unalias GSH_FUZZ_ALIAS\r",
-        "if /usr/bin/true; then alias GSH_FUZZ_COMPOUND=/usr/bin/true; fi\r",
-        ": \"${GSH_FUZZ_ERROR:?expected}\" | /usr/bin/true\r",
-        "ulimit -S -n\r",
-        "umask -S\r",
-        "export GSH_FUZZ_EXPORT=value\r",
-        "readonly GSH_FUZZ_READONLY\r",
-        "export GSH_FUZZ_QUOTE=\"a'b\"; export -p >/dev/null\r",
-        "GSH_FUZZ_UNSET=value; unset GSH_FUZZ_UNSET\r",
-        "unset GSH_FUZZ_MISSING\r",
-        "for GSH_FUZZ_ITEM in a 'b c' ''; do :; done\r",
-        ("for GSH_FUZZ_OUTER in a b; do "
-         "for GSH_FUZZ_INNER in 1 2; do :; done; done\r"),
-        "set -- a 'b c' ''; shift\r",
-        "if /usr/bin/true; then set -- x y; shift 0; fi\r",
-        "set -aCfu; GSH_FUZZ_AUTO=value; "
-        ": \"${GSH_FUZZ_KNOWN:=known}\"; set +aCfu\r",
-        "GSH_FUZZ_DEFINED=value; set -u; "
-        ": \"$GSH_FUZZ_DEFINED\"; set +u\r",
-        "unset GSH_FUZZ_DEFAULT; set -u; "
-        ": \"${GSH_FUZZ_DEFAULT:=value}\"; set +u\r",
-        "GSH_FUZZ_ARITH=010; : \"$((GSH_FUZZ_ARITH += 1))\"; "
-        "/bin/test \"$GSH_FUZZ_ARITH\" = 9\r",
-        "GSH_FUZZ_ARITH=1; : \"$((0 && "
-        "(GSH_FUZZ_ARITH = 2)))\"; "
-        "/bin/test \"$GSH_FUZZ_ARITH\" = 1\r",
-        "GSH_FUZZ_COLON=value :\r",
-        "if /usr/bin/true; then cd .; fi\r",
-        "set -f; /usr/bin/printf '%s' /dev/n[uo]ll; set +f\r",
-        "set -C; /usr/bin/printf x >/dev/null; set +C\r",
-        "/usr/bin/true &\r",
-        "wait \"$!\"\r",
-    };
     char fixture[] = "/tmp/gsh-pty-fuzz-XXXXXX";
     unsigned char bytes[512];
     pty_session session;
@@ -6403,7 +7017,6 @@ static int pty_byte_fuzz(const char *executable, unsigned long cases)
     int initial_fds;
     int initial_children;
     unsigned long index;
-    int failed = 0;
 
     if (cases == 0 || cases > 1000000 ||
         unsetenv("GSH_FUZZ_PIPE") == -1 ||
@@ -6418,105 +7031,103 @@ static int pty_byte_fuzz(const char *executable, unsigned long cases)
     }
     if (consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1) {
         perror("pty fuzz: initial prompt");
-        failed = 1;
-        goto done;
+        return finish_session_directory(&session, fixture, 1);
     }
     initial_fds = process_fd_count(session.pid);
     initial_children = process_child_count(session.pid);
     if (initial_fds < 0 || initial_children < 0) {
-        fprintf(stderr, "pty fuzz: process metrics unavailable\n");
-        failed = 1;
-        goto done;
+        (void)fprintf(stderr, "pty fuzz: process metrics unavailable\n");
+        return finish_session_directory(&session, fixture, 1);
     }
     for (index = 0; index < cases; index++) {
-        if ((index & 7U) == 0) {
-            const char *command = semantic_commands[
-                pty_fuzz_next(&random_state) %
-                (sizeof(semantic_commands) /
-                 sizeof(semantic_commands[0]))];
-
-            if (send_text(&session, command) == -1 ||
-                consume_through(&session, "gsh$ ",
-                                TEST_TIMEOUT_MS) == -1) {
-                fprintf(stderr,
-                        "pty fuzz: semantic seed failed at case %lu\n",
-                        index);
-                failed = 1;
-                goto done;
-            }
-        }
-        size_t length = (size_t)(pty_fuzz_next(&random_state) %
-                                 sizeof(bytes));
-        size_t offset;
-
-        for (offset = 0; offset < length; offset++) {
-            uint64_t choice = pty_fuzz_next(&random_state);
-
-            switch (choice & 15U) {
-            case 0:
-                bytes[offset] = 0;
-                break;
-            case 1:
-                bytes[offset] = 0x08U;
-                break;
-            case 2:
-                bytes[offset] = 0x0cU;
-                break;
-            case 3:
-                bytes[offset] = 0x15U;
-                break;
-            case 4:
-                bytes[offset] = 0x1bU;
-                break;
-            case 5:
-            case 6:
-                bytes[offset] = (unsigned char)(0x80U +
-                    (choice >> 8U) % 0x80U);
-                break;
-            default:
-                bytes[offset] = (unsigned char)(0x20U +
-                    (choice >> 8U) % 0x5fU);
-                if (bytes[offset] == '^') {
-                    bytes[offset] = '_';
-                }
-                break;
-            }
-        }
-        if (send_bytes(&session, (const char *)bytes, length) == -1 ||
-            ((pty_fuzz_next(&random_state) & 7U) == 0 &&
-             kill(session.pid, SIGWINCH) == -1) ||
-            send_bytes(&session, "\003", 1) == -1 ||
-            consume_through(&session, "^C", TEST_TIMEOUT_MS) == -1 ||
-            consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1) {
-            fprintf(stderr, "pty fuzz: failed at case %lu\n", index);
+        if (run_pty_fuzz_case(&session, bytes, &random_state, index) == -1) {
+            (void)fprintf(stderr, "pty fuzz: failed at case %lu\n", index);
             dump_capture(&session);
-            failed = 1;
-            goto done;
+            return finish_session_directory(&session, fixture, 1);
         }
     }
-    {
-        int final_fds = process_fd_count(session.pid);
-        int final_children = process_child_count(session.pid);
-
-        if (final_fds < 0 || final_fds > initial_fds + 1 ||
-            final_children < 0 || final_children > initial_children) {
-            fprintf(stderr, "pty fuzz: resource growth exceeded bounds\n");
-            failed = 1;
-            goto done;
-        }
-        printf("pty byte fuzz: cases=%lu seed=0x6a09e667f3bcc909 "
-               "fds_initial=%d fds_final=%d children_initial=%d "
-               "children_final=%d passed\n",
-               cases, initial_fds, final_fds, initial_children,
-               final_children);
+    if (report_pty_fuzz_resources(&session, cases, initial_fds,
+                                  initial_children) == -1) {
+        (void)fprintf(stderr, "pty fuzz: resource growth exceeded bounds\n");
+        return finish_session_directory(&session, fixture, 1);
     }
+    return finish_session_directory(&session, fixture, 0);
+}
 
-done:
-    if (stop_session(&session) == -1) {
-        failed = 1;
+static int smoke_flow_failure(const char *name)
+{
+    if (!require(name != NULL)) return 1;
+    (void)fprintf(stderr, "pty smoke: %s flow failed\n", name);
+    return 1;
+}
+
+static int run_primary_smoke_flows(const char *executable)
+{
+    if (!require(executable != NULL)) return 1;
+    if (ordinary_flow(executable) != 0) {
+        return smoke_flow_failure("ordinary");
     }
-    (void)rmdir(fixture);
-    return failed;
+    if (job_service_control_flow(executable) != 0) {
+        return smoke_flow_failure("job service control");
+    }
+    if (fc_builtin_flow(executable) != 0) {
+        return smoke_flow_failure("fc builtin");
+    }
+    if (protected_bridge_flow(executable) != 0) {
+        return smoke_flow_failure("protected bridge");
+    }
+    if (history_flow(executable) != 0) {
+        return smoke_flow_failure("history");
+    }
+    if (managed_async_repl_flow(executable) != 0) {
+        return smoke_flow_failure("managed async REPL");
+    }
+    return 0;
+}
+
+static int run_builtin_smoke_flows(const char *executable)
+{
+    if (!require(executable != NULL)) return 1;
+    if (variable_builtin_flow(executable) != 0) {
+        return smoke_flow_failure("variable builtin");
+    }
+    if (alias_builtin_flow(executable) != 0) {
+        return smoke_flow_failure("alias builtin");
+    }
+    if (command_hash_flow(executable) != 0) {
+        return smoke_flow_failure("command hash");
+    }
+    if (times_builtin_flow(executable) != 0) {
+        return smoke_flow_failure("times builtin");
+    }
+    if (exec_builtin_flow(executable) != 0) {
+        return smoke_flow_failure("exec builtin");
+    }
+    return 0;
+}
+
+static int run_language_smoke_flows(const char *executable)
+{
+    if (!require(executable != NULL)) return 1;
+    if (interactive_enoexec_flow(executable) != 0) {
+        return smoke_flow_failure("interactive ENOEXEC");
+    }
+    if (interactive_source_flow(executable) != 0) {
+        return smoke_flow_failure("interactive source");
+    }
+    if (function_builtin_flow(executable) != 0) {
+        return smoke_flow_failure("function builtin");
+    }
+    if (deferred_pattern_flow(executable) != 0) {
+        return smoke_flow_failure("deferred pattern");
+    }
+    if (asynchronous_list_flow(executable) != 0) {
+        return smoke_flow_failure("asynchronous list");
+    }
+    if (async_redirection_flow(executable) != 0) {
+        return smoke_flow_failure("async redirection");
+    }
+    return 0;
 }
 
 int main(int argc, char **argv)
@@ -6549,7 +7160,7 @@ int main(int argc, char **argv)
         unsigned long seconds = strtoul(argv[3], &end, 10);
 
         if (*end != '\0' || seconds == 0 || seconds > 86400) {
-            fprintf(stderr, "pty-harness: soak seconds must be 1..86400\n");
+            (void)fprintf(stderr, "pty-harness: soak seconds must be 1..86400\n");
             return 2;
         }
         return soak_flow(argv[2], seconds);
@@ -6559,13 +7170,13 @@ int main(int argc, char **argv)
         unsigned long cases = strtoul(argv[3], &end, 10);
 
         if (*end != '\0' || cases == 0 || cases > 1000000) {
-            fprintf(stderr, "pty-harness: fuzz cases must be 1..1000000\n");
+            (void)fprintf(stderr, "pty-harness: fuzz cases must be 1..1000000\n");
             return 2;
         }
         return pty_byte_fuzz(argv[2], cases);
     }
     if (argc != 2) {
-        fprintf(stderr,
+        (void)fprintf(stderr,
                 "usage: pty-harness /absolute/path/to/gsh\n"
                 "       pty-harness --fault /absolute/path/to/gsh-fault\n"
                 "       pty-harness --resource /absolute/path/to/gsh\n"
@@ -6578,10 +7189,10 @@ int main(int argc, char **argv)
     }
     if (argv[1][0] == '/') {
         if (strlen(argv[1]) + 1U > sizeof(executable)) {
-            fprintf(stderr, "pty smoke: executable path is too long\n");
+            (void)fprintf(stderr, "pty smoke: executable path is too long\n");
             return 2;
         }
-        memcpy(executable, argv[1], strlen(argv[1]) + 1U);
+        (void)memcpy(executable, argv[1], strlen(argv[1]) + 1U);
     } else if (getcwd(executable, sizeof(executable)) == NULL ||
                strlen(executable) + strlen(argv[1]) + 2U >
                    sizeof(executable)) {
@@ -6591,29 +7202,15 @@ int main(int argc, char **argv)
         size_t length = strlen(executable);
 
         executable[length++] = '/';
-        memcpy(executable + length, argv[1], strlen(argv[1]) + 1U);
+        (void)memcpy(executable + length, argv[1], strlen(argv[1]) + 1U);
     }
 
-    if (ordinary_flow(executable) != 0 ||
-        job_service_control_flow(executable) != 0 ||
-        fc_builtin_flow(executable) != 0 ||
-        protected_bridge_flow(executable) != 0 ||
-        history_flow(executable) != 0 ||
-        managed_async_repl_flow(executable) != 0 ||
-        variable_builtin_flow(executable) != 0 ||
-        alias_builtin_flow(executable) != 0 ||
-        command_hash_flow(executable) != 0 ||
-        times_builtin_flow(executable) != 0 ||
-        exec_builtin_flow(executable) != 0 ||
-        interactive_enoexec_flow(executable) != 0 ||
-        interactive_source_flow(executable) != 0 ||
-        function_builtin_flow(executable) != 0 ||
-        deferred_pattern_flow(executable) != 0 ||
-        asynchronous_list_flow(executable) != 0 ||
-        async_redirection_flow(executable) != 0) {
+    if (run_primary_smoke_flows(executable) != 0 ||
+        run_builtin_smoke_flows(executable) != 0 ||
+        run_language_smoke_flows(executable) != 0) {
         return 1;
     }
-    puts("pty smoke: exec paths, native fc, protected bridge, encrypted history, "
+    (void)puts("pty smoke: exec paths, native fc, protected bridge, encrypted history, "
          "editor recall/search, managed async REPL, job control, "
          "async prompt/redirection and cancellation passed");
     return 0;

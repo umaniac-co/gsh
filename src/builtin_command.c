@@ -51,6 +51,9 @@ static bool name_in_table(const char *name, size_t length,
 
 bool gsh_command_special_builtin_name(const char *name, size_t length)
 {
+    if (name == NULL) {
+        return false;
+    }
     static const char *const names[] = {
         ".",      ":",      "break",  "continue", "eval", "exec",
         "exit",   "export", "readonly", "return", "set",  "shift",
@@ -63,6 +66,9 @@ bool gsh_command_special_builtin_name(const char *name, size_t length)
 
 static bool reserved_word_name(const char *name, size_t length)
 {
+    if (name == NULL) {
+        return false;
+    }
     static const char *const names[] = {
         "!",    "{",    "}",    "case", "do",   "done", "elif",
         "else", "esac", "fi",   "for",  "if",   "in",   "then",
@@ -75,6 +81,9 @@ static bool reserved_word_name(const char *name, size_t length)
 
 static bool implemented_special_name(const char *name, size_t length)
 {
+    if (name == NULL) {
+        return false;
+    }
     const gsh_builtin_descriptor *descriptor =
         gsh_builtin_lookup(name, length);
 
@@ -84,11 +93,17 @@ static bool implemented_special_name(const char *name, size_t length)
 
 static bool regular_builtin_name(const char *name, size_t length)
 {
+    if (name == NULL) {
+        return false;
+    }
     return gsh_builtin_regular_name(name, length);
 }
 
 bool gsh_command_intrinsic_name(const char *name, size_t length)
 {
+    if (name == NULL) {
+        return false;
+    }
     return implemented_special_name(name, length) ||
            regular_builtin_name(name, length);
 }
@@ -105,6 +120,9 @@ static gsh_command_result resolve_name(
     const gsh_function_store *functions, gsh_command_cache *cache,
     uint64_t path_generation, bool *cache_changed)
 {
+    if (name == NULL || path == NULL) {
+        return (gsh_command_result){0};
+    }
     gsh_command_result result = {0};
     size_t length = name == NULL
                         ? 0
@@ -145,12 +163,18 @@ static gsh_command_result resolve_name(
 static int write_output(const gsh_builtin_io *io, int descriptor,
                         const char *text)
 {
-    return io->output(io->opaque, descriptor, text, strlen(text));
+    if (io == NULL || text == NULL) {
+        return -1;
+    }
+    return gsh_builtin_output(io, descriptor, text, strlen(text));
 }
 
 static int write_alias_definition(const gsh_builtin_io *io,
                                   const char *name, const char *value)
 {
+    if (value == NULL) {
+        return -1;
+    }
     const char *cursor = value;
     size_t remaining = strnlen(value, GSH_ALIAS_VALUE_CAP + 1U);
     size_t segments = 0;
@@ -166,7 +190,7 @@ static int write_alias_definition(const gsh_builtin_io *io,
         size_t length = quote == NULL ? remaining
                                       : (size_t)(quote - cursor);
 
-        if ((length != 0 && io->output(io->opaque, STDOUT_FILENO, cursor,
+        if ((length != 0 && gsh_builtin_output(io, STDOUT_FILENO, cursor,
                                        length) != 0) ||
             (quote != NULL &&
              write_output(io, STDOUT_FILENO, "'\\''") != 0)) {
@@ -190,6 +214,9 @@ static int write_description(const gsh_builtin_io *io, const char *name,
                              const gsh_command_result *result,
                              bool verbose)
 {
+    if (io == NULL || name == NULL || result == NULL) {
+        return -1;
+    }
     static const char *const descriptions[] = {
         "not found",       "a shell reserved word", "an alias for ",
         "a special builtin", "a shell function",      "a regular builtin",
@@ -299,10 +326,13 @@ static int inspect_operands(size_t argc, char *const argv[], size_t first,
                             bool *cache_changed,
                             const gsh_builtin_io *io)
 {
+    if (argv == NULL) {
+        return -1;
+    }
     size_t index;
     int status = 0;
 
-    if (path == NULL || io == NULL || io->output == NULL) {
+    if (path == NULL || !gsh_builtin_io_valid(io)) {
         errno = EINVAL;
         return 125;
     }
@@ -333,6 +363,9 @@ int gsh_builtin_command_inspect(
     uint64_t path_generation, bool cacheable, bool *cache_changed,
     const gsh_builtin_io *io)
 {
+    if (argv == NULL || path == NULL || !gsh_builtin_io_valid(io)) {
+        return -1;
+    }
     gsh_command_invocation invocation = gsh_command_parse(argc, argv);
 
     if (invocation.form == GSH_COMMAND_FORM_ERROR) {
@@ -342,6 +375,10 @@ int gsh_builtin_command_inspect(
         return 0;
     }
     if (invocation.form != GSH_COMMAND_FORM_INSPECT) {
+        errno = EINVAL;
+        return 125;
+    }
+    if (invocation.use_default_path && default_path == NULL) {
         errno = EINVAL;
         return 125;
     }
@@ -362,7 +399,8 @@ int gsh_builtin_type(size_t argc, char *const argv[], const char *path,
 {
     size_t first = 1U;
 
-    if (argc == 0 || argv == NULL || strcmp(argv[0], "type") != 0) {
+    if (argc == 0 || argv == NULL || path == NULL ||
+        !gsh_builtin_io_valid(io) || strcmp(argv[0], "type") != 0) {
         errno = EINVAL;
         return 125;
     }
@@ -387,6 +425,9 @@ int gsh_builtin_type(size_t argc, char *const argv[], const char *path,
 static int hash_report(const gsh_command_cache *cache,
                        const gsh_builtin_io *io)
 {
+    if (cache == NULL) {
+        return -1;
+    }
     size_t index;
 
     for (index = 0; index < gsh_command_cache_count(cache); index++) {
@@ -422,7 +463,7 @@ int gsh_builtin_hash(size_t argc, char *const argv[], const char *path,
         *cache_changed = false;
     }
     if (argc == 0 || argc > GSH_COMMAND_ARGUMENT_CAP || argv == NULL ||
-        path == NULL || cache == NULL || io == NULL || io->output == NULL ||
+        path == NULL || cache == NULL || !gsh_builtin_io_valid(io) ||
         strcmp(argv[0], "hash") != 0) {
         errno = EINVAL;
         return 125;

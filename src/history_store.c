@@ -25,6 +25,9 @@ static const unsigned char history_magic_v2[8] = {
 
 static void encode_u32(unsigned char output[4], uint32_t value)
 {
+    if (output == NULL) {
+        return;
+    }
     output[0] = (unsigned char)(value >> 24);
     output[1] = (unsigned char)(value >> 16);
     output[2] = (unsigned char)(value >> 8);
@@ -33,12 +36,18 @@ static void encode_u32(unsigned char output[4], uint32_t value)
 
 static uint32_t decode_u32(const unsigned char input[4])
 {
+    if (input == NULL) {
+        return 0U;
+    }
     return ((uint32_t)input[0] << 24) | ((uint32_t)input[1] << 16) |
            ((uint32_t)input[2] << 8) | (uint32_t)input[3];
 }
 
 static void encode_u64(unsigned char output[8], uint64_t value)
 {
+    if (output == NULL) {
+        return;
+    }
     size_t index;
 
     for (index = 0; index < 8U; index++) {
@@ -48,6 +57,9 @@ static void encode_u64(unsigned char output[8], uint64_t value)
 
 static uint64_t decode_u64(const unsigned char input[8])
 {
+    if (input == NULL) {
+        return 0U;
+    }
     uint64_t value = 0;
     size_t index;
 
@@ -60,7 +72,7 @@ static uint64_t decode_u64(const unsigned char input[8])
 void gsh_history_initialize(gsh_history_store *store)
 {
     if (store != NULL) {
-        memset(store->lengths, 0, sizeof(store->lengths));
+        (void)memset(store->lengths, 0, sizeof(store->lengths));
         store->start = 0;
         store->count = 0;
         store->next_event = 1U;
@@ -70,7 +82,7 @@ void gsh_history_initialize(gsh_history_store *store)
 void gsh_history_clear(gsh_history_store *store)
 {
     if (store != NULL) {
-        memset(store, 0, sizeof(*store));
+        (void)memset(store, 0, sizeof(*store));
         store->next_event = 1U;
     }
 }
@@ -78,6 +90,9 @@ void gsh_history_clear(gsh_history_store *store)
 static size_t physical_index(const gsh_history_store *store,
                              size_t chronological)
 {
+    if (store == NULL) {
+        return 0U;
+    }
     return (store->start + chronological) % GSH_HISTORY_CAP;
 }
 
@@ -110,7 +125,7 @@ int gsh_history_add(gsh_history_store *store, const char *command,
         slot = store->start;
         store->start = (store->start + 1U) % GSH_HISTORY_CAP;
     }
-    memcpy(store->entries[slot], command, length);
+    (void)memcpy(store->entries[slot], command, length);
     store->entries[slot][length] = '\0';
     store->lengths[slot] = (uint16_t)length;
     store->next_event++;
@@ -181,6 +196,9 @@ int gsh_history_search_reverse(const gsh_history_store *store,
 
 uint64_t gsh_history_oldest_event(const gsh_history_store *store)
 {
+    if (store == NULL) {
+        return 0U;
+    }
     return store == NULL || store->count == 0 ||
                    store->next_event <= store->count
                ? 0
@@ -189,6 +207,9 @@ uint64_t gsh_history_oldest_event(const gsh_history_store *store)
 
 uint64_t gsh_history_newest_event(const gsh_history_store *store)
 {
+    if (store == NULL) {
+        return 0U;
+    }
     return store == NULL || store->count == 0 || store->next_event == 0
                ? 0
                : store->next_event - 1U;
@@ -197,6 +218,9 @@ uint64_t gsh_history_newest_event(const gsh_history_store *store)
 const char *gsh_history_event(const gsh_history_store *store,
                               uint64_t event, size_t *length)
 {
+    if (store == NULL) {
+        return NULL;
+    }
     uint64_t oldest = gsh_history_oldest_event(store);
     size_t chronological;
     size_t slot;
@@ -218,6 +242,9 @@ int gsh_history_find_prefix(const gsh_history_store *store,
                             const char *prefix, size_t prefix_length,
                             uint64_t before_event, uint64_t *event)
 {
+    if (store == NULL) {
+        return -1;
+    }
     uint64_t oldest = gsh_history_oldest_event(store);
     uint64_t candidate;
     size_t checked;
@@ -256,7 +283,7 @@ size_t gsh_history_serialize(const gsh_history_store *store,
         errno = EINVAL;
         return 0;
     }
-    memcpy(output, history_magic_v2, sizeof(history_magic_v2));
+    (void)memcpy(output, history_magic_v2, sizeof(history_magic_v2));
     encode_u32(output + 8, (uint32_t)store->count);
     encode_u64(output + 12, store->next_event);
     for (index = 0; index < store->count; index++) {
@@ -270,7 +297,7 @@ size_t gsh_history_serialize(const gsh_history_store *store,
         }
         encode_u32(output + used, (uint32_t)length);
         used += 4U;
-        memcpy(output + used, store->entries[slot], length);
+        (void)memcpy(output + used, store->entries[slot], length);
         used += length;
     }
     return used;

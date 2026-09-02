@@ -10,7 +10,6 @@
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/wait.h>
 
 void gsh_background_initialize(gsh_background_table *table)
 {
@@ -24,6 +23,9 @@ void gsh_background_initialize(gsh_background_table *table)
 
 static bool entry_reclaimable(const gsh_background_entry *entry)
 {
+    if (entry == NULL) {
+        return false;
+    }
     return !entry->known ||
            (entry->state == GSH_JOB_DONE &&
             (entry->notified || entry->consumed));
@@ -64,6 +66,7 @@ size_t gsh_background_active_count(const gsh_background_table *table)
 static bool job_id_in_use(const gsh_background_table *table,
                           uint32_t job_id)
 {
+    if (table == NULL) return false;
     size_t index;
 
     if (table->used > GSH_BACKGROUND_CAP) return true;
@@ -76,6 +79,9 @@ static bool job_id_in_use(const gsh_background_table *table,
 
 static int next_job_id(gsh_background_table *table, uint32_t *job_id)
 {
+    if (job_id == NULL || table == NULL) {
+        return -1;
+    }
     size_t checked;
 
     for (checked = 0; checked <= GSH_BACKGROUND_CAP; checked++) {
@@ -93,6 +99,9 @@ static int next_job_id(gsh_background_table *table, uint32_t *job_id)
 
 static void refresh_current_jobs(gsh_background_table *table)
 {
+    if (table == NULL) {
+        return;
+    }
     uint64_t newest = 0;
     uint64_t prior = 0;
     uint32_t current = 0;
@@ -119,6 +128,7 @@ static void refresh_current_jobs(gsh_background_table *table)
 
 static gsh_background_entry *available_entry(gsh_background_table *table)
 {
+    if (table == NULL) return NULL;
     gsh_background_entry *free_entry = NULL;
     size_t index;
 
@@ -144,6 +154,7 @@ static gsh_background_entry *available_entry(gsh_background_table *table)
 
 static bool member_in_use(const gsh_background_table *table, pid_t pid)
 {
+    if (table == NULL) return false;
     size_t entry_index;
 
     if (table->used > GSH_BACKGROUND_CAP) return true;
@@ -194,8 +205,8 @@ int gsh_background_add_job(gsh_background_table *table, pid_t pgid,
     free_entry->pid = status_pid;
     free_entry->pgid = pgid;
     free_entry->status_pid = status_pid;
-    memcpy(free_entry->members, members, member_count * sizeof(members[0]));
-    memset(free_entry->member_states, 0,
+    (void)memcpy(free_entry->members, members, member_count * sizeof(members[0]));
+    (void)memset(free_entry->member_states, 0,
            member_count * sizeof(free_entry->member_states[0]));
     free_entry->member_count = member_count;
     free_entry->remaining = member_count;
@@ -212,7 +223,7 @@ int gsh_background_add_job(gsh_background_table *table, pid_t pgid,
     free_entry->notified = false;
     free_entry->consumed = false;
     if (command_length != 0) {
-        memcpy(free_entry->command, command, command_length);
+        (void)memcpy(free_entry->command, command, command_length);
     }
     free_entry->command[command_length] = '\0';
     free_entry->command_length = command_length;
@@ -234,6 +245,7 @@ int gsh_background_add(gsh_background_table *table, pid_t pid,
 
 static bool all_members_stopped(const gsh_background_entry *entry)
 {
+    if (entry == NULL) return false;
     size_t index;
 
     if (entry->remaining == 0) return false;
@@ -296,6 +308,9 @@ bool gsh_background_update_member(gsh_background_table *table, pid_t pid,
 bool gsh_background_record(gsh_background_table *table, pid_t pid,
                            int wait_status)
 {
+    if (table == NULL) {
+        return false;
+    }
     return gsh_background_update_member(table, pid, wait_status);
 }
 
@@ -349,7 +364,7 @@ bool gsh_background_consume(gsh_background_table *table, pid_t pid,
             if (wait_status != NULL) {
                 *wait_status = entry->wait_status;
             }
-            memset(entry->command, 0, entry->command_length + 1U);
+            (void)memset(entry->command, 0, entry->command_length + 1U);
             entry->command_length = 0;
             entry->consumed = true;
             entry->known = false;
@@ -388,6 +403,9 @@ bool gsh_background_consume_all_if_done(gsh_background_table *table)
 size_t gsh_background_snapshot(const gsh_background_table *table,
                                pid_t output[GSH_BACKGROUND_CAP])
 {
+    if (output == NULL) {
+        return 0U;
+    }
     size_t count = 0;
     size_t index;
 
@@ -404,6 +422,9 @@ size_t gsh_background_live_snapshot(
     const gsh_background_table *table,
     pid_t output[GSH_BACKGROUND_CAP])
 {
+    if (output == NULL) {
+        return 0U;
+    }
     size_t count = 0;
     size_t index;
 
@@ -436,6 +457,9 @@ const gsh_background_entry *gsh_background_entry_for_id(
 gsh_background_entry *gsh_background_mutable_entry_for_id(
     gsh_background_table *table, uint32_t job_id)
 {
+    if (table == NULL) {
+        return NULL;
+    }
     return (gsh_background_entry *)gsh_background_entry_for_id(table,
                                                                job_id);
 }
@@ -463,6 +487,10 @@ const gsh_background_entry *gsh_background_entry_for_pid(
 static bool command_matches(const gsh_background_entry *entry,
                             const char *text, bool substring)
 {
+    if (entry == NULL) return false;
+    if (text == NULL) {
+        return false;
+    }
     size_t length = strlen(text);
 
     if (length == 0 || entry->command_length == 0) return false;
@@ -475,6 +503,10 @@ static gsh_jobspec_status resolve_textual(
     const gsh_background_table *table, const char *text, bool substring,
     uint32_t *job_id)
 {
+    if (table == NULL) return GSH_JOBSPEC_INVALID;
+    if (job_id == NULL) {
+        return GSH_JOBSPEC_INVALID;
+    }
     size_t matches = 0;
     size_t index;
 
@@ -523,6 +555,9 @@ gsh_jobspec_status gsh_background_resolve(
 bool gsh_background_mark_notified(gsh_background_table *table,
                                   uint32_t job_id)
 {
+    if (table == NULL) {
+        return false;
+    }
     gsh_background_entry *entry =
         gsh_background_mutable_entry_for_id(table, job_id);
 
@@ -534,6 +569,9 @@ bool gsh_background_mark_notified(gsh_background_table *table,
 bool gsh_background_continue_job(gsh_background_table *table,
                                  uint32_t job_id)
 {
+    if (table == NULL) {
+        return false;
+    }
     gsh_background_entry *entry =
         gsh_background_mutable_entry_for_id(table, job_id);
     size_t member;
@@ -556,6 +594,9 @@ bool gsh_background_continue_job(gsh_background_table *table,
 bool gsh_background_stop_job(gsh_background_table *table,
                              uint32_t job_id)
 {
+    if (table == NULL) {
+        return false;
+    }
     gsh_background_entry *entry =
         gsh_background_mutable_entry_for_id(table, job_id);
     size_t member;
@@ -578,11 +619,14 @@ bool gsh_background_stop_job(gsh_background_table *table,
 bool gsh_background_remove_job(gsh_background_table *table,
                                uint32_t job_id)
 {
+    if (table == NULL) {
+        return false;
+    }
     gsh_background_entry *entry =
         gsh_background_mutable_entry_for_id(table, job_id);
 
     if (entry == NULL) return false;
-    memset(entry->command, 0, entry->command_length + 1U);
+    (void)memset(entry->command, 0, entry->command_length + 1U);
     entry->command_length = 0;
     entry->known = false;
     while (table->used != 0 &&

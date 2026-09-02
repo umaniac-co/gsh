@@ -15,6 +15,9 @@
 
 void gsh_positionals_initialize(gsh_positional_store *store)
 {
+    if (store == NULL) {
+        return;
+    }
     store->version = GSH_POSITIONAL_VERSION;
     store->count = 0;
     store->start = 0;
@@ -24,6 +27,9 @@ void gsh_positionals_initialize(gsh_positional_store *store)
 int gsh_positionals_assign(gsh_positional_store *store, size_t count,
                            char *const values[])
 {
+    if (store == NULL || (count != 0U && values == NULL)) {
+        return -1;
+    }
     size_t lengths[GSH_POSITIONAL_CAP];
     size_t used = 0;
     size_t index;
@@ -46,7 +52,7 @@ int gsh_positionals_assign(gsh_positional_store *store, size_t count,
     gsh_positionals_initialize(store);
     for (index = 0; index < count; index++) {
         store->offsets[index] = (uint16_t)store->text_used;
-        memcpy(store->text + store->text_used, values[index],
+        (void)memcpy(store->text + store->text_used, values[index],
                lengths[index] + 1U);
         store->text_used += (uint32_t)lengths[index] + 1U;
     }
@@ -56,6 +62,7 @@ int gsh_positionals_assign(gsh_positional_store *store, size_t count,
 
 int gsh_positionals_shift(gsh_positional_store *store, size_t amount)
 {
+    if (store == NULL) return -1;
     if (amount > store->count) {
         errno = EINVAL;
         return -1;
@@ -71,12 +78,18 @@ int gsh_positionals_shift(gsh_positional_store *store, size_t amount)
 
 size_t gsh_positionals_count(const gsh_positional_store *store)
 {
+    if (store == NULL) {
+        return 0U;
+    }
     return store == NULL ? 0 : store->count;
 }
 
 void gsh_positionals_view(const gsh_positional_store *store,
                           char *values[GSH_POSITIONAL_CAP])
 {
+    if (store == NULL || values == NULL) {
+        return;
+    }
     size_t index;
     size_t count = gsh_positionals_count(store);
 

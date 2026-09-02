@@ -14,16 +14,14 @@
 
 #include <errno.h>
 #include <fcntl.h>
-#include <stdarg.h>
+#include <stdarg.h> /* CANON-INCLUDE: macos */
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
-#include <sys/types.h>
 #include <unistd.h>
 
 enum {
     GSH_CONFIG_FILE_CAP = 65536,
-    GSH_CONFIG_VERSION = 1,
 };
 
 static const uint64_t GSH_HISTORY_REMINDER_MIN_NS =
@@ -61,6 +59,9 @@ typedef struct {
 
 static void set_diagnostic(gsh_shell_config *config, const char *format, ...)
 {
+    if (config == NULL || format == NULL) {
+        return;
+    }
     va_list arguments;
 
     va_start(arguments, format);
@@ -74,7 +75,7 @@ void gsh_config_defaults(gsh_shell_config *config)
     if (config == NULL) {
         return;
     }
-    memset(config, 0, sizeof(*config));
+    (void)memset(config, 0, sizeof(*config));
     config->async_repl_enabled = true;
     config->history_enabled = true;
     config->history_max_entries = GSH_HISTORY_CAP;
@@ -87,6 +88,9 @@ void gsh_config_defaults(gsh_shell_config *config)
 
 static int write_all(int descriptor, const char *text, size_t length)
 {
+    if (text == NULL) {
+        return -1;
+    }
     size_t offset = 0;
 
     while (offset < length) {
@@ -105,6 +109,9 @@ static int write_all(int descriptor, const char *text, size_t length)
 
 static int create_initial(const char *path)
 {
+    if (path == NULL) {
+        return -1;
+    }
     int descriptor = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC |
                                     O_NOFOLLOW,
                           S_IRUSR | S_IWUSR);
@@ -139,6 +146,9 @@ static int secure_regular_file(int descriptor)
 
 static ssize_t read_config(int descriptor, char *text, size_t capacity)
 {
+    if (text == NULL) {
+        return -1;
+    }
     size_t used = 0;
 
     while (used < capacity) {
@@ -158,6 +168,9 @@ static ssize_t read_config(int descriptor, char *text, size_t capacity)
 
 static char *trim_left(char *text)
 {
+    if (text == NULL) {
+        return NULL;
+    }
     while (*text == ' ' || *text == '\t') {
         text++;
     }
@@ -166,6 +179,9 @@ static char *trim_left(char *text)
 
 static void trim_right(char *text)
 {
+    if (text == NULL) {
+        return;
+    }
     size_t length = strlen(text);
 
     while (length > 0 &&
@@ -177,6 +193,9 @@ static void trim_right(char *text)
 
 static int parse_boolean(const char *text, bool *value)
 {
+    if (value == NULL) {
+        return -1;
+    }
     if (strcmp(text, "true") == 0) {
         *value = true;
         return 0;
@@ -191,6 +210,10 @@ static int parse_boolean(const char *text, bool *value)
 
 static int parse_count(const char *text, size_t *value)
 {
+    if (text == NULL) return -1;
+    if (value == NULL) {
+        return -1;
+    }
     size_t parsed = 0;
     size_t index;
 
@@ -216,6 +239,9 @@ static int parse_count(const char *text, size_t *value)
 
 static int parse_duration(const char *text, uint64_t *value)
 {
+    if (text == NULL || value == NULL) {
+        return -1;
+    }
     uint64_t number = 0;
     uint64_t multiplier;
     size_t index = 0;
@@ -271,6 +297,9 @@ static int field_index(const char *key)
 static int apply_history_field(gsh_shell_config *config, int field,
                                const char *value)
 {
+    if (config == NULL || value == NULL) {
+        return -1;
+    }
     switch (field) {
     case 0:
         return parse_boolean(value, &config->history_enabled);
@@ -300,6 +329,9 @@ static int apply_history_field(gsh_shell_config *config, int field,
 static int parse_assignment(config_parser *parser,
                             gsh_shell_config *config, char *line)
 {
+    if (config == NULL || line == NULL || parser == NULL) {
+        return -1;
+    }
     char *separator = strchr(line, '=');
     char *key;
     char *value;
@@ -334,6 +366,9 @@ static int parse_assignment(config_parser *parser,
 static int parse_text(gsh_shell_config *candidate, char *text, size_t length,
                       size_t *failed_line)
 {
+    if (failed_line == NULL || text == NULL) {
+        return -1;
+    }
     config_parser parser = {.text = text, .length = length, .line = 1};
     size_t begin = 0;
 
@@ -406,7 +441,7 @@ int gsh_config_load(gsh_shell_config *config, const char *home,
     }
     text[(size_t)length] = '\0';
     gsh_config_defaults(&candidate);
-    memcpy(candidate.path, config->path, strlen(config->path) + 1U);
+    (void)memcpy(candidate.path, config->path, strlen(config->path) + 1U);
     if (parse_text(&candidate, text, (size_t)length, &failed_line) == -1) {
         set_diagnostic(config, "%s:%zu: invalid configuration", config->path,
                        failed_line);

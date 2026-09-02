@@ -7,13 +7,15 @@
 
 #include "builtin_shift.h"
 
-#include <errno.h>
-#include <stdint.h>
 
 int gsh_builtin_shift(size_t argc, char *const argv[],
                       gsh_positional_store *positionals,
                       const gsh_builtin_io *io)
 {
+    if (argv == NULL) return 125;
+    if (io == NULL) {
+        return -1;
+    }
     size_t amount = 1;
     size_t index;
 

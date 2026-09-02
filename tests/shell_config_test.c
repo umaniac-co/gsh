@@ -9,15 +9,16 @@
 
 #include <errno.h>
 #include <fcntl.h>
-#include <stdbool.h>
 #include <stdio.h>
-#include <stdlib.h>
+#include <stdlib.h> /* CANON-INCLUDE: linux */
 #include <string.h>
-#include <sys/stat.h>
 #include <unistd.h>
 
 static int write_configuration(const char *home, const char *text)
 {
+    if (text == NULL) {
+        return -1;
+    }
     char path[4096];
     size_t length = strlen(text);
     size_t offset = 0;
@@ -137,9 +138,9 @@ int main(void)
     }
     (void)rmdir(home);
     if (failed) {
-        fprintf(stderr, "shell config: async repl cases failed\n");
+        (void)fprintf(stderr, "shell config: async repl cases failed\n");
         return 1;
     }
-    puts("shell config: async repl defaults and validation passed");
+    (void)puts("shell config: async repl defaults and validation passed");
     return 0;
 }

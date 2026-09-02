@@ -8,24 +8,32 @@
 #include "builtin_variables.h"
 
 #include <errno.h>
-#include <stdbool.h>
 #include <string.h>
 #include <unistd.h>
 
 static int output(const gsh_builtin_io *io, int descriptor,
                   const char *text, size_t length)
 {
-    return io->output(io->opaque, descriptor, text, length);
+    if (io == NULL || text == NULL) {
+        return -1;
+    }
+    return gsh_builtin_output(io, descriptor, text, length);
 }
 
 static int fail(const gsh_builtin_io *io, const char *name,
                 const char *message)
 {
+    if (io == NULL || message == NULL || name == NULL) {
+        return -1;
+    }
     return gsh_builtin_error(io, name, message);
 }
 
 static int journal_failure(const gsh_builtin_io *io, const char *name)
 {
+    if (io == NULL || name == NULL) {
+        return -1;
+    }
     (void)fail(io, name, "variable transaction capacity exceeded");
     return 125;
 }
@@ -34,6 +42,9 @@ static int list_variables(const char *name, unsigned int attribute,
                           const gsh_variable_store *variables,
                           const gsh_builtin_io *io)
 {
+    if (variables == NULL) {
+        return -1;
+    }
     size_t index;
 
     for (index = 0; index < gsh_variables_count(variables); index++) {
@@ -42,6 +53,7 @@ static int list_variables(const char *name, unsigned int attribute,
             gsh_variables_assignment(variables, index, &attributes);
         const char *separator;
         const char *cursor;
+        size_t segment;
 
         if ((attributes & attribute) == 0) {
             continue;
@@ -64,7 +76,7 @@ static int list_variables(const char *name, unsigned int attribute,
             return 1;
         }
         cursor = separator + 1U;
-        for (;;) {
+        for (segment = 0; segment < GSH_VARIABLE_TEXT_CAP; segment++) {
             const char *quote = strchr(cursor, '\'');
             size_t length = quote != NULL ? (size_t)(quote - cursor)
                                           : strlen(cursor);
@@ -80,6 +92,10 @@ static int list_variables(const char *name, unsigned int attribute,
             }
             cursor = quote + 1U;
         }
+        if (segment == GSH_VARIABLE_TEXT_CAP) {
+            errno = E2BIG;
+            return 1;
+        }
         if (output(io, STDOUT_FILENO, "'\n", 2) != 0) {
             return 1;
         }
@@ -93,6 +109,9 @@ static int declare_variables(size_t argc, char *const argv[],
                              unsigned int assignment_attributes,
                              const gsh_builtin_io *io)
 {
+    if (argv == NULL || io == NULL || variables == NULL) {
+        return -1;
+    }
     const char *name = argv[0];
     unsigned int attribute = strcmp(name, "export") == 0
                                  ? GSH_VARIABLE_EXPORTED
@@ -167,6 +186,9 @@ static int unset_variables(size_t argc, char *const argv[],
                            gsh_variable_journal *journal,
                            const gsh_builtin_io *io)
 {
+    if (argv == NULL || io == NULL) {
+        return -1;
+    }
     size_t index = 1;
     bool functions = false;
     bool variables_selected = false;
@@ -230,8 +252,7 @@ int gsh_builtin_variables(size_t argc, char *const argv[],
                           unsigned int assignment_attributes,
                           const gsh_builtin_io *io)
 {
-    if (argc == 0 || argv == NULL || variables == NULL || io == NULL ||
-        io->output == NULL) {
+    if (argc == 0 || argv == NULL || variables == NULL || !gsh_builtin_io_valid(io)) {
         errno = EINVAL;
         return 125;
     }

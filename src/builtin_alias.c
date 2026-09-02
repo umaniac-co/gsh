@@ -10,12 +10,18 @@
 
 static int output(const gsh_builtin_io *io, const char *text, size_t length)
 {
-    return io->output(io->opaque, STDOUT_FILENO, text, length);
+    if (io == NULL || text == NULL) {
+        return -1;
+    }
+    return gsh_builtin_output(io, STDOUT_FILENO, text, length);
 }
 
 static int write_definition(const gsh_builtin_io *io,
                             const char *assignment)
 {
+    if (assignment == NULL) {
+        return -1;
+    }
     const char *separator = strchr(assignment, '=');
     const char *cursor;
 
@@ -25,7 +31,7 @@ static int write_definition(const gsh_builtin_io *io,
         return 1;
     }
     cursor = separator + 1U;
-    for (;;) {
+    for (size_t segment = 0; segment < GSH_ALIAS_TEXT_CAP; segment++) {
         const char *quote = strchr(cursor, '\'');
         size_t length = quote == NULL ? strlen(cursor)
                                       : (size_t)(quote - cursor);
@@ -39,11 +45,16 @@ static int write_definition(const gsh_builtin_io *io,
         }
         cursor = quote + 1U;
     }
+    errno = E2BIG;
+    return 1;
 }
 
 static int list_all(const gsh_alias_store *aliases,
                     const gsh_builtin_io *io)
 {
+    if (aliases == NULL) {
+        return -1;
+    }
     size_t order[GSH_ALIAS_CAP];
     size_t count = gsh_aliases_count(aliases);
     size_t index;
@@ -77,10 +88,13 @@ int gsh_builtin_alias(size_t argc, char *const argv[],
                       gsh_alias_journal *journal,
                       const gsh_builtin_io *io)
 {
+    if (aliases == NULL) {
+        return -1;
+    }
     size_t index = 1;
     int status = 0;
 
-    if (argc == 0 || argv == NULL || io == NULL || io->output == NULL) {
+    if (argc == 0 || argv == NULL || !gsh_builtin_io_valid(io)) {
         errno = EINVAL;
         return 125;
     }

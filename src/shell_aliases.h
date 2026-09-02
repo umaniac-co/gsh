@@ -31,11 +31,11 @@ typedef struct {
     char text[GSH_ALIAS_TEXT_CAP];
 } gsh_alias_store;
 
-typedef enum {
+enum {
     GSH_ALIAS_JOURNAL_SET = 0,
     GSH_ALIAS_JOURNAL_UNSET,
     GSH_ALIAS_JOURNAL_CLEAR,
-} gsh_alias_journal_operation;
+};
 
 typedef struct {
     uint32_t text_offset;

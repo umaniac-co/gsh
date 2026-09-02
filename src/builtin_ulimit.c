@@ -6,11 +6,9 @@
 #endif
 
 #include "builtin_ulimit.h"
-#include "builtin_common.h"
 
 #include <errno.h>
 #include <inttypes.h>
-#include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/resource.h>
@@ -40,6 +38,9 @@ static const limit_spec limits[] = {
 
 static int fail(const gsh_builtin_io *io, const char *message)
 {
+    if (io == NULL || message == NULL) {
+        return -1;
+    }
     return gsh_builtin_error(io, "ulimit", message);
 }
 
@@ -58,11 +59,14 @@ static const limit_spec *find_limit(char option)
 static int format_limit(char output[128], const limit_spec *spec,
                         rlim_t value, bool labelled)
 {
+    if (output == NULL || spec == NULL) {
+        return -1;
+    }
     char number[64];
     int length;
 
     if (value == RLIM_INFINITY) {
-        memcpy(number, "unlimited", sizeof("unlimited"));
+        (void)memcpy(number, "unlimited", sizeof("unlimited"));
     } else {
         length = snprintf(number, sizeof(number), "%" PRIuMAX,
                           (uintmax_t)(value / spec->unit));
@@ -80,6 +84,10 @@ static int format_limit(char output[128], const limit_spec *spec,
 static int report_limit(const limit_spec *spec, bool hard, bool labelled,
                         const gsh_builtin_io *io)
 {
+    if (spec == NULL) return -1;
+    if (io == NULL) {
+        return -1;
+    }
     char output[128];
     struct rlimit value;
     int length;
@@ -91,13 +99,17 @@ static int report_limit(const limit_spec *spec, bool hard, bool labelled,
                           labelled);
     return length < 0
                ? fail(io, "value cannot be formatted")
-               : io->output(io->opaque, STDOUT_FILENO, output,
+               : gsh_builtin_output(io, STDOUT_FILENO, output,
                             (size_t)length);
 }
 
 static int parse_limit(const char *text, const limit_spec *spec,
                        rlim_t *value)
 {
+    if (spec == NULL) return -1;
+    if (value == NULL) {
+        return -1;
+    }
     char *end;
     uintmax_t number;
 
@@ -118,6 +130,9 @@ static int parse_limit(const char *text, const limit_spec *spec,
 static int set_limit(const limit_spec *spec, const char *operand,
                      bool hard, bool soft, const gsh_builtin_io *io)
 {
+    if (io == NULL) {
+        return -1;
+    }
     struct rlimit current;
     rlim_t value;
 
@@ -139,6 +154,9 @@ static int set_limit(const limit_spec *spec, const char *operand,
 int gsh_builtin_ulimit(size_t argc, char *const argv[],
                        const gsh_builtin_io *io)
 {
+    if (argv == NULL || io == NULL) {
+        return -1;
+    }
     const limit_spec *selected = NULL;
     const char *operand = NULL;
     bool all = false;

@@ -26,6 +26,9 @@ static const option_descriptor descriptors[] = {
 
 void gsh_options_initialize(gsh_shell_options *options, bool interactive)
 {
+    if (options == NULL) {
+        return;
+    }
     options->enabled = interactive ? GSH_OPTION_INTERACTIVE : 0U;
     options->getopts_index = 1U;
     options->getopts_offset = 1U;
@@ -35,11 +38,17 @@ void gsh_options_initialize(gsh_shell_options *options, bool interactive)
 bool gsh_options_enabled(const gsh_shell_options *options,
                          unsigned int option)
 {
+    if (options == NULL) {
+        return false;
+    }
     return options != NULL && (options->enabled & option) != 0U;
 }
 
 bool gsh_options_validate(const gsh_shell_options *options)
 {
+    if (options == NULL) {
+        return false;
+    }
     const unsigned int known = GSH_OPTION_NOCLOBBER | GSH_OPTION_NOGLOB |
                                GSH_OPTION_ALLEXPORT | GSH_OPTION_NOUNSET |
                                GSH_OPTION_INTERACTIVE;
@@ -54,6 +63,9 @@ bool gsh_options_validate(const gsh_shell_options *options)
 static int update(gsh_shell_options *options,
                   const option_descriptor *descriptor, bool enabled)
 {
+    if (descriptor == NULL || options == NULL) {
+        return -1;
+    }
     if (enabled) {
         options->enabled |= descriptor->bit;
     } else {
@@ -65,6 +77,9 @@ static int update(gsh_shell_options *options,
 int gsh_options_update_letter(gsh_shell_options *options, char letter,
                               bool enabled)
 {
+    if (options == NULL) {
+        return -1;
+    }
     size_t index;
 
     for (index = 0; index < gsh_options_count(); index++) {
@@ -79,6 +94,9 @@ int gsh_options_update_letter(gsh_shell_options *options, char letter,
 int gsh_options_update_name(gsh_shell_options *options, const char *name,
                             bool enabled)
 {
+    if (options == NULL) {
+        return -1;
+    }
     size_t index;
 
     for (index = 0; index < gsh_options_count(); index++) {
@@ -93,6 +111,9 @@ int gsh_options_update_name(gsh_shell_options *options, const char *name,
 void gsh_options_flags(const gsh_shell_options *options,
                        char output[GSH_OPTION_FLAG_CAP])
 {
+    if (output == NULL) {
+        return;
+    }
     static const char order[] = "abCefhimnuvx";
     size_t source;
     size_t used = 0;
@@ -127,6 +148,9 @@ const char *gsh_options_name(size_t index)
 bool gsh_options_index_enabled(const gsh_shell_options *options,
                                size_t index)
 {
+    if (options == NULL) {
+        return false;
+    }
     return index < gsh_options_count() &&
            gsh_options_enabled(options, descriptors[index].bit);
 }

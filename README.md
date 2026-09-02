@@ -41,8 +41,9 @@ Every POSIX shell builtin is completed as a native C implementation inside gsh; 
 
 The mandatory code-writing policy for human contributors and AI agents is
 [`CODE.md`](CODE.md). It adopts JPL's Power of Ten rules and gsh's Literate Code
-discipline; new and materially changed code must follow it, while legacy
-violations remain explicit migration work rather than precedent.
+discipline. Its permanent zero-tolerance gate covers all repository-owned
+production, test, fuzz, policy, and executable support code; there is no legacy
+violation baseline.
 
 The MVP already follows the central shape described by
 [`specs/0002.real_time.md`](specs/0002.real_time.md):
@@ -335,10 +336,84 @@ make check-traps
 make analyze
 make fuzz-smoke
 make fuzz-sanitize
+make fuzz-libfuzzer-linux FUZZ_SECONDS=60
 make fuzz-pty
 make fuzz-pty-sanitize
 make soak SOAK_SECONDS=60
 ```
+
+## Code quality utilities
+
+The repository exposes its first-party code-quality checks through `make`, so
+the same bounded tools are available to contributors and to automation:
+
+```sh
+make quality
+make policy
+make quality-callgraph
+make quality-dependencies
+make quality-includes
+make quality-maps
+make quality-compilers
+make quality-linux
+make analyze
+```
+
+`quality` is the local aggregate: it applies the permanent zero-tolerance
+source-policy gate, checks
+the complete source-to-target manifest, runs Clang's static analyzer over every
+manifest-owned production, test, fuzz, and policy C source, and builds and
+verifies a linker map for every non-sanitized executable target.
+`quality-dependencies` requires every such target to have a nonempty, current
+compiler-generated `.d` dependency graph, including transitive headers, and
+works unchanged with an out-of-tree `BUILD_DIR`. This prevents a stale binary
+from concealing a source or header that no longer compiles. The aggregate also runs
+`quality-includes`, which removes each direct include from each translation
+unit in isolation and requires compilation in its reachable target
+configuration, with the same strict flags, to fail;
+a unit that still compiles has a redundant include and fails the gate.
+An unconditional include whose declarations are exposed transitively on one
+platform but required by the other is marked `CANON-INCLUDE: linux` or
+`CANON-INCLUDE: macos`. The non-owning pass defers that one removal, while the
+owning platform must prove it necessary; includes in inactive preprocessor
+branches are likewise left to the configuration that reaches them. Unknown
+platform tags fail the gate.
+`policy` is the concise form used by the wider verification gate.
+`quality-callgraph` runs the same policy but also lists every unreachable
+function, direct recursive call, recursive call-cycle member, and the direct
+edges that keep each recursive component connected, so a refactor has an
+actionable cut list. It also lists functions above the 60-unit structural
+limit; the summary reports the repository-wide assertion deficit relative to
+two per function. Recoverable guards contribute one check per pure Boolean
+clause; explicit recoverable `require` calls are counted once and are not
+double-counted through the surrounding recovery branch. Embedded fixtures
+reject effectful predicates and dead types, fields, enumerators, and macros.
+`quality-maps` parses the Darwin and GNU linker formats and fails if
+a first-party function is discarded in every supported target; embedded
+positive and negative fixtures keep both parsers honest. The maps are written
+beside their binaries as `BUILD_DIR/*.map` and are removed by `make clean`.
+`quality-compilers` repeats the policy and linker-map matrix in
+temporary, isolated Clang and GCC build directories, using
+`QUALITY_CLANG_CC` and `QUALITY_GCC_CC` when the compiler commands need local
+overrides. On macOS, `/usr/bin/gcc` is normally another Clang driver, so a
+separate GNU GCC installation or the Linux matrix is required for independent
+GCC evidence. `quality-linux` supplies that matrix reproducibly with Docker:
+it builds the pinned Debian toolchain image in
+`dev/quality-linux.Dockerfile`, verifies that the container is Linux `x86_64`,
+then runs policy, all non-sanitized linker-map builds, and conformance with both
+GNU GCC and Clang. Docker Desktop must be running; the source tree is mounted
+read-only and all Linux build products stay in the disposable container.
+
+`policy` has no accepted debt baseline: every violation count must remain
+zero. Source ownership lives in `dev/target-manifest.tsv`: every C source must
+belong to one or more of the 18
+closed, supported targets, and every target must have an explicit `main` or
+fuzzer root. Unknown targets, unknown roles, duplicate sources, unowned files,
+and dependency-only targets fail `policy`; embedded positive and negative
+fixtures protect the target parser.
+The manifest is an enforcement input rather than an exception to the Code
+Canon. As with the normal build, an isolated artifact directory can be selected with, for
+example, `make BUILD_DIR=/tmp/gsh-quality quality`.
 
 `check-fault` uses a separate test-only binary and exercises 88 deterministic
 failure points. The production build contains neither the injection
@@ -383,7 +458,12 @@ corpus only after minimizing it and giving it a name that identifies the
 behavior or defect it preserves.
 
 Apple's bundled Clang may omit the libFuzzer runtime; `fuzz-sanitize` remains
-available there, while the Linux Clang CI job runs the coverage-guided gate.
+available there. The reproducible Linux x86_64 container includes the Clang
+runtime and exposes the same coverage-guided gate through Make:
+
+```sh
+make fuzz-libfuzzer-linux FUZZ_SECONDS=60
+```
 
 Run the reproducible clean-shell latency comparison with:
 

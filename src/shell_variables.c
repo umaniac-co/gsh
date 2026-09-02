@@ -5,9 +5,9 @@
 #include "shell_variables.h"
 
 #include <errno.h>
-#include <limits.h>
-#include <stdlib.h>
 #include <string.h>
+
+#define require(condition) (condition)
 
 enum {
     GSH_VARIABLE_IMPORT_SCAN_CAP = 4096,
@@ -42,6 +42,9 @@ bool gsh_variable_name_is_valid(const char *name, size_t length)
 
 static uint32_t variable_hash(const char *name, size_t length)
 {
+    if (name == NULL) {
+        return 0U;
+    }
     uint32_t hash = UINT32_C(2166136261);
     size_t offset;
 
@@ -54,7 +57,10 @@ static uint32_t variable_hash(const char *name, size_t length)
 
 void gsh_variables_initialize(gsh_variable_store *store)
 {
-    memset(store, 0, sizeof(*store));
+    if (store == NULL) {
+        return;
+    }
+    (void)memset(store, 0, sizeof(*store));
     store->next_value_generation = 1U;
 }
 
@@ -63,6 +69,10 @@ static bool entry_name_matches(const gsh_variable_store *store,
                                const char *name, size_t name_length,
                                uint32_t hash)
 {
+    if (entry == NULL || store == NULL) return false;
+    if (name == NULL) {
+        return false;
+    }
     const char *assignment;
 
     if (entry->hash != hash || entry->name_length != name_length ||
@@ -78,6 +88,9 @@ static size_t variable_index(const gsh_variable_store *store,
                              const char *name, size_t name_length,
                              uint32_t hash)
 {
+    if (store == NULL) {
+        return 0U;
+    }
     size_t slot = hash & (GSH_VARIABLE_HASH_CAP - 1U);
     size_t probes;
 
@@ -99,6 +112,9 @@ static size_t variable_index(const gsh_variable_store *store,
 
 static int insert_hash_slot(gsh_variable_store *store, size_t index)
 {
+    if (store == NULL) {
+        return -1;
+    }
     size_t slot = store->entries[index].hash &
                   (GSH_VARIABLE_HASH_CAP - 1U);
     size_t probes;
@@ -118,6 +134,9 @@ const char *gsh_variables_lookup(const gsh_variable_store *store,
                                  const char *name, size_t name_length,
                                  bool *found)
 {
+    if (found == NULL || store == NULL) {
+        return NULL;
+    }
     uint32_t hash;
     size_t index;
 
@@ -141,6 +160,9 @@ bool gsh_variables_get_state(const gsh_variable_store *store,
                              const char *name, size_t name_length,
                              bool *is_set, unsigned int *attributes)
 {
+    if (attributes == NULL || is_set == NULL || store == NULL) {
+        return false;
+    }
     size_t index;
 
     *is_set = false;
@@ -160,30 +182,37 @@ bool gsh_variables_get_state(const gsh_variable_store *store,
     return true;
 }
 
-static int write_assignment(char *destination, const char *name,
-                            size_t name_length, const char *value,
-                            size_t value_length)
+static void write_assignment(char *destination, const char *name,
+                             size_t name_length, const char *value,
+                             size_t value_length)
 {
-    memcpy(destination, name, name_length);
+    if (destination == NULL || name == NULL || value == NULL) {
+        return;
+    }
+    (void)memcpy(destination, name, name_length);
     destination[name_length] = '=';
-    memcpy(destination + name_length + 1U, value, value_length);
+    (void)memcpy(destination + name_length + 1U, value, value_length);
     destination[name_length + 1U + value_length] = '\0';
-    return 0;
 }
 
 static int successful_update(gsh_variable_store *store, const char *name,
                              size_t name_length, bool set_value)
 {
+    if (store == NULL) {
+        return -1;
+    }
     if (set_value && name_length == 4U && memcmp(name, "PATH", 4) == 0) {
         store->path_generation++;
     }
     return 0;
 }
 
-static void mark_value_update(gsh_variable_store *store, size_t index)
+static int mark_value_update(gsh_variable_store *store, size_t index)
 {
     size_t attempts;
 
+    if (!require(store != NULL && index < store->count)) return -1;
+    if (!require(store->count <= GSH_VARIABLE_CAP)) return -1;
     for (attempts = 0; attempts <= store->count; attempts++) {
         uint64_t candidate = store->next_value_generation++;
         size_t entry;
@@ -197,12 +226,119 @@ static void mark_value_update(gsh_variable_store *store, size_t index)
         }
         if (!used) {
             store->entries[index].value_generation = candidate;
-            return;
+            return 0;
         }
     }
-    /* At most count generations are live, so the bounded search above must
-     * always find a free non-zero generation. */
-    abort();
+    errno = EOVERFLOW;
+    return -1;
+}
+
+static int update_existing_variable(
+    gsh_variable_store *store, size_t index, const char *name,
+    size_t name_length, const char *value, size_t value_length,
+    size_t new_length, unsigned int attribute_mask,
+    unsigned int attributes, bool set_value)
+{
+    gsh_variable_entry *entry;
+    size_t old_offset;
+    size_t old_length;
+    size_t tail_length;
+    size_t other;
+
+    if (!require(store != NULL && index < store->count)) return -1;
+    if (!require(name != NULL && value != NULL)) return -1;
+    entry = &store->entries[index];
+    old_offset = entry->assignment_offset;
+    old_length = entry->assignment_length;
+    if ((entry->attributes & GSH_VARIABLE_READONLY) != 0 &&
+        (set_value || ((attribute_mask & GSH_VARIABLE_READONLY) != 0 &&
+                       (attributes & GSH_VARIABLE_READONLY) == 0))) {
+        errno = EROFS;
+        return -1;
+    }
+    if (!set_value) {
+        entry->attributes = (uint16_t)((entry->attributes & ~attribute_mask) |
+                                       (attributes & attribute_mask));
+        return 0;
+    }
+    if ((entry->attributes & GSH_VARIABLE_INTERNAL_UNSET) == 0 &&
+        old_length == new_length &&
+        memcmp(store->text + old_offset + name_length + 1U, value,
+               value_length) == 0) {
+        entry->attributes = (uint16_t)((entry->attributes & ~attribute_mask) |
+                                       (attributes & attribute_mask));
+        if (mark_value_update(store, index) == -1) return -1;
+        return successful_update(store, name, name_length, true);
+    }
+    if (new_length > old_length &&
+        new_length - old_length > GSH_VARIABLE_TEXT_CAP - store->text_used) {
+        errno = ENOSPC;
+        return -1;
+    }
+    tail_length = store->text_used - old_offset - old_length;
+    (void)memmove(store->text + old_offset + new_length,
+            store->text + old_offset + old_length, tail_length);
+    if (new_length != old_length) {
+        ptrdiff_t delta = (ptrdiff_t)new_length - (ptrdiff_t)old_length;
+
+        for (other = 0; other < store->count; other++) {
+            if (other != index &&
+                store->entries[other].assignment_offset > old_offset) {
+                store->entries[other].assignment_offset = (uint32_t)(
+                    (ptrdiff_t)store->entries[other].assignment_offset +
+                    delta);
+            }
+        }
+        store->text_used = (uint32_t)((ptrdiff_t)store->text_used + delta);
+    }
+    write_assignment(store->text + old_offset, name, name_length, value,
+                     value_length);
+    entry->assignment_length = (uint32_t)new_length;
+    entry->attributes = (uint16_t)((entry->attributes & ~attribute_mask) |
+                                   (attributes & attribute_mask));
+    entry->attributes &= (uint16_t)~GSH_VARIABLE_INTERNAL_UNSET;
+    if (mark_value_update(store, index) == -1) return -1;
+    return successful_update(store, name, name_length, true);
+}
+
+static int insert_variable(gsh_variable_store *store, uint32_t hash,
+                           const char *name, size_t name_length,
+                           const char *value, size_t value_length,
+                           size_t new_length, unsigned int attribute_mask,
+                           unsigned int attributes, bool set_value)
+{
+    size_t index;
+
+    if (!require(store != NULL && store->count <= GSH_VARIABLE_CAP)) return -1;
+    if (!require(name != NULL && value != NULL)) return -1;
+    if (store->count == GSH_VARIABLE_CAP ||
+        new_length > GSH_VARIABLE_TEXT_CAP - store->text_used) {
+        errno = ENOSPC;
+        return -1;
+    }
+    index = store->count;
+    store->entries[index].assignment_offset = store->text_used;
+    store->entries[index].assignment_length = (uint32_t)new_length;
+    store->entries[index].hash = hash;
+    store->entries[index].name_length = (uint16_t)name_length;
+    store->entries[index].attributes =
+        (uint16_t)((attributes & attribute_mask) |
+                   (set_value ? 0U : GSH_VARIABLE_INTERNAL_UNSET));
+    write_assignment(store->text + store->text_used, name, name_length,
+                     value, value_length);
+    store->text_used += (uint32_t)new_length;
+    store->count++;
+    if (insert_hash_slot(store, index) == -1) {
+        store->count--;
+        store->text_used -= (uint32_t)new_length;
+        return -1;
+    }
+    if (set_value && mark_value_update(store, index) == -1) {
+        store->count--;
+        store->text_used -= (uint32_t)new_length;
+        return -1;
+    }
+    return successful_update(store, name, name_length, set_value);
 }
 
 static int set_variable(gsh_variable_store *store, const char *name,
@@ -210,6 +346,9 @@ static int set_variable(gsh_variable_store *store, const char *name,
                         size_t value_length, unsigned int attribute_mask,
                         unsigned int attributes, bool set_value)
 {
+    if (store == NULL) {
+        return -1;
+    }
     uint32_t hash;
     size_t index;
     size_t new_length;
@@ -234,98 +373,13 @@ static int set_variable(gsh_variable_store *store, const char *name,
     hash = variable_hash(name, name_length);
     index = variable_index(store, name, name_length, hash);
     if (index != GSH_VARIABLE_CAP) {
-        gsh_variable_entry *entry = &store->entries[index];
-        size_t old_offset = entry->assignment_offset;
-        size_t old_length = entry->assignment_length;
-        size_t tail_offset = old_offset + old_length;
-        size_t tail_length = store->text_used - tail_offset;
-        size_t other;
-
-        if (((entry->attributes & GSH_VARIABLE_READONLY) != 0 &&
-             set_value) ||
-            ((entry->attributes & GSH_VARIABLE_READONLY) != 0 &&
-             (attribute_mask & GSH_VARIABLE_READONLY) != 0 &&
-             (attributes & GSH_VARIABLE_READONLY) == 0)) {
-            errno = EROFS;
-            return -1;
-        }
-        if (!set_value) {
-            entry->attributes = (uint16_t)(
-                (entry->attributes & ~attribute_mask) |
-                (attributes & attribute_mask));
-            return 0;
-        }
-        if ((entry->attributes & GSH_VARIABLE_INTERNAL_UNSET) == 0 &&
-            old_length == new_length &&
-            memcmp(store->text + old_offset + name_length + 1U, value,
-                   value_length) == 0) {
-            entry->attributes = (uint16_t)(
-                (entry->attributes & ~attribute_mask) |
-                (attributes & attribute_mask));
-            mark_value_update(store, index);
-            return successful_update(store, name, name_length, set_value);
-        }
-        if (new_length > old_length &&
-            new_length - old_length >
-                GSH_VARIABLE_TEXT_CAP - store->text_used) {
-            errno = ENOSPC;
-            return -1;
-        }
-        memmove(store->text + old_offset + new_length,
-                store->text + tail_offset, tail_length);
-        if (new_length != old_length) {
-            ptrdiff_t delta = (ptrdiff_t)new_length -
-                              (ptrdiff_t)old_length;
-
-            for (other = 0; other < store->count; other++) {
-                if (other != index &&
-                    store->entries[other].assignment_offset > old_offset) {
-                    store->entries[other].assignment_offset =
-                        (uint32_t)((ptrdiff_t)store->entries[other]
-                                       .assignment_offset +
-                                   delta);
-                }
-            }
-            store->text_used =
-                (uint32_t)((ptrdiff_t)store->text_used + delta);
-        }
-        write_assignment(store->text + old_offset, name, name_length, value,
-                         value_length);
-        entry->assignment_length = (uint32_t)new_length;
-        entry->attributes = (uint16_t)(
-            (entry->attributes & ~attribute_mask) |
-            (attributes & attribute_mask));
-        entry->attributes &= (uint16_t)~GSH_VARIABLE_INTERNAL_UNSET;
-        mark_value_update(store, index);
-        return successful_update(store, name, name_length, set_value);
+        return update_existing_variable(
+            store, index, name, name_length, value, value_length,
+            new_length, attribute_mask, attributes, set_value);
     }
-    if (store->count == GSH_VARIABLE_CAP) {
-        errno = ENOSPC;
-        return -1;
-    }
-    if (new_length > GSH_VARIABLE_TEXT_CAP - store->text_used) {
-        errno = ENOSPC;
-        return -1;
-    }
-    index = store->count;
-    store->entries[index].assignment_offset = store->text_used;
-    store->entries[index].assignment_length = (uint32_t)new_length;
-    store->entries[index].hash = hash;
-    store->entries[index].name_length = (uint16_t)name_length;
-    store->entries[index].attributes =
-        (uint16_t)((attributes & attribute_mask) |
-                   (set_value ? 0U : GSH_VARIABLE_INTERNAL_UNSET));
-    write_assignment(store->text + store->text_used, name, name_length,
-                     value, value_length);
-    store->text_used += (uint32_t)new_length;
-    store->count++;
-    if (insert_hash_slot(store, index) == -1) {
-        store->count--;
-        store->text_used -= (uint32_t)new_length;
-        return -1;
-    }
-    if (set_value) mark_value_update(store, index);
-    return successful_update(store, name, name_length, set_value);
+    return insert_variable(store, hash, name, name_length, value,
+                           value_length, new_length, attribute_mask,
+                           attributes, set_value);
 }
 
 int gsh_variables_set(gsh_variable_store *store, const char *name,
@@ -333,6 +387,9 @@ int gsh_variables_set(gsh_variable_store *store, const char *name,
                       size_t value_length, unsigned int attribute_mask,
                       unsigned int attributes)
 {
+    if (name == NULL || store == NULL || value == NULL) {
+        return -1;
+    }
     return set_variable(store, name, name_length, value, value_length,
                         attribute_mask, attributes, true);
 }
@@ -342,15 +399,21 @@ int gsh_variables_set_attributes(gsh_variable_store *store,
                                  unsigned int attribute_mask,
                                  unsigned int attributes)
 {
+    if (name == NULL || store == NULL) {
+        return -1;
+    }
     return set_variable(store, name, name_length, "", 0, attribute_mask,
                         attributes, false);
 }
 
 static void rebuild_hash(gsh_variable_store *store)
 {
+    if (store == NULL) {
+        return;
+    }
     size_t index;
 
-    memset(store->hash_slots, 0, sizeof(store->hash_slots));
+    (void)memset(store->hash_slots, 0, sizeof(store->hash_slots));
     for (index = 0; index < store->count; index++) {
         (void)insert_hash_slot(store, index);
     }
@@ -359,6 +422,9 @@ static void rebuild_hash(gsh_variable_store *store)
 int gsh_variables_unset(gsh_variable_store *store, const char *name,
                         size_t name_length)
 {
+    if (store == NULL) {
+        return -1;
+    }
     uint32_t hash;
     size_t index;
     size_t text_offset;
@@ -382,9 +448,9 @@ int gsh_variables_unset(gsh_variable_store *store, const char *name,
     text_offset = store->entries[index].assignment_offset;
     text_length = store->entries[index].assignment_length;
     tail_length = store->text_used - text_offset - text_length;
-    memmove(store->text + text_offset,
+    (void)memmove(store->text + text_offset,
             store->text + text_offset + text_length, tail_length);
-    memmove(store->entries + index, store->entries + index + 1U,
+    (void)memmove(store->entries + index, store->entries + index + 1U,
             (store->count - index - 1U) * sizeof(store->entries[0]));
     store->count--;
     store->text_used -= (uint32_t)text_length;
@@ -401,6 +467,9 @@ int gsh_variables_unset(gsh_variable_store *store, const char *name,
 int gsh_variables_import(gsh_variable_store *store,
                          char *const environment[])
 {
+    if (environment == NULL || store == NULL) {
+        return -1;
+    }
     size_t index;
     bool saw_end = false;
 
@@ -446,6 +515,9 @@ int gsh_variables_import(gsh_variable_store *store,
 
 size_t gsh_variables_count(const gsh_variable_store *store)
 {
+    if (store == NULL) {
+        return 0U;
+    }
     return store->count;
 }
 
@@ -453,6 +525,7 @@ const char *gsh_variables_assignment(const gsh_variable_store *store,
                                      size_t index,
                                      unsigned int *attributes)
 {
+    if (store == NULL) return NULL;
     if (index >= store->count) {
         return NULL;
     }
@@ -465,6 +538,9 @@ const char *gsh_variables_assignment(const gsh_variable_store *store,
 
 bool gsh_variables_is_set(const gsh_variable_store *store, size_t index)
 {
+    if (store == NULL) {
+        return false;
+    }
     return index < store->count &&
            (store->entries[index].attributes &
             GSH_VARIABLE_INTERNAL_UNSET) == 0;
@@ -472,6 +548,9 @@ bool gsh_variables_is_set(const gsh_variable_store *store, size_t index)
 
 uint64_t gsh_variables_path_generation(const gsh_variable_store *store)
 {
+    if (store == NULL) {
+        return 0U;
+    }
     return store == NULL ? 0U : store->path_generation;
 }
 
@@ -493,7 +572,10 @@ uint64_t gsh_variables_value_generation(const gsh_variable_store *store,
 void gsh_variable_journal_initialize(gsh_variable_journal *journal,
                                      uint64_t base_generation)
 {
-    memset(journal, 0, sizeof(*journal));
+    if (journal == NULL) {
+        return;
+    }
+    (void)memset(journal, 0, sizeof(*journal));
     journal->version = GSH_VARIABLE_JOURNAL_VERSION;
     journal->base_generation = base_generation;
 }
@@ -502,6 +584,9 @@ static size_t journal_name_index(const gsh_variable_journal *journal,
                                  unsigned int scope, const char *name,
                                  size_t name_length)
 {
+    if (journal == NULL) {
+        return 0U;
+    }
     size_t index;
 
     for (index = 0; index < journal->count; index++) {
@@ -527,6 +612,9 @@ const char *gsh_variable_journal_lookup(
     const gsh_variable_journal *journal, const char *name,
     size_t name_length, gsh_variable_journal_value_state *state)
 {
+    if (journal == NULL || name == NULL || state == NULL) {
+        return NULL;
+    }
     return gsh_variable_journal_lookup_scoped(journal, 0, name,
                                               name_length, state);
 }
@@ -536,6 +624,9 @@ const char *gsh_variable_journal_lookup_scoped(
     const char *name, size_t name_length,
     gsh_variable_journal_value_state *state)
 {
+    if (journal == NULL || name == NULL || state == NULL) {
+        return NULL;
+    }
     size_t index;
 
     if (scope > UINT16_MAX) {
@@ -564,6 +655,9 @@ int gsh_variable_journal_record(gsh_variable_journal *journal,
                                 unsigned int attribute_mask,
                                 unsigned int attributes)
 {
+    if (journal == NULL || name == NULL || value == NULL) {
+        return -1;
+    }
     return gsh_variable_journal_record_scoped(
         journal, 0, name, name_length, value, value_length,
         attribute_mask, attributes);
@@ -574,6 +668,9 @@ int gsh_variable_journal_record_scoped(
     size_t name_length, const char *value, size_t value_length,
     unsigned int attribute_mask, unsigned int attributes)
 {
+    if (journal == NULL || name == NULL || value == NULL) {
+        return -1;
+    }
     return journal_record(journal, scope, name, name_length, value,
                           value_length, attribute_mask, attributes,
                           GSH_VARIABLE_JOURNAL_SET);
@@ -583,6 +680,9 @@ int gsh_variable_journal_record_attributes(
     gsh_variable_journal *journal, const char *name, size_t name_length,
     unsigned int attribute_mask, unsigned int attributes)
 {
+    if (journal == NULL || name == NULL) {
+        return -1;
+    }
     return journal_record(journal, 0, name, name_length, "", 0,
                           attribute_mask, attributes,
                           GSH_VARIABLE_JOURNAL_ATTRIBUTES);
@@ -592,8 +692,116 @@ int gsh_variable_journal_record_unset(gsh_variable_journal *journal,
                                       const char *name,
                                       size_t name_length)
 {
+    if (journal == NULL || name == NULL) {
+        return -1;
+    }
     return journal_record(journal, 0, name, name_length, "", 0, 0, 0,
                           GSH_VARIABLE_JOURNAL_UNSET);
+}
+
+static int update_journal_entry(
+    gsh_variable_journal *journal, size_t index, const char *name,
+    size_t name_length, const char *value, size_t value_length,
+    size_t new_length, unsigned int attribute_mask,
+    unsigned int attributes, gsh_variable_journal_operation operation)
+{
+    gsh_variable_journal_entry *entry;
+    size_t old_offset;
+    size_t old_length;
+    size_t tail_length;
+    size_t other;
+
+    if (!require(journal != NULL && index < journal->count)) return -1;
+    if (!require(name != NULL && value != NULL)) return -1;
+    entry = &journal->entries[index];
+    old_offset = entry->assignment_offset;
+    old_length = entry->assignment_length;
+    if ((entry->attributes & GSH_VARIABLE_READONLY) != 0 &&
+        (operation != GSH_VARIABLE_JOURNAL_ATTRIBUTES ||
+         ((attribute_mask & GSH_VARIABLE_READONLY) != 0 &&
+          (attributes & GSH_VARIABLE_READONLY) == 0))) {
+        errno = EROFS;
+        return -1;
+    }
+    if (operation == GSH_VARIABLE_JOURNAL_ATTRIBUTES) {
+        if (entry->operation == GSH_VARIABLE_JOURNAL_UNSET) {
+            entry->operation = GSH_VARIABLE_JOURNAL_UNSET_ATTRIBUTES;
+        }
+        entry->attribute_mask |= (uint16_t)attribute_mask;
+        entry->attributes = (uint16_t)((entry->attributes & ~attribute_mask) |
+                                       (attributes & attribute_mask));
+        return 0;
+    }
+    if (new_length > old_length && new_length - old_length >
+                                           GSH_VARIABLE_JOURNAL_TEXT_CAP -
+                                               journal->text_used) {
+        errno = ENOSPC;
+        return -1;
+    }
+    tail_length = journal->text_used - old_offset - old_length;
+    (void)memmove(journal->text + old_offset + new_length,
+            journal->text + old_offset + old_length, tail_length);
+    if (new_length != old_length) {
+        ptrdiff_t delta = (ptrdiff_t)new_length - (ptrdiff_t)old_length;
+
+        for (other = 0; other < journal->count; other++) {
+            if (other != index &&
+                journal->entries[other].assignment_offset > old_offset) {
+                journal->entries[other].assignment_offset = (uint32_t)(
+                    (ptrdiff_t)journal->entries[other].assignment_offset +
+                    delta);
+            }
+        }
+        journal->text_used =
+            (uint32_t)((ptrdiff_t)journal->text_used + delta);
+    }
+    write_assignment(journal->text + old_offset, name, name_length, value,
+                     value_length);
+    entry->assignment_length = (uint32_t)new_length;
+    entry->operation = (uint8_t)operation;
+    if (operation == GSH_VARIABLE_JOURNAL_UNSET) {
+        entry->attribute_mask = 0U;
+        entry->attributes = 0U;
+    } else {
+        entry->attribute_mask |= (uint16_t)attribute_mask;
+        entry->attributes = (uint16_t)((entry->attributes & ~attribute_mask) |
+                                       (attributes & attribute_mask));
+    }
+    return 0;
+}
+
+static int insert_journal_entry(
+    gsh_variable_journal *journal, unsigned int scope, const char *name,
+    size_t name_length, const char *value, size_t value_length,
+    size_t new_length, unsigned int attribute_mask,
+    unsigned int attributes, gsh_variable_journal_operation operation)
+{
+    size_t index;
+
+    if (!require(journal != NULL && journal->count <=
+                                      GSH_VARIABLE_JOURNAL_CAP)) return -1;
+    if (!require(name != NULL && value != NULL)) return -1;
+    if (journal->count == GSH_VARIABLE_JOURNAL_CAP ||
+        new_length > GSH_VARIABLE_JOURNAL_TEXT_CAP - journal->text_used) {
+        errno = ENOSPC;
+        return -1;
+    }
+    index = journal->count;
+    journal->entries[index].assignment_offset = journal->text_used;
+    journal->entries[index].assignment_length = (uint32_t)new_length;
+    journal->entries[index].name_length = (uint16_t)name_length;
+    journal->entries[index].attribute_mask = (uint16_t)attribute_mask;
+    journal->entries[index].attributes =
+        (uint16_t)(attributes & attribute_mask);
+    journal->entries[index].scope = (uint16_t)scope;
+    journal->entries[index].operation = (uint8_t)operation;
+    (void)memset(journal->entries[index].reserved, 0,
+           sizeof(journal->entries[index].reserved));
+    write_assignment(journal->text + journal->text_used, name, name_length,
+                     value, value_length);
+    journal->text_used += (uint32_t)new_length;
+    journal->count++;
+    return 0;
 }
 
 static int journal_record(
@@ -602,6 +810,7 @@ static int journal_record(
     unsigned int attribute_mask, unsigned int attributes,
     gsh_variable_journal_operation operation)
 {
+    if (journal == NULL) return -1;
     size_t index;
     size_t new_length;
 
@@ -627,97 +836,18 @@ static int journal_record(
     }
     index = journal_name_index(journal, scope, name, name_length);
     if (index != GSH_VARIABLE_JOURNAL_CAP) {
-        gsh_variable_journal_entry *entry = &journal->entries[index];
-        size_t old_offset = entry->assignment_offset;
-        size_t old_length = entry->assignment_length;
-        size_t tail_offset = old_offset + old_length;
-        size_t tail_length = journal->text_used - tail_offset;
-        size_t other;
-
-        if ((entry->attributes & GSH_VARIABLE_READONLY) != 0 &&
-            (operation != GSH_VARIABLE_JOURNAL_ATTRIBUTES ||
-             ((attribute_mask & GSH_VARIABLE_READONLY) != 0 &&
-              (attributes & GSH_VARIABLE_READONLY) == 0))) {
-            errno = EROFS;
-            return -1;
-        }
-        if (operation == GSH_VARIABLE_JOURNAL_ATTRIBUTES) {
-            if (entry->operation == GSH_VARIABLE_JOURNAL_UNSET) {
-                entry->operation = GSH_VARIABLE_JOURNAL_UNSET_ATTRIBUTES;
-            }
-            entry->attribute_mask |= (uint16_t)attribute_mask;
-            entry->attributes = (uint16_t)(
-                (entry->attributes & ~attribute_mask) |
-                (attributes & attribute_mask));
-            return 0;
-        }
-        if (new_length > old_length &&
-            new_length - old_length >
-                GSH_VARIABLE_JOURNAL_TEXT_CAP - journal->text_used) {
-            errno = ENOSPC;
-            return -1;
-        }
-        memmove(journal->text + old_offset + new_length,
-                journal->text + tail_offset, tail_length);
-        if (new_length != old_length) {
-            ptrdiff_t delta = (ptrdiff_t)new_length -
-                              (ptrdiff_t)old_length;
-
-            for (other = 0; other < journal->count; other++) {
-                if (other != index &&
-                    journal->entries[other].assignment_offset > old_offset) {
-                    journal->entries[other].assignment_offset =
-                        (uint32_t)((ptrdiff_t)journal->entries[other]
-                                       .assignment_offset +
-                                   delta);
-                }
-            }
-            journal->text_used =
-                (uint32_t)((ptrdiff_t)journal->text_used + delta);
-        }
-        write_assignment(journal->text + old_offset, name, name_length,
-                         value, value_length);
-        entry->assignment_length = (uint32_t)new_length;
-        entry->operation = (uint8_t)operation;
-        if (operation == GSH_VARIABLE_JOURNAL_UNSET) {
-            entry->attribute_mask = 0;
-            entry->attributes = 0;
-        } else {
-            entry->attribute_mask |= (uint16_t)attribute_mask;
-            entry->attributes = (uint16_t)(
-                (entry->attributes & ~attribute_mask) |
-                (attributes & attribute_mask));
-        }
-        return 0;
+        return update_journal_entry(
+            journal, index, name, name_length, value, value_length,
+            new_length, attribute_mask, attributes, operation);
     }
-    if (journal->count == GSH_VARIABLE_JOURNAL_CAP) {
-        errno = ENOSPC;
-        return -1;
-    }
-    if (new_length > GSH_VARIABLE_JOURNAL_TEXT_CAP - journal->text_used) {
-        errno = ENOSPC;
-        return -1;
-    }
-    index = journal->count;
-    journal->entries[index].assignment_offset = journal->text_used;
-    journal->entries[index].assignment_length = (uint32_t)new_length;
-    journal->entries[index].name_length = (uint16_t)name_length;
-    journal->entries[index].attribute_mask = (uint16_t)attribute_mask;
-    journal->entries[index].attributes =
-        (uint16_t)(attributes & attribute_mask);
-    journal->entries[index].scope = (uint16_t)scope;
-    journal->entries[index].operation = (uint8_t)operation;
-    memset(journal->entries[index].reserved, 0,
-           sizeof(journal->entries[index].reserved));
-    write_assignment(journal->text + journal->text_used, name, name_length,
-                     value, value_length);
-    journal->text_used += (uint32_t)new_length;
-    journal->count++;
-    return 0;
+    return insert_journal_entry(
+        journal, scope, name, name_length, value, value_length, new_length,
+        attribute_mask, attributes, operation);
 }
 
 bool gsh_variable_journal_validate(const gsh_variable_journal *journal)
 {
+    if (journal == NULL) return false;
     size_t index;
 
     if (journal->version != GSH_VARIABLE_JOURNAL_VERSION ||
@@ -769,6 +899,9 @@ static int can_apply_journal_scope(const gsh_variable_store *store,
                                    unsigned int scope,
                                    bool require_only_scope)
 {
+    if (store == NULL) {
+        return -1;
+    }
     size_t final_count = store->count;
     size_t final_text = store->text_used;
     size_t index;
@@ -836,6 +969,9 @@ int gsh_variables_can_apply_journal(
     const gsh_variable_store *store,
     const gsh_variable_journal *journal)
 {
+    if (journal == NULL || store == NULL) {
+        return -1;
+    }
     return can_apply_journal_scope(store, journal, 0, true);
 }
 
@@ -843,6 +979,9 @@ int gsh_variables_can_apply_journal_scope(
     const gsh_variable_store *store, const gsh_variable_journal *journal,
     unsigned int scope)
 {
+    if (journal == NULL || store == NULL) {
+        return -1;
+    }
     return can_apply_journal_scope(store, journal, scope, false);
 }
 
@@ -850,6 +989,9 @@ static int apply_journal_entry(
     gsh_variable_store *store, const gsh_variable_journal_entry *entry,
     const char *assignment)
 {
+    if (assignment == NULL || entry == NULL || store == NULL) {
+        return -1;
+    }
     const char *value = assignment + entry->name_length + 1U;
     size_t value_length = entry->assignment_length - entry->name_length - 2U;
 
@@ -923,14 +1065,17 @@ int gsh_variables_apply_journal(gsh_variable_store *store,
                                 const gsh_variable_journal *journal,
                                 gsh_variable_store *scratch)
 {
+    if (store == NULL) {
+        return -1;
+    }
     if (scratch == NULL || !gsh_variable_journal_validate(journal)) {
         errno = EPROTO;
         return -1;
     }
-    memcpy(scratch, store, sizeof(*scratch));
+    (void)memcpy(scratch, store, sizeof(*scratch));
     if (gsh_variables_apply_journal_in_place(scratch, journal) == -1) {
         return -1;
     }
-    memcpy(store, scratch, sizeof(*store));
+    (void)memcpy(store, scratch, sizeof(*store));
     return 0;
 }

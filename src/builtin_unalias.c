@@ -12,11 +12,14 @@ int gsh_builtin_unalias(size_t argc, char *const argv[],
                         gsh_alias_journal *journal,
                         const gsh_builtin_io *io)
 {
+    if (aliases == NULL) {
+        return -1;
+    }
     size_t index = 1;
     bool all = false;
     int status = 0;
 
-    if (argc == 0 || argv == NULL || io == NULL || io->output == NULL) {
+    if (argc == 0 || argv == NULL || !gsh_builtin_io_valid(io)) {
         errno = EINVAL;
         return 125;
     }

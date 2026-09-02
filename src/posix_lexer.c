@@ -13,8 +13,11 @@
 #include <stdbool.h>
 #include <string.h>
 
+#define require(condition) (condition)
+
 enum {
     CONTEXT_CAP = 128,
+    LEXER_TRIVIA_STEP_CAP = 1024 * 1024 + 1,
 };
 
 typedef enum {
@@ -62,6 +65,7 @@ static const operator_definition OPERATORS[] = {
 
 static void advance_one(gsh_lexer *lexer)
 {
+    if (lexer == NULL) return;
     if (lexer->input[lexer->offset] == '\n') {
         lexer->line++;
         lexer->column = 1;
@@ -73,6 +77,9 @@ static void advance_one(gsh_lexer *lexer)
 
 static void advance_count(gsh_lexer *lexer, size_t count)
 {
+    if (lexer == NULL) {
+        return;
+    }
     while (count-- > 0) {
         advance_one(lexer);
     }
@@ -81,6 +88,10 @@ static void advance_count(gsh_lexer *lexer, size_t count)
 static bool push_context(gsh_lexer *lexer, context_stack *stack,
                          context_kind context)
 {
+    if (stack == NULL) return false;
+    if (lexer == NULL) {
+        return false;
+    }
     if (stack->length == CONTEXT_CAP) {
         lexer->status = GSH_LEX_LIMIT;
         lexer->error_offset = lexer->offset;
@@ -92,6 +103,7 @@ static bool push_context(gsh_lexer *lexer, context_stack *stack,
 
 static void pop_context(context_stack *stack)
 {
+    if (stack == NULL) return;
     if (stack->length > 0) {
         stack->length--;
     }
@@ -100,6 +112,9 @@ static void pop_context(context_stack *stack)
 static bool starts_with(const gsh_lexer *lexer, const char *text,
                         size_t length)
 {
+    if (lexer == NULL || text == NULL) {
+        return false;
+    }
     return length <= lexer->length - lexer->offset &&
            memcmp(lexer->input + lexer->offset, text, length) == 0;
 }
@@ -120,6 +135,9 @@ static const operator_definition *operator_at(const gsh_lexer *lexer)
 
 static bool begin_substitution(gsh_lexer *lexer, context_stack *stack)
 {
+    if (stack == NULL) {
+        return false;
+    }
     if (starts_with(lexer, "$((", 3)) {
         if (!push_context(lexer, stack, CONTEXT_ARITHMETIC)) {
             return false;
@@ -153,16 +171,117 @@ static bool begin_substitution(gsh_lexer *lexer, context_stack *stack)
 
 static void consume_escape(gsh_lexer *lexer)
 {
+    if (lexer == NULL) {
+        return;
+    }
     advance_one(lexer);
     if (lexer->offset < lexer->length) {
         advance_one(lexer);
     }
 }
 
+static bool scan_plain_word_byte(gsh_lexer *lexer, context_stack *stack,
+                                 unsigned char byte)
+{
+    if (!require(lexer != NULL && stack != NULL)) return false;
+    if (!require(stack->length == 0U)) return false;
+    if (byte == '\\') {
+        consume_escape(lexer);
+    } else if (byte == '\'') {
+        if (!push_context(lexer, stack, CONTEXT_SINGLE)) return false;
+        advance_one(lexer);
+    } else if (byte == '"') {
+        if (!push_context(lexer, stack, CONTEXT_DOUBLE)) return false;
+        advance_one(lexer);
+    } else if (byte == 0x60U) {
+        if (!push_context(lexer, stack, CONTEXT_BACKQUOTE)) return false;
+        advance_one(lexer);
+    } else if (byte != '$' || !begin_substitution(lexer, stack)) {
+        advance_one(lexer);
+    }
+    return true;
+}
+
+static bool scan_quoted_word_byte(gsh_lexer *lexer, context_stack *stack,
+                                  context_kind context,
+                                  unsigned char byte)
+{
+    if (!require(lexer != NULL && stack != NULL)) return false;
+    if (!require(stack->length > 0U)) return false;
+    if (context == CONTEXT_SINGLE) {
+        advance_one(lexer);
+        if (byte == '\'') pop_context(stack);
+    } else if (context == CONTEXT_DOLLAR_SINGLE) {
+        if (byte == '\\') consume_escape(lexer);
+        else {
+            advance_one(lexer);
+            if (byte == '\'') pop_context(stack);
+        }
+    } else if (context == CONTEXT_BACKQUOTE) {
+        if (byte == '\\') consume_escape(lexer);
+        else {
+            advance_one(lexer);
+            if (byte == 0x60U) pop_context(stack);
+        }
+    } else if (byte == '"') {
+        advance_one(lexer);
+        pop_context(stack);
+    } else if (byte == '\\') {
+        consume_escape(lexer);
+    } else if (byte == 0x60U) {
+        if (!push_context(lexer, stack, CONTEXT_BACKQUOTE)) return false;
+        advance_one(lexer);
+    } else if (byte != '$' || !begin_substitution(lexer, stack)) {
+        advance_one(lexer);
+    }
+    return true;
+}
+
+static bool scan_nested_word_byte(gsh_lexer *lexer, context_stack *stack,
+                                  context_kind context,
+                                  unsigned char byte)
+{
+    if (!require(lexer != NULL && stack != NULL)) return false;
+    if (!require(stack->length > 0U)) return false;
+    if (byte == '\\') consume_escape(lexer);
+    else if (byte == '\'') {
+        if (!push_context(lexer, stack, CONTEXT_SINGLE)) return false;
+        advance_one(lexer);
+    } else if (byte == '"') {
+        if (!push_context(lexer, stack, CONTEXT_DOUBLE)) return false;
+        advance_one(lexer);
+    } else if (byte == 0x60U) {
+        if (!push_context(lexer, stack, CONTEXT_BACKQUOTE)) return false;
+        advance_one(lexer);
+    } else if (byte == '$' && begin_substitution(lexer, stack)) return true;
+    else if (context == CONTEXT_PARAMETER && byte == '}') {
+        advance_one(lexer);
+        pop_context(stack);
+    } else if ((context == CONTEXT_COMMAND ||
+                context == CONTEXT_PARENTHESIS) && byte == '(') {
+        if (!push_context(lexer, stack, CONTEXT_PARENTHESIS)) return false;
+        advance_one(lexer);
+    } else if ((context == CONTEXT_PARENTHESIS ||
+                context == CONTEXT_COMMAND) && byte == ')') {
+        advance_one(lexer);
+        pop_context(stack);
+    } else if (context == CONTEXT_ARITHMETIC &&
+               starts_with(lexer, "))", 2U)) {
+        advance_count(lexer, 2U);
+        pop_context(stack);
+    } else if (context == CONTEXT_ARITHMETIC && byte == '(') {
+        if (!push_context(lexer, stack, CONTEXT_PARENTHESIS)) return false;
+        advance_one(lexer);
+    } else advance_one(lexer);
+    return true;
+}
+
 static bool scan_word(gsh_lexer *lexer)
 {
     context_stack stack = {{0}, 0};
 
+    if (!require(lexer != NULL && lexer->input != NULL)) return false;
+    if (!require(lexer->offset <= lexer->length)) return false;
     while (lexer->offset < lexer->length) {
         unsigned char byte = lexer->input[lexer->offset];
         context_kind context = stack.length > 0
@@ -180,133 +299,19 @@ static bool scan_word(gsh_lexer *lexer)
                 operator_at(lexer) != NULL) {
                 return true;
             }
-            if (byte == '\\') {
-                consume_escape(lexer);
-                continue;
-            }
-            if (byte == '\'') {
-                if (!push_context(lexer, &stack, CONTEXT_SINGLE)) {
-                    return false;
-                }
-                advance_one(lexer);
-                continue;
-            }
-            if (byte == '"') {
-                if (!push_context(lexer, &stack, CONTEXT_DOUBLE)) {
-                    return false;
-                }
-                advance_one(lexer);
-                continue;
-            }
-            if (byte == 0x60U) {
-                if (!push_context(lexer, &stack, CONTEXT_BACKQUOTE)) {
-                    return false;
-                }
-                advance_one(lexer);
-                continue;
-            }
-            if (byte == '$' && begin_substitution(lexer, &stack)) {
-                continue;
-            }
-            advance_one(lexer);
+            if (!scan_plain_word_byte(lexer, &stack, byte)) return false;
             continue;
         }
 
-        if (context == CONTEXT_SINGLE) {
-            advance_one(lexer);
-            if (byte == '\'') {
-                pop_context(&stack);
+        if (context == CONTEXT_SINGLE ||
+            context == CONTEXT_DOLLAR_SINGLE ||
+            context == CONTEXT_BACKQUOTE || context == CONTEXT_DOUBLE) {
+            if (!scan_quoted_word_byte(lexer, &stack, context, byte)) {
+                return false;
             }
             continue;
         }
-        if (context == CONTEXT_DOLLAR_SINGLE) {
-            if (byte == '\\') {
-                consume_escape(lexer);
-            } else {
-                advance_one(lexer);
-                if (byte == '\'') {
-                    pop_context(&stack);
-                }
-            }
-            continue;
-        }
-        if (context == CONTEXT_BACKQUOTE) {
-            if (byte == '\\') {
-                consume_escape(lexer);
-            } else {
-                advance_one(lexer);
-                if (byte == 0x60U) {
-                    pop_context(&stack);
-                }
-            }
-            continue;
-        }
-        if (context == CONTEXT_DOUBLE) {
-            if (byte == '"') {
-                advance_one(lexer);
-                pop_context(&stack);
-            } else if (byte == '\\') {
-                consume_escape(lexer);
-            } else if (byte == 0x60U) {
-                if (!push_context(lexer, &stack, CONTEXT_BACKQUOTE)) {
-                    return false;
-                }
-                advance_one(lexer);
-            } else if (byte == '$' && begin_substitution(lexer, &stack)) {
-                continue;
-            } else {
-                advance_one(lexer);
-            }
-            continue;
-        }
-
-        if (byte == '\\') {
-            consume_escape(lexer);
-        } else if (byte == '\'') {
-            if (!push_context(lexer, &stack, CONTEXT_SINGLE)) {
-                return false;
-            }
-            advance_one(lexer);
-        } else if (byte == '"') {
-            if (!push_context(lexer, &stack, CONTEXT_DOUBLE)) {
-                return false;
-            }
-            advance_one(lexer);
-        } else if (byte == 0x60U) {
-            if (!push_context(lexer, &stack, CONTEXT_BACKQUOTE)) {
-                return false;
-            }
-            advance_one(lexer);
-        } else if (byte == '$' && begin_substitution(lexer, &stack)) {
-            continue;
-        } else if (context == CONTEXT_PARAMETER && byte == '}') {
-            advance_one(lexer);
-            pop_context(&stack);
-        } else if ((context == CONTEXT_COMMAND ||
-                    context == CONTEXT_PARENTHESIS) &&
-                   byte == '(') {
-            if (!push_context(lexer, &stack, CONTEXT_PARENTHESIS)) {
-                return false;
-            }
-            advance_one(lexer);
-        } else if (context == CONTEXT_PARENTHESIS && byte == ')') {
-            advance_one(lexer);
-            pop_context(&stack);
-        } else if (context == CONTEXT_COMMAND && byte == ')') {
-            advance_one(lexer);
-            pop_context(&stack);
-        } else if (context == CONTEXT_ARITHMETIC &&
-                   starts_with(lexer, "))", 2)) {
-            advance_count(lexer, 2);
-            pop_context(&stack);
-        } else if (context == CONTEXT_ARITHMETIC && byte == '(') {
-            if (!push_context(lexer, &stack, CONTEXT_PARENTHESIS)) {
-                return false;
-            }
-            advance_one(lexer);
-        } else {
-            advance_one(lexer);
-        }
+        if (!scan_nested_word_byte(lexer, &stack, context, byte)) return false;
     }
 
     if (stack.length != 0) {
@@ -319,6 +324,9 @@ static bool scan_word(gsh_lexer *lexer)
 
 void gsh_lexer_init(gsh_lexer *lexer, const void *input, size_t length)
 {
+    if (input == NULL || lexer == NULL) {
+        return;
+    }
     lexer->input = input;
     lexer->length = length;
     lexer->offset = 0;
@@ -330,12 +338,18 @@ void gsh_lexer_init(gsh_lexer *lexer, const void *input, size_t length)
 
 gsh_lex_status gsh_lexer_next(gsh_lexer *lexer, gsh_token *token)
 {
+    if (lexer == NULL) return GSH_LEX_INVALID;
+    if (token == NULL) {
+        return GSH_LEX_LIMIT;
+    }
     const operator_definition *operator;
+    size_t trivia_step;
 
     if (lexer->status != GSH_LEX_OK) {
         return lexer->status;
     }
-    for (;;) {
+    for (trivia_step = 0; trivia_step < LEXER_TRIVIA_STEP_CAP;
+         trivia_step++) {
         while (lexer->offset < lexer->length &&
                (lexer->input[lexer->offset] == ' ' ||
                 lexer->input[lexer->offset] == '\t')) {
@@ -356,6 +370,11 @@ gsh_lex_status gsh_lexer_next(gsh_lexer *lexer, gsh_token *token)
             continue;
         }
         break;
+    }
+    if (trivia_step == LEXER_TRIVIA_STEP_CAP) {
+        lexer->status = GSH_LEX_LIMIT;
+        lexer->error_offset = lexer->offset;
+        return lexer->status;
     }
 
     token->begin = lexer->offset;

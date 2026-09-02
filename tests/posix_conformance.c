@@ -10,20 +10,16 @@
 
 #include "../src/source_workspace.h"
 
-#include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <locale.h>
 #include <poll.h>
-#include <signal.h>
-#include <stdbool.h>
-#include <stdint.h>
+#include <signal.h> /* CANON-INCLUDE: macos */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
-#include <sys/types.h>
-#include <sys/wait.h>
+#include <sys/wait.h> /* CANON-INCLUDE: linux */
 #include <time.h>
 #include <unistd.h>
 
@@ -35,13 +31,25 @@ typedef struct {
     const char *diagnostic;
 } syntax_case;
 
-enum { ECHO_DIFFERENTIAL_CASE_COUNT = 15 };
+enum {
+    ECHO_DIFFERENTIAL_CASE_COUNT = 15,
+    CONFORMANCE_WAIT_ATTEMPT_CAP = 4096,
+};
 
 typedef struct {
     unsigned char bytes[65536];
     size_t length;
     int status;
 } command_capture;
+
+static bool require(bool condition)
+{
+    if (!condition) {
+        errno = EINVAL;
+        return false;
+    }
+    return true;
+}
 
 static int build_nested_substitution(char *command, size_t capacity,
                                      size_t depth)
@@ -56,14 +64,14 @@ static int build_nested_substitution(char *command, size_t capacity,
         sizeof(prefix) > capacity) {
         return -1;
     }
-    memcpy(command, prefix, sizeof(prefix));
+    (void)memcpy(command, prefix, sizeof(prefix));
     used = sizeof(prefix) - 1U;
     for (index = 0; index < GSH_SOURCE_DEPTH_CAP + 1U && index < depth;
          index++) {
         if (sizeof(opening) - 1U > capacity - used - 1U) {
             return -1;
         }
-        memcpy(command + used, opening, sizeof(opening) - 1U);
+        (void)memcpy(command + used, opening, sizeof(opening) - 1U);
         used += sizeof(opening) - 1U;
     }
     if (used + 1U >= capacity) {
@@ -75,7 +83,7 @@ static int build_nested_substitution(char *command, size_t capacity,
         if (sizeof(closing) - 1U > capacity - used - 1U) {
             return -1;
         }
-        memcpy(command + used, closing, sizeof(closing) - 1U);
+        (void)memcpy(command + used, closing, sizeof(closing) - 1U);
         used += sizeof(closing) - 1U;
     }
     if (used + 1U >= capacity) {
@@ -83,14 +91,15 @@ static int build_nested_substitution(char *command, size_t capacity,
     }
     command[used++] = '"';
     command[used] = '\0';
-    assert(used < capacity);
-    assert(index == depth);
     return 0;
 }
 
 static int build_nested_eval(char *command, size_t capacity,
                              size_t final_index)
 {
+    if (command == NULL) {
+        return -1;
+    }
     size_t used = 0;
     size_t index;
     int length;
@@ -142,6 +151,9 @@ static uint64_t monotonic_ns(void)
 
 static bool bytes_contain(const char *data, size_t length, const char *needle)
 {
+    if (needle == NULL) {
+        return false;
+    }
     size_t needle_length = strlen(needle);
     size_t index;
 
@@ -158,6 +170,7 @@ static bool bytes_contain(const char *data, size_t length, const char *needle)
 
 static bool valid_hexadecimal_float_output(const char *data, size_t length)
 {
+    if (data == NULL) return false;
     char copy[128];
     char *separator;
     char *end;
@@ -167,7 +180,7 @@ static bool valid_hexadecimal_float_output(const char *data, size_t length)
     if (length < 8U || length >= sizeof(copy) || data[length - 1U] != '\n') {
         return false;
     }
-    memcpy(copy, data, length);
+    (void)memcpy(copy, data, length);
     copy[length - 1U] = '\0';
     separator = strchr(copy, ':');
     if (separator == NULL || strchr(separator + 1, ':') != NULL) {
@@ -192,181 +205,294 @@ static bool valid_hexadecimal_float_output(const char *data, size_t length)
     return errno == 0 && *end == '\0' && upper_value == 2.0;
 }
 
-static int run_case_arguments(
+static void execute_case_child(
     const char *executable, const syntax_case *test, bool syntax_only,
     const char *parameter_zero, const char *const *positionals,
-    size_t positional_count)
+    size_t positional_count, int descriptors[2])
 {
-    char diagnostic[65536];
-    char discarded[4096];
-    size_t diagnostic_length = 0;
-    uint64_t deadline;
-    int descriptors[2];
+    char *arguments[134];
+    size_t argument_count = 0;
+    size_t index;
+
+    if (!require(executable != NULL && test != NULL)) _exit(125);
+    if (!require(descriptors != NULL && positional_count <= 128U)) {
+        _exit(125);
+    }
+    if (positional_count != 0U &&
+        (parameter_zero == NULL || positionals == NULL)) {
+        _exit(125);
+    }
+    arguments[argument_count++] = (char *)executable;
+    arguments[argument_count++] = (char *)(syntax_only ? "-n"
+                                                       : "--native-only");
+    arguments[argument_count++] = (char *)"-c";
+    arguments[argument_count++] = (char *)test->command;
+    if (!syntax_only && parameter_zero != NULL) {
+        arguments[argument_count++] = (char *)parameter_zero;
+        for (index = 0; index < positional_count; index++) {
+            arguments[argument_count++] = (char *)positionals[index];
+        }
+    }
+    arguments[argument_count] = NULL;
+    (void)close(descriptors[0]);
+    if (dup2(descriptors[1], STDERR_FILENO) == -1 ||
+        dup2(descriptors[1], STDOUT_FILENO) == -1) _exit(126);
+    (void)close(descriptors[1]);
+    execv(executable, arguments);
+    _exit(127);
+}
+
+static int configure_case_capture(pid_t pid, int descriptor)
+{
     int flags;
-    int status = 0;
-    pid_t pid;
 
-    if (positional_count > 128U || pipe(descriptors) == -1) {
-        return -1;
-    }
-    pid = fork();
-    if (pid == 0) {
-        char *arguments[134];
-        size_t argument_count = 0;
-        size_t index;
-
-        arguments[argument_count++] = (char *)executable;
-        if (syntax_only) {
-            arguments[argument_count++] = (char *)"-n";
-        } else {
-            arguments[argument_count++] = (char *)"--native-only";
-        }
-        arguments[argument_count++] = (char *)"-c";
-        arguments[argument_count++] = (char *)test->command;
-        if (!syntax_only && parameter_zero != NULL) {
-            arguments[argument_count++] = (char *)parameter_zero;
-            for (index = 0; index < positional_count; index++) {
-                arguments[argument_count++] = (char *)positionals[index];
-            }
-        }
-        arguments[argument_count] = NULL;
-
-        close(descriptors[0]);
-        if (dup2(descriptors[1], STDERR_FILENO) == -1 ||
-            dup2(descriptors[1], STDOUT_FILENO) == -1) {
-            _exit(126);
-        }
-        close(descriptors[1]);
-        execv(executable, arguments);
-        _exit(127);
-    }
-    close(descriptors[1]);
-    if (pid == -1) {
-        close(descriptors[0]);
-        return -1;
-    }
-    flags = fcntl(descriptors[0], F_GETFL);
+    if (!require(pid > 0)) return -1;
+    if (!require(descriptor >= 0)) return -1;
+    flags = fcntl(descriptor, F_GETFL);
     if (flags == -1 ||
-        fcntl(descriptors[0], F_SETFL, flags | O_NONBLOCK) == -1) {
+        fcntl(descriptor, F_SETFL, flags | O_NONBLOCK) == -1) {
         (void)kill(pid, SIGKILL);
         (void)waitpid(pid, NULL, 0);
-        close(descriptors[0]);
+        (void)close(descriptor);
         return -1;
     }
+    return 0;
+}
 
-    deadline = monotonic_ns() + 2000000000ULL;
-    for (;;) {
-        pid_t waited = waitpid(pid, &status, WNOHANG);
-        ssize_t count;
+static void read_case_available(int descriptor, char *diagnostic,
+                                size_t capacity, size_t *used)
+{
+    char discarded[4096];
+    ssize_t count;
 
-        do {
-            char *destination = diagnostic_length < sizeof(diagnostic)
-                                    ? diagnostic + diagnostic_length
-                                    : discarded;
-            size_t capacity = diagnostic_length < sizeof(diagnostic)
-                                  ? sizeof(diagnostic) - diagnostic_length
-                                  : sizeof(discarded);
+    if (!require(descriptor >= 0 && diagnostic != NULL)) return;
+    if (!require(used != NULL && *used <= capacity)) return;
+    do {
+        char *destination = *used < capacity ? diagnostic + *used
+                                             : discarded;
+        size_t available = *used < capacity ? capacity - *used
+                                            : sizeof(discarded);
 
-            count = read(descriptors[0], destination, capacity);
-            if (count > 0) {
-                if (destination != discarded) {
-                    diagnostic_length += (size_t)count;
-                }
-            }
-        } while (count > 0);
-        if (waited == pid) {
-            break;
-        }
-        if (waited == -1 && errno != EINTR) {
-            close(descriptors[0]);
+        count = read(descriptor, destination, available);
+        if (count > 0 && destination != discarded) *used += (size_t)count;
+    } while (count > 0);
+}
+
+static int wait_case_capture(pid_t pid, int descriptor,
+                             const syntax_case *test, char *diagnostic,
+                             size_t capacity, size_t *used, int *status)
+{
+    uint64_t deadline = monotonic_ns() + 2000000000ULL;
+    size_t attempt;
+
+    if (!require(pid > 0 && descriptor >= 0 && test != NULL)) return -1;
+    if (!require(diagnostic != NULL && used != NULL && status != NULL)) {
+        return -1;
+    }
+    for (attempt = 0; attempt < CONFORMANCE_WAIT_ATTEMPT_CAP; attempt++) {
+        pid_t waited = waitpid(pid, status, WNOHANG);
+        int wait_error = errno;
+
+        read_case_available(descriptor, diagnostic, capacity, used);
+        if (waited == pid) break;
+        if (waited == -1 && wait_error != EINTR) {
+            (void)fprintf(stderr,
+                    "conformance: waitpid failed for %s: %s\n",
+                    test->name, strerror(wait_error));
             return -1;
         }
         if (monotonic_ns() >= deadline) {
             (void)kill(pid, SIGKILL);
             (void)waitpid(pid, NULL, 0);
-            close(descriptors[0]);
-            fprintf(stderr, "conformance: timeout: %s\n", test->name);
+            (void)fprintf(stderr, "conformance: timeout: %s\n", test->name);
             return 1;
         }
         {
-            struct pollfd descriptor = {descriptors[0], POLLIN, 0};
+            struct pollfd item = {descriptor, POLLIN, 0};
 
-            (void)poll(&descriptor, 1, 10);
+            (void)poll(&item, 1, 10);
+            (void)poll(NULL, 0, 1);
         }
     }
-    for (;;) {
-        char *destination = diagnostic_length < sizeof(diagnostic)
-                                ? diagnostic + diagnostic_length
-                                : discarded;
-        size_t capacity = diagnostic_length < sizeof(diagnostic)
-                              ? sizeof(diagnostic) - diagnostic_length
-                              : sizeof(discarded);
-        ssize_t count = read(descriptors[0], destination, capacity);
+    if (attempt == CONFORMANCE_WAIT_ATTEMPT_CAP) {
+        (void)fprintf(stderr,
+                "conformance: wait attempt limit reached: %s\n",
+                test->name);
+        return -1;
+    }
+    read_case_available(descriptor, diagnostic, capacity, used);
+    return 0;
+}
 
-        if (count > 0) {
-            if (destination != discarded) {
-                diagnostic_length += (size_t)count;
-            }
-        } else if (count == -1 && errno == EINTR) {
-            continue;
-        } else {
-            break;
+static int verify_case_capture(const syntax_case *test,
+                               const char diagnostic[static 65536],
+                               size_t diagnostic_length, int status)
+{
+    bool status_matches;
+    bool diagnostic_matches;
+
+    if (!require(test != NULL && diagnostic != NULL)) return 1;
+    if (!require(diagnostic_length <= 65536U)) return 1;
+    status_matches =
+        (test->status >= 0 && WIFEXITED(status) &&
+         WEXITSTATUS(status) == test->status) ||
+        (test->status < 0 && WIFSIGNALED(status) &&
+         WTERMSIG(status) == -test->status);
+    diagnostic_matches =
+        test->diagnostic == NULL ||
+        (strcmp(test->name, "printf hexadecimal floating conversions") == 0
+             ? valid_hexadecimal_float_output(diagnostic,
+                                              diagnostic_length)
+             : bytes_contain(diagnostic, diagnostic_length,
+                             test->diagnostic));
+    if (status_matches && diagnostic_matches) return 0;
+    (void)fprintf(stderr,
+            "conformance: %s (%s): expected status %d and diagnostic %s\n",
+            test->name, test->section, test->status,
+            test->diagnostic != NULL ? test->diagnostic : "<none>");
+    if (diagnostic_length > 0) {
+        size_t offset;
+
+        for (offset = 0U; offset < diagnostic_length && offset < 65536U;
+             offset++) {
+            (void)fputc((unsigned char)diagnostic[offset], stderr);
         }
     }
-    close(descriptors[0]);
+    return 1;
+}
 
-    {
-        bool status_matches =
-            (test->status >= 0 && WIFEXITED(status) &&
-             WEXITSTATUS(status) == test->status) ||
-            (test->status < 0 && WIFSIGNALED(status) &&
-             WTERMSIG(status) == -test->status);
-        bool diagnostic_matches =
-            test->diagnostic == NULL ||
-            (strcmp(test->name, "printf hexadecimal floating conversions") ==
-                 0
-                 ? valid_hexadecimal_float_output(diagnostic,
-                                                  diagnostic_length)
-                 : bytes_contain(diagnostic, diagnostic_length,
-                                 test->diagnostic));
-
-        if (status_matches && diagnostic_matches) {
-            return 0;
-        }
-        fprintf(stderr,
-                "conformance: %s (%s): expected status %d and diagnostic "
-                "%s\n",
-                test->name, test->section, test->status,
-                test->diagnostic != NULL ? test->diagnostic : "<none>");
-        if (diagnostic_length > 0) {
-            size_t safe_length = diagnostic_length < sizeof(diagnostic)
-                                     ? diagnostic_length
-                                     : sizeof(diagnostic);
-
-            (void)fwrite(diagnostic, 1, safe_length, stderr);
-        }
-        return 1;
+static int run_case_arguments(
+    const char *executable, const syntax_case *test, bool syntax_only,
+    const char *parameter_zero, const char *const *positionals,
+    size_t positional_count)
+{
+    if (executable == NULL || test == NULL ||
+        (positional_count != 0U &&
+         (parameter_zero == NULL || positionals == NULL))) {
+        return -1;
     }
+    char diagnostic[65536];
+    size_t diagnostic_length = 0;
+    int descriptors[2];
+    int status = 0;
+    int capture_status;
+    pid_t pid;
+
+    if (positional_count > 128U || pipe(descriptors) == -1) return -1;
+    pid = fork();
+    if (pid == 0) execute_case_child(
+        executable, test, syntax_only, parameter_zero, positionals,
+        positional_count, descriptors);
+    (void)close(descriptors[1]);
+    if (pid == -1) {
+        (void)close(descriptors[0]);
+        return -1;
+    }
+    if (configure_case_capture(pid, descriptors[0]) != 0) return -1;
+    capture_status = wait_case_capture(
+        pid, descriptors[0], test, diagnostic, sizeof(diagnostic),
+        &diagnostic_length, &status);
+    (void)close(descriptors[0]);
+    return capture_status == 0
+               ? verify_case_capture(test, diagnostic,
+                                     diagnostic_length, status)
+               : capture_status;
 }
 
 static int run_case(const char *executable, const syntax_case *test,
                     bool syntax_only)
 {
+    if (executable == NULL || test == NULL) {
+        return -1;
+    }
     return run_case_arguments(executable, test, syntax_only, NULL, NULL, 0);
+}
+
+static void execute_capture_child(const char *executable, bool bash,
+                                  const char *command,
+                                  const char *bash_command,
+                                  int descriptors[2])
+{
+    if (bash_command == NULL || command == NULL || executable == NULL) {
+        return;
+    }
+    char *gsh_arguments[] = {(char *)executable, (char *)"-c",
+                             (char *)command, NULL};
+    char *bash_arguments[] = {
+        (char *)executable, (char *)"--noprofile", (char *)"--norc",
+        (char *)"-c", (char *)bash_command, NULL};
+
+    if (!require(executable != NULL && command != NULL)) _exit(125);
+    if (!require(bash_command != NULL && descriptors != NULL)) _exit(125);
+    (void)close(descriptors[0]);
+    if (dup2(descriptors[1], STDOUT_FILENO) == -1) _exit(126);
+    (void)close(descriptors[1]);
+    execv(executable, bash ? bash_arguments : gsh_arguments);
+    _exit(127);
+}
+
+static int read_command_capture(int descriptor, command_capture *capture)
+{
+    ssize_t count;
+
+    if (!require(descriptor >= 0)) return -1;
+    if (!require(capture != NULL &&
+                 capture->length <= sizeof(capture->bytes))) return -1;
+    do {
+        count = read(descriptor, capture->bytes + capture->length,
+                     sizeof(capture->bytes) - capture->length);
+        if (count > 0) capture->length += (size_t)count;
+    } while (count > 0 && capture->length < sizeof(capture->bytes));
+    if (capture->length < sizeof(capture->bytes)) return 0;
+    errno = EOVERFLOW;
+    return -1;
+}
+
+static int wait_command_capture(pid_t pid, int descriptor,
+                                command_capture *capture, int *wait_status)
+{
+    uint64_t deadline = monotonic_ns() + 2000000000ULL;
+    size_t attempt;
+
+    if (!require(pid > 0 && descriptor >= 0)) return -1;
+    if (!require(capture != NULL && wait_status != NULL)) return -1;
+    for (attempt = 0; attempt < CONFORMANCE_WAIT_ATTEMPT_CAP; attempt++) {
+        pid_t waited = waitpid(pid, wait_status, WNOHANG);
+        int wait_error = errno;
+
+        if (read_command_capture(descriptor, capture) != 0) break;
+        if (waited == pid) return read_command_capture(descriptor, capture);
+        if (waited == -1 && wait_error != EINTR) return -1;
+        if (monotonic_ns() >= deadline) {
+            errno = ETIMEDOUT;
+            break;
+        }
+        {
+            struct pollfd item = {descriptor, POLLIN, 0};
+
+            (void)poll(&item, 1, 10);
+            (void)poll(NULL, 0, 1);
+        }
+    }
+    (void)kill(pid, SIGKILL);
+    (void)waitpid(pid, NULL, 0);
+    return -1;
 }
 
 static int capture_shell_command(const char *executable, bool bash,
                                  const char *command,
                                  command_capture *capture)
 {
-    char bash_command[4096];
+    if (capture == NULL || executable == NULL) {
+        return -1;
+    }
+    char bash_command[4096] = {0};
     int descriptors[2];
-    int flags;
     int wait_status = 0;
-    uint64_t deadline;
+    int result;
     pid_t pid;
 
-    memset(capture, 0, sizeof(*capture));
+    (void)memset(capture, 0, sizeof(*capture));
     if (bash && snprintf(bash_command, sizeof(bash_command),
                          "shopt -u xpg_echo; %s", command) >=
                     (int)sizeof(bash_command)) {
@@ -374,81 +500,18 @@ static int capture_shell_command(const char *executable, bool bash,
     }
     if (pipe(descriptors) == -1) return -1;
     pid = fork();
-    if (pid == 0) {
-        char *gsh_arguments[] = {(char *)executable, (char *)"-c",
-                                 (char *)command, NULL};
-        char *bash_arguments[] = {
-            (char *)executable, (char *)"--noprofile", (char *)"--norc",
-            (char *)"-c", bash_command, NULL};
-
-        close(descriptors[0]);
-        if (dup2(descriptors[1], STDOUT_FILENO) == -1) _exit(126);
-        close(descriptors[1]);
-        execv(executable, bash ? bash_arguments : gsh_arguments);
-        _exit(127);
-    }
-    close(descriptors[1]);
+    if (pid == 0) execute_capture_child(
+        executable, bash, command, bash_command, descriptors);
+    (void)close(descriptors[1]);
     if (pid == -1) {
-        close(descriptors[0]);
+        (void)close(descriptors[0]);
         return -1;
     }
-    flags = fcntl(descriptors[0], F_GETFL);
-    if (flags == -1 ||
-        fcntl(descriptors[0], F_SETFL, flags | O_NONBLOCK) == -1) {
-        (void)kill(pid, SIGKILL);
-        (void)waitpid(pid, NULL, 0);
-        close(descriptors[0]);
-        return -1;
-    }
-    deadline = monotonic_ns() + 2000000000ULL;
-    for (;;) {
-        pid_t waited = waitpid(pid, &wait_status, WNOHANG);
-        ssize_t count;
-
-        do {
-            count = read(descriptors[0], capture->bytes + capture->length,
-                         sizeof(capture->bytes) - capture->length);
-            if (count > 0) capture->length += (size_t)count;
-        } while (count > 0 && capture->length < sizeof(capture->bytes));
-        if (capture->length == sizeof(capture->bytes)) {
-            (void)kill(pid, SIGKILL);
-            (void)waitpid(pid, NULL, 0);
-            close(descriptors[0]);
-            errno = EOVERFLOW;
-            return -1;
-        }
-        if (waited == pid) break;
-        if (waited == -1 && errno != EINTR) {
-            close(descriptors[0]);
-            return -1;
-        }
-        if (monotonic_ns() >= deadline) {
-            (void)kill(pid, SIGKILL);
-            (void)waitpid(pid, NULL, 0);
-            close(descriptors[0]);
-            errno = ETIMEDOUT;
-            return -1;
-        }
-        {
-            struct pollfd descriptor = {descriptors[0], POLLIN, 0};
-
-            (void)poll(&descriptor, 1, 10);
-        }
-    }
-    for (;;) {
-        ssize_t count = read(descriptors[0],
-                             capture->bytes + capture->length,
-                             sizeof(capture->bytes) - capture->length);
-
-        if (count > 0) {
-            capture->length += (size_t)count;
-        } else if (count == -1 && errno == EINTR) {
-            continue;
-        } else {
-            break;
-        }
-    }
-    close(descriptors[0]);
+    if (configure_case_capture(pid, descriptors[0]) != 0) return -1;
+    result = wait_command_capture(
+        pid, descriptors[0], capture, &wait_status);
+    (void)close(descriptors[0]);
+    if (result != 0) return -1;
     capture->status = WIFEXITED(wait_status) ? WEXITSTATUS(wait_status)
                                              : 128 + WTERMSIG(wait_status);
     return 0;
@@ -476,7 +539,7 @@ static int echo_differential_cases(const char *gsh, const char *bash)
     size_t index;
 
     if (bash == NULL || access(bash, X_OK) == -1) {
-        fprintf(stderr,
+        (void)fprintf(stderr,
                 "conformance: Bash is required for echo differential\n");
         return 1;
     }
@@ -491,7 +554,7 @@ static int echo_differential_cases(const char *gsh, const char *bash)
             actual.status != expected.status ||
             actual.length != expected.length ||
             memcmp(actual.bytes, expected.bytes, actual.length) != 0) {
-            fprintf(stderr, "conformance: echo differs from Bash: %s\n",
+            (void)fprintf(stderr, "conformance: echo differs from Bash: %s\n",
                     commands[index]);
             return 1;
         }
@@ -501,6 +564,9 @@ static int echo_differential_cases(const char *gsh, const char *bash)
 
 static int no_execution_case(const char *executable)
 {
+    if (executable == NULL) {
+        return -1;
+    }
     char directory[] = "/tmp/gsh-native-n-XXXXXX";
     char target[1024];
     char command[1200];
@@ -516,7 +582,7 @@ static int no_execution_case(const char *executable)
     }
     failed = run_case(executable, &test, true);
     if (access(target, F_OK) == 0 || errno != ENOENT) {
-        fprintf(stderr, "conformance: -n executed a side effect\n");
+        (void)fprintf(stderr, "conformance: -n executed a side effect\n");
         failed = 1;
         (void)unlink(target);
     }
@@ -530,7 +596,7 @@ static int write_repeated_byte(int descriptor, unsigned char byte,
     unsigned char bytes[4096];
     size_t written = 0;
 
-    memset(bytes, byte, sizeof(bytes));
+    (void)memset(bytes, byte, sizeof(bytes));
     while (written < count) {
         size_t available = count - written;
         size_t request = available < sizeof(bytes) ? available
@@ -661,6 +727,9 @@ static int native_unlimited_line_input_case(const char *executable)
 
 static int native_nonblocking_input_case(const char *executable)
 {
+    if (executable == NULL) {
+        return -1;
+    }
     static const char script[] = "exit 0\n";
     int input[2];
     int flags;
@@ -679,19 +748,19 @@ static int native_nonblocking_input_case(const char *executable)
     if (pid == 0) {
         char *const arguments[] = {(char *)executable, "-s", NULL};
 
-        close(input[1]);
+        (void)close(input[1]);
         if (dup2(input[0], STDIN_FILENO) == -1) {
             _exit(126);
         }
         if (input[0] != STDIN_FILENO) {
-            close(input[0]);
+            (void)close(input[0]);
         }
         execv(executable, arguments);
         _exit(127);
     }
     if (pid == -1) {
-        close(input[1]);
-        close(input[0]);
+        (void)close(input[1]);
+        (void)close(input[0]);
         return 1;
     }
     deadline = monotonic_ns() + 2000000000ULL;
@@ -708,8 +777,8 @@ static int native_nonblocking_input_case(const char *executable)
             (ssize_t)(sizeof(script) - 1U)) {
         blocking = false;
     }
-    close(input[1]);
-    close(input[0]);
+    (void)close(input[1]);
+    (void)close(input[0]);
     if (!blocking) {
         (void)kill(pid, SIGKILL);
     }
@@ -836,6 +905,9 @@ static int native_invocation_cases(const char *executable)
 static int create_source_fixture(const char *path, const char *text,
                                  mode_t mode)
 {
+    if (path == NULL || text == NULL) {
+        return -1;
+    }
     size_t length = strlen(text);
     size_t written = 0;
     size_t attempts;
@@ -887,6 +959,9 @@ typedef struct {
 static int source_fixture_path(char output[1024], const char *directory,
                                const char *name)
 {
+    if (directory == NULL || name == NULL || output == NULL) {
+        return -1;
+    }
     int length = snprintf(output, 1024, "%s/%s", directory, name);
 
     return length < 0 || length >= 1024 ? -1 : 0;
@@ -894,10 +969,13 @@ static int source_fixture_path(char output[1024], const char *directory,
 
 static int initialize_source_paths(source_fixtures *fixtures)
 {
+    if (fixtures == NULL) {
+        return -1;
+    }
     static const char template[] = "/tmp/gsh-native-source-XXXXXX";
 
-    memset(fixtures, 0, sizeof(*fixtures));
-    memcpy(fixtures->directory, template, sizeof(template));
+    (void)memset(fixtures, 0, sizeof(*fixtures));
+    (void)memcpy(fixtures->directory, template, sizeof(template));
     if (mkdtemp(fixtures->directory) == NULL) {
         return -1;
     }
@@ -932,6 +1010,9 @@ static int initialize_source_paths(source_fixtures *fixtures)
 
 static int initialize_source_files(const source_fixtures *fixtures)
 {
+    if (fixtures == NULL) {
+        return -1;
+    }
     static const char state[] =
         "GSH_DOT_VALUE=loaded\n"
         "gsh_dot_function() { /usr/bin/printf function; }\n"
@@ -978,6 +1059,9 @@ static int initialize_source_files(const source_fixtures *fixtures)
 
 static void destroy_source_fixtures(const source_fixtures *fixtures)
 {
+    if (fixtures == NULL) {
+        return;
+    }
     const char *paths[] = {
         fixtures->output, fixtures->print, fixtures->parse, fixtures->cd,
         fixtures->false_script, fixtures->empty, fixtures->outer,
@@ -998,6 +1082,7 @@ static void destroy_source_fixtures(const source_fixtures *fixtures)
 static int source_state_cases(const char *executable,
                               const source_fixtures *fixtures)
 {
+    if (fixtures == NULL) return -1;
     char command[8192];
     syntax_case test = {"dot", "slash pathname sources current state",
                         command, 0, "functionalias"};
@@ -1053,6 +1138,7 @@ static int source_state_cases(const char *executable,
 static int source_return_cases(const char *executable,
                                const source_fixtures *fixtures)
 {
+    if (fixtures == NULL) return -1;
     char command[8192];
     syntax_case test = {"dot", "dot return stops its source", command, 0,
                         "beforeafter:7"};
@@ -1094,6 +1180,7 @@ static int source_return_cases(const char *executable,
 static int source_status_cases(const char *executable,
                                const source_fixtures *fixtures)
 {
+    if (fixtures == NULL) return -1;
     char command[8192];
     syntax_case test = {"dot", "dot redirection spans its source", command,
                         0, "DOT_REDIRECT_RESTORED"};
@@ -1152,6 +1239,7 @@ static int source_status_cases(const char *executable,
 static int source_error_cases(const char *executable,
                               const source_fixtures *fixtures)
 {
+    if (fixtures == NULL) return -1;
     char command[8192];
     syntax_case test = {"dot", "missing dot file aborts the shell", command,
                         1, "No such file"};
@@ -1192,6 +1280,9 @@ static int source_error_cases(const char *executable,
 
 static int native_source_cases(const char *executable)
 {
+    if (executable == NULL) {
+        return -1;
+    }
     source_fixtures fixtures;
     int failed;
 
@@ -1267,8 +1358,6 @@ static int native_exit_file_cases(const char *executable)
     struct stat information;
     syntax_case test = {"exit", "exit crosses a dot frame", command, 20,
                         NULL};
-    int failed = 1;
-
     if (mkdtemp(directory) == NULL ||
         snprintf(source, sizeof(source), "%s/source", directory) >=
             (int)sizeof(source) ||
@@ -1278,7 +1367,10 @@ static int native_exit_file_cases(const char *executable)
         snprintf(command, sizeof(command), ". '%s'; :", source) >=
             (int)sizeof(command) ||
         run_case(executable, &test, false) != 0) {
-        goto done;
+        if (output[0] != '\0') (void)unlink(output);
+        if (source[0] != '\0') (void)unlink(source);
+        (void)rmdir(directory);
+        return 1;
     }
     test.name = "exit applies redirections before termination";
     test.status = 21;
@@ -1287,10 +1379,11 @@ static int native_exit_file_cases(const char *executable)
         run_case(executable, &test, false) != 0 ||
         stat(output, &information) == -1 ||
         !S_ISREG(information.st_mode) || information.st_size != 0) {
-        goto done;
+        if (output[0] != '\0') (void)unlink(output);
+        if (source[0] != '\0') (void)unlink(source);
+        (void)rmdir(directory);
+        return 1;
     }
-    failed = 0;
-done:
     if (output[0] != '\0') {
         (void)unlink(output);
     }
@@ -1298,11 +1391,14 @@ done:
         (void)unlink(source);
     }
     (void)rmdir(directory);
-    return failed;
+    return 0;
 }
 
 static int native_exit_cases(const char *executable)
 {
+    if (executable == NULL) {
+        return -1;
+    }
     return native_exit_core_cases(executable) != 0 ||
            native_exit_file_cases(executable) != 0;
 }
@@ -1388,6 +1484,9 @@ static int enoexec_environment_cases(const char *executable,
 
 static int native_enoexec_cases(const char *executable)
 {
+    if (executable == NULL) {
+        return -1;
+    }
     static const char source[] =
         "/usr/bin/printf '<script:%s:%s:%s:%s>\\n' \"$0\" "
         "\"${1-unset}\" \"${2-unset}\" \"${GSH_ENOEXEC_ENV-unset}\"\n"
@@ -1415,6 +1514,9 @@ static int native_enoexec_cases(const char *executable)
 
 static int native_umask_creation_case(const char *executable)
 {
+    if (executable == NULL) {
+        return -1;
+    }
     char directory[] = "/tmp/gsh-native-umask-XXXXXX";
     char target[1024];
     char command[1200];
@@ -1433,7 +1535,7 @@ static int native_umask_creation_case(const char *executable)
     failed = run_case(executable, &test, false);
     if (stat(target, &information) == -1 ||
         (information.st_mode & 0777) != 0600) {
-        fprintf(stderr, "conformance: umask did not affect redirection\n");
+        (void)fprintf(stderr, "conformance: umask did not affect redirection\n");
         failed = 1;
     }
     (void)unlink(target);
@@ -1444,6 +1546,9 @@ static int native_umask_creation_case(const char *executable)
 static pid_t start_builtin_with_broken_output(const char *executable,
                                               const char *command)
 {
+    if (command == NULL || executable == NULL) {
+        return -1;
+    }
     int descriptors[2];
     pid_t pid;
 
@@ -1474,6 +1579,9 @@ static pid_t start_builtin_with_broken_output(const char *executable,
 
 static int native_builtin_output_failure_cases(const char *executable)
 {
+    if (executable == NULL) {
+        return -1;
+    }
     static const char *const commands[] = {
         "umask", "ulimit -S -n", "times", "export -p",
         "readonly GSH_CLOSED_OUTPUT=value; readonly -p",
@@ -1490,7 +1598,8 @@ static int native_builtin_output_failure_cases(const char *executable)
             return 1;
         }
         deadline = monotonic_ns() + 2000000000ULL;
-        for (;;) {
+        for (size_t attempt = 0;
+             attempt < CONFORMANCE_WAIT_ATTEMPT_CAP; attempt++) {
             pid_t waited = waitpid(pid, &status, WNOHANG);
 
             if (waited == pid) {
@@ -1502,19 +1611,30 @@ static int native_builtin_output_failure_cases(const char *executable)
             if (monotonic_ns() >= deadline) {
                 (void)kill(pid, SIGKILL);
                 (void)waitpid(pid, NULL, 0);
-                fprintf(stderr, "conformance: builtin output failure timeout\n");
+                (void)fprintf(stderr, "conformance: builtin output failure timeout\n");
                 return 1;
             }
             (void)poll(NULL, 0, 10);
         }
         if (!WIFEXITED(status) || WEXITSTATUS(status) != 1) {
-            fprintf(stderr,
+            (void)fprintf(stderr,
                     "conformance: builtin output failure was not reported: %s\n",
                     commands[index]);
             return 1;
         }
     }
     return 0;
+}
+
+static int finish_redirection_fixture(const char *directory,
+                                      const char *target, int failed)
+{
+    if (directory == NULL || target == NULL) {
+        return -1;
+    }
+    (void)unlink(target);
+    (void)rmdir(directory);
+    return failed;
 }
 
 static int native_redirection_cases(const char *executable)
@@ -1538,36 +1658,31 @@ static int native_redirection_cases(const char *executable)
                  "/usr/bin/printf 'first\\n' > %s", target) >=
             (int)sizeof(command) ||
         run_case(executable, &test, false) != 0) {
-        failed = 1;
-        goto done;
+        return finish_redirection_fixture(directory, target, 1);
     }
     test.name = "native append redirection";
     if (snprintf(command, sizeof(command),
                  "/usr/bin/printf 'second\\n' >> %s", target) >=
             (int)sizeof(command) ||
         run_case(executable, &test, false) != 0) {
-        failed = 1;
-        goto done;
+        return finish_redirection_fixture(directory, target, 1);
     }
     descriptor = open(target, O_RDONLY);
     if (descriptor == -1) {
-        failed = 1;
-        goto done;
+        return finish_redirection_fixture(directory, target, 1);
     }
     length = read(descriptor, contents, sizeof(contents));
-    close(descriptor);
+    (void)close(descriptor);
     if (length != 13 || memcmp(contents, "first\nsecond\n", 13) != 0) {
-        fprintf(stderr, "conformance: native redirection content mismatch\n");
-        failed = 1;
-        goto done;
+        (void)fprintf(stderr, "conformance: native redirection content mismatch\n");
+        return finish_redirection_fixture(directory, target, 1);
     }
     test.name = "native input redirection";
     test.diagnostic = "first\nsecond\n";
     if (snprintf(command, sizeof(command), "/bin/cat < %s", target) >=
             (int)sizeof(command) ||
         run_case(executable, &test, false) != 0) {
-        failed = 1;
-        goto done;
+        return finish_redirection_fixture(directory, target, 1);
     }
 
     test.name = "native descriptor ordering to file";
@@ -1576,20 +1691,17 @@ static int native_redirection_cases(const char *executable)
                  "/usr/bin/printf routed 2>%s 1>&2", target) >=
             (int)sizeof(command) ||
         run_case(executable, &test, false) != 0) {
-        failed = 1;
-        goto done;
+        return finish_redirection_fixture(directory, target, 1);
     }
     descriptor = open(target, O_RDONLY);
     if (descriptor == -1) {
-        failed = 1;
-        goto done;
+        return finish_redirection_fixture(directory, target, 1);
     }
     length = read(descriptor, contents, sizeof(contents));
-    close(descriptor);
+    (void)close(descriptor);
     if (length != 6 || memcmp(contents, "routed", 6) != 0) {
-        fprintf(stderr, "conformance: descriptor ordering mismatch\n");
-        failed = 1;
-        goto done;
+        (void)fprintf(stderr, "conformance: descriptor ordering mismatch\n");
+        return finish_redirection_fixture(directory, target, 1);
     }
 
     test.name = "native descriptor ordering to original stderr";
@@ -1598,25 +1710,20 @@ static int native_redirection_cases(const char *executable)
                  "/usr/bin/printf visible 1>&2 2>%s", target) >=
             (int)sizeof(command) ||
         run_case(executable, &test, false) != 0) {
-        failed = 1;
-        goto done;
+        return finish_redirection_fixture(directory, target, 1);
     }
     descriptor = open(target, O_RDONLY);
     if (descriptor == -1) {
-        failed = 1;
-        goto done;
+        return finish_redirection_fixture(directory, target, 1);
     }
     length = read(descriptor, contents, sizeof(contents));
-    close(descriptor);
+    (void)close(descriptor);
     if (length != 0) {
-        fprintf(stderr, "conformance: reversed descriptor ordering mismatch\n");
+        (void)fprintf(stderr, "conformance: reversed descriptor ordering mismatch\n");
         failed = 1;
     }
 
-done:
-    (void)unlink(target);
-    (void)rmdir(directory);
-    return failed;
+    return finish_redirection_fixture(directory, target, failed);
 }
 
 static int native_function_redirection_cases(const char *executable)
@@ -1630,13 +1737,14 @@ static int native_function_redirection_cases(const char *executable)
     if (mkdtemp(directory) == NULL) {
         return 1;
     }
+    do {
     if (snprintf(command, sizeof(command),
                  "p=%s/not-created; f(){ /usr/bin/printf body; } "
                  ">\"$p\"; /bin/test ! -e \"$p\"; p=%s/deferred; "
                  "f; /bin/test \"$(/bin/cat \"$p\")\" = body",
                  directory, directory) >= (int)sizeof(command) ||
         run_case(executable, &test, false) != 0) {
-        goto failed;
+        break;
     }
     passed++;
     test.name = "function definition redirect uses invocation positionals";
@@ -1646,7 +1754,7 @@ static int native_function_redirection_cases(const char *executable)
                  "/bin/test \"$(/bin/cat %s/positional)\" = value",
                  directory, directory) >= (int)sizeof(command) ||
         run_case(executable, &test, false) != 0) {
-        goto failed;
+        break;
     }
     passed++;
     test.name = "function call redirect";
@@ -1655,7 +1763,7 @@ static int native_function_redirection_cases(const char *executable)
                  "/bin/test \"$(/bin/cat %s/call)\" = call",
                  directory, directory) >= (int)sizeof(command) ||
         run_case(executable, &test, false) != 0) {
-        goto failed;
+        break;
     }
     passed++;
     test.name = "function definition redirect is nested inside call redirect";
@@ -1666,7 +1774,7 @@ static int native_function_redirection_cases(const char *executable)
                  directory, directory, directory, directory) >=
             (int)sizeof(command) ||
         run_case(executable, &test, false) != 0) {
-        goto failed;
+        break;
     }
     passed++;
     test.name = "function redirects restore descriptors";
@@ -1677,14 +1785,14 @@ static int native_function_redirection_cases(const char *executable)
                  "/bin/test \"$(/bin/cat %s/restore)\" = inner",
                  directory, directory) >= (int)sizeof(command) ||
         run_case(executable, &test, false) != 0) {
-        goto failed;
+        break;
     }
     passed++;
     test.name = "function attached heredoc expands at invocation";
     test.diagnostic = "argument\n";
     test.command = "f(){ /bin/cat; } <<EOF\n$1\nEOF\nf argument";
     if (run_case(executable, &test, false) != 0) {
-        goto failed;
+        break;
     }
     passed++;
     test.name = "failed function body redirect reports failure";
@@ -1692,7 +1800,7 @@ static int native_function_redirection_cases(const char *executable)
     test.command = "f(){ /usr/bin/printf BAD; } >/dev/null/missing; "
                    "f; s=$?; /bin/test \"$s\" -ne 0";
     if (run_case(executable, &test, false) != 0) {
-        goto failed;
+        break;
     }
     passed++;
     test.name = "failed call redirect suppresses function body";
@@ -1703,16 +1811,16 @@ static int native_function_redirection_cases(const char *executable)
                  "/bin/test \"$s\" -ne 0; /bin/test ! -e %s/effect",
                  directory, directory) >= (int)sizeof(command) ||
         run_case(executable, &test, false) != 0) {
-        goto failed;
+        break;
     }
     passed++;
-    goto done;
+    } while (false);
 
-failed:
-    fprintf(stderr,
-            "conformance: function redirection stopped after %zu cases\n",
-            passed);
-done:
+    if (passed != 8U) {
+        (void)fprintf(stderr,
+                "conformance: function redirection stopped after %zu cases\n",
+                passed);
+    }
     (void)snprintf(command, sizeof(command), "%s/not-created", directory);
     (void)unlink(command);
     {
@@ -1794,335 +1902,369 @@ static int native_function_context_cases(const char *executable)
     return 0;
 }
 
-static int native_limit_cases(const char *executable)
+static int native_shape_limit_cases(const char *executable, char *command,
+                                    size_t capacity)
 {
-    char command[70000];
-    char directory[] = "/tmp/gsh-native-glob-XXXXXX";
-    char path[1024];
+    if (command == NULL) {
+        return -1;
+    }
     syntax_case test = {"limits", "native pipeline width", command, 2,
                         "native execution unsupported"};
     size_t used = 0;
     size_t index;
 
-    for (index = 0; index < 33; index++) {
-        int length = snprintf(command + used, sizeof(command) - used,
-                              "%s/usr/bin/true", index == 0 ? "" : " | ");
-
-        if (length < 0 || (size_t)length >= sizeof(command) - used) {
-            return 1;
-        }
-        used += (size_t)length;
-    }
-    if (run_case(executable, &test, false) != 0) {
+    if (!require(executable != NULL) || !require(command != NULL) ||
+        !require(capacity >= 70000U)) {
         return 1;
     }
+    for (index = 0; index < 33U; index++) {
+        int length = snprintf(command + used, capacity - used,
+                              "%s/usr/bin/true", index == 0 ? "" : " | ");
 
-    memcpy(command, "/usr/bin/true", 14);
-    used = 13;
-    for (index = 0; index < 129; index++) {
-        if (used + 2U >= sizeof(command)) {
-            return 1;
-        }
+        if (length < 0 || (size_t)length >= capacity - used) return 1;
+        used += (size_t)length;
+    }
+    if (run_case(executable, &test, false) != 0) return 1;
+    (void)memcpy(command, "/usr/bin/true", 14U);
+    used = 13U;
+    for (index = 0; index < 129U; index++) {
+        if (used + 2U >= capacity) return 1;
         command[used++] = ' ';
         command[used++] = 'x';
     }
     command[used] = '\0';
     test.name = "native argument limit";
-    if (run_case(executable, &test, false) != 0) {
-        return 1;
-    }
-
-    memcpy(command, "for item in", 12);
-    used = 11;
-    for (index = 0; index < 129; index++) {
-        if (used + 2U >= sizeof(command)) {
-            return 1;
-        }
+    if (run_case(executable, &test, false) != 0) return 1;
+    (void)memcpy(command, "for item in", 12U);
+    used = 11U;
+    for (index = 0; index < 129U; index++) {
+        if (used + 2U >= capacity) return 1;
         command[used++] = ' ';
         command[used++] = 'x';
     }
-    if (snprintf(command + used, sizeof(command) - used,
-                 "; do :; done") >= (int)(sizeof(command) - used)) {
+    if (snprintf(command + used, capacity - used, "; do :; done") >=
+        (int)(capacity - used)) {
         return 1;
     }
     test.name = "native for item limit";
-    if (run_case(executable, &test, false) != 0) {
-        return 1;
-    }
-
-    memcpy(command, "/usr/bin/true", 14);
-    used = 13;
-    for (index = 0; index < 33; index++) {
-        int length = snprintf(command + used, sizeof(command) - used,
+    if (run_case(executable, &test, false) != 0) return 1;
+    (void)memcpy(command, "/usr/bin/true", 14U);
+    used = 13U;
+    for (index = 0; index < 33U; index++) {
+        int length = snprintf(command + used, capacity - used,
                               " %zu>/dev/null", index + 3U);
 
-        if (length < 0 || (size_t)length >= sizeof(command) - used) {
-            return 1;
-        }
+        if (length < 0 || (size_t)length >= capacity - used) return 1;
         used += (size_t)length;
     }
     test.name = "native redirection limit";
-    if (run_case(executable, &test, false) != 0) {
+    return run_case(executable, &test, false);
+}
+
+static int native_substitution_limit_cases(const char *executable,
+                                           char *command, size_t capacity)
+{
+    if (command == NULL) {
+        return -1;
+    }
+    syntax_case test = {"limits", "native expansion storage limit", command,
+                        2, "native execution unsupported"};
+    size_t used = 16U;
+
+    if (!require(executable != NULL) || !require(command != NULL) ||
+        !require(capacity >= 70000U)) {
         return 1;
     }
-
-    memcpy(command, "/usr/bin/printf ", 17);
-    used = 16;
-    memset(command + used, 'a', 17000);
-    used += 17000;
+    (void)memcpy(command, "/usr/bin/printf ", 17U);
+    (void)memset(command + used, 'a', 17000U);
+    used += 17000U;
     command[used] = '\0';
-    test.name = "native expansion storage limit";
-    if (run_case(executable, &test, false) != 0) {
-        return 1;
-    }
-
-    if (snprintf(command, sizeof(command),
+    if (run_case(executable, &test, false) != 0) return 1;
+    if (snprintf(command, capacity,
                  "/usr/bin/printf '%%s' \"$(/usr/bin/yes x | "
-                 "/usr/bin/head -c 17000)\"") >= (int)sizeof(command)) {
+                 "/usr/bin/head -c 17000)\"") >= (int)capacity) {
         return 1;
     }
     test.name = "native command substitution output limit";
     test.status = 125;
     test.diagnostic = NULL;
-    if (run_case(executable, &test, false) != 0) {
-        return 1;
-    }
-
-    if (build_nested_substitution(command, sizeof(command),
-                                  GSH_SOURCE_DEPTH_CAP) == -1) {
+    if (run_case(executable, &test, false) != 0) return 1;
+    if (build_nested_substitution(command, capacity, GSH_SOURCE_DEPTH_CAP) ==
+        -1) {
         return 1;
     }
     test.name = "native nested source depth boundary";
     test.status = 0;
     test.diagnostic = "<x>\n";
-    if (run_case(executable, &test, false) != 0) {
-        return 1;
-    }
-
-    if (build_nested_substitution(command, sizeof(command),
+    if (run_case(executable, &test, false) != 0) return 1;
+    if (build_nested_substitution(command, capacity,
                                   GSH_SOURCE_DEPTH_CAP + 1U) == -1) {
         return 1;
     }
     test.name = "native nested source depth limit";
-    test.status = 0;
     test.diagnostic = "nested source workspace limit exceeded";
-    if (run_case(executable, &test, false) != 0) {
-        return 1;
-    }
-    test.status = 2;
-    test.diagnostic = "native execution unsupported";
-
-    if (build_nested_eval(command, sizeof(command),
-                          GSH_SOURCE_DEPTH_CAP - 1U) == -1) {
+    if (run_case(executable, &test, false) != 0) return 1;
+    if (build_nested_eval(command, capacity, GSH_SOURCE_DEPTH_CAP - 1U) == -1) {
         return 1;
     }
     test.name = "native nested eval depth boundary";
-    test.status = 0;
     test.diagnostic = NULL;
-    if (run_case(executable, &test, false) != 0) {
-        return 1;
-    }
-
-    if (build_nested_eval(command, sizeof(command),
-                          GSH_SOURCE_DEPTH_CAP) == -1) {
+    if (run_case(executable, &test, false) != 0) return 1;
+    if (build_nested_eval(command, capacity, GSH_SOURCE_DEPTH_CAP) == -1) {
         return 1;
     }
     test.name = "native nested eval depth limit";
     test.status = 125;
     test.diagnostic = "nested source workspace limit exceeded";
-    if (run_case(executable, &test, false) != 0) {
+    return run_case(executable, &test, false);
+}
+
+static int native_expansion_depth_limit_cases(const char *executable,
+                                              char *command, size_t capacity)
+{
+    if (command == NULL) {
+        return -1;
+    }
+    static const char opening[] = "${GSH_CONFORMANCE_UNSET:-";
+    syntax_case test = {"limits", "native parameter expansion depth limit",
+                        command, 2, "native execution unsupported"};
+    size_t used;
+    size_t index;
+    int length;
+
+    if (!require(executable != NULL) || !require(command != NULL) ||
+        !require(capacity >= 70000U)) {
         return 1;
     }
-    test.status = 2;
-    test.diagnostic = "native execution unsupported";
-
-    used = 0;
-    {
-        int length = snprintf(command, sizeof(command),
-                              "/usr/bin/printf '%%s' ");
-
-        if (length < 0 || (size_t)length >= sizeof(command)) {
-            return 1;
-        }
-        used = (size_t)length;
-    }
-    for (index = 0; index < 33; index++) {
-        static const char opening[] = "${GSH_CONFORMANCE_UNSET:-";
-
-        if (sizeof(opening) - 1U > sizeof(command) - used - 1U) {
-            return 1;
-        }
-        memcpy(command + used, opening, sizeof(opening) - 1U);
+    length = snprintf(command, capacity, "/usr/bin/printf '%%s' ");
+    if (length < 0 || (size_t)length >= capacity) return 1;
+    used = (size_t)length;
+    for (index = 0; index < 33U; index++) {
+        if (sizeof(opening) - 1U > capacity - used - 1U) return 1;
+        (void)memcpy(command + used, opening, sizeof(opening) - 1U);
         used += sizeof(opening) - 1U;
     }
     command[used++] = 'x';
-    for (index = 0; index < 33; index++) {
-        command[used++] = '}';
-    }
+    for (index = 0; index < 33U; index++) command[used++] = '}';
     command[used] = '\0';
-    test.name = "native parameter expansion depth limit";
-    if (run_case(executable, &test, false) != 0) {
-        return 1;
-    }
-
-    memcpy(command, ": \"$((", 7);
-    used = 6;
-    for (index = 0; index < 33; index++) {
-        int length = snprintf(command + used, sizeof(command) - used,
-                              "GSH_ARITH_DEPTH_%zu=", index);
-
-        if (length < 0 || (size_t)length >= sizeof(command) - used) {
-            return 1;
-        }
+    if (run_case(executable, &test, false) != 0) return 1;
+    (void)memcpy(command, ": \"$((", 7U);
+    used = 6U;
+    for (index = 0; index < 33U; index++) {
+        length = snprintf(command + used, capacity - used,
+                          "GSH_ARITH_DEPTH_%zu=", index);
+        if (length < 0 || (size_t)length >= capacity - used) return 1;
         used += (size_t)length;
     }
-    memcpy(command + used, "1))\"", 5);
+    (void)memcpy(command + used, "1))\"", 5U);
     test.name = "native arithmetic assignment depth limit";
-    if (run_case(executable, &test, false) != 0) {
-        return 1;
-    }
-
-    memcpy(command, ":", 2);
-    used = 1;
-    for (index = 0; index < 65; index++) {
-        int length = snprintf(command + used, sizeof(command) - used,
-                              " ${GSH_SCOPE_%zu:=x}", index);
-
-        if (length < 0 || (size_t)length >= sizeof(command) - used) {
-            return 1;
-        }
+    if (run_case(executable, &test, false) != 0) return 1;
+    (void)memcpy(command, ":", 2U);
+    used = 1U;
+    for (index = 0; index < 65U; index++) {
+        length = snprintf(command + used, capacity - used,
+                          " ${GSH_SCOPE_%zu:=x}", index);
+        if (length < 0 || (size_t)length >= capacity - used) return 1;
         used += (size_t)length;
     }
-    if (snprintf(command + used, sizeof(command) - used,
-                 " | /usr/bin/true") >= (int)(sizeof(command) - used)) {
+    if (snprintf(command + used, capacity - used, " | /usr/bin/true") >=
+        (int)(capacity - used)) {
         return 1;
     }
     test.name = "native scoped variable journal limit";
-    if (run_case(executable, &test, false) != 0) {
+    return run_case(executable, &test, false);
+}
+
+static int native_store_limit_case(const char *executable, char *command,
+                                   size_t capacity)
+{
+    if (command == NULL) {
+        return -1;
+    }
+    syntax_case test = {"limits", "native variable store exhaustion", command,
+                        1, "variable update failed"};
+    size_t used = 0;
+    size_t index;
+
+    if (!require(executable != NULL) || !require(command != NULL) ||
+        !require(capacity >= 70000U)) {
         return 1;
     }
-
-    used = 0;
-    for (index = 0; index < 1025; index++) {
+    for (index = 0; index < 1025U; index++) {
         int length;
 
         if (index % 120U == 0) {
-            length = snprintf(command + used, sizeof(command) - used,
-                              "%sexport", index == 0 ? "" : "; ");
-            if (length < 0 || (size_t)length >= sizeof(command) - used) {
-                return 1;
-            }
+            length = snprintf(command + used, capacity - used, "%sexport",
+                              index == 0 ? "" : "; ");
+            if (length < 0 || (size_t)length >= capacity - used) return 1;
             used += (size_t)length;
         }
-        length = snprintf(command + used, sizeof(command) - used,
+        length = snprintf(command + used, capacity - used,
                           " GSH_VARIABLE_CAP_%04zu=x", index);
-        if (length < 0 || (size_t)length >= sizeof(command) - used) {
-            return 1;
-        }
+        if (length < 0 || (size_t)length >= capacity - used) return 1;
         used += (size_t)length;
     }
-    test.name = "native variable store exhaustion";
-    test.status = 1;
-    test.diagnostic = "variable update failed";
-    if (run_case(executable, &test, false) != 0) {
+    return run_case(executable, &test, false);
+}
+
+static int native_heredoc_count_limit_case(const char *executable,
+                                           char *command, size_t capacity)
+{
+    if (command == NULL) {
+        return -1;
+    }
+    syntax_case test = {"limits", "native here-document count limit", command,
+                        2, "native execution unsupported"};
+    size_t used = 0;
+    size_t index;
+
+    if (!require(executable != NULL) || !require(command != NULL) ||
+        !require(capacity >= 70000U)) {
         return 1;
     }
-    test.status = 2;
-    test.diagnostic = "native execution unsupported";
-
-    used = 0;
-    for (index = 0; index < 34; index++) {
+    for (index = 0; index < 34U; index++) {
         int length;
 
-        if (index == 0 || index == 17) {
-            length = snprintf(command + used, sizeof(command) - used,
-                              "%s/bin/cat", index == 0 ? "" : " | ");
-            if (length < 0 || (size_t)length >= sizeof(command) - used) {
-                return 1;
-            }
+        if (index == 0 || index == 17U) {
+            length = snprintf(command + used, capacity - used, "%s/bin/cat",
+                              index == 0 ? "" : " | ");
+            if (length < 0 || (size_t)length >= capacity - used) return 1;
             used += (size_t)length;
         }
-        length = snprintf(command + used, sizeof(command) - used,
-                          " <<D%zu", index);
-        if (length < 0 || (size_t)length >= sizeof(command) - used) {
-            return 1;
-        }
+        length = snprintf(command + used, capacity - used, " <<D%zu", index);
+        if (length < 0 || (size_t)length >= capacity - used) return 1;
         used += (size_t)length;
     }
-    if (used + 1U >= sizeof(command)) {
-        return 1;
-    }
+    if (used + 1U >= capacity) return 1;
     command[used++] = '\n';
-    for (index = 0; index < 34; index++) {
-        int length = snprintf(command + used, sizeof(command) - used,
+    for (index = 0; index < 34U; index++) {
+        int length = snprintf(command + used, capacity - used,
                               "x\nD%zu\n", index);
 
-        if (length < 0 || (size_t)length >= sizeof(command) - used) {
-            return 1;
-        }
+        if (length < 0 || (size_t)length >= capacity - used) return 1;
         used += (size_t)length;
     }
-    test.name = "native here-document count limit";
-    if (run_case(executable, &test, false) != 0) {
+    return run_case(executable, &test, false);
+}
+
+static int native_heredoc_storage_limit_case(const char *executable,
+                                             char *command, size_t capacity)
+{
+    if (command == NULL) {
+        return -1;
+    }
+    syntax_case test = {"limits", "native here-document storage limit",
+                        command, 2, "native execution unsupported"};
+    size_t used = 15U;
+
+    if (!require(executable != NULL) || !require(command != NULL) ||
+        !require(capacity > 65558U)) {
         return 1;
     }
-
-    memcpy(command, "/bin/cat <<EOF\n", 16);
-    used = 15;
-    memset(command + used, 'h', 65537U);
+    (void)memcpy(command, "/bin/cat <<EOF\n", 16U);
+    (void)memset(command + used, 'h', 65537U);
     used += 65537U;
-    memcpy(command + used, "\nEOF\n", 6);
-    used += 5;
+    (void)memcpy(command + used, "\nEOF\n", 6U);
+    used += 5U;
     command[used] = '\0';
-    test.name = "native here-document storage limit";
-    if (run_case(executable, &test, false) != 0) {
-        return 1;
-    }
+    return run_case(executable, &test, false);
+}
 
-    if (mkdtemp(directory) == NULL) {
+static int native_pathname_limit_case(const char *executable, char *command,
+                                      size_t capacity)
+{
+    if (command == NULL) {
+        return -1;
+    }
+    char directory[] = "/tmp/gsh-native-glob-XXXXXX";
+    char path[1024];
+    syntax_case test = {"limits", "native pathname result limit", command,
+                        125, NULL};
+    size_t index;
+    int failed = 0;
+
+    if (!require(executable != NULL) || !require(command != NULL) ||
+        !require(capacity >= 70000U)) {
         return 1;
     }
-    for (index = 0; index < 129; index++) {
+    if (mkdtemp(directory) == NULL) return 1;
+    for (index = 0; index < 129U; index++) {
         int descriptor;
 
-        if (snprintf(path, sizeof(path), "%s/item-%03zu", directory,
-                     index) >= (int)sizeof(path)) {
+        if (snprintf(path, sizeof(path), "%s/item-%03zu", directory, index) >=
+            (int)sizeof(path)) {
             break;
         }
         descriptor = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
-        if (descriptor == -1 || close(descriptor) == -1) {
-            break;
-        }
+        if (descriptor == -1 || close(descriptor) == -1) break;
     }
-    if (index == 129 &&
-        snprintf(command, sizeof(command), "/usr/bin/printf x %s/*",
-                 directory) < (int)sizeof(command)) {
-        test.name = "native pathname result limit";
-        test.status = 125;
-        test.diagnostic = NULL;
-        if (run_case(executable, &test, false) != 0) {
-            used = 1;
-        } else {
-            used = 0;
-        }
-    } else {
-        used = 1;
+    if (index != 129U ||
+        snprintf(command, capacity, "/usr/bin/printf x %s/*", directory) >=
+            (int)capacity ||
+        run_case(executable, &test, false) != 0) {
+        failed = 1;
     }
-    for (index = 0; index < 129; index++) {
-        if (snprintf(path, sizeof(path), "%s/item-%03zu", directory,
-                     index) < (int)sizeof(path)) {
+    for (index = 0; index < 129U; index++) {
+        if (snprintf(path, sizeof(path), "%s/item-%03zu", directory, index) <
+            (int)sizeof(path)) {
             (void)unlink(path);
         }
     }
     (void)rmdir(directory);
-    if (used != 0) {
+    return failed;
+}
+
+static int native_limit_cases(const char *executable)
+{
+    static char command[70000];
+
+    if (!require(executable != NULL) || !require(sizeof(command) == 70000U)) {
+        return 1;
+    }
+    if (native_shape_limit_cases(executable, command, sizeof(command)) != 0 ||
+        native_substitution_limit_cases(executable, command,
+                                        sizeof(command)) != 0) {
+        return 1;
+    }
+
+    if (native_expansion_depth_limit_cases(executable, command,
+                                           sizeof(command)) != 0) {
+        return 1;
+    }
+
+    if (native_store_limit_case(executable, command, sizeof(command)) != 0 ||
+        native_heredoc_count_limit_case(executable, command,
+                                        sizeof(command)) != 0) {
+        return 1;
+    }
+
+    if (native_heredoc_storage_limit_case(executable, command,
+                                          sizeof(command)) != 0 ||
+        native_pathname_limit_case(executable, command, sizeof(command)) != 0) {
         return 1;
     }
     return 0;
 }
 
+static int finish_read_overflow_fixture(const char *directory,
+                                        const char *path, int descriptor,
+                                        int failed)
+{
+    if (path == NULL) return -1;
+    if (directory == NULL) {
+        return -1;
+    }
+    if (descriptor >= 0) (void)close(descriptor);
+    if (path[0] != '\0') (void)unlink(path);
+    (void)rmdir(directory);
+    return failed;
+}
+
 static int native_read_overflow_case(const char *executable)
 {
+    if (executable == NULL) {
+        return -1;
+    }
     char directory[] = "/tmp/gsh-read-overflow-XXXXXX";
     char path[1024] = {0};
     char command[4096];
@@ -2141,26 +2283,19 @@ static int native_read_overflow_case(const char *executable)
                  "printf '<%%s:%%s:%%s:%%s>\\n' \"$keep\" "
                  "\"${extra-unset}\" \"$next\" \"$overflow\"",
                  path) >= (int)sizeof(command)) {
-        failed = 1;
-        goto done;
+        return finish_read_overflow_fixture(directory, path, descriptor, 1);
     }
     descriptor = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
     if (descriptor == -1 ||
         write_repeated_byte(descriptor, 'x', 5000U) == -1 ||
         write(descriptor, "\nnext\n", 6U) != 6 ||
         close(descriptor) == -1) {
-        failed = 1;
         descriptor = -1;
-        goto done;
+        return finish_read_overflow_fixture(directory, path, descriptor, 1);
     }
     descriptor = -1;
     failed = run_case(executable, &test, false) != 0;
-
-done:
-    if (descriptor >= 0) (void)close(descriptor);
-    if (path[0] != '\0') (void)unlink(path);
-    (void)rmdir(directory);
-    return failed;
+    return finish_read_overflow_fixture(directory, path, descriptor, failed);
 }
 
 static int native_heredoc_stress_cases(const char *executable)
@@ -2173,10 +2308,10 @@ static int native_heredoc_stress_cases(const char *executable)
 
     prefix = "/usr/bin/wc -c <<EOF\n";
     used = strlen(prefix);
-    memcpy(command, prefix, used);
-    memset(command + used, 'x', 60000);
+    (void)memcpy(command, prefix, used);
+    (void)memset(command + used, 'x', 60000);
     used += 60000;
-    memcpy(command + used, "\nEOF\n", 6);
+    (void)memcpy(command + used, "\nEOF\n", 6);
     used += 5;
     command[used] = '\0';
     if (run_case(executable, &test, false) != 0) {
@@ -2185,10 +2320,10 @@ static int native_heredoc_stress_cases(const char *executable)
 
     prefix = "/usr/bin/true <<EOF\n";
     used = strlen(prefix);
-    memcpy(command, prefix, used);
-    memset(command + used, 'x', 60000);
+    (void)memcpy(command, prefix, used);
+    (void)memset(command + used, 'x', 60000);
     used += 60000;
-    memcpy(command + used, "\nEOF\n", 6);
+    (void)memcpy(command + used, "\nEOF\n", 6);
     used += 5;
     command[used] = '\0';
     test.name = "unread large here-document cleanup";
@@ -2198,6 +2333,9 @@ static int native_heredoc_stress_cases(const char *executable)
 
 static int native_pattern_stress_cases(const char *executable)
 {
+    if (executable == NULL) {
+        return -1;
+    }
     char value[12001];
     syntax_case prefix = {
         "2.6.2", "bounded multi-star prefix removal",
@@ -2209,7 +2347,7 @@ static int native_pattern_stress_cases(const char *executable)
         0, NULL};
     int failed;
 
-    memset(value, '0', sizeof(value) - 2U);
+    (void)memset(value, '0', sizeof(value) - 2U);
     value[sizeof(value) - 2U] = 'z';
     value[sizeof(value) - 1U] = '\0';
     if (setenv("GSH_PATTERN_STRESS", value, 1) == -1) {
@@ -2222,6 +2360,17 @@ static int native_pattern_stress_cases(const char *executable)
     if (unsetenv("GSH_PATTERN_STRESS") == -1) {
         failed = 1;
     }
+    return failed;
+}
+
+static int finish_loop_fixture(const char *directory, const char *target,
+                               int failed)
+{
+    if (directory == NULL || target == NULL) {
+        return -1;
+    }
+    (void)unlink(target);
+    (void)rmdir(directory);
     return failed;
 }
 
@@ -2243,8 +2392,7 @@ static int native_loop_cases(const char *executable)
                  target, target) >= (int)sizeof(command) ||
         run_case(executable, &test, false) != 0 ||
         access(target, F_OK) == -1) {
-        failed = 1;
-        goto done;
+        return finish_loop_fixture(directory, target, 1);
     }
     (void)unlink(target);
     if (snprintf(target, sizeof(target), "%s/until-done", directory) >=
@@ -2253,8 +2401,7 @@ static int native_loop_cases(const char *executable)
                  "until /bin/test -e %s; do /usr/bin/touch %s; "
                  "/usr/bin/true; done",
                  target, target) >= (int)sizeof(command)) {
-        failed = 1;
-        goto done;
+        return finish_loop_fixture(directory, target, 1);
     }
     test.section = "2.9.4.6";
     test.name = "native until iteration";
@@ -2263,14 +2410,10 @@ static int native_loop_cases(const char *executable)
         access(target, F_OK) == -1) {
         failed = 1;
     }
-
-done:
-    (void)unlink(target);
-    (void)rmdir(directory);
-    return failed;
+    return finish_loop_fixture(directory, target, failed);
 }
 
-static int native_positional_cases(const char *executable)
+static int native_positional_expansion_cases(const char *executable)
 {
     static const char *const ten[] = {
         "one two", "",      "three", "four", "five",
@@ -2282,6 +2425,9 @@ static int native_positional_cases(const char *executable)
         "\"$0|$#|$1|${08}|${10}|$10|${#1}\"",
         0, "command-name|10|one two|eight|ten|one two0|7\n"};
 
+    if (!require(executable != NULL) || !require(sizeof(ten) > sizeof(three))) {
+        return 1;
+    }
     if (run_case_arguments(executable, &test, false, "command-name", ten,
                            sizeof(ten) / sizeof(ten[0])) != 0) {
         return 1;
@@ -2350,12 +2496,21 @@ static int native_positional_cases(const char *executable)
                            three, sizeof(three) / sizeof(three[0])) != 0) {
         return 1;
     }
-    test.section = "set";
-    test.name = "set delimiter replaces positional parameters";
-    test.command =
+    return 0;
+}
+
+static int native_set_positional_cases(const char *executable)
+{
+    static const char *const three[] = {"a b", "", "c"};
+    syntax_case test = {
+        "set", "set delimiter replaces positional parameters",
         "set -- 'one two' '' three; "
-        "/usr/bin/printf '<%s>\\n' \"$0|$#|$1|$2|$3\"";
-    test.diagnostic = "<command-name|3|one two||three>\n";
+        "/usr/bin/printf '<%s>\\n' \"$0|$#|$1|$2|$3\"",
+        0, "<command-name|3|one two||three>\n"};
+
+    if (!require(executable != NULL) || !require(sizeof(three) > 0U)) {
+        return 1;
+    }
     if (run_case_arguments(executable, &test, false, "command-name", NULL,
                            0) != 0) {
         return 1;
@@ -2447,12 +2602,20 @@ static int native_positional_cases(const char *executable)
                            0) != 0) {
         return 1;
     }
-    test.section = "shift";
-    test.name = "shift default removes one parameter";
-    test.command =
+    return 0;
+}
+
+static int native_shift_positional_cases(const char *executable)
+{
+    syntax_case test = {
+        "shift", "shift default removes one parameter",
         "set -- a b c; shift; "
-        "/usr/bin/printf '%s\\n' \"$#|$1|$2\"";
-    test.diagnostic = "2|b|c\n";
+        "/usr/bin/printf '%s\\n' \"$#|$1|$2\"",
+        0, "2|b|c\n"};
+
+    if (!require(executable != NULL) || !require(test.command != NULL)) {
+        return 1;
+    }
     if (run_case_arguments(executable, &test, false, "command-name", NULL,
                            0) != 0) {
         return 1;
@@ -2499,6 +2662,33 @@ static int native_positional_cases(const char *executable)
     test.diagnostic = "gsh: shift: invalid shift count\n";
     return run_case_arguments(executable, &test, false, "command-name",
                               NULL, 0);
+}
+
+static int native_positional_cases(const char *executable)
+{
+    if (!require(executable != NULL) || !require(executable[0] != '\0')) {
+        return 1;
+    }
+    if (native_positional_expansion_cases(executable) != 0 ||
+        native_set_positional_cases(executable) != 0 ||
+        native_shift_positional_cases(executable) != 0) {
+        return 1;
+    }
+    return 0;
+}
+
+static int finish_set_fixture(const char *directory, const char *target,
+                              const char *link, const char *created,
+                              int failed)
+{
+    if (created == NULL || directory == NULL || link == NULL || target == NULL) {
+        return -1;
+    }
+    (void)unlink(link);
+    (void)unlink(created);
+    (void)unlink(target);
+    (void)rmdir(directory);
+    return failed;
 }
 
 static int native_set_option_cases(const char *executable)
@@ -2688,18 +2878,16 @@ static int native_set_option_cases(const char *executable)
             -1 || write(descriptor, "original", 8) != 8 ||
         close(descriptor) == -1 || symlink(target, link) == -1) {
         if (descriptor >= 0) {
-            close(descriptor);
+            (void)close(descriptor);
         }
         return 1;
     }
-    descriptor = -1;
     if (snprintf(command, sizeof(command),
                  "set -C; if /usr/bin/printf changed 2>/dev/null >%s; "
                  "then false; fi; /bin/test \"$(/bin/cat %s)\" = original",
                  target, target) >= (int)sizeof(command) ||
         run_case(executable, &test, false) != 0) {
-        failed = 1;
-        goto done;
+        return finish_set_fixture(directory, target, link, created, 1);
     }
     test.name = "clobber operator overrides noclobber";
     if (snprintf(command, sizeof(command),
@@ -2707,8 +2895,7 @@ static int native_set_option_cases(const char *executable)
                  "/bin/test \"$(/bin/cat %s)\" = changed",
                  target, target) >= (int)sizeof(command) ||
         run_case(executable, &test, false) != 0) {
-        failed = 1;
-        goto done;
+        return finish_set_fixture(directory, target, link, created, 1);
     }
     test.name = "noclobber creates absent file atomically";
     if (snprintf(command, sizeof(command),
@@ -2716,8 +2903,7 @@ static int native_set_option_cases(const char *executable)
                  "/bin/test \"$(/bin/cat %s)\" = new",
                  created, created) >= (int)sizeof(command) ||
         run_case(executable, &test, false) != 0) {
-        failed = 1;
-        goto done;
+        return finish_set_fixture(directory, target, link, created, 1);
     }
     test.name = "append redirection ignores noclobber";
     if (snprintf(command, sizeof(command),
@@ -2726,8 +2912,7 @@ static int native_set_option_cases(const char *executable)
                  "/bin/test \"$(/bin/cat %s)\" = baseplus",
                  target, target, target) >= (int)sizeof(command) ||
         run_case(executable, &test, false) != 0) {
-        failed = 1;
-        goto done;
+        return finish_set_fixture(directory, target, link, created, 1);
     }
     test.name = "noclobber follows symlink to regular file";
     if (snprintf(command, sizeof(command),
@@ -2735,8 +2920,7 @@ static int native_set_option_cases(const char *executable)
                  "then false; fi; /bin/test \"$(/bin/cat %s)\" = baseplus",
                  link, target) >= (int)sizeof(command) ||
         run_case(executable, &test, false) != 0) {
-        failed = 1;
-        goto done;
+        return finish_set_fixture(directory, target, link, created, 1);
     }
     test.name = "failed redirection precedes option mutation";
     if (snprintf(command, sizeof(command),
@@ -2744,21 +2928,14 @@ static int native_set_option_cases(const char *executable)
                  "case \"$-\" in *C*) true;; *) false;; esac",
                  target) >= (int)sizeof(command) ||
         run_case(executable, &test, false) != 0) {
-        failed = 1;
-        goto done;
+        return finish_set_fixture(directory, target, link, created, 1);
     }
     test.name = "noclobber permits non-regular output";
     test.command = "set -C; /usr/bin/printf x >/dev/null";
     if (run_case(executable, &test, false) != 0) {
         failed = 1;
     }
-
-done:
-    (void)unlink(link);
-    (void)unlink(created);
-    (void)unlink(target);
-    (void)rmdir(directory);
-    return failed;
+    return finish_set_fixture(directory, target, link, created, failed);
 }
 
 static int native_pwd_cases(const char *executable)
@@ -2796,6 +2973,9 @@ static bool wait_for_path(const char *path, size_t attempts)
 
 static bool file_equals(const char *path, const char *expected)
 {
+    if (expected == NULL || path == NULL) {
+        return false;
+    }
     char contents[64];
     size_t expected_length = strlen(expected);
     int descriptor = open(path, O_RDONLY);
@@ -2817,6 +2997,9 @@ static bool file_equals(const char *path, const char *expected)
 
 static int inherited_ignored_trap_case(const char *executable)
 {
+    if (executable == NULL) {
+        return -1;
+    }
     struct sigaction ignore;
     struct sigaction previous;
     syntax_case test = {
@@ -2826,9 +3009,9 @@ static int inherited_ignored_trap_case(const char *executable)
         0, "INHERITED_OKtrap -- '' USR1\n"};
     int failed;
 
-    memset(&ignore, 0, sizeof(ignore));
+    (void)memset(&ignore, 0, sizeof(ignore));
     ignore.sa_handler = SIG_IGN;
-    sigemptyset(&ignore.sa_mask);
+    (void)sigemptyset(&ignore.sa_mask);
     if (sigaction(SIGUSR1, &ignore, &previous) == -1) {
         return 1;
     }
@@ -2841,6 +3024,9 @@ static int inherited_ignored_trap_case(const char *executable)
 
 static pid_t start_stdin_shell(const char *executable, int input[2])
 {
+    if (executable == NULL) {
+        return -1;
+    }
     pid_t pid;
 
     if (pipe(input) == -1) {
@@ -2867,6 +3053,9 @@ static pid_t start_stdin_shell(const char *executable, int input[2])
 
 static ssize_t write_text_once(int descriptor, const char *text)
 {
+    if (text == NULL) {
+        return -1;
+    }
     ssize_t count;
 
     do {
@@ -2877,6 +3066,9 @@ static ssize_t write_text_once(int descriptor, const char *text)
 
 static pid_t wait_child(pid_t pid, int *status)
 {
+    if (status == NULL) {
+        return -1;
+    }
     size_t attempt;
 
     for (attempt = 0; attempt < 64U; attempt++) {
@@ -2892,6 +3084,9 @@ static pid_t wait_child(pid_t pid, int *status)
 
 static int idle_input_trap_case(const char *executable)
 {
+    if (executable == NULL) {
+        return -1;
+    }
     char directory[] = "/tmp/gsh-trap-input-XXXXXX";
     char ready[1024] = {0};
     char trapped[1024] = {0};
@@ -2939,10 +3134,162 @@ static int idle_input_trap_case(const char *executable)
     (void)unlink(ready);
     (void)rmdir(directory);
     if (!passed) {
-        fprintf(stderr,
+        (void)fprintf(stderr,
                 "conformance: idle input did not dispatch and resume trap\n");
     }
     return passed ? 0 : 1;
+}
+
+static int configure_conformance_environment(void)
+{
+    if (!require(ECHO_DIFFERENTIAL_CASE_COUNT == 15) ||
+        !require(GSH_SOURCE_DEPTH_CAP > 1U)) {
+        return -1;
+    }
+    if (configure_utf8_locale() == -1 ||
+        setenv("IFS", " \t\n", 1) == -1 ||
+        setenv("GSH_CONFORMANCE_VALUE", "alpha beta", 1) == -1 ||
+        setenv("GSH_CONFORMANCE_ATOM", "atom", 1) == -1 ||
+        setenv("GSH_CONFORMANCE_NUMBER", "7", 1) == -1 ||
+        setenv("GSH_CONFORMANCE_PATTERN", "/dev/n[uo]ll", 1) == -1 ||
+        setenv("GSH_CONFORMANCE_UTF8", "\xC3\xA9" "a", 1) == -1 ||
+        setenv("HOME", "/tmp/gsh-conformance-home", 1) == -1 ||
+        unsetenv("GSH_CONFORMANCE_UNSET") == -1 ||
+        unsetenv("GSH_ASSIGN_TEMP") == -1 ||
+        unsetenv("GSH_ASSIGN_ONLY") == -1 ||
+        unsetenv("GSH_PARAMETER_ASSIGNED") == -1 ||
+        unsetenv("GSH_PARAMETER_QUESTION_UNSET") == -1 ||
+        unsetenv("GSH_SUBSHELL_LOCAL") == -1 ||
+        unsetenv("GSH_SUBSHELL_PARAMETER") == -1 ||
+        unsetenv("GSH_SUBSTITUTION_LOCAL") == -1 ||
+        unsetenv("GSH_PIPE_LEFT") == -1 ||
+        unsetenv("GSH_PIPE_SAME") == -1 ||
+        unsetenv("GSH_PIPE_ERROR") == -1 ||
+        unsetenv("GSH_PIPE_LAST") == -1) {
+        return -1;
+    }
+    return 0;
+}
+
+static int run_conformance_table(const char *executable,
+                                 const syntax_case *cases, size_t count,
+                                 bool syntax_only, size_t *passed,
+                                 size_t *unsupported)
+{
+    size_t index;
+
+    if (!require(executable != NULL) || !require(cases != NULL) ||
+        !require(passed != NULL) || !require(unsupported != NULL)) {
+        return 1;
+    }
+    for (index = 0; index < count; index++) {
+        const char *diagnostic = cases[index].diagnostic;
+        int case_status = run_case(executable, &cases[index], syntax_only);
+
+        if (case_status != 0) {
+            (void)fprintf(stderr,
+                    "conformance: case infrastructure failed: %s (%d)\n",
+                    cases[index].name, case_status);
+            return 1;
+        }
+        (*passed)++;
+        if (diagnostic != NULL &&
+            (strcmp(diagnostic, "unsupported") == 0 ||
+             strcmp(diagnostic, "native execution unsupported") == 0)) {
+            (*unsupported)++;
+        }
+    }
+    return 0;
+}
+
+static int run_native_initial_groups(const char *executable, const char *bash,
+                                     size_t *execution_passed)
+{
+    if (!require(executable != NULL) || !require(bash != NULL) ||
+        !require(execution_passed != NULL)) {
+        return 1;
+    }
+    if (no_execution_case(executable) != 0 ||
+        native_invocation_cases(executable) != 0) {
+        return 1;
+    }
+    *execution_passed += 9U;
+    if (echo_differential_cases(executable, bash) != 0) return 1;
+    *execution_passed += ECHO_DIFFERENTIAL_CASE_COUNT;
+    return 0;
+}
+
+static int run_native_core_groups(const char *executable,
+                                  size_t *execution_passed)
+{
+    if (!require(executable != NULL) ||
+        !require(execution_passed != NULL)) {
+        return 1;
+    }
+    if (inherited_ignored_trap_case(executable) != 0 ||
+        idle_input_trap_case(executable) != 0) {
+        return 1;
+    }
+    *execution_passed += 2U;
+    if (native_source_cases(executable) != 0) return 1;
+    *execution_passed += 19U;
+    if (native_exit_cases(executable) != 0) return 1;
+    *execution_passed += 19U;
+    if (native_enoexec_cases(executable) != 0) return 1;
+    *execution_passed += 6U;
+    if (native_redirection_cases(executable) != 0) return 1;
+    *execution_passed += 5U;
+    if (native_function_redirection_cases(executable) != 0) return 1;
+    *execution_passed += 8U;
+    if (native_function_context_cases(executable) != 0) return 1;
+    *execution_passed += 11U;
+    if (native_loop_cases(executable) != 0) return 1;
+    *execution_passed += 4U;
+    return 0;
+}
+
+static int run_native_builtin_groups(const char *executable,
+                                     size_t *execution_passed)
+{
+    if (!require(executable != NULL) || !require(execution_passed != NULL)) {
+        return 1;
+    }
+    if (native_positional_cases(executable) != 0) return 1;
+    *execution_passed += 26U;
+    if (native_set_option_cases(executable) != 0) return 1;
+    *execution_passed += 50U;
+    if (native_pwd_cases(executable) != 0) return 1;
+    *execution_passed += 5U;
+    if (native_umask_creation_case(executable) != 0) return 1;
+    (*execution_passed)++;
+    if (native_builtin_output_failure_cases(executable) != 0) return 1;
+    *execution_passed += 2U;
+    if (native_heredoc_stress_cases(executable) != 0) return 1;
+    *execution_passed += 2U;
+    if (native_pattern_stress_cases(executable) != 0) return 1;
+    *execution_passed += 2U;
+    return 0;
+}
+
+static int run_native_limit_groups(const char *executable,
+                                   size_t *limit_passed)
+{
+    if (!require(executable != NULL) || !require(limit_passed != NULL)) {
+        return 1;
+    }
+    if (native_read_overflow_case(executable) != 0 ||
+        native_limit_cases(executable) != 0) {
+        return 1;
+    }
+    *limit_passed = 18U;
+    return 0;
+}
+
+static int report_conformance_stage_failure(const char *stage)
+{
+    if (!require(stage != NULL)) return 1;
+    (void)fprintf(stderr, "conformance: stage failed: %s\n", stage);
+    return 1;
 }
 
 int main(int argc, char **argv)
@@ -4529,141 +4876,44 @@ int main(int argc, char **argv)
         {"pwd", "native pwd invalid operand", "pwd extra", 1,
          "gsh: pwd: invalid operand"},
     };
-    size_t index;
     size_t passed = 0;
     size_t execution_passed = 0;
     size_t limit_passed = 0;
     size_t unsupported = 0;
 
     if (argc != 3) {
-        fprintf(stderr,
+        (void)fprintf(stderr,
                 "usage: posix-conformance /absolute/path/to/gsh bash\n");
         return 2;
     }
-    if (configure_utf8_locale() == -1 ||
-        setenv("IFS", " \t\n", 1) == -1 ||
-        setenv("GSH_CONFORMANCE_VALUE", "alpha beta", 1) == -1 ||
-        setenv("GSH_CONFORMANCE_ATOM", "atom", 1) == -1 ||
-        setenv("GSH_CONFORMANCE_NUMBER", "7", 1) == -1 ||
-        setenv("GSH_CONFORMANCE_PATTERN", "/dev/n[uo]ll", 1) == -1 ||
-        setenv("GSH_CONFORMANCE_UTF8", "\xC3\xA9" "a", 1) == -1 ||
-        setenv("HOME", "/tmp/gsh-conformance-home", 1) == -1 ||
-        unsetenv("GSH_CONFORMANCE_UNSET") == -1 ||
-        unsetenv("GSH_ASSIGN_TEMP") == -1 ||
-        unsetenv("GSH_ASSIGN_ONLY") == -1 ||
-        unsetenv("GSH_PARAMETER_ASSIGNED") == -1 ||
-        unsetenv("GSH_PARAMETER_QUESTION_UNSET") == -1 ||
-        unsetenv("GSH_SUBSHELL_LOCAL") == -1 ||
-        unsetenv("GSH_SUBSHELL_PARAMETER") == -1 ||
-        unsetenv("GSH_SUBSTITUTION_LOCAL") == -1 ||
-        unsetenv("GSH_PIPE_LEFT") == -1 ||
-        unsetenv("GSH_PIPE_SAME") == -1 ||
-        unsetenv("GSH_PIPE_ERROR") == -1 ||
-        unsetenv("GSH_PIPE_LAST") == -1) {
+    if (configure_conformance_environment() == -1) {
         perror("conformance: environment");
         return 1;
     }
-    for (index = 0; index < sizeof(cases) / sizeof(cases[0]); index++) {
-        if (run_case(argv[1], &cases[index], true) != 0) {
-            return 1;
-        }
-        passed++;
-        if (cases[index].diagnostic != NULL &&
-            strcmp(cases[index].diagnostic, "unsupported") == 0) {
-            unsupported++;
-        }
+    if (run_conformance_table(argv[1], cases,
+                              sizeof(cases) / sizeof(cases[0]), true,
+                              &passed, &unsupported) != 0) {
+        return report_conformance_stage_failure("syntax table");
     }
-    if (no_execution_case(argv[1]) != 0) {
-        return 1;
+    if (run_native_initial_groups(argv[1], argv[2], &execution_passed) != 0) {
+        return report_conformance_stage_failure("native initial groups");
     }
-    if (native_invocation_cases(argv[1]) != 0) {
-        return 1;
+    if (run_conformance_table(
+            argv[1], execution_cases,
+            sizeof(execution_cases) / sizeof(execution_cases[0]), false,
+            &execution_passed, &unsupported) != 0) {
+        return report_conformance_stage_failure("execution table");
     }
-    execution_passed += 9U;
-    if (echo_differential_cases(argv[1], argv[2]) != 0) {
-        return 1;
+    if (run_native_core_groups(argv[1], &execution_passed) != 0) {
+        return report_conformance_stage_failure("native core groups");
     }
-    execution_passed += ECHO_DIFFERENTIAL_CASE_COUNT;
-    for (index = 0;
-         index < sizeof(execution_cases) / sizeof(execution_cases[0]);
-         index++) {
-        if (run_case(argv[1], &execution_cases[index], false) != 0) {
-            return 1;
-        }
-        execution_passed++;
-        if (execution_cases[index].diagnostic != NULL &&
-            strcmp(execution_cases[index].diagnostic,
-                   "native execution unsupported") == 0) {
-            unsupported++;
-        }
+    if (run_native_builtin_groups(argv[1], &execution_passed) != 0) {
+        return report_conformance_stage_failure("native builtin groups");
     }
-    if (inherited_ignored_trap_case(argv[1]) != 0 ||
-        idle_input_trap_case(argv[1]) != 0) {
-        return 1;
+    if (run_native_limit_groups(argv[1], &limit_passed) != 0) {
+        return report_conformance_stage_failure("native limit groups");
     }
-    execution_passed += 2U;
-    if (native_source_cases(argv[1]) != 0) {
-        return 1;
-    }
-    execution_passed += 19U;
-    if (native_exit_cases(argv[1]) != 0) {
-        return 1;
-    }
-    execution_passed += 19U;
-    if (native_enoexec_cases(argv[1]) != 0) {
-        return 1;
-    }
-    execution_passed += 6U;
-    if (native_redirection_cases(argv[1]) != 0) {
-        return 1;
-    }
-    execution_passed += 5U;
-    if (native_function_redirection_cases(argv[1]) != 0) {
-        return 1;
-    }
-    execution_passed += 8U;
-    if (native_function_context_cases(argv[1]) != 0) {
-        return 1;
-    }
-    execution_passed += 11U;
-    if (native_loop_cases(argv[1]) != 0) {
-        return 1;
-    }
-    execution_passed += 4U;
-    if (native_positional_cases(argv[1]) != 0) {
-        return 1;
-    }
-    execution_passed += 26U;
-    if (native_set_option_cases(argv[1]) != 0) {
-        return 1;
-    }
-    execution_passed += 50U;
-    if (native_pwd_cases(argv[1]) != 0) {
-        return 1;
-    }
-    execution_passed += 5U;
-    if (native_umask_creation_case(argv[1]) != 0) {
-        return 1;
-    }
-    execution_passed++;
-    if (native_builtin_output_failure_cases(argv[1]) != 0) {
-        return 1;
-    }
-    execution_passed += 2U;
-    if (native_heredoc_stress_cases(argv[1]) != 0) {
-        return 1;
-    }
-    execution_passed += 2U;
-    if (native_pattern_stress_cases(argv[1]) != 0) {
-        return 1;
-    }
-    execution_passed += 2U;
-    if (native_read_overflow_case(argv[1]) != 0 ||
-        native_limit_cases(argv[1]) != 0) {
-        return 1;
-    }
-    limit_passed = 18;
-    printf("POSIX native tranche: syntax=%zu execution=%zu limits=%zu "
+    (void)printf("POSIX native tranche: syntax=%zu execution=%zu limits=%zu "
            "unsupported=%zu delegated=0\n",
            passed + 1U, execution_passed, limit_passed, unsupported);
     return 0;

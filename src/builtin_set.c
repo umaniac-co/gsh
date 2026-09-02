@@ -7,32 +7,52 @@
 
 #include "builtin_set.h"
 
-#include <stdbool.h>
-#include <stdlib.h>
+#include <errno.h>
 #include <string.h>
 #include <unistd.h>
 
 static int output(const gsh_builtin_io *io, const char *text, size_t length)
 {
-    return io->output(io->opaque, STDOUT_FILENO, text, length);
+    if (io == NULL || text == NULL) {
+        return -1;
+    }
+    return gsh_builtin_output(io, STDOUT_FILENO, text, length);
 }
 
 static int fail(const gsh_builtin_io *io, const char *message)
 {
+    if (io == NULL || message == NULL) {
+        return -1;
+    }
     return gsh_builtin_error(io, "set", message);
 }
 
-static int compare_assignments(const void *left, const void *right)
+static void sort_assignments(const char **assignments, size_t count)
 {
-    const char *const *first = left;
-    const char *const *second = right;
+    if (assignments == NULL) {
+        return;
+    }
+    size_t unsorted;
 
-    return strcoll(*first, *second);
+    for (unsorted = 1; unsorted < count; unsorted++) {
+        const char *value = assignments[unsorted];
+        size_t insertion = unsorted;
+
+        while (insertion > 0 &&
+               strcoll(assignments[insertion - 1U], value) > 0) {
+            assignments[insertion] = assignments[insertion - 1U];
+            insertion--;
+        }
+        assignments[insertion] = value;
+    }
 }
 
 static int quote_assignment(const gsh_builtin_io *io,
                             const char *assignment)
 {
+    if (assignment == NULL) {
+        return -1;
+    }
     const char *separator = strchr(assignment, '=');
     const char *cursor;
 
@@ -42,7 +62,7 @@ static int quote_assignment(const gsh_builtin_io *io,
         return 1;
     }
     cursor = separator + 1U;
-    for (;;) {
+    for (size_t segment = 0; segment < GSH_VARIABLE_TEXT_CAP; segment++) {
         const char *quote = strchr(cursor, '\'');
         size_t length = quote == NULL ? strlen(cursor)
                                       : (size_t)(quote - cursor);
@@ -56,11 +76,16 @@ static int quote_assignment(const gsh_builtin_io *io,
         }
         cursor = quote + 1U;
     }
+    errno = E2BIG;
+    return 1;
 }
 
 static int list_variables(const gsh_variable_store *variables,
                           const gsh_builtin_io *io)
 {
+    if (variables == NULL) {
+        return -1;
+    }
     const char *assignments[GSH_VARIABLE_CAP];
     size_t count = 0;
     size_t index;
@@ -71,7 +96,7 @@ static int list_variables(const gsh_variable_store *variables,
                 gsh_variables_assignment(variables, index, NULL);
         }
     }
-    qsort(assignments, count, sizeof(assignments[0]), compare_assignments);
+    sort_assignments(assignments, count);
     for (index = 0; index < count; index++) {
         if (quote_assignment(io, assignments[index]) != 0) {
             return 1;
@@ -83,6 +108,9 @@ static int list_variables(const gsh_variable_store *variables,
 static int list_options(const gsh_shell_options *options, bool reusable,
                         const gsh_builtin_io *io)
 {
+    if (io == NULL || options == NULL) {
+        return -1;
+    }
     size_t index;
 
     for (index = 0; index < gsh_options_count(); index++) {
@@ -109,6 +137,9 @@ static int list_options(const gsh_shell_options *options, bool reusable,
 static int update_letters(gsh_shell_options *options, const char *letters,
                           bool enabled, const gsh_builtin_io *io)
 {
+    if (io == NULL || letters == NULL) {
+        return -1;
+    }
     while (*letters != '\0') {
         if (*letters == 'o' ||
             gsh_options_update_letter(options, *letters, enabled) == -1) {
@@ -122,6 +153,9 @@ static int update_letters(gsh_shell_options *options, const char *letters,
 bool gsh_builtin_set_mutates_positionals(size_t argc,
                                          char *const argv[])
 {
+    if (argv == NULL) {
+        return false;
+    }
     size_t index = 1;
 
     while (index < argc) {
@@ -148,6 +182,9 @@ int gsh_builtin_set(size_t argc, char *const argv[],
                     gsh_shell_options *options,
                     const gsh_builtin_io *io)
 {
+    if (argv == NULL || io == NULL || options == NULL || variables == NULL) {
+        return -1;
+    }
     gsh_shell_options next = *options;
     size_t index = 1;
     size_t positional_begin = argc;

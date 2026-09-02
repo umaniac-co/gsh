@@ -5,16 +5,17 @@
 #error "gsh function tests require the POSIX.1-2024 baseline"
 #endif
 
-#include "../src/posix_parser.h"
 #include "../src/shell_functions.h"
 
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 
 static size_t function_node(const gsh_parse_storage *storage,
                             const char *input, const char *name)
 {
+    if (input == NULL || name == NULL || storage == NULL) {
+        return 0U;
+    }
     size_t index;
     size_t length = strlen(name);
 
@@ -38,17 +39,17 @@ int main(void)
     static const char input[] =
         "alpha(){ /usr/bin/printf '%s' \"$1\"; } >\"$2\"; "
         "beta(){ :; }";
-    gsh_parse_storage *parsed = malloc(sizeof(*parsed));
-    gsh_function_store *store = malloc(sizeof(*store));
-    gsh_function_store *clone = malloc(sizeof(*clone));
+    static gsh_parse_storage parsed_storage;
+    static gsh_function_store store_storage;
+    static gsh_function_store clone_storage;
+    gsh_parse_storage *parsed = &parsed_storage;
+    gsh_function_store *store = &store_storage;
+    gsh_function_store *clone = &clone_storage;
     gsh_function_snapshot_header header;
     gsh_parse_result result;
     size_t alpha;
     size_t beta;
 
-    if (parsed == NULL || store == NULL || clone == NULL) {
-        return 1;
-    }
     result = gsh_parse(input, sizeof(input) - 1U, parsed);
     alpha = function_node(parsed, input, "alpha");
     beta = function_node(parsed, input, "beta");
@@ -64,7 +65,7 @@ int main(void)
         !gsh_functions_clone(clone, store) ||
         gsh_functions_lookup(clone, "alpha", 5) == NULL ||
         gsh_functions_lookup(clone, "beta", 4) == NULL) {
-        fprintf(stderr, "function test: build or clone failed\n");
+        (void)fprintf(stderr, "function test: build or clone failed\n");
         return 1;
     }
 
@@ -72,18 +73,18 @@ int main(void)
     if (!gsh_functions_snapshot_header_valid(&header) ||
         header.base_generation != 17 ||
         gsh_functions_snapshot_payload_size(&header) == 0) {
-        fprintf(stderr, "function test: valid snapshot rejected\n");
+        (void)fprintf(stderr, "function test: valid snapshot rejected\n");
         return 1;
     }
     header.version++;
     if (gsh_functions_snapshot_header_valid(&header)) {
-        fprintf(stderr, "function test: version corruption accepted\n");
+        (void)fprintf(stderr, "function test: version corruption accepted\n");
         return 1;
     }
     gsh_functions_snapshot_header(store, 17, &header);
     header.node_count = GSH_PARSE_NODE_CAP + 1U;
     if (gsh_functions_snapshot_header_valid(&header)) {
-        fprintf(stderr, "function test: count corruption accepted\n");
+        (void)fprintf(stderr, "function test: count corruption accepted\n");
         return 1;
     }
 
@@ -93,7 +94,7 @@ int main(void)
     gsh_functions_snapshot_header(clone, 17, &header);
     clone->entries[0].source_offset = header.text_used;
     if (gsh_functions_snapshot_finalize(clone, &header)) {
-        fprintf(stderr, "function test: source corruption accepted\n");
+        (void)fprintf(stderr, "function test: source corruption accepted\n");
         return 1;
     }
     if (!gsh_functions_clone(clone, store)) {
@@ -103,7 +104,7 @@ int main(void)
     clone->programs.nodes[clone->entries[0].node_offset].first_child =
         GSH_PARSE_NODE_CAP;
     if (gsh_functions_snapshot_finalize(clone, &header)) {
-        fprintf(stderr, "function test: AST corruption accepted\n");
+        (void)fprintf(stderr, "function test: AST corruption accepted\n");
         return 1;
     }
     if (!gsh_functions_clone(clone, store)) {
@@ -112,19 +113,16 @@ int main(void)
     gsh_functions_snapshot_header(clone, 17, &header);
     clone->entries[1] = clone->entries[0];
     if (gsh_functions_snapshot_finalize(clone, &header)) {
-        fprintf(stderr, "function test: duplicate name accepted\n");
+        (void)fprintf(stderr, "function test: duplicate name accepted\n");
         return 1;
     }
 
     if (gsh_functions_unset(store, "alpha", 5) == -1 ||
         gsh_functions_lookup(store, "alpha", 5) != NULL ||
         gsh_functions_lookup(store, "beta", 4) == NULL) {
-        fprintf(stderr, "function test: unset damaged namespace\n");
+        (void)fprintf(stderr, "function test: unset damaged namespace\n");
         return 1;
     }
-    free(parsed);
-    free(store);
-    free(clone);
-    puts("function store: clone, snapshot validation, corruption, and unset passed");
+    (void)puts("function store: clone, snapshot validation, corruption, and unset passed");
     return 0;
 }

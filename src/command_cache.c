@@ -19,6 +19,9 @@ _Static_assert(GSH_COMMAND_PATH_SCAN_CAP >= GSH_COMMAND_PATH_CAP,
 
 static uint32_t command_hash(const char *name, size_t length)
 {
+    if (name == NULL) {
+        return 0U;
+    }
     uint32_t hash = UINT32_C(2166136261);
     size_t offset;
 
@@ -31,6 +34,9 @@ static uint32_t command_hash(const char *name, size_t length)
 
 static bool executable_candidate(const char *candidate)
 {
+    if (candidate == NULL) {
+        return false;
+    }
     struct stat status;
 
     return candidate != NULL && access(candidate, X_OK) == 0 &&
@@ -41,6 +47,9 @@ static bool copy_candidate(const char *directory, size_t directory_length,
                            const char *name, size_t name_length,
                            char output[GSH_COMMAND_PATH_CAP])
 {
+    if (directory == NULL || name == NULL || output == NULL) {
+        return false;
+    }
     size_t used = directory_length == 0 ? 1U : directory_length;
 
     if (used + 1U + name_length + 1U > GSH_COMMAND_PATH_CAP) {
@@ -49,10 +58,10 @@ static bool copy_candidate(const char *directory, size_t directory_length,
     if (directory_length == 0) {
         output[0] = '.';
     } else {
-        memcpy(output, directory, directory_length);
+        (void)memcpy(output, directory, directory_length);
     }
     output[used++] = '/';
-    memcpy(output + used, name, name_length + 1U);
+    (void)memcpy(output + used, name, name_length + 1U);
     return true;
 }
 
@@ -82,7 +91,7 @@ int gsh_command_search_external(const char *name, const char *path,
         if (!executable_candidate(name)) {
             return 0;
         }
-        memcpy(output, name, name_length + 1U);
+        (void)memcpy(output, name, name_length + 1U);
         return 1;
     }
     path_length = strnlen(path, GSH_COMMAND_PATH_SCAN_CAP + 1U);
@@ -118,7 +127,7 @@ void gsh_command_cache_initialize(gsh_command_cache *cache,
     if (cache == NULL) {
         return;
     }
-    memset(cache, 0, sizeof(*cache));
+    (void)memset(cache, 0, sizeof(*cache));
     cache->version = GSH_COMMAND_CACHE_VERSION;
     cache->observed_path_generation = path_generation;
 }
@@ -126,6 +135,9 @@ void gsh_command_cache_initialize(gsh_command_cache *cache,
 void gsh_command_cache_clear(gsh_command_cache *cache,
                              uint64_t path_generation)
 {
+    if (cache == NULL) {
+        return;
+    }
     gsh_command_cache_initialize(cache, path_generation);
 }
 
@@ -145,6 +157,9 @@ static bool entry_matches(const gsh_command_cache *cache,
                           const char *name, size_t name_length,
                           uint32_t hash)
 {
+    if (cache == NULL || entry == NULL || name == NULL) {
+        return false;
+    }
     return entry->hash == hash && entry->name_length == name_length &&
            entry->name_offset < cache->text_used &&
            memcmp(cache->text + entry->name_offset, name, name_length) == 0;
@@ -153,6 +168,9 @@ static bool entry_matches(const gsh_command_cache *cache,
 static size_t cache_index(const gsh_command_cache *cache, const char *name,
                           size_t name_length, uint32_t hash)
 {
+    if (cache == NULL) {
+        return 0U;
+    }
     size_t slot = hash & (GSH_COMMAND_CACHE_HASH_CAP - 1U);
     size_t probes;
 
@@ -174,6 +192,9 @@ static size_t cache_index(const gsh_command_cache *cache, const char *name,
 
 static int insert_hash_slot(gsh_command_cache *cache, size_t index)
 {
+    if (cache == NULL) {
+        return -1;
+    }
     size_t slot = cache->entries[index].hash &
                   (GSH_COMMAND_CACHE_HASH_CAP - 1U);
     size_t probes;
@@ -191,9 +212,12 @@ static int insert_hash_slot(gsh_command_cache *cache, size_t index)
 
 static void rebuild_hash(gsh_command_cache *cache)
 {
+    if (cache == NULL) {
+        return;
+    }
     size_t index;
 
-    memset(cache->hash_slots, 0, sizeof(cache->hash_slots));
+    (void)memset(cache->hash_slots, 0, sizeof(cache->hash_slots));
     for (index = 0; index < cache->count; index++) {
         (void)insert_hash_slot(cache, index);
     }
@@ -201,15 +225,18 @@ static void rebuild_hash(gsh_command_cache *cache)
 
 static void remove_entry(gsh_command_cache *cache, size_t index)
 {
+    if (cache == NULL) {
+        return;
+    }
     size_t begin = cache->entries[index].name_offset;
     size_t end = cache->entries[index].path_offset +
                  cache->entries[index].path_length + 1U;
     size_t removed = end - begin;
     size_t other;
 
-    memmove(cache->text + begin, cache->text + end,
+    (void)memmove(cache->text + begin, cache->text + end,
             cache->text_used - end);
-    memmove(cache->entries + index, cache->entries + index + 1U,
+    (void)memmove(cache->entries + index, cache->entries + index + 1U,
             (cache->count - index - 1U) * sizeof(cache->entries[0]));
     cache->count--;
     cache->text_used -= (uint32_t)removed;
@@ -219,9 +246,9 @@ static void remove_entry(gsh_command_cache *cache, size_t index)
             cache->entries[other].path_offset -= (uint32_t)removed;
         }
     }
-    memset(&cache->entries[cache->count], 0,
+    (void)memset(&cache->entries[cache->count], 0,
            sizeof(cache->entries[0]));
-    memset(cache->text + cache->text_used, 0, removed);
+    (void)memset(cache->text + cache->text_used, 0, removed);
     rebuild_hash(cache);
 }
 
@@ -229,6 +256,9 @@ static int remember_path(gsh_command_cache *cache, const char *name,
                          size_t name_length, const char *path,
                          size_t path_length)
 {
+    if (cache == NULL) {
+        return -1;
+    }
     size_t required = name_length + path_length + 2U;
     size_t index;
 
@@ -257,14 +287,14 @@ static int remember_path(gsh_command_cache *cache, const char *name,
     cache->entries[index].hash = command_hash(name, name_length);
     cache->entries[index].name_length = (uint16_t)name_length;
     cache->entries[index].path_length = (uint16_t)path_length;
-    memcpy(cache->text + cache->text_used, name, name_length + 1U);
-    memcpy(cache->text + cache->entries[index].path_offset, path,
+    (void)memcpy(cache->text + cache->text_used, name, name_length + 1U);
+    (void)memcpy(cache->text + cache->entries[index].path_offset, path,
            path_length + 1U);
     cache->text_used += (uint32_t)required;
     if (insert_hash_slot(cache, index) == -1) {
         cache->count--;
         cache->text_used -= (uint32_t)required;
-        memset(&cache->entries[index], 0, sizeof(cache->entries[index]));
+        (void)memset(&cache->entries[index], 0, sizeof(cache->entries[index]));
         return -1;
     }
     return 0;
@@ -336,7 +366,7 @@ int gsh_command_cache_resolve(gsh_command_cache *cache,
         const char *cached = cache->text + cache->entries[index].path_offset;
 
         if (executable_candidate(cached)) {
-            memcpy(output, cached, cache->entries[index].path_length + 1U);
+            (void)memcpy(output, cached, cache->entries[index].path_length + 1U);
             return 1;
         }
         remove_entry(cache, index);
@@ -365,12 +395,18 @@ int gsh_command_cache_resolve(gsh_command_cache *cache,
 
 size_t gsh_command_cache_count(const gsh_command_cache *cache)
 {
+    if (cache == NULL) {
+        return 0U;
+    }
     return cache == NULL ? 0U : cache->count;
 }
 
 const char *gsh_command_cache_name(const gsh_command_cache *cache,
                                    size_t index)
 {
+    if (cache == NULL) {
+        return NULL;
+    }
     return cache == NULL || index >= cache->count
                ? NULL
                : cache->text + cache->entries[index].name_offset;
@@ -379,6 +415,9 @@ const char *gsh_command_cache_name(const gsh_command_cache *cache,
 const char *gsh_command_cache_path(const gsh_command_cache *cache,
                                    size_t index)
 {
+    if (cache == NULL) {
+        return NULL;
+    }
     return cache == NULL || index >= cache->count
                ? NULL
                : cache->text + cache->entries[index].path_offset;

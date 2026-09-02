@@ -22,8 +22,7 @@ enum {
 };
 
 typedef enum {
-    GSH_ASYNC_UNUSED,
-    GSH_ASYNC_QUEUED,
+    GSH_ASYNC_QUEUED = 1,
     GSH_ASYNC_STARTING,
     GSH_ASYNC_RUNNING,
     GSH_ASYNC_STOPPED,
@@ -118,7 +117,6 @@ size_t gsh_async_repl_job_count(const gsh_async_repl *repl);
 bool gsh_async_repl_all_settled(const gsh_async_repl *repl);
 bool gsh_async_repl_all_settled_except(const gsh_async_repl *repl,
                                        int ignored_cell);
-int gsh_async_repl_latest_job(const gsh_async_repl *repl);
 int gsh_async_repl_focused_job(const gsh_async_repl *repl);
 int gsh_async_repl_focus(gsh_async_repl *repl, int cell_index);
 int gsh_async_repl_request_input(gsh_async_repl *repl, int cell_index,

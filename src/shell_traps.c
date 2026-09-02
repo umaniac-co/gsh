@@ -7,11 +7,10 @@
 
 #include "shell_traps.h"
 
-#include <assert.h>
 #include <errno.h>
 #include <limits.h>
 #include <signal.h>
-#include <stdint.h>
+#include <stdint.h> /* CANON-INCLUDE: linux */
 #include <string.h>
 
 typedef struct {
@@ -167,8 +166,8 @@ static int set_signal_state(int signal_number, gsh_trap_state state)
     if (signal_number == 0 || uncatchable_signal(signal_number)) {
         return 0;
     }
-    memset(&disposition, 0, sizeof(disposition));
-    sigemptyset(&disposition.sa_mask);
+    (void)memset(&disposition, 0, sizeof(disposition));
+    (void)sigemptyset(&disposition.sa_mask);
     disposition.sa_handler = state == GSH_TRAP_ACTION
                                  ? trap_signal_handler
                                  : state == GSH_TRAP_IGNORE ||
@@ -180,27 +179,31 @@ static int set_signal_state(int signal_number, gsh_trap_state state)
 
 static int block_condition(size_t condition, sigset_t *previous)
 {
+    if (previous == NULL) {
+        return -1;
+    }
     sigset_t blocked;
     int signal_number = CONDITIONS[condition].signal_number;
 
-    sigemptyset(&blocked);
-    if (signal_number != 0 && sigaddset(&blocked, signal_number) == -1) {
-        return -1;
+    (void)sigemptyset(&blocked);
+    if (signal_number != 0) {
+        (void)sigaddset(&blocked, signal_number);
     }
     return sigprocmask(SIG_BLOCK, &blocked, previous);
 }
 
 static void remove_action_text(gsh_trap_store *store, size_t condition)
 {
+    if (store == NULL || condition >= GSH_TRAP_CONDITION_CAP) return;
     gsh_trap_entry *entry = &store->entries[condition];
     size_t following;
     size_t index;
 
-    assert(entry->state == GSH_TRAP_ACTION);
-    assert(entry->offset <= store->text_used);
-    assert(entry->length <= store->text_used - entry->offset);
+    if (entry->state != GSH_TRAP_ACTION ||
+        entry->offset > store->text_used ||
+        entry->length > store->text_used - entry->offset) return;
     following = store->text_used - entry->offset - entry->length;
-    memmove(store->text + entry->offset,
+    (void)memmove(store->text + entry->offset,
             store->text + entry->offset + entry->length, following);
     store->text_used -= entry->length;
     for (index = 0; index < gsh_traps_condition_count(); index++) {
@@ -217,6 +220,10 @@ static void commit_trap_entry(gsh_trap_store *store, size_t condition,
                               gsh_trap_state state, const char *action,
                               size_t action_length)
 {
+    if (store == NULL || condition >= gsh_traps_condition_count() ||
+        (state == GSH_TRAP_ACTION && action == NULL)) {
+        return;
+    }
     gsh_trap_entry *entry = &store->entries[condition];
     bool was_nondefault = entry->state != GSH_TRAP_DEFAULT;
     bool was_action = entry->state == GSH_TRAP_ACTION;
@@ -230,7 +237,7 @@ static void commit_trap_entry(gsh_trap_store *store, size_t condition,
     if (state == GSH_TRAP_ACTION) {
         entry->offset = store->text_used;
         entry->length = action_length;
-        memcpy(store->text + store->text_used, action, action_length);
+        (void)memcpy(store->text + store->text_used, action, action_length);
         store->text_used += action_length;
         store->text[store->text_used] = '\0';
     }
@@ -242,12 +249,13 @@ static void commit_trap_entry(gsh_trap_store *store, size_t condition,
 
 static void discard_subshell_snapshot(gsh_trap_store *store)
 {
+    if (store == NULL) return;
     size_t condition;
 
     if (!store->snapshot_valid) {
         return;
     }
-    assert(store->action_count == 0U);
+    if (store->action_count != 0U) return;
     store->snapshot_valid = false;
     store->snapshot_text_used = 0;
     store->text_used = 0;
@@ -370,6 +378,9 @@ bool gsh_traps_parse_condition(const char *text, size_t *condition)
 gsh_trap_state gsh_traps_state(const gsh_trap_store *store,
                                size_t condition)
 {
+    if (store == NULL) {
+        return (gsh_trap_state){0};
+    }
     return store != NULL && condition < gsh_traps_condition_count()
                ? store->entries[condition].state
                : GSH_TRAP_DEFAULT;
@@ -385,8 +396,8 @@ const char *gsh_traps_action(const gsh_trap_store *store,
         return NULL;
     }
     entry = &store->entries[condition];
-    assert(entry->offset <= store->text_used);
-    assert(entry->length <= store->text_used - entry->offset);
+    if (entry->offset > store->text_used ||
+        entry->length > store->text_used - entry->offset) return NULL;
     if (length != NULL) {
         *length = entry->length;
     }
@@ -496,11 +507,11 @@ int gsh_traps_enter_subshell(gsh_trap_store *store)
         return 0;
     }
     discard_subshell_snapshot(store);
-    memcpy(store->snapshot_entries, store->entries,
+    (void)memcpy(store->snapshot_entries, store->entries,
            gsh_traps_condition_count() * sizeof(store->entries[0]));
     store->snapshot_text_used = store->text_used;
     store->snapshot_valid = true;
-    sigemptyset(&blocked);
+    (void)sigemptyset(&blocked);
     for (condition = 1U; condition < gsh_traps_condition_count();
          condition++) {
         (void)sigaddset(&blocked, CONDITIONS[condition].signal_number);
@@ -544,6 +555,9 @@ int gsh_traps_enter_subshell(gsh_trap_store *store)
 
 bool gsh_traps_have_pending(const gsh_trap_store *store)
 {
+    if (store == NULL) {
+        return false;
+    }
     return store != NULL && store->action_count != 0U &&
            any_pending != 0;
 }
@@ -577,7 +591,7 @@ bool gsh_traps_take_pending(gsh_trap_store *store, size_t *condition)
         !gsh_traps_have_pending(store)) {
         return false;
     }
-    sigemptyset(&blocked);
+    (void)sigemptyset(&blocked);
     for (index = 1U; index < gsh_traps_condition_count(); index++) {
         if (store->entries[index].state == GSH_TRAP_ACTION) {
             (void)sigaddset(&blocked, CONDITIONS[index].signal_number);

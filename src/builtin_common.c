@@ -11,10 +11,12 @@
 #include <string.h>
 #include <unistd.h>
 
-int gsh_builtin_descriptor_output(void *opaque, int descriptor,
-                                  const char *text, size_t length)
+static int descriptor_output(int descriptor, const char *text,
+                             size_t length)
 {
-    (void)opaque;
+    if (text == NULL) {
+        return -1;
+    }
     while (length > 0) {
         ssize_t written = write(descriptor, text, length);
 
@@ -30,13 +32,82 @@ int gsh_builtin_descriptor_output(void *opaque, int descriptor,
     return 0;
 }
 
+static int bounded_buffer_output(const gsh_builtin_io *io,
+                                 const char *text, size_t length)
+{
+    if (io == NULL || text == NULL) {
+        return -1;
+    }
+    size_t *offset = io->buffer.offset;
+    size_t *used = io->buffer.length;
+
+    if (io->buffer.async_repl != NULL) {
+        return gsh_async_repl_append(io->buffer.async_repl,
+                                     io->buffer.async_cell, text,
+                                     length) >= 0
+                   ? 0
+                   : 1;
+    }
+    if (io->buffer.bytes == NULL || offset == NULL || used == NULL ||
+        *used > io->buffer.capacity || length > io->buffer.capacity - *used) {
+        if (io->buffer.overloads != NULL) {
+            (*io->buffer.overloads)++;
+        }
+        return 1;
+    }
+    if (*offset + *used + length > io->buffer.capacity) {
+        (void)memmove(io->buffer.bytes, io->buffer.bytes + *offset, *used);
+        *offset = 0;
+    }
+    (void)memcpy(io->buffer.bytes + *offset + *used, text, length);
+    *used += length;
+    return 0;
+}
+
+bool gsh_builtin_io_valid(const gsh_builtin_io *io)
+{
+    if (io == NULL) {
+        return false;
+    }
+    if (io->kind == GSH_BUILTIN_SINK_DESCRIPTORS) {
+        return io->descriptors.output >= 0 && io->descriptors.error >= 0;
+    }
+    return io->kind == GSH_BUILTIN_SINK_BUFFER &&
+           (io->buffer.async_repl != NULL ||
+            (io->buffer.bytes != NULL && io->buffer.offset != NULL &&
+             io->buffer.length != NULL));
+}
+
+int gsh_builtin_output(const gsh_builtin_io *io, int descriptor,
+                       const char *text, size_t length)
+{
+    if (!gsh_builtin_io_valid(io) || text == NULL) {
+        errno = EINVAL;
+        return 1;
+    }
+    if (io->kind == GSH_BUILTIN_SINK_DESCRIPTORS) {
+        int target = descriptor == STDERR_FILENO ? io->descriptors.error
+                                                  : io->descriptors.output;
+
+        return descriptor_output(target, text, length);
+    }
+    if (io->kind == GSH_BUILTIN_SINK_BUFFER) {
+        return bounded_buffer_output(io, text, length);
+    }
+    errno = EINVAL;
+    return 1;
+}
+
 int gsh_builtin_error(const gsh_builtin_io *io, const char *name,
                       const char *message)
 {
-    (void)io->output(io->opaque, STDERR_FILENO, "gsh: ", 5);
-    (void)io->output(io->opaque, STDERR_FILENO, name, strlen(name));
-    (void)io->output(io->opaque, STDERR_FILENO, ": ", 2);
-    (void)io->output(io->opaque, STDERR_FILENO, message, strlen(message));
-    (void)io->output(io->opaque, STDERR_FILENO, "\n", 1);
+    if (io == NULL || message == NULL || name == NULL) {
+        return -1;
+    }
+    (void)gsh_builtin_output(io, STDERR_FILENO, "gsh: ", 5);
+    (void)gsh_builtin_output(io, STDERR_FILENO, name, strlen(name));
+    (void)gsh_builtin_output(io, STDERR_FILENO, ": ", 2);
+    (void)gsh_builtin_output(io, STDERR_FILENO, message, strlen(message));
+    (void)gsh_builtin_output(io, STDERR_FILENO, "\n", 1);
     return 1;
 }

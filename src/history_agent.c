@@ -19,18 +19,13 @@
 #include <poll.h>
 #include <signal.h>
 #include <sodium.h>
-#include <stdbool.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
+#include <string.h> /* CANON-INCLUDE: macos */
+#include <sys/resource.h> /* CANON-INCLUDE: linux */
 #include <sys/socket.h>
-#include <sys/resource.h>
 #include <sys/stat.h>
-#include <sys/types.h>
 #include <sys/un.h>
 #include <time.h>
-#include <unistd.h>
+#include <unistd.h> /* CANON-INCLUDE: macos */
 
 enum {
     AGENT_CLIENT_CAP = 16,
@@ -60,6 +55,13 @@ typedef struct {
     unsigned char *cipher;
 } agent_state;
 
+typedef struct {
+    gsh_history_store store;
+    unsigned char plain[GSH_HISTORY_SERIALIZED_CAP];
+    unsigned char cipher[GSH_HISTORY_SERIALIZED_CAP +
+                         crypto_aead_xchacha20poly1305_ietf_ABYTES];
+} agent_storage;
+
 static const unsigned char vault_magic[8] = {
     'G', 'S', 'H', 'V', 'A', 'U', 'L', '1'};
 
@@ -74,6 +76,9 @@ static const unsigned char vault_magic[8] = {
 
 static void encode_u32(unsigned char output[4], uint32_t value)
 {
+    if (output == NULL) {
+        return;
+    }
     output[0] = (unsigned char)(value >> 24);
     output[1] = (unsigned char)(value >> 16);
     output[2] = (unsigned char)(value >> 8);
@@ -82,12 +87,18 @@ static void encode_u32(unsigned char output[4], uint32_t value)
 
 static uint32_t decode_u32(const unsigned char input[4])
 {
+    if (input == NULL) {
+        return 0U;
+    }
     return ((uint32_t)input[0] << 24) | ((uint32_t)input[1] << 16) |
            ((uint32_t)input[2] << 8) | (uint32_t)input[3];
 }
 
 static void encode_u64(unsigned char output[8], uint64_t value)
 {
+    if (output == NULL) {
+        return;
+    }
     size_t index;
 
     for (index = 0; index < 8U; index++) {
@@ -97,6 +108,9 @@ static void encode_u64(unsigned char output[8], uint64_t value)
 
 static uint64_t decode_u64(const unsigned char input[8])
 {
+    if (input == NULL) {
+        return 0U;
+    }
     uint64_t value = 0;
     size_t index;
 
@@ -108,6 +122,9 @@ static uint64_t decode_u64(const unsigned char input[8])
 
 static int read_all(int descriptor, void *buffer, size_t length)
 {
+    if (buffer == NULL) {
+        return -1;
+    }
     size_t offset = 0;
     unsigned int attempts = 0;
 
@@ -133,6 +150,9 @@ static int read_all(int descriptor, void *buffer, size_t length)
 
 static int write_all(int descriptor, const void *buffer, size_t length)
 {
+    if (buffer == NULL) {
+        return -1;
+    }
     size_t offset = 0;
     unsigned int attempts = 0;
 
@@ -160,6 +180,9 @@ static int write_all(int descriptor, const void *buffer, size_t length)
 static int send_response(int descriptor, int status, const void *payload,
                          size_t length)
 {
+    if (length != 0U && payload == NULL) {
+        return -1;
+    }
     gsh_history_message message = {
         .magic = GSH_HISTORY_PROTOCOL_MAGIC,
         .version = GSH_HISTORY_PROTOCOL_VERSION,
@@ -211,12 +234,15 @@ static int secure_vault_descriptor(int descriptor)
 static void build_header(agent_state *state, unsigned char *header,
                          size_t plain_length)
 {
-    memset(header, 0, VAULT_HEADER_CAP);
-    memcpy(header, vault_magic, sizeof(vault_magic));
+    if (header == NULL || state == NULL) {
+        return;
+    }
+    (void)memset(header, 0, VAULT_HEADER_CAP);
+    (void)memcpy(header, vault_magic, sizeof(vault_magic));
     encode_u32(header + 8, 1U);
     encode_u64(header + 12, state->opslimit);
     encode_u64(header + 20, (uint64_t)state->memlimit);
-    memcpy(header + 28, state->salt, crypto_pwhash_SALTBYTES);
+    (void)memcpy(header + 28, state->salt, crypto_pwhash_SALTBYTES);
     randombytes_buf(header + 44,
                     crypto_aead_xchacha20poly1305_ietf_NPUBBYTES);
     encode_u64(header + 68, (uint64_t)plain_length);
@@ -225,6 +251,7 @@ static void build_header(agent_state *state, unsigned char *header,
 static int atomic_replace(agent_state *state, const unsigned char *header,
                           size_t cipher_length)
 {
+    if (state == NULL) return -1;
     char temporary[4096];
     int descriptor;
     int result = 0;
@@ -260,6 +287,9 @@ static int atomic_replace(agent_state *state, const unsigned char *header,
 
 static int save_vault(agent_state *state)
 {
+    if (state == NULL) {
+        return -1;
+    }
     unsigned char header[VAULT_HEADER_CAP];
     unsigned long long cipher_length = 0;
     size_t plain_length = gsh_history_serialize(
@@ -302,6 +332,9 @@ static int derive_key(const char *passphrase, size_t length,
 static int read_vault_file(agent_state *state, unsigned char *header,
                            size_t *cipher_length)
 {
+    if (cipher_length == NULL || state == NULL) {
+        return -1;
+    }
     struct stat status;
     int descriptor = open(state->vault_path,
                           O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
@@ -329,6 +362,9 @@ static int read_vault_file(agent_state *state, unsigned char *header,
 static int validate_header(agent_state *state, const unsigned char *header,
                            size_t cipher_length, size_t *plain_length)
 {
+    if (plain_length == NULL || state == NULL) {
+        return -1;
+    }
     uint64_t encoded_length;
 
     if (memcmp(header, vault_magic, sizeof(vault_magic)) != 0 ||
@@ -349,7 +385,7 @@ static int validate_header(agent_state *state, const unsigned char *header,
         errno = EPROTO;
         return -1;
     }
-    memcpy(state->salt, header + 28, crypto_pwhash_SALTBYTES);
+    (void)memcpy(state->salt, header + 28, crypto_pwhash_SALTBYTES);
     *plain_length = (size_t)encoded_length;
     return 0;
 }
@@ -377,7 +413,7 @@ static int unlock_existing(agent_state *state, const char *passphrase,
         decrypted == plain_length &&
         gsh_history_deserialize(state->store, state->plain,
                                 plain_length) == 0) {
-        memcpy(state->key, candidate, sizeof(state->key));
+        (void)memcpy(state->key, candidate, sizeof(state->key));
         state->unlocked = true;
         result = 0;
     } else {
@@ -390,6 +426,9 @@ static int unlock_existing(agent_state *state, const char *passphrase,
 static int create_vault(agent_state *state, const char *passphrase,
                         size_t length)
 {
+    if (state == NULL) {
+        return -1;
+    }
     randombytes_buf(state->salt, sizeof(state->salt));
     state->opslimit = crypto_pwhash_OPSLIMIT_INTERACTIVE;
     state->memlimit = crypto_pwhash_MEMLIMIT_INTERACTIVE;
@@ -410,6 +449,9 @@ static int create_vault(agent_state *state, const char *passphrase,
 static uint64_t reminder_interval(const unsigned char *request,
                                   size_t length)
 {
+    if (request == NULL) {
+        return 0U;
+    }
     uint64_t minimum;
     uint64_t maximum;
     uint64_t seconds;
@@ -441,6 +483,9 @@ static uint64_t agent_monotonic_ns(void)
 static uint64_t renew_reminder(agent_state *state,
                                const unsigned char *request, size_t length)
 {
+    if (request == NULL || state == NULL) {
+        return 0U;
+    }
     uint64_t interval = reminder_interval(request, length);
     uint64_t now = agent_monotonic_ns();
 
@@ -456,6 +501,10 @@ static uint64_t reminder_remaining(agent_state *state,
                                    const unsigned char *request,
                                    size_t length)
 {
+    if (state == NULL) return 0U;
+    if (request == NULL) {
+        return 0U;
+    }
     uint64_t now;
 
     if (state->reminder_deadline_ns == 0) {
@@ -472,6 +521,9 @@ static int snapshot_response(agent_state *state, int descriptor,
                              const unsigned char *request,
                              size_t request_length)
 {
+    if (request == NULL || state == NULL) {
+        return -1;
+    }
     size_t serialized = gsh_history_serialize(
         state->store, state->plain + 8, GSH_HISTORY_SERIALIZED_CAP - 8U);
 
@@ -488,6 +540,10 @@ static int handle_unlock(agent_state *state, int descriptor,
                          const unsigned char *request, size_t length,
                          bool reset)
 {
+    if (state == NULL) return -1;
+    if (request == NULL) {
+        return -1;
+    }
     const char *passphrase;
     size_t passphrase_length;
     int result;
@@ -512,6 +568,7 @@ static int handle_unlock(agent_state *state, int descriptor,
 static int handle_verify(agent_state *state, int descriptor,
                          const unsigned char *request, size_t length)
 {
+    if (state == NULL) return -1;
     unsigned char candidate[crypto_aead_xchacha20poly1305_ietf_KEYBYTES];
     int status = EACCES;
 
@@ -531,6 +588,9 @@ static int handle_verify(agent_state *state, int descriptor,
 
 static void lock_agent(agent_state *state)
 {
+    if (state == NULL) {
+        return;
+    }
     sodium_memzero(state->key, sizeof(state->key));
     sodium_memzero(state->plain, GSH_HISTORY_SERIALIZED_CAP);
     gsh_history_clear(state->store);
@@ -542,6 +602,10 @@ static int handle_message(agent_state *state, int descriptor,
                           const gsh_history_message *message,
                           unsigned char *request)
 {
+    if (message == NULL) return -1;
+    if (request == NULL || state == NULL) {
+        return -1;
+    }
     if (message->type == GSH_HISTORY_MESSAGE_STATUS) {
         if (state->unlocked) {
             return snapshot_response(state, descriptor, request,
@@ -588,6 +652,9 @@ static int handle_message(agent_state *state, int descriptor,
 static int service_client(agent_state *state, int descriptor,
                           unsigned char *request)
 {
+    if (state == NULL) {
+        return -1;
+    }
     gsh_history_message message;
     int result;
 
@@ -606,6 +673,7 @@ static int service_client(agent_state *state, int descriptor,
 
 static int make_listener(agent_state *state)
 {
+    if (state == NULL) return -1;
     struct sockaddr_un address;
     int descriptor = socket(AF_UNIX, SOCK_STREAM, 0);
 
@@ -617,9 +685,9 @@ static int make_listener(agent_state *state)
         errno = ENAMETOOLONG;
         return -1;
     }
-    memset(&address, 0, sizeof(address));
+    (void)memset(&address, 0, sizeof(address));
     address.sun_family = AF_UNIX;
-    memcpy(address.sun_path, state->socket_path,
+    (void)memcpy(address.sun_path, state->socket_path,
            strlen(state->socket_path) + 1U);
     (void)unlink(state->socket_path);
     if (bind(descriptor, (struct sockaddr *)&address, sizeof(address)) == -1 ||
@@ -635,6 +703,7 @@ static int make_listener(agent_state *state)
 
 static int acquire_agent_lock(agent_state *state)
 {
+    if (state == NULL) return -1;
     char lock_path[4096];
     struct flock lock;
     int descriptor;
@@ -652,7 +721,7 @@ static int acquire_agent_lock(agent_state *state)
         }
         return -1;
     }
-    memset(&lock, 0, sizeof(lock));
+    (void)memset(&lock, 0, sizeof(lock));
     lock.l_type = F_WRLCK;
     lock.l_whence = SEEK_SET;
     if (fcntl(descriptor, F_SETLK, &lock) == -1) {
@@ -665,6 +734,9 @@ static int acquire_agent_lock(agent_state *state)
 
 static void accept_client(agent_state *state)
 {
+    if (state == NULL) {
+        return;
+    }
     int descriptor = accept(state->listener, NULL, NULL);
     int index;
     struct timeval timeout = {.tv_sec = 2, .tv_usec = 0};
@@ -694,6 +766,9 @@ static void accept_client(agent_state *state)
 
 static int run_agent(agent_state *state)
 {
+    if (state == NULL) {
+        return -1;
+    }
     unsigned char request[AGENT_REQUEST_CAP];
     struct pollfd descriptors[AGENT_CLIENT_CAP + 1U];
     int index;
@@ -728,12 +803,15 @@ static int run_agent(agent_state *state)
     return 0;
 }
 
-static int initialize_agent(agent_state *state, const char *socket_path,
-                            const char *vault_path)
+static int initialize_agent(agent_state *state, agent_storage *storage,
+                            const char *socket_path, const char *vault_path)
 {
+    if (state == NULL || storage == NULL) {
+        return -1;
+    }
     int index;
 
-    memset(state, 0, sizeof(*state));
+    (void)memset(state, 0, sizeof(*state));
     state->listener = -1;
     state->lock_descriptor = -1;
     for (index = 0; index < AGENT_CLIENT_CAP; index++) {
@@ -744,15 +822,14 @@ static int initialize_agent(agent_state *state, const char *socket_path,
         errno = ENAMETOOLONG;
         return -1;
     }
-    memcpy(state->socket_path, socket_path, strlen(socket_path) + 1U);
-    memcpy(state->vault_path, vault_path, strlen(vault_path) + 1U);
+    (void)memcpy(state->socket_path, socket_path, strlen(socket_path) + 1U);
+    (void)memcpy(state->vault_path, vault_path, strlen(vault_path) + 1U);
     state->vault_exists = access(vault_path, F_OK) == 0;
-    state->store = malloc(sizeof(*state->store));
-    state->plain = malloc(GSH_HISTORY_SERIALIZED_CAP);
-    state->cipher = malloc(GSH_HISTORY_SERIALIZED_CAP +
-                           crypto_aead_xchacha20poly1305_ietf_ABYTES);
-    if (state->store == NULL || state->plain == NULL ||
-        state->cipher == NULL || sodium_init() < 0) {
+    (void)memset(storage, 0, sizeof(*storage));
+    state->store = &storage->store;
+    state->plain = storage->plain;
+    state->cipher = storage->cipher;
+    if (sodium_init() < 0) {
         errno = ENOMEM;
         return -1;
     }
@@ -767,6 +844,9 @@ static int initialize_agent(agent_state *state, const char *socket_path,
 
 static void close_agent(agent_state *state)
 {
+    if (state == NULL) {
+        return;
+    }
     int index;
 
     lock_agent(state);
@@ -785,23 +865,54 @@ static void close_agent(agent_state *state)
     if (state->key_memory_locked) {
         (void)sodium_munlock(state->key, sizeof(state->key));
     }
-    free(state->store);
-    free(state->plain);
-    free(state->cipher);
+    sodium_memzero(state->cipher, GSH_HISTORY_SERIALIZED_CAP +
+                                      crypto_aead_xchacha20poly1305_ietf_ABYTES);
+    state->store = NULL;
+    state->plain = NULL;
+    state->cipher = NULL;
 }
 
+/* ── The Agent Ignores Signals Through One POSIX Adapter ─────────
+ * History persistence must not terminate on a stale client hangup or write.
+ * CANON-EXCEPTION: POSIX-SIGNAL-DISPOSITION permits only SIG_IGN assignments
+ * in this adapter; no repository callback is installed or retained.
+ * sigaction failures abort startup instead of leaving a partial disposition.
+ * Agent lifecycle tests cover disconnects and clean encrypted persistence.
+ * ─────────────────────────────────────────────────────────────── */
+static int ignore_agent_signal(int signo)
+{
+    struct sigaction action;
+
+    (void)memset(&action, 0, sizeof(action));
+    action.sa_handler = SIG_IGN;
+    (void)sigemptyset(&action.sa_mask);
+    return sigaction(signo, &action, NULL);
+}
+
+/* ── Agent Arguments Become Bounded Initialization Inputs ───────
+ * The operating system supplies the history path and session token via argv.
+ * CANON-EXCEPTION: C-PROCESS-ABI is confined to this main entry point.
+ * argc is validated before either element is read, and initialize_agent copies
+ * both values into fixed-capacity storage rather than retaining the pointers.
+ * Restart and hostile-initialization tests exercise this boundary contract.
+ * ─────────────────────────────────────────────────────────────── */
 int main(int argc, char **argv)
 {
-    agent_state state;
+    static agent_state state;
+    static agent_storage storage;
     struct rlimit core_limit = {0, 0};
     int status;
 
     (void)setrlimit(RLIMIT_CORE, &core_limit);
-    if (argc != 3 || initialize_agent(&state, argv[1], argv[2]) == -1) {
+    if (argc != 3 ||
+        initialize_agent(&state, &storage, argv[1], argv[2]) == -1) {
         return 1;
     }
-    (void)signal(SIGHUP, SIG_IGN);
-    (void)signal(SIGPIPE, SIG_IGN);
+    if (ignore_agent_signal(SIGHUP) == -1 ||
+        ignore_agent_signal(SIGPIPE) == -1) {
+        close_agent(&state);
+        return 1;
+    }
     status = run_agent(&state);
     close_agent(&state);
     return status == 0 ? 0 : 1;

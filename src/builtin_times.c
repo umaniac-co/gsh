@@ -7,7 +7,6 @@
 
 #include "builtin_times.h"
 
-#include <assert.h>
 #include <errno.h>
 #include <inttypes.h>
 #include <stdio.h>
@@ -38,7 +37,7 @@ int gsh_times_rebase(gsh_times_context *context,
         errno = EINVAL;
         return -1;
     }
-    memset(context, 0, sizeof(*context));
+    (void)memset(context, 0, sizeof(*context));
     context->accumulated = *accumulated;
     if (gsh_times_snapshot(&context->process_origin) == -1) {
         return -1;
@@ -92,8 +91,10 @@ static gsh_time_parts split_ticks(uintmax_t ticks, uintmax_t rate,
     unsigned int index;
     long double scaled;
 
-    assert(rate > 0U);
-    assert(places > 0U && places <= GSH_TIMES_DECIMAL_CAP);
+    if (rate == 0U || places == 0U || places > GSH_TIMES_DECIMAL_CAP) {
+        errno = EINVAL;
+        return (gsh_time_parts){0};
+    }
     for (index = 0; index < places; index++) {
         scale *= 10U;
     }
@@ -126,8 +127,10 @@ static int logical_ticks(const struct tms *current,
     clock_t origin[4] = {0, 0, 0, 0};
     size_t index;
 
-    assert(current != NULL);
-    assert(values != NULL);
+    if (current == NULL || values == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
     live[0] = current->tms_utime;
     live[1] = current->tms_stime;
     live[2] = current->tms_cutime;
@@ -168,7 +171,7 @@ int gsh_builtin_times(size_t argc, char *const argv[],
     int length;
     size_t index;
 
-    if (argv == NULL || io == NULL || io->output == NULL) {
+    if (argv == NULL || !gsh_builtin_io_valid(io)) {
         errno = EINVAL;
         return 125;
     }
@@ -197,5 +200,5 @@ int gsh_builtin_times(size_t argc, char *const argv[],
     if (length < 0 || (size_t)length >= sizeof(output)) {
         return gsh_builtin_error(io, "times", "process timing overflow");
     }
-    return io->output(io->opaque, STDOUT_FILENO, output, (size_t)length);
+    return gsh_builtin_output(io, STDOUT_FILENO, output, (size_t)length);
 }

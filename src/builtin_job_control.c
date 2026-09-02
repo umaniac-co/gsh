@@ -11,7 +11,6 @@
 #include <errno.h>
 #include <limits.h>
 #include <signal.h>
-#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -75,14 +74,20 @@ typedef struct {
 static int emit_text(const gsh_builtin_io *io, int descriptor,
                      const char *text, size_t length)
 {
-    return io == NULL || io->output == NULL ||
-                   io->output(io->opaque, descriptor, text, length) != 0
+    if (io == NULL || text == NULL) {
+        return -1;
+    }
+    return !gsh_builtin_io_valid(io) ||
+                   gsh_builtin_output(io, descriptor, text, length) != 0
                ? 1 : 0;
 }
 
 static int job_error(const gsh_builtin_io *io, const char *name,
                      const char *message)
 {
+    if (io == NULL || message == NULL || name == NULL) {
+        return -1;
+    }
     return gsh_builtin_error(io, name, message);
 }
 
@@ -97,6 +102,9 @@ static int write_job(const gsh_background_table *table,
                      const gsh_background_entry *entry, bool long_format,
                      bool process_group_only, const gsh_builtin_io *io)
 {
+    if (entry == NULL || io == NULL || table == NULL) {
+        return -1;
+    }
     char line[GSH_BACKGROUND_COMMAND_CAP + 96U];
     const char *command = entry->command_length == 0 ? "(command)"
                                                      : entry->command;
@@ -126,6 +134,9 @@ static int resolve_job_operand(const gsh_background_table *table,
                                const char *operand, uint32_t *job_id,
                                const gsh_builtin_io *io)
 {
+    if (io == NULL || job_id == NULL || operand == NULL || table == NULL) {
+        return -1;
+    }
     gsh_jobspec_status status =
         gsh_background_resolve(table, operand, job_id);
 
@@ -143,6 +154,9 @@ int gsh_builtin_jobs(size_t argc, char *const argv[],
                      gsh_background_table *jobs,
                      const gsh_builtin_io *io)
 {
+    if (argv == NULL || io == NULL) {
+        return -1;
+    }
     uint32_t selected[GSH_JOB_OPERAND_CAP];
     size_t selected_count = 0;
     size_t index = 1U;
@@ -205,6 +219,9 @@ int gsh_builtin_jobs(size_t argc, char *const argv[],
 
 static bool signal_text_equal(const char *left, const char *right)
 {
+    if (left == NULL || right == NULL) {
+        return false;
+    }
     size_t index;
 
     for (index = 0; left[index] != '\0' && right[index] != '\0'; index++) {
@@ -216,6 +233,9 @@ static bool signal_text_equal(const char *left, const char *right)
 
 static int parse_signal_name(const char *text, int *number)
 {
+    if (number == NULL || text == NULL) {
+        return -1;
+    }
     const char *name = text;
     char *end;
     long parsed;
@@ -257,6 +277,9 @@ static const char *signal_number_name(int number)
 static int list_signals(size_t argc, char *const argv[], size_t index,
                         const gsh_builtin_io *io)
 {
+    if (argv == NULL || io == NULL) {
+        return -1;
+    }
     char line[512];
     size_t used = 0;
     size_t signal_index;
@@ -310,6 +333,10 @@ static int parse_kill_target(const gsh_background_table *jobs,
                              const char *operand, kill_target *target,
                              const gsh_builtin_io *io)
 {
+    if (operand == NULL) return -1;
+    if (io == NULL || jobs == NULL || target == NULL) {
+        return -1;
+    }
     if (operand[0] == '%') {
         uint32_t job_id;
         gsh_jobspec_status status =
@@ -351,13 +378,17 @@ int gsh_builtin_kill(size_t argc, char *const argv[],
                      const gsh_background_table *jobs,
                      const gsh_builtin_io *io)
 {
+    if (argv == NULL) return 125;
+    if (io == NULL) {
+        return -1;
+    }
     kill_target targets[GSH_JOB_OPERAND_CAP];
     size_t index = 1U;
     size_t target_count = 0;
     int signal_number = SIGTERM;
     int result = 0;
 
-    memset(targets, 0, sizeof(targets));
+    (void)memset(targets, 0, sizeof(targets));
     if (jobs == NULL) return job_error(io, "kill", "job service unavailable");
     if (index < argc && strcmp(argv[index], "-l") == 0) {
         return list_signals(argc, argv, index + 1U, io);

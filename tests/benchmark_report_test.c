@@ -10,7 +10,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
-#include <stdlib.h>
+#include <stdlib.h> /* CANON-INCLUDE: linux */
 #include <string.h>
 #include <unistd.h>
 
@@ -18,6 +18,9 @@ enum { TEST_CAPTURE_CAP = 65536 };
 
 static int read_capture(const char *path, char *capture, size_t capacity)
 {
+    if (capture == NULL || path == NULL) {
+        return -1;
+    }
     int descriptor = open(path, O_RDONLY);
     ssize_t count;
 
@@ -68,6 +71,9 @@ static int verify_report(const char *capture)
 
 static int verify_column_counts(const char *capture)
 {
+    if (capture == NULL) {
+        return -1;
+    }
     size_t columns = 1;
     size_t rows = 0;
     size_t index;
@@ -97,6 +103,9 @@ static int verify_column_counts(const char *capture)
 
 static int abort_preserves_previous(const char *path)
 {
+    if (path == NULL) {
+        return -1;
+    }
     static const char original[] = "previous-complete-report\n";
     static const uint64_t samples[] = {1};
     benchmark_report report;
@@ -122,6 +131,9 @@ static int abort_preserves_previous(const char *path)
 
 static int capacity_failure_preserves_previous(const char *path)
 {
+    if (path == NULL) {
+        return -1;
+    }
     static const char original[] = "previous-capacity-report\n";
     static const uint64_t sample = 1;
     benchmark_report report;
@@ -170,7 +182,7 @@ int main(void)
     (void)unlink(path);
     (void)rmdir(directory);
     if (!failed) {
-        puts("benchmark report: tabular schema and atomic publication passed");
+        (void)puts("benchmark report: tabular schema and atomic publication passed");
     }
     return failed;
 }

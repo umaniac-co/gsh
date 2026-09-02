@@ -44,7 +44,7 @@ int main(void)
         memcmp(&store, &before, sizeof(store)) != 0) {
         return 1;
     }
-    memset(oversized, 'x', GSH_POSITIONAL_TEXT_CAP);
+    (void)memset(oversized, 'x', GSH_POSITIONAL_TEXT_CAP);
     oversized[GSH_POSITIONAL_TEXT_CAP] = '\0';
     {
         char *too_large[] = {oversized};
@@ -63,6 +63,6 @@ int main(void)
     if (gsh_positionals_validate(&store)) {
         return 1;
     }
-    puts("positionals: atomic arena and O(1) shift passed");
+    (void)puts("positionals: atomic arena and O(1) shift passed");
     return 0;
 }

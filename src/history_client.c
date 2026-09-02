@@ -15,16 +15,12 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
-#include <signal.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
-#include <sys/time.h>
-#include <sys/types.h>
+#include <sys/time.h> /* CANON-INCLUDE: linux */
 #include <sys/un.h>
-#include <sys/uio.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -45,6 +41,9 @@ enum {
 
 static void encode_u64(unsigned char output[8], uint64_t value)
 {
+    if (output == NULL) {
+        return;
+    }
     size_t index;
 
     for (index = 0; index < 8U; index++) {
@@ -54,6 +53,9 @@ static void encode_u64(unsigned char output[8], uint64_t value)
 
 static uint64_t decode_u64(const unsigned char input[8])
 {
+    if (input == NULL) {
+        return 0U;
+    }
     uint64_t value = 0;
     size_t index;
 
@@ -65,6 +67,9 @@ static uint64_t decode_u64(const unsigned char input[8])
 
 static void wipe_bytes(void *buffer, size_t length)
 {
+    if (buffer == NULL) {
+        return;
+    }
     volatile unsigned char *bytes = buffer;
     size_t index;
 
@@ -75,6 +80,9 @@ static void wipe_bytes(void *buffer, size_t length)
 
 static int write_all(int descriptor, const void *buffer, size_t length)
 {
+    if (buffer == NULL) {
+        return -1;
+    }
     size_t offset = 0;
     unsigned int attempts = 0;
 
@@ -99,6 +107,9 @@ static int write_all(int descriptor, const void *buffer, size_t length)
 
 static int read_all(int descriptor, void *buffer, size_t length)
 {
+    if (buffer == NULL) {
+        return -1;
+    }
     size_t offset = 0;
     unsigned int attempts = 0;
 
@@ -138,6 +149,10 @@ static int secure_history_directory(const char *path)
 static int configure_paths(gsh_history_client *client, const char *home,
                            const char *program_path)
 {
+    if (client == NULL) return -1;
+    if (program_path == NULL) {
+        return -1;
+    }
     char directory[HISTORY_PATH_CAP];
     const char *separator = strrchr(program_path, '/');
     size_t parent_length;
@@ -155,7 +170,7 @@ static int configure_paths(gsh_history_client *client, const char *home,
         return -1;
     }
     if (separator == NULL) {
-        memcpy(client->agent_path, "gsh-history-agent", 18U);
+        (void)memcpy(client->agent_path, "gsh-history-agent", 18U);
         return 0;
     }
     parent_length = (size_t)(separator - program_path) + 1U;
@@ -164,8 +179,8 @@ static int configure_paths(gsh_history_client *client, const char *home,
         errno = ENAMETOOLONG;
         return -1;
     }
-    memcpy(client->agent_path, program_path, parent_length);
-    memcpy(client->agent_path + parent_length, "gsh-history-agent", 18U);
+    (void)memcpy(client->agent_path, program_path, parent_length);
+    (void)memcpy(client->agent_path + parent_length, "gsh-history-agent", 18U);
     return 0;
 }
 
@@ -182,9 +197,9 @@ static int connect_agent(const char *socket_path)
         errno = ENAMETOOLONG;
         return -1;
     }
-    memset(&address, 0, sizeof(address));
+    (void)memset(&address, 0, sizeof(address));
     address.sun_family = AF_UNIX;
-    memcpy(address.sun_path, socket_path, strlen(socket_path) + 1U);
+    (void)memcpy(address.sun_path, socket_path, strlen(socket_path) + 1U);
     if (connect(descriptor, (struct sockaddr *)&address,
                 sizeof(address)) == -1) {
         (void)close(descriptor);
@@ -203,6 +218,9 @@ static int connect_agent(const char *socket_path)
 
 static void execute_agent(const gsh_history_client *client)
 {
+    if (client == NULL) {
+        return;
+    }
     int null_descriptor;
     pid_t child;
 
@@ -232,6 +250,9 @@ static void execute_agent(const gsh_history_client *client)
 
 static int start_agent(const gsh_history_client *client)
 {
+    if (client == NULL) {
+        return -1;
+    }
     pid_t child = fork();
     unsigned int attempts = 0;
 
@@ -256,6 +277,9 @@ static int start_agent(const gsh_history_client *client)
 
 static int await_agent(const gsh_history_client *client)
 {
+    if (client == NULL) {
+        return -1;
+    }
     unsigned int attempt;
 
     for (attempt = 0; attempt < CONNECT_ATTEMPT_CAP; attempt++) {
@@ -273,6 +297,7 @@ static int await_agent(const gsh_history_client *client)
 static int send_message(gsh_history_client *client, uint32_t type,
                         const void *payload, size_t length)
 {
+    if (client == NULL) return -1;
     gsh_history_message message = {
         .magic = GSH_HISTORY_PROTOCOL_MAGIC,
         .version = GSH_HISTORY_PROTOCOL_VERSION,
@@ -294,6 +319,10 @@ static int send_message(gsh_history_client *client, uint32_t type,
 static int receive_response(gsh_history_client *client, int *status,
                             size_t *length)
 {
+    if (client == NULL) return -1;
+    if (status == NULL) {
+        return -1;
+    }
     gsh_history_message response;
 
     if (read_all(client->descriptor, &response, sizeof(response)) == -1 ||
@@ -321,6 +350,9 @@ static int request_snapshot(gsh_history_client *client, uint32_t type,
                             gsh_history_store *store, int *status,
                             uint64_t *reminder_ns)
 {
+    if (reminder_ns == NULL) {
+        return -1;
+    }
     size_t response_length;
 
     if (send_message(client, type, request, request_length) == -1 ||
@@ -346,29 +378,28 @@ static int request_snapshot(gsh_history_client *client, uint32_t type,
 
 int gsh_history_client_initialize(gsh_history_client *client,
                                   const char *home,
-                                  const char *program_path)
+                                  const char *program_path,
+                                  unsigned char *snapshot,
+                                  size_t snapshot_capacity)
 {
     int descriptor;
 
-    if (client == NULL) {
+    if (client == NULL || snapshot == NULL ||
+        snapshot_capacity < GSH_HISTORY_SERIALIZED_CAP) {
         errno = EINVAL;
         return -1;
     }
-    memset(client, 0, sizeof(*client));
+    (void)memset(client, 0, sizeof(*client));
     client->descriptor = -1;
+    client->snapshot = snapshot;
+    client->snapshot_capacity = snapshot_capacity;
     if (configure_paths(client, home, program_path) == -1) {
-        return -1;
-    }
-    client->snapshot = malloc(GSH_HISTORY_SERIALIZED_CAP);
-    if (client->snapshot == NULL) {
         return -1;
     }
     descriptor = connect_agent(client->socket_path);
     if (descriptor < 0) {
         if (start_agent(client) == -1 ||
             (descriptor = await_agent(client)) < 0) {
-            free(client->snapshot);
-            client->snapshot = NULL;
             return -1;
         }
     }
@@ -415,7 +446,7 @@ int gsh_history_client_unlock(gsh_history_client *client,
     }
     encode_u64(request, reminder_min_ns);
     encode_u64(request + 8, reminder_max_ns);
-    memcpy(request + 16, passphrase, length);
+    (void)memcpy(request + 16, passphrase, length);
     result = request_snapshot(client,
                               reset ? GSH_HISTORY_MESSAGE_RESET
                                     : GSH_HISTORY_MESSAGE_UNLOCK,
@@ -447,7 +478,7 @@ int gsh_history_client_verify(gsh_history_client *client,
     }
     encode_u64(request, reminder_min_ns);
     encode_u64(request + 8, reminder_max_ns);
-    memcpy(request + 16, passphrase, length);
+    (void)memcpy(request + 16, passphrase, length);
     result = send_message(client, GSH_HISTORY_MESSAGE_VERIFY, request,
                           length + 16U);
     wipe_bytes(request, sizeof(request));
@@ -482,7 +513,7 @@ int gsh_history_client_add(gsh_history_client *client,
         errno = EINVAL;
         return -1;
     }
-    memset(&request, 0, sizeof(request));
+    (void)memset(&request, 0, sizeof(request));
     vectors[0].iov_base = &message;
     vectors[0].iov_len = sizeof(message);
     vectors[1].iov_base = (void *)command;
@@ -525,10 +556,10 @@ void gsh_history_client_close(gsh_history_client *client)
         (void)close(client->descriptor);
     }
     if (client->snapshot != NULL) {
-        wipe_bytes(client->snapshot, GSH_HISTORY_SERIALIZED_CAP);
+        wipe_bytes(client->snapshot, client->snapshot_capacity);
     }
-    free(client->snapshot);
     client->snapshot = NULL;
+    client->snapshot_capacity = 0;
     client->descriptor = -1;
     client->connected = false;
 }

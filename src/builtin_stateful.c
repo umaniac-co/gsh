@@ -8,17 +8,17 @@
 #include "builtin_stateful.h"
 
 #include <errno.h>
-#include <limits.h>
-#include <stdbool.h>
-#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
+#define require(condition) (condition)
+
 enum {
     GSH_READ_RECORD_CAP = 4096,
     GSH_READ_VARIABLE_CAP = GSH_VARIABLE_JOURNAL_CAP,
+    GSH_READ_SCAN_CAP = GSH_READ_RECORD_CAP * 2,
 };
 
 typedef struct {
@@ -54,6 +54,9 @@ typedef struct {
  * ────────────────────────────────────────────── */
 static int read_byte(unsigned char *byte)
 {
+    if (byte == NULL) {
+        return -1;
+    }
     size_t attempts;
 
     for (attempts = 0; attempts < 16U; attempts++) {
@@ -75,7 +78,9 @@ static int read_byte(unsigned char *byte)
 
 static int drain_read_record(bool raw)
 {
-    for (;;) {
+    size_t scanned;
+
+    for (scanned = 0; scanned < GSH_READ_SCAN_CAP; scanned++) {
         unsigned char byte;
         int status = read_byte(&byte);
 
@@ -88,11 +93,14 @@ static int drain_read_record(bool raw)
             if (byte == '\n') continue;
         }
     }
+    errno = E2BIG;
+    return -1;
 }
 
 static int append_read_byte(read_record *record, unsigned char byte,
                             bool escaped)
 {
+    if (record == NULL) return -1;
     if (record->length + 1U >= GSH_READ_RECORD_CAP) {
         record->overflow = true;
         return -1;
@@ -106,13 +114,16 @@ static int append_read_byte(read_record *record, unsigned char byte,
 static void prompt_read_continuation(
     const gsh_variable_store *variables, const gsh_builtin_io *io)
 {
+    if (variables == NULL) {
+        return;
+    }
     bool found;
     const char *prompt;
 
-    if (!isatty(STDIN_FILENO) || io == NULL || io->output == NULL) return;
+    if (!isatty(STDIN_FILENO) || !gsh_builtin_io_valid(io)) return;
     prompt = gsh_variables_lookup(variables, "PS2", 3U, &found);
     if (!found || prompt == NULL) prompt = "> ";
-    (void)io->output(io->opaque, STDERR_FILENO, prompt, strlen(prompt));
+    (void)gsh_builtin_output(io, STDERR_FILENO, prompt, strlen(prompt));
 }
 
 static int capture_read_record(bool raw,
@@ -120,8 +131,16 @@ static int capture_read_record(bool raw,
                                const gsh_builtin_io *io,
                                read_record *record)
 {
-    memset(record, 0, sizeof(*record));
-    for (;;) {
+    if (record == NULL) {
+        return -1;
+    }
+    size_t scanned;
+
+    (void)memset(record, 0, sizeof(*record));
+    if (io == NULL || variables == NULL) {
+        return -1;
+    }
+    for (scanned = 0; scanned < GSH_READ_SCAN_CAP; scanned++) {
         unsigned char byte;
         int status = read_byte(&byte);
 
@@ -155,12 +174,19 @@ static int capture_read_record(bool raw,
             return drain_read_record(raw);
         }
     }
+    if (scanned == GSH_READ_SCAN_CAP) {
+        errno = E2BIG;
+        return -1;
+    }
     record->text[record->length] = '\0';
     return record->overflow ? -1 : 0;
 }
 
 static bool ifs_contains(const char *ifs, unsigned char byte)
 {
+    if (ifs == NULL) {
+        return false;
+    }
     size_t index;
 
     for (index = 0; ifs[index] != '\0'; index++) {
@@ -173,6 +199,9 @@ static bool ifs_contains(const char *ifs, unsigned char byte)
 
 static bool ifs_whitespace(const char *ifs, unsigned char byte)
 {
+    if (ifs == NULL) {
+        return false;
+    }
     return (byte == ' ' || byte == '\t' || byte == '\n') &&
            ifs_contains(ifs, byte);
 }
@@ -180,6 +209,9 @@ static bool ifs_whitespace(const char *ifs, unsigned char byte)
 static size_t skip_ifs_whitespace(const read_record *record,
                                   const char *ifs, size_t offset)
 {
+    if (ifs == NULL || record == NULL) {
+        return 0U;
+    }
     while (offset < record->length && record->escaped[offset] == 0U &&
            ifs_whitespace(ifs, (unsigned char)record->text[offset])) {
         offset++;
@@ -197,7 +229,7 @@ static int store_read_value(read_values *values, size_t index,
     }
     values->offsets[index] = values->used;
     values->lengths[index] = length;
-    memcpy(values->text + values->used, text, length);
+    (void)memcpy(values->text + values->used, text, length);
     values->text[values->used + length] = '\0';
     values->used += length + 1U;
     return 0;
@@ -206,6 +238,9 @@ static int store_read_value(read_values *values, size_t index,
 static size_t read_field_end(const read_record *record, const char *ifs,
                              size_t offset)
 {
+    if (ifs == NULL || record == NULL) {
+        return 0U;
+    }
     while (offset < record->length &&
            (record->escaped[offset] != 0U ||
             !ifs_contains(ifs, (unsigned char)record->text[offset]))) {
@@ -217,6 +252,9 @@ static size_t read_field_end(const read_record *record, const char *ifs,
 static size_t consume_ifs_separator(const read_record *record,
                                     const char *ifs, size_t offset)
 {
+    if (ifs == NULL || record == NULL) {
+        return 0U;
+    }
     bool white = offset < record->length &&
                  ifs_whitespace(ifs, (unsigned char)record->text[offset]);
 
@@ -240,6 +278,9 @@ static size_t consume_ifs_separator(const read_record *record,
 static size_t trim_last_value(const read_record *record, const char *ifs,
                               size_t begin)
 {
+    if (ifs == NULL || record == NULL) {
+        return 0U;
+    }
     size_t end = record->length;
 
     while (end > begin && record->escaped[end - 1U] == 0U &&
@@ -252,10 +293,13 @@ static size_t trim_last_value(const read_record *record, const char *ifs,
 static int split_read_values(const read_record *record, const char *ifs,
                              size_t variable_count, read_values *values)
 {
+    if (ifs == NULL || record == NULL || values == NULL) {
+        return -1;
+    }
     size_t offset = skip_ifs_whitespace(record, ifs, 0);
     size_t variable;
 
-    memset(values, 0, sizeof(*values));
+    (void)memset(values, 0, sizeof(*values));
     for (variable = 0; variable < variable_count; variable++) {
         size_t begin = offset;
         size_t end;
@@ -284,6 +328,10 @@ static int apply_one_update(gsh_variable_store *store,
                             gsh_variable_journal *journal,
                             const variable_update *update)
 {
+    if (update == NULL) return -1;
+    if (store == NULL) {
+        return -1;
+    }
     int changed;
 
     if (update->unset) {
@@ -312,6 +360,7 @@ static int apply_updates_atomically(gsh_variable_store *variables,
                                     const variable_update *updates,
                                     size_t count)
 {
+    if (updates == NULL) return -1;
     gsh_variable_journal journal_scratch;
     gsh_variable_journal *candidate = NULL;
     size_t index;
@@ -321,9 +370,9 @@ static int apply_updates_atomically(gsh_variable_store *variables,
         errno = EINVAL;
         return -1;
     }
-    memcpy(scratch, variables, sizeof(*scratch));
+    (void)memcpy(scratch, variables, sizeof(*scratch));
     if (journal != NULL) {
-        memcpy(&journal_scratch, journal, sizeof(journal_scratch));
+        (void)memcpy(&journal_scratch, journal, sizeof(journal_scratch));
         candidate = &journal_scratch;
     }
     for (index = 0; index < count; index++) {
@@ -333,15 +382,18 @@ static int apply_updates_atomically(gsh_variable_store *variables,
             return -1;
         }
     }
-    memcpy(variables, scratch, sizeof(*variables));
+    (void)memcpy(variables, scratch, sizeof(*variables));
     if (journal != NULL) {
-        memcpy(journal, candidate, sizeof(*journal));
+        (void)memcpy(journal, candidate, sizeof(*journal));
     }
     return 0;
 }
 
 static const char *read_ifs(const gsh_variable_store *variables)
 {
+    if (variables == NULL) {
+        return NULL;
+    }
     bool found;
     const char *ifs = gsh_variables_lookup(variables, "IFS", 3, &found);
 
@@ -355,6 +407,9 @@ int gsh_builtin_read(size_t argc, char *const argv[],
                      gsh_variable_journal *journal,
                      const gsh_builtin_io *io)
 {
+    if (argv == NULL || io == NULL) {
+        return -1;
+    }
     read_record record;
     read_values values;
     variable_update updates[GSH_READ_VARIABLE_CAP];
@@ -411,6 +466,9 @@ int gsh_builtin_read(size_t argc, char *const argv[],
 
 static int parse_optind(const gsh_variable_store *variables)
 {
+    if (variables == NULL) {
+        return -1;
+    }
     bool found;
     const char *text = gsh_variables_lookup(variables, "OPTIND", 6, &found);
     char *end;
@@ -433,6 +491,9 @@ static void getopts_arguments(size_t argc, char *const argv[],
                               char *storage[GSH_POSITIONAL_CAP],
                               char *const **arguments, size_t *count)
 {
+    if (arguments == NULL || argv == NULL || count == NULL || positionals == NULL || storage == NULL) {
+        return;
+    }
     if (argc > 3U) {
         *arguments = argv + 3U;
         *count = argc - 3U;
@@ -446,6 +507,9 @@ static void getopts_arguments(size_t argc, char *const argv[],
 static int getopts_diagnostic(const gsh_builtin_io *io, char option,
                               bool missing)
 {
+    if (io == NULL) {
+        return -1;
+    }
     char message[64];
     int length = snprintf(message, sizeof(message),
                           missing ? "option requires an argument -- %c"
@@ -464,6 +528,10 @@ static int commit_getopts_result(gsh_variable_store *variables,
                                  bool optarg_set, const char *optarg,
                                  size_t optarg_length, unsigned int optind)
 {
+    if (name == NULL || optarg == NULL || scratch == NULL ||
+        variables == NULL) {
+        return -1;
+    }
     variable_update updates[3];
     char result_text[2] = {result, '\0'};
     char index_text[16];
@@ -483,6 +551,9 @@ static int commit_getopts_result(gsh_variable_store *variables,
 
 static const char *getopts_find_option(const char *optstring, char option)
 {
+    if (optstring == NULL) {
+        return NULL;
+    }
     const char *cursor = optstring[0] == ':' ? optstring + 1U : optstring;
 
     while (*cursor != '\0') {
@@ -494,6 +565,82 @@ static const char *getopts_find_option(const char *optstring, char option)
     return NULL;
 }
 
+static int finish_getopts(
+    gsh_variable_store *variables, gsh_variable_store *scratch,
+    gsh_variable_journal *journal, const char *name, char result,
+    bool optarg_set, const char *optarg, size_t optarg_length,
+    gsh_shell_options *next, gsh_shell_options *options,
+    const gsh_builtin_io *io, int success_status)
+{
+    if (io == NULL) {
+        return -1;
+    }
+    if (!require(variables != NULL && scratch != NULL && name != NULL)) {
+        return gsh_builtin_error(io, "getopts", "invalid state");
+    }
+    if (!require(next != NULL && options != NULL && optarg != NULL)) {
+        return gsh_builtin_error(io, "getopts", "invalid state");
+    }
+    if (commit_getopts_result(
+            variables, scratch, journal, name, result, optarg_set, optarg,
+            optarg_length, next->getopts_index) == -1) {
+        return gsh_builtin_error(io, "getopts", "state update failed");
+    }
+    next->getopts_optind_generation = gsh_variables_value_generation(
+        variables, "OPTIND", 6U);
+    *options = *next;
+    return success_status;
+}
+
+static int handle_invalid_getopts(
+    const char *candidate, char option, bool silent,
+    gsh_variable_store *variables, gsh_variable_store *scratch,
+    gsh_variable_journal *journal, const char *name,
+    gsh_shell_options *next, gsh_shell_options *options,
+    const gsh_builtin_io *io)
+{
+    if (io == NULL) {
+        return -1;
+    }
+    bool cluster_done;
+    int result;
+
+    if (!require(candidate != NULL && name != NULL && next != NULL)) return 1;
+    if (!require(options != NULL && variables != NULL && scratch != NULL)) {
+        return 1;
+    }
+    cluster_done = candidate[next->getopts_offset + 1U] == '\0';
+    next->getopts_offset++;
+    if (cluster_done) {
+        next->getopts_index++;
+        next->getopts_offset = 1U;
+    }
+    result = finish_getopts(variables, scratch, journal, name, '?', silent,
+                            &option, 1U, next, options, io, 0);
+    if (result != 0) return result;
+    if (!silent) (void)getopts_diagnostic(io, option, false);
+    return 0;
+}
+
+static int handle_missing_getopts_value(
+    char option, bool silent, gsh_variable_store *variables,
+    gsh_variable_store *scratch, gsh_variable_journal *journal,
+    const char *name, gsh_shell_options *next,
+    gsh_shell_options *options, const gsh_builtin_io *io)
+{
+    int result;
+
+    if (name == NULL || next == NULL || options == NULL) return 1;
+    next->getopts_index++;
+    next->getopts_offset = 1U;
+    result = finish_getopts(
+        variables, scratch, journal, name, silent ? ':' : '?', silent,
+        &option, silent ? 1U : 0U, next, options, io, 0);
+    if (result != 0) return result;
+    if (!silent) (void)getopts_diagnostic(io, option, true);
+    return 0;
+}
+
 int gsh_builtin_getopts(size_t argc, char *const argv[],
                         const gsh_variable_store *lookup_variables,
                         gsh_variable_store *variables,
@@ -503,6 +650,10 @@ int gsh_builtin_getopts(size_t argc, char *const argv[],
                         gsh_shell_options *options,
                         const gsh_builtin_io *io)
 {
+    if (argv == NULL) return 125;
+    if (io == NULL || lookup_variables == NULL || positionals == NULL) {
+        return -1;
+    }
     char *positional_view[GSH_POSITIONAL_CAP];
     char *const *arguments;
     gsh_shell_options next;
@@ -530,63 +681,28 @@ int gsh_builtin_getopts(size_t argc, char *const argv[],
         next.getopts_offset = 1U;
     }
     if (index == 0 || index > argument_count) {
-        if (commit_getopts_result(variables, scratch, journal, argv[2], '?',
-                                  false, "", 0U, index) == -1) {
-            return gsh_builtin_error(io, "getopts", "state update failed");
-        }
-        next.getopts_optind_generation = gsh_variables_value_generation(
-            variables, "OPTIND", 6U);
-        *options = next;
-        return 1;
+        return finish_getopts(variables, scratch, journal, argv[2], '?',
+                              false, "", 0U, &next, options, io, 1);
     }
     candidate = arguments[index - 1U];
     if (strcmp(candidate, "--") == 0) {
         next.getopts_index = (uint16_t)(index + 1U);
         next.getopts_offset = 1U;
-        if (commit_getopts_result(variables, scratch, journal, argv[2], '?',
-                                  false, "", 0U,
-                                  next.getopts_index) == -1) {
-            return gsh_builtin_error(io, "getopts", "state update failed");
-        }
-        next.getopts_optind_generation = gsh_variables_value_generation(
-            variables, "OPTIND", 6U);
-        *options = next;
-        return 1;
+        return finish_getopts(variables, scratch, journal, argv[2], '?',
+                              false, "", 0U, &next, options, io, 1);
     }
     if (candidate[0] != '-' || candidate[1] == '\0' ||
         next.getopts_offset >= strlen(candidate)) {
-        if (commit_getopts_result(variables, scratch, journal, argv[2], '?',
-                                  false, "", 0U, index) == -1) {
-            return gsh_builtin_error(io, "getopts", "state update failed");
-        }
-        next.getopts_optind_generation = gsh_variables_value_generation(
-            variables, "OPTIND", 6U);
-        *options = next;
-        return 1;
+        return finish_getopts(variables, scratch, journal, argv[2], '?',
+                              false, "", 0U, &next, options, io, 1);
     }
     option = candidate[next.getopts_offset];
     definition = getopts_find_option(argv[1], option);
     silent = argv[1][0] == ':';
     if (definition == NULL || option == ':') {
-        bool cluster_done = candidate[next.getopts_offset + 1U] == '\0';
-
-        next.getopts_offset++;
-        if (cluster_done) {
-            next.getopts_index++;
-            next.getopts_offset = 1U;
-        }
-        if (commit_getopts_result(variables, scratch, journal, argv[2], '?',
-                                  silent, &option, 1,
-                                  next.getopts_index) == -1) {
-            return gsh_builtin_error(io, "getopts", "state update failed");
-        }
-        next.getopts_optind_generation = gsh_variables_value_generation(
-            variables, "OPTIND", 6U);
-        *options = next;
-        if (!silent) {
-            (void)getopts_diagnostic(io, option, false);
-        }
-        return 0;
+        return handle_invalid_getopts(
+            candidate, option, silent, variables, scratch, journal,
+            argv[2], &next, options, io);
     }
     if (definition[1] == ':') {
         const char *value = candidate + next.getopts_offset + 1U;
@@ -597,44 +713,20 @@ int gsh_builtin_getopts(size_t argc, char *const argv[],
             value = arguments[index];
             next.getopts_index += 2U;
         } else {
-            next.getopts_index++;
-            next.getopts_offset = 1U;
-            if (commit_getopts_result(
-                    variables, scratch, journal, argv[2], silent ? ':' : '?',
-                    silent, &option, silent ? 1U : 0U,
-                    next.getopts_index) == -1) {
-                return gsh_builtin_error(io, "getopts", "state update failed");
-            }
-            next.getopts_optind_generation = gsh_variables_value_generation(
-                variables, "OPTIND", 6U);
-            *options = next;
-            if (!silent) {
-                (void)getopts_diagnostic(io, option, true);
-            }
-            return 0;
+            return handle_missing_getopts_value(
+                option, silent, variables, scratch, journal, argv[2],
+                &next, options, io);
         }
         next.getopts_offset = 1U;
-        if (commit_getopts_result(variables, scratch, journal, argv[2], option,
-                                  true, value, strlen(value),
-                                  next.getopts_index) == -1) {
-            return gsh_builtin_error(io, "getopts", "state update failed");
-        }
-        next.getopts_optind_generation = gsh_variables_value_generation(
-            variables, "OPTIND", 6U);
-        *options = next;
-        return 0;
+        return finish_getopts(variables, scratch, journal, argv[2], option,
+                              true, value, strlen(value), &next, options,
+                              io, 0);
     }
     next.getopts_offset++;
     if (candidate[next.getopts_offset] == '\0') {
         next.getopts_index++;
         next.getopts_offset = 1U;
     }
-    if (commit_getopts_result(variables, scratch, journal, argv[2], option,
-                              false, "", 0, next.getopts_index) == -1) {
-        return gsh_builtin_error(io, "getopts", "state update failed");
-    }
-    next.getopts_optind_generation = gsh_variables_value_generation(
-        variables, "OPTIND", 6U);
-    *options = next;
-    return 0;
+    return finish_getopts(variables, scratch, journal, argv[2], option,
+                          false, "", 0U, &next, options, io, 0);
 }

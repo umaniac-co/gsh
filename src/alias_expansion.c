@@ -4,8 +4,6 @@
 
 #include "alias_expansion.h"
 
-#include <stdbool.h>
-#include <stdint.h>
 #include <string.h>
 
 typedef struct {
@@ -43,6 +41,9 @@ static bool reserved_word(const char *word, size_t length)
 static void token_ancestors(const alias_probe *probe, size_t begin,
                             size_t end, uint64_t ancestors[2])
 {
+    if (ancestors == NULL || probe == NULL) {
+        return;
+    }
     size_t index;
 
     ancestors[0] = 0;
@@ -59,6 +60,9 @@ static void token_ancestors(const alias_probe *probe, size_t begin,
 
 static bool find_alias(alias_probe *probe, const char *word, size_t length)
 {
+    if (probe == NULL || word == NULL) {
+        return false;
+    }
     uint64_t ancestors[2];
     size_t alias_index;
     size_t begin = (size_t)(word - probe->input);
@@ -82,35 +86,48 @@ static bool find_alias(alias_probe *probe, const char *word, size_t length)
     return true;
 }
 
-static bool command_probe(void *opaque, const char *word, size_t length)
+static bool find_command_alias(alias_probe *probe,
+                               const gsh_parse_storage *storage,
+                               gsh_word_ref *candidate)
 {
-    return find_alias(opaque, word, length);
-}
+    if (candidate == NULL || storage == NULL) {
+        return false;
+    }
+    size_t index;
 
-static bool last_command_probe(void *opaque, const char *word,
-                               size_t length)
-{
-    bool *is_command = opaque;
+    for (index = 0; index < storage->command_word_count; index++) {
+        gsh_word_ref word = storage->command_words[index];
 
-    *is_command = length == 7U && memcmp(word, "command", 7) == 0;
+        if (find_alias(probe, probe->input + word.begin,
+                       word.end - word.begin)) {
+            *candidate = word;
+            return true;
+        }
+    }
     return false;
 }
 
 static bool replacement_ends_in_command(
     const char *value, size_t length, gsh_parse_storage *storage)
 {
-    gsh_word_ref candidate;
-    bool is_command = false;
-    gsh_parse_result result = gsh_parse_command_probe(
-        value, length, storage, last_command_probe, &is_command,
-        &candidate);
+    if (storage == NULL || value == NULL) {
+        return false;
+    }
+    gsh_parse_result result = gsh_parse(value, length, storage);
+    const gsh_word_ref *candidate;
 
-    (void)candidate;
-    return result.status == GSH_PARSE_OK && is_command;
+    if (result.status != GSH_PARSE_OK ||
+        storage->command_word_count == 0U) {
+        return false;
+    }
+    candidate = &storage->command_words[storage->command_word_count - 1U];
+    return candidate->end - candidate->begin == 7U &&
+           memcmp(value + candidate->begin, "command", 7U) == 0;
 }
 
 static bool ends_in_unquoted_blank(const char *value, size_t length)
 {
+    if (value == NULL) return false;
     enum { QUOTE_NONE, QUOTE_SINGLE, QUOTE_DOUBLE } quote = QUOTE_NONE;
     bool final_quoted = false;
     size_t offset;
@@ -159,6 +176,10 @@ static bool rewrite_alias(char *input, size_t *length, size_t capacity,
                           size_t alias_index, alias_frame *frames,
                           size_t *frame_count)
 {
+    if (frame_count == NULL || length == NULL) return false;
+    if (frames == NULL || input == NULL || value == NULL) {
+        return false;
+    }
     size_t value_length = strlen(value);
     size_t replacement_length = value_length + 1U;
     size_t old_length = end - begin;
@@ -191,9 +212,9 @@ static bool rewrite_alias(char *input, size_t *length, size_t capacity,
             frames[write++] = frame;
         }
     }
-    memmove(input + begin + replacement_length, input + end,
+    (void)memmove(input + begin + replacement_length, input + end,
             *length - end);
-    memcpy(input + begin, value, value_length);
+    (void)memcpy(input + begin, value, value_length);
     input[begin + value_length] = ' ';
     *length = (size_t)((ptrdiff_t)*length + delta);
     input[*length] = '\0';
@@ -210,6 +231,9 @@ static bool force_following_aliases(
     char *input, size_t *length, size_t capacity, size_t marker,
     alias_probe *probe, size_t *expansions)
 {
+    if (expansions == NULL || input == NULL || length == NULL || probe == NULL) {
+        return false;
+    }
     while (marker < *length && *expansions < GSH_ALIAS_EXPANSION_LIMIT) {
         gsh_lexer lexer;
         gsh_token token;
@@ -262,6 +286,9 @@ gsh_parse_result gsh_alias_parse(
     char *expanded, size_t expanded_capacity, gsh_parse_storage *storage,
     const char **parsed_input, size_t *parsed_length)
 {
+    if (aliases == NULL || input == NULL || parsed_input == NULL || parsed_length == NULL || storage == NULL) {
+        return (gsh_parse_result){.status = GSH_PARSE_LIMIT};
+    }
     alias_frame frames[GSH_ALIAS_EXPANSION_LIMIT];
     alias_probe probe = {
         .aliases = aliases,
@@ -280,15 +307,14 @@ gsh_parse_result gsh_alias_parse(
     if (gsh_aliases_count(aliases) == 0) {
         return gsh_parse(input, length, storage);
     }
-    result = gsh_parse_command_probe(
-        input, length, storage, command_probe, &probe, &candidate);
-    if (result.status != GSH_PARSE_REWRITE) {
+    result = gsh_parse(input, length, storage);
+    if (!find_command_alias(&probe, storage, &candidate)) {
         return result;
     }
     if (expanded == NULL || length >= expanded_capacity) {
         return limit_result(length);
     }
-    memcpy(expanded, input, length);
+    (void)memcpy(expanded, input, length);
     expanded[length] = '\0';
     probe.input = expanded;
     if (!rewrite_alias(expanded, &length, expanded_capacity,
@@ -311,17 +337,15 @@ gsh_parse_result gsh_alias_parse(
             return limit_result(candidate.begin);
         }
     }
-    for (;;) {
-        result = gsh_parse_command_probe(
-            expanded, length, storage, command_probe, &probe, &candidate);
+    for (; expansions < GSH_ALIAS_EXPANSION_LIMIT; expansions++) {
+        result = gsh_parse(expanded, length, storage);
 
-        if (result.status != GSH_PARSE_REWRITE) {
+        if (!find_command_alias(&probe, storage, &candidate)) {
             *parsed_input = expanded;
             *parsed_length = length;
             return result;
         }
-        if (expansions == GSH_ALIAS_EXPANSION_LIMIT ||
-            !rewrite_alias(expanded, &length, expanded_capacity,
+        if (!rewrite_alias(expanded, &length, expanded_capacity,
                            candidate.begin, candidate.end,
                            probe.matched_value, probe.matched_index, frames,
                            &probe.frame_count)) {
@@ -330,7 +354,6 @@ gsh_parse_result gsh_alias_parse(
         {
             size_t value_length = strlen(probe.matched_value);
 
-            expansions++;
             probe.input = expanded;
             if (ends_in_unquoted_blank(probe.matched_value,
                                        value_length) &&
@@ -344,4 +367,5 @@ gsh_parse_result gsh_alias_parse(
             }
         }
     }
+    return limit_result(candidate.begin);
 }

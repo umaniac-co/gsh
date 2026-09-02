@@ -8,12 +8,14 @@
 #include "builtin_trap.h"
 
 #include <errno.h>
-#include <stdbool.h>
 #include <string.h>
 #include <unistd.h>
 
 static bool unsigned_decimal(const char *text)
 {
+    if (text == NULL) {
+        return false;
+    }
     const char *cursor = text;
 
     if (cursor == NULL || *cursor == '\0') {
@@ -28,12 +30,18 @@ static bool unsigned_decimal(const char *text)
 static int output_text(const gsh_builtin_io *io, const char *text,
                        size_t length)
 {
-    return io->output(io->opaque, STDOUT_FILENO, text, length);
+    if (io == NULL || text == NULL) {
+        return -1;
+    }
+    return gsh_builtin_output(io, STDOUT_FILENO, text, length);
 }
 
 static int output_quoted_action(const gsh_builtin_io *io,
                                 const char *action, size_t length)
 {
+    if (action == NULL) {
+        return -1;
+    }
     size_t offset = 0;
 
     if (output_text(io, "'", 1U) != 0) {
@@ -58,6 +66,9 @@ static int output_condition(const gsh_builtin_io *io,
                             const gsh_trap_store *traps,
                             size_t condition)
 {
+    if (traps == NULL) {
+        return -1;
+    }
     gsh_trap_state state = gsh_traps_query_state(traps, condition);
     const char *name = gsh_traps_condition_name(condition);
     const char *action = NULL;
@@ -92,19 +103,25 @@ static int output_condition(const gsh_builtin_io *io,
 
 static int invalid_condition(const gsh_builtin_io *io, const char *text)
 {
-    (void)io->output(io->opaque, STDERR_FILENO,
+    if (io == NULL || text == NULL) {
+        return -1;
+    }
+    (void)gsh_builtin_output(io, STDERR_FILENO,
                      "gsh: trap: invalid condition: ", 30U);
-    (void)io->output(io->opaque, STDERR_FILENO, text, strlen(text));
-    (void)io->output(io->opaque, STDERR_FILENO, "\n", 1U);
+    (void)gsh_builtin_output(io, STDERR_FILENO, text, strlen(text));
+    (void)gsh_builtin_output(io, STDERR_FILENO, "\n", 1U);
     return 1;
 }
 
 static int invalid_option(const gsh_builtin_io *io, const char *text)
 {
-    (void)io->output(io->opaque, STDERR_FILENO,
+    if (io == NULL || text == NULL) {
+        return -1;
+    }
+    (void)gsh_builtin_output(io, STDERR_FILENO,
                      "gsh: trap: invalid option: ", 27U);
-    (void)io->output(io->opaque, STDERR_FILENO, text, strlen(text));
-    (void)io->output(io->opaque, STDERR_FILENO, "\n", 1U);
+    (void)gsh_builtin_output(io, STDERR_FILENO, text, strlen(text));
+    (void)gsh_builtin_output(io, STDERR_FILENO, "\n", 1U);
     return 2;
 }
 
@@ -112,6 +129,10 @@ static int list_traps(int argc, char *const argv[], int first,
                       const gsh_trap_store *traps,
                       const gsh_builtin_io *io, bool all)
 {
+    if (argv == NULL) return -1;
+    if (io == NULL) {
+        return -1;
+    }
     size_t condition;
 
     if (first < argc) {
@@ -140,6 +161,7 @@ static bool selected_conditions_fit(const gsh_trap_store *traps,
                                     const bool selected[],
                                     size_t action_length)
 {
+    if (traps == NULL || selected == NULL) return false;
     size_t projected = 0;
     size_t condition;
 
@@ -171,6 +193,10 @@ static int configure_traps(int argc, char *const argv[], int first,
                            gsh_trap_store *traps,
                            const gsh_builtin_io *io)
 {
+    if (argv == NULL) return -1;
+    if (io == NULL) {
+        return -1;
+    }
     bool selected[GSH_TRAP_CONDITION_CAP] = {false};
     size_t condition;
     int operand;
@@ -207,7 +233,7 @@ int gsh_builtin_trap(int argc, char *const argv[], gsh_trap_store *traps,
     const char *action;
 
     if (argc < 1 || argc > GSH_TRAP_OPERAND_CAP || argv == NULL ||
-        traps == NULL || io == NULL || io->output == NULL) {
+        traps == NULL || !gsh_builtin_io_valid(io)) {
         errno = EINVAL;
         return 1;
     }

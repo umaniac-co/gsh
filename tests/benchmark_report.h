@@ -4,7 +4,6 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
-#include <stdio.h>
 
 enum {
     BENCHMARK_REPORT_SAMPLE_CAP = 500,
@@ -13,7 +12,7 @@ enum {
 };
 
 typedef struct {
-    FILE *stream;
+    int descriptor;
     char final_path[BENCHMARK_REPORT_PATH_CAP];
     char temporary_path[BENCHMARK_REPORT_TEMP_PATH_CAP];
     char recorded_at_utc[32];

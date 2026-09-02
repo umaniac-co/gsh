@@ -6,17 +6,19 @@
 #endif
 
 #include "builtin_umask.h"
-#include "builtin_common.h"
 
-#include <errno.h>
-#include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
+enum { GSH_UMASK_TEXT_CAP = 64 };
+
 static int fail(const gsh_builtin_io *io, const char *message)
 {
+    if (io == NULL || message == NULL) {
+        return -1;
+    }
     return gsh_builtin_error(io, "umask", message);
 }
 
@@ -54,6 +56,10 @@ static mode_t permission_bits(unsigned int who, unsigned int permissions)
 
 static int parse_octal(const char *text, mode_t *mask)
 {
+    if (text == NULL) return -1;
+    if (mask == NULL) {
+        return -1;
+    }
     mode_t value = 0;
 
     if (*text == '\0') {
@@ -75,13 +81,17 @@ static int parse_octal(const char *text, mode_t *mask)
 
 static int parse_symbolic(const char *text, mode_t initial, mode_t *result)
 {
+    if (result == NULL || text == NULL) {
+        return -1;
+    }
     mode_t mask = initial;
     const char *cursor = text;
+    size_t clause;
 
     if (*cursor == '\0') {
         return -1;
     }
-    for (;;) {
+    for (clause = 0; clause < GSH_UMASK_TEXT_CAP; clause++) {
         unsigned int who = 0;
         bool action = false;
 
@@ -149,11 +159,15 @@ static int parse_symbolic(const char *text, mode_t initial, mode_t *result)
             return -1;
         }
     }
+    return -1;
 }
 
 static int report_mask(mode_t mask, bool symbolic,
                        const gsh_builtin_io *io)
 {
+    if (io == NULL) {
+        return -1;
+    }
     char output[64];
     int length;
 
@@ -183,13 +197,17 @@ static int report_mask(mode_t mask, bool symbolic,
     }
     return length < 0 || (size_t)length >= sizeof(output)
                ? fail(io, "value cannot be formatted")
-               : io->output(io->opaque, STDOUT_FILENO, output,
+               : gsh_builtin_output(io, STDOUT_FILENO, output,
                             (size_t)length);
 }
 
 int gsh_builtin_umask(size_t argc, char *const argv[],
                       const gsh_builtin_io *io)
 {
+    if (argv == NULL) return 125;
+    if (io == NULL) {
+        return -1;
+    }
     const char *operand = NULL;
     bool symbolic = false;
     mode_t current;

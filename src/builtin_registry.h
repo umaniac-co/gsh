@@ -42,6 +42,5 @@ const gsh_builtin_descriptor *gsh_builtin_lookup(const char *name,
 size_t gsh_builtin_descriptor_count(void);
 const gsh_builtin_descriptor *gsh_builtin_descriptor_at(size_t index);
 bool gsh_builtin_regular_name(const char *name, size_t length);
-bool gsh_builtin_pure_name(const char *name, size_t length);
 
 #endif
