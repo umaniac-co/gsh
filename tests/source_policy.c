@@ -46,7 +46,7 @@ static const char *const FORBIDDEN_CALLS[] = {
 static const char *const MANIFEST_TARGETS[] = {
     "alias-test", "background-test", "benchmark-report-test",
     "command-cache-test", "config-test", "conformance", "fault", "function-test",
-    "file-builtins-test", "fuzz", "gsh", "history-agent", "job-probe",
+    "file-builtins-test", "fuzz", "gsh", "job-probe",
     "positional-test", "pty", "resource-actions-test", "source-policy",
     "source-workspace-test", "trap-test", "variable-test",
 };
@@ -1243,7 +1243,7 @@ static int link_map_fixture_test(void)
     char darwin_live[] = "0x1 0x1 [ 1] _live";
     char darwin_dead[] = "<<dead>> 0x1 [ 1] _orphan";
     char darwin_local_data[] =
-        "<<dead>> 0x1 [ 1] _data_owner.passphrase";
+        "<<dead>> 0x1 [ 1] _data_owner.metadata";
     char linux_live[] =
         " .text.startup.linux_live.part.0 0x1 0x1 /tmp/a.o";
 

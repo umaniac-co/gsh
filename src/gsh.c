@@ -51,8 +51,7 @@
 #include "builtin_set.h"
 #include "builtin_shift.h"
 #include "fault_injection.h"
-#include "history_client.h"
-#include "history_protocol.h"
+#include "history_file.h"
 #include "resource_protocol.h"
 #include "shell_invocation.h"
 #include "source_workspace.h"
@@ -251,8 +250,8 @@ typedef struct {
     uint64_t focus_escape_deadline_ns;
     uint64_t editor_escape_deadline_ns;
     gsh_history_store *history;
-    unsigned char *history_snapshot;
-    gsh_history_client history_client;
+    gsh_history_store *session_history;
+    gsh_history_file history_file;
     gsh_shell_config config;
     gsh_terminal_image_protocol image_protocol;
     bool config_error;
@@ -267,7 +266,6 @@ typedef struct {
     size_t history_search_position;
     char history_search_draft[LINE_CAP];
     size_t history_search_draft_length;
-    uint64_t history_reminder_deadline_ns;
     bool classic_redraw_pending;
     bool classic_clear_pending;
     size_t classic_cursor_row;
@@ -454,7 +452,7 @@ static gsh_alias_journal *state_alias_commit(const shell_state *state)
 
 typedef struct {
     gsh_history_store history;
-    unsigned char history_snapshot[GSH_HISTORY_SERIALIZED_CAP];
+    gsh_history_store session_history;
     gsh_async_repl async_repl;
     gsh_parse_storage parse_storage;
     gsh_native_pipeline native_pipeline;
@@ -786,267 +784,30 @@ static void flush_output(shell_state *state)
     }
 }
 
-/* ── Reminder Reauthentication Never Expires the Key ───────────
- * A time-to-live would make long-running shells unexpectedly lose history.
- * The agent therefore keeps its derived key until logout or explicit death.
- * A randomized timer asks for the passphrase only as a memory reminder.
- * A wrong or cancelled reminder leaves the already-unlocked key untouched.
- * Secret input remains unechoed and is wiped immediately after each request.
+/* ── History Is Ready Before the Reactor Starts ────────────────
+ * Startup loads the bounded text file before the reactor begins, just as
+ * traditional interactive shells do. A malformed or inaccessible file
+ * degrades to in-process session history without delaying the editor.
  * ─────────────────────────────────────────────────────────────── */
-static void wipe_secret(char *secret, size_t capacity)
-{
-    if (secret == NULL) {
-        return;
-    }
-    volatile unsigned char *bytes = (volatile unsigned char *)secret;
-    size_t index;
-
-    for (index = 0; index < capacity; index++) {
-        bytes[index] = 0;
-    }
-}
-
-static void flush_secret_prompt(shell_state *state)
-{
-    if (state == NULL) {
-        return;
-    }
-    unsigned int attempt;
-
-    for (attempt = 0; attempt < 20U && state->output_len != 0; attempt++) {
-        flush_output(state);
-        if (state->output_len != 0) {
-            (void)poll(NULL, 0, 1);
-        }
-    }
-}
-
-static int read_secret_line(shell_state *state, const char *prompt,
-                            char secret[GSH_HISTORY_SECRET_CAP],
-                            size_t *secret_length)
-{
-    if (prompt == NULL || secret == NULL || secret_length == NULL || state == NULL) {
-        return -1;
-    }
-    bool reading = true;
-    size_t length = 0;
-
-    (void)output_text(state, prompt);
-    flush_secret_prompt(state);
-    while (reading) {
-        unsigned char byte;
-        struct pollfd descriptor = {.fd = state->tty_fd, .events = POLLIN};
-        int ready = poll(&descriptor, 1, 250);
-
-        if (ready < 0 && errno != EINTR) {
-            return -1;
-        }
-        if (ready <= 0 || (descriptor.revents & POLLIN) == 0) {
-            if (g_shutdown_pending != 0) {
-                errno = EINTR;
-                return -1;
-            }
-            continue;
-        }
-        if (read(state->tty_fd, &byte, 1) != 1) {
-            if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
-                return -1;
-            }
-            continue;
-        }
-        if (byte == '\r' || byte == '\n') {
-            reading = false;
-        } else if (byte == 0x03U) {
-            (void)output_text(state, "^C\r\n");
-            flush_secret_prompt(state);
-            errno = ECANCELED;
-            return -1;
-        } else if ((byte == 0x7fU || byte == 0x08U) && length != 0) {
-            length--;
-        } else if (byte >= 0x20U && length + 1U < GSH_HISTORY_SECRET_CAP) {
-            secret[length++] = (char)byte;
-        }
-    }
-    secret[length] = '\0';
-    *secret_length = length;
-    (void)output_text(state, "\r\n");
-    flush_secret_prompt(state);
-    return 0;
-}
-
-static void schedule_history_reminder(shell_state *state,
-                                      uint64_t interval_ns)
-{
-    if (state == NULL) {
-        return;
-    }
-    uint64_t now = monotonic_ns();
-
-    if (interval_ns == 0) {
-        state->history_reminder_deadline_ns = now;
-    } else if (UINT64_MAX - now < interval_ns) {
-        state->history_reminder_deadline_ns = UINT64_MAX;
-    } else {
-        state->history_reminder_deadline_ns = now + interval_ns;
-    }
-}
-
-static int create_history_passphrase(shell_state *state, bool reset)
-{
-    char first[GSH_HISTORY_SECRET_CAP] = {0};
-    char second[GSH_HISTORY_SECRET_CAP] = {0};
-    size_t first_length = 0;
-    size_t second_length = 0;
-    uint64_t reminder = 0;
-    int result = -1;
-
-    errno = EINVAL;
-    if (read_secret_line(state, "New history passphrase: ", first,
-                         &first_length) == 0 &&
-        read_secret_line(state, "Confirm history passphrase: ", second,
-                         &second_length) == 0 &&
-        first_length == second_length && first_length != 0 &&
-        memcmp(first, second, first_length) == 0 &&
-        gsh_history_client_unlock(
-            &state->history_client, first, first_length,
-            state->config.history_reminder_min_ns,
-            state->config.history_reminder_max_ns, reset, state->history,
-            &reminder) == 0) {
-        state->history_persistent = true;
-        schedule_history_reminder(state, reminder);
-        result = 0;
-    } else if (errno != ECANCELED) {
-        (void)output_text(state,
-                          "gsh: passphrases do not match or are invalid\r\n");
-        flush_secret_prompt(state);
-    }
-    wipe_secret(first, sizeof(first));
-    wipe_secret(second, sizeof(second));
-    return result;
-}
-
-static int unlock_history(shell_state *state)
-{
-    char secret[GSH_HISTORY_SECRET_CAP] = {0};
-    unsigned int attempt;
-    int result = -1;
-
-    for (attempt = 0; attempt < 3U && result == -1; attempt++) {
-        size_t length = 0;
-        uint64_t reminder = 0;
-
-        if (read_secret_line(state, "History passphrase: ", secret,
-                             &length) == -1) {
-            break;
-        }
-        if (gsh_history_client_unlock(
-                &state->history_client, secret, length,
-                state->config.history_reminder_min_ns,
-                state->config.history_reminder_max_ns, false,
-                state->history, &reminder) == 0) {
-            state->history_persistent = true;
-            schedule_history_reminder(state, reminder);
-            result = 0;
-        } else {
-            (void)output_text(state, "gsh: incorrect passphrase\r\n");
-            flush_secret_prompt(state);
-        }
-        wipe_secret(secret, sizeof(secret));
-    }
-    wipe_secret(secret, sizeof(secret));
-    return result;
-}
-
-static void offer_history_reset(shell_state *state)
-{
-    char answer[GSH_HISTORY_SECRET_CAP] = {0};
-    size_t length = 0;
-
-    if (read_secret_line(
-            state,
-            "Reset encrypted history? Old entries will be lost [y/N]: ",
-            answer, &length) == 0 && length == 1U &&
-        (answer[0] == 'y' || answer[0] == 'Y')) {
-        (void)create_history_passphrase(state, true);
-    }
-    wipe_secret(answer, sizeof(answer));
-}
-
 static void initialize_history(shell_state *state)
 {
-    if (state == NULL) return;
-    int status = GSH_HISTORY_STATUS_LOCKED;
-    uint64_t reminder = 0;
-    unsigned int attempt;
+    if (!require(state != NULL)) return;
+    if (!require(state->history != NULL)) return;
 
     if (state->config_error) {
         (void)output_format(state, "gsh: %s; history disabled\r\n",
                             state->config.diagnostic);
-        flush_secret_prompt(state);
         return;
     }
-    if (!state->config.history_enabled || state->history == NULL) {
-        return;
-    }
-    if (gsh_history_client_initialize(&state->history_client,
-                                      getenv("HOME"),
-                                      state->parameter_zero,
-                                      state->history_snapshot,
-                                      GSH_HISTORY_SERIALIZED_CAP) == -1 ||
-        gsh_history_client_status(
-            &state->history_client,
-            state->config.history_reminder_min_ns,
-            state->config.history_reminder_max_ns, state->history, &status,
-            &reminder) == -1) {
+    if (!state->config.history_enabled) return;
+    if (gsh_history_file_initialize(&state->history_file, getenv("HOME"),
+                                    state->history) == -1) {
         (void)output_text(
             state,
-            "gsh: encrypted history unavailable; using session history\r\n");
-        flush_secret_prompt(state);
+            "gsh: persistent history unavailable; using session history\r\n");
         return;
     }
-    if (status == GSH_HISTORY_STATUS_OK) {
-        state->history_persistent = true;
-        schedule_history_reminder(state, reminder);
-    } else if (status == GSH_HISTORY_STATUS_NEW) {
-        for (attempt = 0; attempt < 3U && !state->history_persistent;
-             attempt++) {
-            if (create_history_passphrase(state, false) == -1 &&
-                errno == ECANCELED) {
-                break;
-            }
-        }
-    } else if (status == GSH_HISTORY_STATUS_LOCKED &&
-               unlock_history(state) == -1 && errno != ECANCELED) {
-        offer_history_reset(state);
-    }
-}
-
-static void verify_history_reminder(shell_state *state)
-{
-    if (state == NULL) {
-        return;
-    }
-    char secret[GSH_HISTORY_SECRET_CAP] = {0};
-    size_t length = 0;
-    uint64_t reminder = state->config.history_reminder_min_ns;
-
-    (void)output_text(state, "\r\n");
-    if (read_secret_line(state, "History reminder — passphrase: ", secret,
-                         &length) == 0) {
-        if (gsh_history_client_verify(
-                &state->history_client, secret, length,
-                state->config.history_reminder_min_ns,
-                state->config.history_reminder_max_ns, &reminder) == -1) {
-            (void)output_text(
-                state,
-                "gsh: incorrect passphrase; history remains unlocked\r\n");
-        } else {
-            (void)output_text(state, "gsh: passphrase remembered\r\n");
-        }
-    }
-    wipe_secret(secret, sizeof(secret));
-    schedule_history_reminder(state, reminder);
-    queue_redraw(state);
+    state->history_persistent = true;
 }
 
 static size_t primary_prompt_text(const shell_state *state, char *prompt,
@@ -1701,7 +1462,7 @@ static int bind_interactive_storage(shell_state *state,
     (void)memset(storage, 0, sizeof(*storage));
     if (gsh_fault_should_fail(GSH_FAULT_HISTORY_ALLOCATION, ENOMEM)) return -1;
     state->history = &storage->history;
-    state->history_snapshot = storage->history_snapshot;
+    state->session_history = &storage->session_history;
     if (gsh_fault_should_fail(GSH_FAULT_ALLOCATION, ENOMEM)) return -1;
     state->parse_storage = &storage->parse_storage;
     if (gsh_fault_should_fail(GSH_FAULT_ALLOCATION, ENOMEM)) return -1;
@@ -1753,7 +1514,6 @@ static void initialize_shell_state(shell_state *state,
     state->async_state_cell = -1;
     state->async_dispatch_cell = -1;
     state->focus_escape_cell = -1;
-    state->history_client.descriptor = -1;
     state->running = true;
 }
 
@@ -1788,6 +1548,7 @@ static int initialize_interactive_stores(shell_state *state,
     if (!require(storage != NULL)) return -1;
     if (bind_interactive_storage(state, storage) == -1) return -1;
     gsh_history_initialize(state->history);
+    gsh_history_initialize(state->session_history);
     gsh_options_initialize(&state->options, true);
     gsh_background_initialize(&state->background_jobs);
     state->redirection_next_request_id = 1;
@@ -2115,33 +1876,6 @@ static void receive_redirection_result(shell_state *state)
     queue_prompt(state);
 }
 
-static int history_poll_timeout(const shell_state *state)
-{
-    if (state == NULL) {
-        return -1;
-    }
-    bool history_deadline =
-        state->history_persistent &&
-        state->history_reminder_deadline_ns != 0 &&
-        state->mode == MODE_EDITOR &&
-        gsh_async_repl_job_count(state->async_repl) == 0 &&
-        gsh_async_repl_focused_job(state->async_repl) < 0;
-    uint64_t now;
-    uint64_t remaining;
-    uint64_t milliseconds;
-
-    if (!history_deadline) {
-        return -1;
-    }
-    now = monotonic_ns();
-    if (now >= state->history_reminder_deadline_ns) {
-        return 0;
-    }
-    remaining = state->history_reminder_deadline_ns - now;
-    milliseconds = (remaining + 999999U) / 1000000U;
-    return milliseconds > (uint64_t)INT_MAX ? INT_MAX : (int)milliseconds;
-}
-
 static int bounded_deadline_timeout(uint64_t deadline, int current)
 {
     uint64_t now;
@@ -2159,9 +1893,8 @@ static int bounded_deadline_timeout(uint64_t deadline, int current)
 
 static int reactor_poll_timeout(const shell_state *state)
 {
-    int timeout;
+    int timeout = -1;
     if (state == NULL) return -1;
-    timeout = history_poll_timeout(state);
     timeout = bounded_deadline_timeout(state->focus_escape_deadline_ns,
                                        timeout);
     return bounded_deadline_timeout(state->editor_escape_deadline_ns,
@@ -3078,7 +2811,7 @@ static int protect_exec_owner_descriptors(
     }
     int *owned[] = {
         &state->tty_fd, &state->signal_pipe[0],
-        &state->redirection_worker_fd, &state->history_client.descriptor,
+        &state->redirection_worker_fd,
         &state->variable_commit_fd, &state->exec_outcome_fd,
         &state->exec_descriptor_socket, &state->directory_commit_socket,
         &state->directory_commit_fd,
@@ -9602,35 +9335,16 @@ static bool dispatch_history_control(shell_state *state, const char *command)
         strcmp(command, "history") == 0) {
         output_format(state,
                       "history enabled=%s persistent=%s entries=%zu "
-                      "max=%zu unlock=infinite reminder=%lluh-%lluh\r\n",
+                      "max=%zu file=%s\r\n",
                       state->config.history_enabled ? "yes" : "no",
                       state->history_persistent ? "yes" : "no",
                       state->history == NULL ? 0U : state_history(state)->count,
                       state->config.history_max_entries,
-                      (unsigned long long)(
-                          state->config.history_reminder_min_ns /
-                          (60ULL * 60ULL * 1000000000ULL)),
-                      (unsigned long long)(
-                          state->config.history_reminder_max_ns /
-                          (60ULL * 60ULL * 1000000000ULL)));
+                      state->history_file.path[0] == '\0'
+                          ? "-" : state->history_file.path);
         state->last_status = 0;
-    } else if (strcmp(command, "history lock") == 0 ||
-               strcmp(command, "history shutdown") == 0) {
-        bool shutdown = strcmp(command, "history shutdown") == 0;
-        int result = state->history_persistent
-                         ? gsh_history_client_control(&state->history_client,
-                                                      shutdown)
-                         : -1;
-
-        state->last_status = result == 0 ? 0 : 1;
-        state->history_persistent = false;
-        state->history_reminder_deadline_ns = 0;
-        if (state->history != NULL) gsh_history_clear(state->history);
-        output_format(state, "history %s%s\r\n",
-                      shutdown ? "agent stopped" : "locked",
-                      result == 0 ? "" : " (not connected)");
     } else if (strncmp(command, "history ", 8U) == 0) {
-        (void)output_text(state, "usage: history [status|lock|shutdown]\r\n");
+        (void)output_text(state, "usage: history [status]\r\n");
         state->last_status = 2;
     } else {
         return false;
@@ -9676,7 +9390,7 @@ static bool dispatch_reactor_control(shell_state *state, const char *command)
     } else if (strcmp(command, "help") == 0) {
         (void)output_text(state,
                     "builtins: cd [path], exit [status], fg, bg, rt, help, "
-                    "/async, history [status|lock|shutdown]\r\n"
+                    "/async, history [status]\r\n"
                     "non-canonical PTYs receive contained full-screen focus; "
                     "Ctrl-] returns to the editor\r\n"
                     "simple commands use native execve; shell syntax falls "
@@ -10354,11 +10068,10 @@ static void record_history_submission(shell_state *state, size_t length,
     }
     added = gsh_history_add(state->history, state->pending_line, length,
                             state->config.history_deduplicate);
-    if (added > 0 && state->history_persistent &&
-        gsh_history_client_add(&state->history_client,
-                               state->pending_line, length) == -1) {
+    if (added > 0 && state->session_history != NULL &&
+        gsh_history_add(state->session_history, state->pending_line,
+                        length, false) == -1) {
         state->history_persistent = false;
-        state->history_reminder_deadline_ns = 0;
     }
 }
 
@@ -12622,19 +12335,6 @@ static void apply_async_transition(shell_state *state)
     state_async_repl(state)->render_pending = true;
 }
 
-static void maybe_verify_history(shell_state *state)
-{
-    if (state == NULL) return;
-    if (state->history_persistent &&
-        state->history_reminder_deadline_ns != 0 &&
-        monotonic_ns() >= state->history_reminder_deadline_ns &&
-        state->mode == MODE_EDITOR &&
-        gsh_async_repl_job_count(state->async_repl) == 0 &&
-        gsh_async_repl_focused_job(state->async_repl) < 0) {
-        verify_history_reminder(state);
-    }
-}
-
 static bool dispatch_classic_pending(shell_state *state)
 {
     uint64_t start;
@@ -12759,7 +12459,6 @@ static int run_reactor(shell_state *state)
         int result;
         uint64_t service_start;
 
-        maybe_verify_history(state);
         complete_pending_escapes(state);
         schedule_managed_submissions(state);
         apply_async_transition(state);
@@ -12882,6 +12581,7 @@ static void clear_shell_workspaces(shell_state *state)
     if (!require(state->signal_pipe[0] >= -1 &&
                  state->signal_pipe[1] >= -1)) return;
     state->history = NULL;
+    state->session_history = NULL;
     state->parse_storage = NULL;
     state->native_pipeline = NULL;
     state->command_cache = NULL;
@@ -12902,6 +12602,27 @@ static void clear_shell_workspaces(shell_state *state)
     state->positionals = NULL;
     state->positional_storage = NULL;
     state->positional_commit = NULL;
+}
+
+static void persist_history(shell_state *state)
+{
+    int saved_errno;
+
+    if (!require(state != NULL)) return;
+    if (!require(state->history != NULL && state->session_history != NULL))
+        return;
+    if (state->history_persistent &&
+        gsh_history_file_save(&state->history_file, state->history,
+                              state->session_history,
+                              state->config.history_max_entries,
+                              state->config.history_deduplicate) == -1) {
+        saved_errno = errno;
+        (void)fprintf(stderr, "gsh: cannot save %s: %s\n",
+                      state->history_file.path, strerror(saved_errno));
+    }
+    gsh_history_file_close(&state->history_file);
+    gsh_history_clear(state->session_history);
+    gsh_history_clear(state->history);
 }
 
 static void cleanup(shell_state *state)
@@ -12963,12 +12684,9 @@ static void cleanup(shell_state *state)
     if (state->signal_pipe[1] >= 0) {
         (void)close(state->signal_pipe[1]);
     }
+    persist_history(state);
     if (state->tty_fd >= 0) {
         (void)close(state->tty_fd);
-    }
-    gsh_history_client_close(&state->history_client);
-    if (state->history != NULL) {
-        gsh_history_clear(state->history);
     }
     clear_shell_workspaces(state);
 }

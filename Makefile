@@ -25,11 +25,10 @@ endif
 
 BUILD_DIR ?= build
 TARGET := $(BUILD_DIR)/gsh
-HISTORY_AGENT_TARGET := $(BUILD_DIR)/gsh-history-agent
 CORE_SOURCES := src/gsh.c src/async_repl.c src/posix_lexer.c \
 	src/posix_parser.c src/native_plan.c \
 	src/source_workspace.c \
-	src/history_client.c src/history_store.c src/shell_config.c \
+	src/history_file.c src/history_store.c src/shell_config.c \
 	src/shell_variables.c src/builtin_common.c src/builtin_registry.c \
 	src/builtin_pure.c src/builtin_stateful.c src/builtin_fc.c \
 	src/builtin_files.c \
@@ -76,7 +75,7 @@ RESOURCE_ACTIONS_SANITIZE_TEST_TARGET := $(BUILD_DIR)/resource-actions-test-sani
 SOURCE_WORKSPACE_TEST_TARGET := $(BUILD_DIR)/source-workspace-test
 SHELL_TRAPS_TEST_TARGET := $(BUILD_DIR)/shell-traps-test
 SHELL_TRAPS_SANITIZE_TEST_TARGET := $(BUILD_DIR)/shell-traps-test-sanitize
-QUALITY_TARGETS := $(TARGET) $(HISTORY_AGENT_TARGET) $(TEST_TARGET) \
+QUALITY_TARGETS := $(TARGET) $(TEST_TARGET) \
 	$(BENCHMARK_REPORT_TEST_TARGET) $(PROBE_TARGET) $(FAULT_TARGET) \
 	$(FUZZ_SMOKE_TARGET) $(POLICY_TARGET) $(CONFORMANCE_TARGET) \
 	$(VARIABLE_TEST_TARGET) $(COMMAND_CACHE_TEST_TARGET) \
@@ -112,21 +111,12 @@ BENCH_REVISION := $(shell revision=$$(git rev-parse --short=12 HEAD \
 	--untracked-files=normal -- Makefile README.md CODE.md src tests \
 	2>/dev/null)"; then printf '%s-dirty' "$$revision"; else \
 	printf '%s' "$$revision"; fi)
-SODIUM_PREFIX := $(shell if command -v brew >/dev/null 2>&1; then \
-	brew --prefix libsodium 2>/dev/null; fi)
-SODIUM_CFLAGS := $(shell if command -v pkg-config >/dev/null 2>&1; then \
-	pkg-config --cflags libsodium 2>/dev/null; elif test -n "$(SODIUM_PREFIX)"; \
-	then echo -I$(SODIUM_PREFIX)/include; fi)
-SODIUM_LIBS := $(shell if command -v pkg-config >/dev/null 2>&1; then \
-	pkg-config --libs libsodium 2>/dev/null; elif test -n "$(SODIUM_PREFIX)"; \
-	then echo -L$(SODIUM_PREFIX)/lib -lsodium; else echo -lsodium; fi)
-
 .PHONY: all analyze bench bench-record bench-alias bench-alias-record check check-benchmark-report check-fault check-resource check-sanitize clean
 .PHONY: check-aliases check-background check-command-cache check-config check-file-builtins check-functions check-positionals check-resource-actions check-source-workspaces check-traps check-variables conformance fuzz-libfuzzer fuzz-pty fuzz-pty-sanitize fuzz-sanitize
 .PHONY: fuzz-smoke fuzz-libfuzzer-linux policy quality quality-callgraph quality-compilers quality-dependencies quality-includes quality-linux quality-maps soak
 .PHONY: verify-fast
 
-all: $(TARGET) $(HISTORY_AGENT_TARGET)
+all: $(TARGET)
 
 define generate_dependencies
 	@$(CC) $(CPPFLAGS) $(CFLAGS) $(2) -MM -MP -MT '$@' $(1) \
@@ -136,7 +126,7 @@ endef
 
 -include $(wildcard $(DEPENDENCY_FILES))
 
-$(TARGET) $(HISTORY_AGENT_TARGET) $(TEST_TARGET) \
+$(TARGET) $(TEST_TARGET) \
 	$(BENCHMARK_REPORT_TEST_TARGET) $(PROBE_TARGET) $(FAULT_TARGET) \
 	$(SANITIZE_TARGET) $(FUZZ_SMOKE_TARGET) $(FUZZ_TARGET) \
 	$(POLICY_TARGET) $(CONFORMANCE_TARGET) $(VARIABLE_TEST_TARGET) \
@@ -187,12 +177,6 @@ $(TARGET): $(SOURCES) | $(BUILD_DIR)
 	$(call generate_dependencies,$(SOURCES))
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(SOURCES) $(LDFLAGS) \
 		$(AUDIT_LDFLAGS) -o $@
-
-$(HISTORY_AGENT_TARGET): src/history_agent.c src/history_store.c | $(BUILD_DIR)
-	$(call generate_dependencies,src/history_agent.c src/history_store.c,$(SODIUM_CFLAGS))
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(SODIUM_CFLAGS) \
-		src/history_agent.c src/history_store.c $(LDFLAGS) \
-		$(SODIUM_LIBS) $(AUDIT_LDFLAGS) -o $@
 
 $(TEST_TARGET): $(TEST_SOURCES) tests/benchmark_report.h | $(BUILD_DIR)
 	$(call generate_dependencies,$(TEST_SOURCES))
@@ -330,7 +314,7 @@ $(SHELL_TRAPS_SANITIZE_TEST_TARGET): tests/shell_traps_test.c \
 		-Werror -fsanitize=address,undefined \
 		tests/shell_traps_test.c src/shell_traps.c $(LDFLAGS) -o $@
 
-check: $(TARGET) $(HISTORY_AGENT_TARGET) $(TEST_TARGET) $(PROBE_TARGET) \
+check: $(TARGET) $(TEST_TARGET) $(PROBE_TARGET) \
 		$(FILE_BUILTINS_TEST_TARGET) $(RESOURCE_ACTIONS_TEST_TARGET)
 	$(abspath $(TEST_TARGET)) $(abspath $(TARGET))
 	$(abspath $(FILE_BUILTINS_TEST_TARGET))
@@ -342,7 +326,7 @@ check-fault: $(FAULT_TARGET) $(TEST_TARGET)
 check-resource: $(TARGET) $(TEST_TARGET)
 	$(abspath $(TEST_TARGET)) --resource $(abspath $(TARGET))
 
-check-sanitize: $(SANITIZE_TARGET) $(HISTORY_AGENT_TARGET) \
+check-sanitize: $(SANITIZE_TARGET) \
 		$(FUNCTION_SANITIZE_TEST_TARGET) \
 		$(COMMAND_CACHE_SANITIZE_TEST_TARGET) \
 		$(SHELL_TRAPS_SANITIZE_TEST_TARGET) \
@@ -498,7 +482,7 @@ quality-includes:
 			awk -v replace="$$line" \
 				'NR == replace { print "#error CANON_ACTIVE_INCLUDE"; next } \
 				 { print }' "$$source" > "$$active"; \
-			if $(CC) $(CPPFLAGS) $(CFLAGS) $(SODIUM_CFLAGS) \
+			if $(CC) $(CPPFLAGS) $(CFLAGS) \
 				$$source_flags \
 				-Isrc -Itests -iquote "$$(dirname "$$source")" \
 				-fsyntax-only "$$active" >/dev/null 2>&1; then \
@@ -508,7 +492,7 @@ quality-includes:
 			candidate="$$include_dir/candidate-$$sequence.c"; \
 			awk -v skip="$$line" 'NR != skip { print }' "$$source" \
 				> "$$candidate"; \
-			if $(CC) $(CPPFLAGS) $(CFLAGS) $(SODIUM_CFLAGS) \
+			if $(CC) $(CPPFLAGS) $(CFLAGS) \
 				$$source_flags \
 				-Isrc -Itests -iquote "$$(dirname "$$source")" \
 				-fsyntax-only "$$candidate" >/dev/null 2>&1; then \
@@ -534,7 +518,7 @@ quality-maps: $(QUALITY_MAPS) $(TARGET_MANIFEST)
 
 analyze:
 	@set -e; for source in $(CANON_C_SOURCES); do \
-		$(ANALYZE_CC) $(CPPFLAGS) $(CFLAGS) $(SODIUM_CFLAGS) \
+		$(ANALYZE_CC) $(CPPFLAGS) $(CFLAGS) \
 			--analyze -Xanalyzer -analyzer-werror "$$source" \
 			-o /dev/null; \
 	done
@@ -631,7 +615,7 @@ $(BUILD_DIR):
 	mkdir -p $@
 
 clean:
-	rm -f $(TARGET) $(HISTORY_AGENT_TARGET) $(TEST_TARGET) $(PROBE_TARGET) $(FAULT_TARGET)
+	rm -f $(TARGET) $(TEST_TARGET) $(PROBE_TARGET) $(FAULT_TARGET)
 	rm -f $(SANITIZE_TARGET) $(FUZZ_SMOKE_TARGET) $(FUZZ_TARGET) $(POLICY_TARGET)
 	rm -f $(CONFORMANCE_TARGET)
 	rm -f $(VARIABLE_TEST_TARGET)

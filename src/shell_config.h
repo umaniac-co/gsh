@@ -3,7 +3,6 @@
 
 #include <stdbool.h>
 #include <stddef.h>
-#include <stdint.h>
 
 enum {
     GSH_CONFIG_DIAGNOSTIC_CAP = 256,
@@ -36,9 +35,6 @@ typedef struct {
     bool history_store_failed;
     bool history_ignore_space;
     size_t history_max_entries;
-    bool history_unlock_infinite;
-    uint64_t history_reminder_min_ns;
-    uint64_t history_reminder_max_ns;
     gsh_terminal_actions_mode terminal_actions;
     gsh_terminal_images_mode terminal_images;
     gsh_path_detection_mode path_detection;

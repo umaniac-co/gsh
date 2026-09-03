@@ -1031,10 +1031,7 @@ static int write_history_config(const char *home)
         "shell.history.max_entries = 1024\n"
         "shell.history.deduplicate = false\n"
         "shell.history.store_failed = true\n"
-        "shell.history.ignore_space = true\n"
-        "shell.history.unlock_ttl = infinite\n"
-        "shell.history.reminder_min = 3s\n"
-        "shell.history.reminder_max = 3s\n";
+        "shell.history.ignore_space = true\n";
     char path[PATH_MAX];
     int descriptor;
     ssize_t written;
@@ -1060,20 +1057,13 @@ static void remove_history_fixture(const char *home)
 {
     char path[PATH_MAX];
 
-    if (snprintf(path, sizeof(path), "%s/.gsh/history.sock", home) <
+    if (snprintf(path, sizeof(path), "%s/.gsh_history", home) <
         (int)sizeof(path)) {
         (void)unlink(path);
     }
-    if (snprintf(path, sizeof(path), "%s/.gsh/history.sock.lock", home) <
+    if (snprintf(path, sizeof(path), "%s/.gsh_history.lock", home) <
         (int)sizeof(path)) {
         (void)unlink(path);
-    }
-    if (snprintf(path, sizeof(path), "%s/.gsh/history.vault", home) <
-        (int)sizeof(path)) {
-        (void)unlink(path);
-    }
-    if (snprintf(path, sizeof(path), "%s/.gsh", home) < (int)sizeof(path)) {
-        (void)rmdir(path);
     }
     if (snprintf(path, sizeof(path), "%s/.gshrc", home) <
         (int)sizeof(path)) {
@@ -1082,7 +1072,7 @@ static void remove_history_fixture(const char *home)
     (void)rmdir(home);
 }
 
-static bool history_vault_is_encrypted(const char *home)
+static bool history_file_is_plaintext(const char *home)
 {
     static const char plaintext[] = "HISTORY_ALPHA";
     unsigned char bytes[8192 + sizeof(plaintext)];
@@ -1091,9 +1081,9 @@ static bool history_vault_is_encrypted(const char *home)
     size_t carry = 0;
     unsigned int reads;
     int descriptor;
-    bool encrypted = true;
+    bool found = false;
 
-    if (snprintf(path, sizeof(path), "%s/.gsh/history.vault", home) >=
+    if (snprintf(path, sizeof(path), "%s/.gsh_history", home) >=
         (int)sizeof(path)) {
         return false;
     }
@@ -1114,12 +1104,11 @@ static bool history_vault_is_encrypted(const char *home)
             continue;
         }
         if (count <= 0) {
-            encrypted = count == 0;
             break;
         }
         total = carry + (size_t)count;
         if (find_bytes(bytes, total, plaintext) != NULL) {
-            encrypted = false;
+            found = true;
             break;
         }
         carry = total < sizeof(plaintext) - 1U
@@ -1128,30 +1117,16 @@ static bool history_vault_is_encrypted(const char *home)
         (void)memmove(bytes, bytes + total - carry, carry);
     }
     (void)close(descriptor);
-    return encrypted;
-}
-
-static int create_history_vault(pty_session *session)
-{
-    static const char passphrase[] = "history test passphrase";
-
-    if (consume_through(session, "New history passphrase: ",
-                        TEST_TIMEOUT_MS) == -1 ||
-        send_text(session, "history test passphrase\r") == -1 ||
-        consume_through(session, "Confirm history passphrase: ",
-                        TEST_TIMEOUT_MS) == -1 ||
-        send_text(session, "history test passphrase\r") == -1 ||
-        consume_through(session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
-        capture_contains(session, passphrase)) {
-        return -1;
-    }
-    return 0;
+    return found;
 }
 
 static int exercise_history_editor(pty_session *session)
 {
     static const char alpha[] = "/usr/bin/printf 'HISTORY_ALPHA\\n'";
     static const char beta[] = "/usr/bin/printf 'HISTORY_BETA\\n'";
+    static const char multiline[] =
+        "\033[200~/usr/bin/printf 'HISTORY_MULTI_A\\n'\n"
+        "/usr/bin/printf 'HISTORY_MULTI_B\\n'\033[201~\r";
 
     if (send_text(session, "/usr/bin/printf 'HISTORY_ALPHA\\n'\r") == -1 ||
         consume_through(session, "HISTORY_ALPHA\r\n", TEST_TIMEOUT_MS) == -1 ||
@@ -1180,7 +1155,13 @@ static int exercise_history_editor(pty_session *session)
         consume_through(session, alpha, TEST_TIMEOUT_MS) == -1 ||
         send_bytes(session, "\025", 1) == -1 ||
         send_text(session, "history status\r") == -1 ||
-        consume_through(session, "entries=4 max=1024 unlock=infinite",
+        consume_through(session, "entries=4 max=1024 file=",
+                        TEST_TIMEOUT_MS) == -1 ||
+        consume_through(session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
+        send_text(session, multiline) == -1 ||
+        consume_through(session, "HISTORY_MULTI_A\r\n",
+                        TEST_TIMEOUT_MS) == -1 ||
+        consume_through(session, "HISTORY_MULTI_B\r\n",
                         TEST_TIMEOUT_MS) == -1 ||
         consume_through(session, "gsh$ ", TEST_TIMEOUT_MS) == -1) {
         return -1;
@@ -1188,20 +1169,7 @@ static int exercise_history_editor(pty_session *session)
     return 0;
 }
 
-static int shutdown_history_agent(pty_session *session)
-{
-    if (session == NULL) {
-        return -1;
-    }
-    return send_bytes(session, "\025", 1) == -1 ||
-                   send_text(session, "history shutdown\r") == -1 ||
-                   consume_through(session, "history agent stopped",
-                                   TEST_TIMEOUT_MS) == -1
-               ? -1
-               : 0;
-}
-
-static int verify_unlocked_reuse(pty_session *session)
+static int verify_history_reuse(pty_session *session)
 {
     if (consume_through(session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_bytes(session, "\033[A", 3) == -1 ||
@@ -1211,21 +1179,36 @@ static int verify_unlocked_reuse(pty_session *session)
                         TEST_TIMEOUT_MS) == -1 ||
         consume_through(session, "HISTORY_ALPHA", TEST_TIMEOUT_MS) == -1 ||
         send_bytes(session, "\033x", 2) == -1 ||
-        shutdown_history_agent(session) == -1) {
+        send_bytes(session, "\025\022MULTI_A", 9) == -1 ||
+        consume_through(session, "(reverse-i-search)`MULTI_A': ",
+                        TEST_TIMEOUT_MS) == -1 ||
+        consume_through(session, "HISTORY_MULTI_A", TEST_TIMEOUT_MS) == -1 ||
+        send_text(session, "\r") == -1 ||
+        consume_through(session, "HISTORY_MULTI_A\r\n",
+                        TEST_TIMEOUT_MS) == -1 ||
+        consume_through(session, "HISTORY_MULTI_B\r\n",
+                        TEST_TIMEOUT_MS) == -1 ||
+        consume_through(session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
+        send_bytes(session, "\025", 1) == -1 ||
+        send_text(session, "history status\r") == -1 ||
+        consume_through(session, "persistent=yes", TEST_TIMEOUT_MS) == -1) {
         return -1;
     }
     return 0;
 }
 
-static int verify_fresh_agent_unlock(pty_session *session)
+static int verify_fresh_history(pty_session *session)
 {
-    if (consume_through(session, "History passphrase: ",
-                        TEST_TIMEOUT_MS) == -1 ||
-        send_text(session, "history test passphrase\r") == -1 ||
-        consume_through(session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
+    if (consume_through(session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_bytes(session, "\033[A", 3) == -1 ||
-        consume_through(session, "history shutdown", TEST_TIMEOUT_MS) == -1 ||
-        shutdown_history_agent(session) == -1) {
+        consume_through(session, "exit 0", TEST_TIMEOUT_MS) == -1 ||
+        send_bytes(session, "\025\022CONCURRENT_A", 14) == -1 ||
+        consume_through(session, "HISTORY_CONCURRENT_A",
+                        TEST_TIMEOUT_MS) == -1 ||
+        send_bytes(session, "\033x\025\022CONCURRENT_B", 16) == -1 ||
+        consume_through(session, "HISTORY_CONCURRENT_B",
+                        TEST_TIMEOUT_MS) == -1 ||
+        send_bytes(session, "\033x\025", 3) == -1) {
         return -1;
     }
     return 0;
@@ -1248,25 +1231,13 @@ static int run_initial_history_session(const char *executable,
     if (start_session(&session, executable, home, SHELL_GSH) == -1) {
         return -1;
     }
-    if (create_history_vault(&session) == -1) {
-        failed = history_session_failure(&session, "vault creation");
+    if (consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1) {
+        failed = history_session_failure(&session, "initial prompt");
     } else if (exercise_history_editor(&session) == -1) {
         failed = history_session_failure(&session, "editor exercise");
-    } else if (send_bytes(&session, "\025", 1) == -1 ||
-               consume_through(&session, "History reminder", 5000) == -1) {
-        failed = history_session_failure(&session, "reminder");
-    } else if (send_text(&session, "wrong history passphrase\r") == -1 ||
-               consume_through(&session, "history remains unlocked",
-                               TEST_TIMEOUT_MS) == -1) {
-        failed = history_session_failure(&session, "wrong passphrase");
-    } else if (consume_through(&session, "History reminder", 5000) == -1 ||
-               send_text(&session, "history test passphrase\r") == -1 ||
-               consume_through(&session, "passphrase remembered",
-                               TEST_TIMEOUT_MS) == -1) {
-        failed = history_session_failure(&session, "reminder refresh");
     }
     if (stop_session(&session) == -1) {
-        failed = -1;
+        failed = history_session_failure(&session, "initial shutdown");
     }
     return failed;
 }
@@ -1280,11 +1251,11 @@ static int run_reused_history_session(const char *executable,
     if (start_session(&session, executable, home, SHELL_GSH) == -1) {
         return -1;
     }
-    if (verify_unlocked_reuse(&session) == -1) {
-        failed = history_session_failure(&session, "unlocked reuse");
+    if (verify_history_reuse(&session) == -1) {
+        failed = history_session_failure(&session, "managed reuse");
     }
     if (stop_session(&session) == -1) {
-        failed = -1;
+        failed = history_session_failure(&session, "managed shutdown");
     }
     return failed;
 }
@@ -1298,12 +1269,43 @@ static int run_fresh_history_session(const char *executable,
     if (start_session(&session, executable, home, SHELL_GSH) == -1) {
         return -1;
     }
-    if (verify_fresh_agent_unlock(&session) == -1) {
-        failed = history_session_failure(&session, "fresh unlock");
+    if (verify_fresh_history(&session) == -1) {
+        failed = history_session_failure(&session, "fresh reuse");
     }
     if (stop_session(&session) == -1) {
+        failed = history_session_failure(&session, "fresh shutdown");
+    }
+    return failed;
+}
+
+static int run_concurrent_history_sessions(const char *executable,
+                                           const char *home)
+{
+    pty_session first = {0};
+    pty_session second = {0};
+    int failed = 0;
+
+    if (!require(executable != NULL)) return -1;
+    if (!require(home != NULL)) return -1;
+    if (start_session(&first, executable, home, SHELL_GSH) == -1 ||
+        start_session(&second, executable, home, SHELL_GSH) == -1) {
+        failed = -1;
+    } else if (consume_through(&first, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
+               consume_through(&second, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
+               send_text(&first,
+                   "/usr/bin/printf 'HISTORY_CONCURRENT_A\\n'\r") == -1 ||
+               consume_through(&first, "HISTORY_CONCURRENT_A\r\n",
+                               TEST_TIMEOUT_MS) == -1 ||
+               consume_through(&first, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
+               send_text(&second,
+                   "/usr/bin/printf 'HISTORY_CONCURRENT_B\\n'\r") == -1 ||
+               consume_through(&second, "HISTORY_CONCURRENT_B\r\n",
+                               TEST_TIMEOUT_MS) == -1 ||
+               consume_through(&second, "gsh$ ", TEST_TIMEOUT_MS) == -1) {
         failed = -1;
     }
+    if (first.pid > 0 && stop_session(&first) == -1) failed = -1;
+    if (second.pid > 0 && stop_session(&second) == -1) failed = -1;
     return failed;
 }
 
@@ -1323,9 +1325,11 @@ static int history_flow(const char *executable)
         setenv("GSH_HARNESS_HISTORY", "1", 1) == -1) {
         failed = 1;
     } else if (run_initial_history_session(executable, home) == -1 ||
-               !history_vault_is_encrypted(home)) {
+               !history_file_is_plaintext(home)) {
         failed = 1;
     }
+    if (!failed &&
+        run_concurrent_history_sessions(executable, home) == -1) failed = 1;
     if (!failed &&
         (setenv("GSH_HARNESS_MANAGED", "1", 1) == -1 ||
          run_reused_history_session(executable, home) == -1)) {
@@ -7952,7 +7956,7 @@ int main(int argc, char **argv)
         run_language_smoke_flows(executable) != 0) {
         return 1;
     }
-    (void)puts("pty smoke: exec paths, native fc, protected bridge, encrypted history, "
+    (void)puts("pty smoke: exec paths, native fc, protected bridge, plain history, "
          "editor cursor/paste/recall/search, managed async REPL, job control, "
          "async prompt/redirection and cancellation passed");
     return 0;

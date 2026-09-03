@@ -8,8 +8,6 @@
 enum {
     GSH_HISTORY_CAP = 1024,
     GSH_HISTORY_ENTRY_CAP = 4096,
-    GSH_HISTORY_SERIALIZED_CAP =
-        40 + GSH_HISTORY_CAP * (4 + GSH_HISTORY_ENTRY_CAP),
 };
 
 typedef struct {
@@ -35,10 +33,6 @@ const char *gsh_history_event(const gsh_history_store *store,
 int gsh_history_find_prefix(const gsh_history_store *store,
                             const char *prefix, size_t prefix_length,
                             uint64_t before_event, uint64_t *event);
-size_t gsh_history_serialize(const gsh_history_store *store,
-                             unsigned char *output, size_t capacity);
-int gsh_history_deserialize(gsh_history_store *store,
-                            const unsigned char *input, size_t length);
 void gsh_history_clear(gsh_history_store *store);
 
 #endif

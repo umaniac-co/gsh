@@ -24,10 +24,6 @@ enum {
     GSH_CONFIG_FILE_CAP = 65536,
 };
 
-static const uint64_t GSH_HISTORY_REMINDER_MIN_NS =
-    4ULL * 60ULL * 60ULL * 1000000000ULL;
-static const uint64_t GSH_HISTORY_REMINDER_MAX_NS =
-    6ULL * 60ULL * 60ULL * 1000000000ULL;
 static const char initial_config[] =
     "config.version = 1\n"
     "\n"
@@ -40,17 +36,14 @@ static const char initial_config[] =
     "shell.history.max_entries = 1024\n"
     "shell.history.deduplicate = false\n"
     "shell.history.store_failed = true\n"
-    "shell.history.ignore_space = true\n"
-    "shell.history.unlock_ttl = infinite\n"
-    "shell.history.reminder_min = 4h\n"
-    "shell.history.reminder_max = 6h\n";
+    "shell.history.ignore_space = true\n";
 
 typedef struct {
     char *text;
     size_t length;
     size_t line;
     bool version_seen;
-    bool seen[13];
+    bool seen[10];
 } config_parser;
 
 /* ── Configuration Is Parsed Before It Can Mutate State ───────
@@ -85,9 +78,6 @@ void gsh_config_defaults(gsh_shell_config *config)
     config->history_max_entries = GSH_HISTORY_CAP;
     config->history_store_failed = true;
     config->history_ignore_space = true;
-    config->history_unlock_infinite = true;
-    config->history_reminder_min_ns = GSH_HISTORY_REMINDER_MIN_NS;
-    config->history_reminder_max_ns = GSH_HISTORY_REMINDER_MAX_NS;
     config->terminal_actions = GSH_TERMINAL_ACTIONS_AUTO;
     config->terminal_images = GSH_TERMINAL_IMAGES_AUTO;
     config->path_detection = GSH_PATH_DETECTION_SAFE;
@@ -245,51 +235,12 @@ static int parse_count(const char *text, size_t *value)
     return 0;
 }
 
-static int parse_duration(const char *text, uint64_t *value)
-{
-    if (text == NULL || value == NULL) {
-        return -1;
-    }
-    uint64_t number = 0;
-    uint64_t multiplier;
-    size_t index = 0;
-
-    while (text[index] >= '0' && text[index] <= '9') {
-        if (number > (UINT64_MAX - (uint64_t)(text[index] - '0')) / 10U) {
-            errno = ERANGE;
-            return -1;
-        }
-        number = number * 10U + (uint64_t)(text[index++] - '0');
-    }
-    if (number == 0) {
-        errno = EINVAL;
-        return -1;
-    }
-    if (strcmp(text + index, "s") == 0) {
-        multiplier = 1000000000ULL;
-    } else if (strcmp(text + index, "m") == 0) {
-        multiplier = 60ULL * 1000000000ULL;
-    } else if (strcmp(text + index, "h") == 0) {
-        multiplier = 60ULL * 60ULL * 1000000000ULL;
-    } else {
-        errno = EINVAL;
-        return -1;
-    }
-    if (number > UINT64_MAX / multiplier) {
-        errno = ERANGE;
-        return -1;
-    }
-    *value = number * multiplier;
-    return 0;
-}
-
 static int field_index(const char *key)
 {
     static const char *const keys[] = {
         "shell.history.enabled",       "shell.history.max_entries",
         "shell.history.deduplicate",   "shell.history.store_failed",
-        "shell.history.ignore_space",  "shell.history.unlock_ttl",
-        "shell.history.reminder_min",  "shell.history.reminder_max",
+        "shell.history.ignore_space",
         "shell.async_repl.enabled",
         "terminal.actions",
         "terminal.actions.path_detection",
@@ -415,8 +366,8 @@ static int parse_editor_argv(const char *value, gsh_shell_config *config)
     return 0;
 }
 
-static int apply_history_field(gsh_shell_config *config, int field,
-                               const char *value)
+static int apply_config_field(gsh_shell_config *config, int field,
+                              const char *value)
 {
     if (config == NULL || value == NULL) {
         return -1;
@@ -433,21 +384,14 @@ static int apply_history_field(gsh_shell_config *config, int field,
     case 4:
         return parse_boolean(value, &config->history_ignore_space);
     case 5:
-        config->history_unlock_infinite = strcmp(value, "infinite") == 0;
-        return config->history_unlock_infinite ? 0 : -1;
-    case 6:
-        return parse_duration(value, &config->history_reminder_min_ns);
-    case 7:
-        return parse_duration(value, &config->history_reminder_max_ns);
-    case 8:
         return parse_boolean(value, &config->async_repl_enabled);
-    case 9:
+    case 6:
         return parse_actions_mode(value, &config->terminal_actions);
-    case 10:
+    case 7:
         return parse_detection_mode(value, &config->path_detection);
-    case 11:
+    case 8:
         return parse_images_mode(value, &config->terminal_images);
-    case 12:
+    case 9:
         return parse_editor_argv(value, config);
     default:
         errno = EINVAL;
@@ -500,7 +444,7 @@ static int parse_assignment(config_parser *parser,
         return -1;
     }
     parser->seen[field] = true;
-    return apply_history_field(config, field, value);
+    return apply_config_field(config, field, value);
 }
 
 static int parse_text(gsh_shell_config *candidate, char *text, size_t length,
@@ -532,9 +476,7 @@ static int parse_text(gsh_shell_config *candidate, char *text, size_t length,
         begin = end + 1U;
         parser.line++;
     }
-    if (!parser.version_seen ||
-        candidate->history_reminder_min_ns >
-            candidate->history_reminder_max_ns) {
+    if (!parser.version_seen) {
         *failed_line = parser.line;
         errno = EINVAL;
         return -1;

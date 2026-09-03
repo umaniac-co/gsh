@@ -24,9 +24,8 @@ src/builtin_variables.c gsh,fault dependency
 src/command_cache.c gsh,fault,command-cache-test dependency
 src/fault_injection_disabled.c gsh dependency
 src/fault_injection_enabled.c fault dependency
-src/history_agent.c history-agent main
-src/history_client.c gsh,fault dependency
-src/history_store.c gsh,fault,history-agent dependency
+src/history_file.c gsh,fault dependency
+src/history_store.c gsh,fault dependency
 src/native_plan.c gsh,fault,fuzz dependency
 src/native_viewer.c gsh,fault,file-builtins-test dependency
 src/positional_parameters.c gsh,fault,positional-test dependency

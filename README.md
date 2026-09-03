@@ -296,10 +296,6 @@ internal workers as jobs.
 - macOS or Linux
 - a C17 compiler with POSIX APIs (`cc`, Clang, or GCC)
 - `make`
-- libsodium development headers and library
-
-On macOS, install the crypto dependency with `brew install libsodium`. On
-Debian or Ubuntu, install `libsodium-dev`.
 
 The source requests the POSIX.1-2024 feature-test baseline with
 `_POSIX_C_SOURCE=202405L`. Current platform SDKs may still report an older
@@ -312,8 +308,7 @@ on both macOS and Linux and keeps platform capability differences explicit.
 make
 ```
 
-The shell and its per-user history agent are written to `build/gsh` and
-`build/gsh-history-agent`. To remove them:
+The shell is written to `build/gsh`. To remove it:
 
 ```sh
 make clean
@@ -332,9 +327,8 @@ The test and its lifecycle probe are also written in C. They launch the real
 executable through a pseudo-terminal and verify direct execution, shell
 fallback, stop/`fg`/`Ctrl-C` job control, settled and pending prompts,
 isolation of a redirection worker blocked on filesystem I/O, and exact
-terminal-mode restoration. It also exercises encrypted history across agent and shell
-restarts, arrow-key recall, incremental `Ctrl-R`, private commands, and timed
-passphrase reminders.
+terminal-mode restoration. It also exercises plain-text history across shell
+restarts, arrow-key recall, incremental `Ctrl-R`, and private commands.
 
 Additional reliability gates are:
 
@@ -713,25 +707,18 @@ Interactive command history retains at most 1024 accepted commands. Use the
 left and right arrows to move through the current command, the up and down
 arrows to navigate history, and `Ctrl-R` for incremental reverse search. A
 complete command whose first and last bytes are ASCII spaces executes normally
-but is not recorded. History is stored in `~/.gsh/history.vault`, encrypted
-with a passphrase-derived Argon2id key and XChaCha20-Poly1305; the passphrase
-and plaintext entries are never written to `~/.gshrc`.
+but is not recorded. History is stored as owner-only text in
+`~/.gsh_history`, using a zsh-style extended-history line with reversible
+escaping for embedded newlines and backslashes. The file is loaded before the
+first prompt and this session's entries are merged and atomically written on a
+clean shell exit. A short sidecar lock preserves entries when multiple shells
+exit concurrently; abnormal termination may lose only the unsaved session,
+matching the traditional bash/zsh lifecycle.
 
-One per-user `gsh-history-agent` owns the decrypted ring and keeps its key in
-RAM without an automatic expiry. At a cryptographically random interval from
-four through six hours, the next idle prompt asks for the passphrase as a
-memory reminder. A failed or cancelled reminder does not lock history. The
-defaults are created in `~/.gshrc` and can be adjusted declaratively:
-
-```text
-shell.history.unlock_ttl = infinite
-shell.history.reminder_min = 4h
-shell.history.reminder_max = 6h
-```
-
-`history status` reports the effective state. `history lock` explicitly wipes
-the agent key and `history shutdown` stops the agent; the next shell then asks
-for the passphrase before decrypting the existing vault.
+`history status` reports the effective state and file path. Passphrases,
+history agents, lock commands, and reminder prompts are not part of the
+history lifecycle. A legacy `~/.gsh/history.vault` is neither read nor deleted
+automatically.
 
 `rt` exposes the bounded reactor's local service-time diagnostics. Its 5 ms
 deadline applies only to work performed by the interactive core after `poll()`

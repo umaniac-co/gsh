@@ -10,64 +10,13 @@
 #include <errno.h>
 #include <string.h>
 
-static const unsigned char history_magic_v1[8] = {
-    'G', 'S', 'H', 'H', 'I', 'S', 'T', '1'};
-static const unsigned char history_magic_v2[8] = {
-    'G', 'S', 'H', 'H', 'I', 'S', 'T', '2'};
-
-/* ── Fixed Slots Make History Cost Provable ─────────────────────
+/* ── Fixed Slots Make History Cost Provable ────────────────────
  * A linked list made command retention depend on allocator health and age.
  * History now owns exactly 1024 command slots with the editor's input bound.
  * Overwrite advances one ring index, so admission never allocates or scans.
- * Serialization carries only live entries and validates every length on load.
+ * Disk persistence is a separate text adapter that admits validated entries.
  * The fixed representation keeps corruption and resource recovery explicit.
- * ─────────────────────────────────────────────── */
-
-static void encode_u32(unsigned char output[4], uint32_t value)
-{
-    if (output == NULL) {
-        return;
-    }
-    output[0] = (unsigned char)(value >> 24);
-    output[1] = (unsigned char)(value >> 16);
-    output[2] = (unsigned char)(value >> 8);
-    output[3] = (unsigned char)value;
-}
-
-static uint32_t decode_u32(const unsigned char input[4])
-{
-    if (input == NULL) {
-        return 0U;
-    }
-    return ((uint32_t)input[0] << 24) | ((uint32_t)input[1] << 16) |
-           ((uint32_t)input[2] << 8) | (uint32_t)input[3];
-}
-
-static void encode_u64(unsigned char output[8], uint64_t value)
-{
-    if (output == NULL) {
-        return;
-    }
-    size_t index;
-
-    for (index = 0; index < 8U; index++) {
-        output[7U - index] = (unsigned char)(value >> (index * 8U));
-    }
-}
-
-static uint64_t decode_u64(const unsigned char input[8])
-{
-    if (input == NULL) {
-        return 0U;
-    }
-    uint64_t value = 0;
-    size_t index;
-
-    for (index = 0; index < 8U; index++) {
-        value = (value << 8U) | input[index];
-    }
-    return value;
-}
+ * ────────────────────────────────────────────── */
 
 void gsh_history_initialize(gsh_history_store *store)
 {
@@ -199,8 +148,7 @@ uint64_t gsh_history_oldest_event(const gsh_history_store *store)
     if (store == NULL) {
         return 0U;
     }
-    return store == NULL || store->count == 0 ||
-                   store->next_event <= store->count
+    return store->count == 0 || store->next_event <= store->count
                ? 0
                : store->next_event - store->count;
 }
@@ -210,7 +158,7 @@ uint64_t gsh_history_newest_event(const gsh_history_store *store)
     if (store == NULL) {
         return 0U;
     }
-    return store == NULL || store->count == 0 || store->next_event == 0
+    return store->count == 0 || store->next_event == 0
                ? 0
                : store->next_event - 1U;
 }
@@ -218,17 +166,18 @@ uint64_t gsh_history_newest_event(const gsh_history_store *store)
 const char *gsh_history_event(const gsh_history_store *store,
                               uint64_t event, size_t *length)
 {
-    if (store == NULL) {
-        return NULL;
-    }
-    uint64_t oldest = gsh_history_oldest_event(store);
+    uint64_t oldest;
     size_t chronological;
     size_t slot;
 
+    if (store == NULL) {
+        return NULL;
+    }
+    oldest = gsh_history_oldest_event(store);
     if (length != NULL) {
         *length = 0;
     }
-    if (store == NULL || length == NULL || oldest == 0 || event < oldest ||
+    if (length == NULL || oldest == 0 || event < oldest ||
         event >= store->next_event) {
         return NULL;
     }
@@ -242,14 +191,15 @@ int gsh_history_find_prefix(const gsh_history_store *store,
                             const char *prefix, size_t prefix_length,
                             uint64_t before_event, uint64_t *event)
 {
-    if (store == NULL) {
-        return -1;
-    }
-    uint64_t oldest = gsh_history_oldest_event(store);
+    uint64_t oldest;
     uint64_t candidate;
     size_t checked;
 
-    if (store == NULL || prefix == NULL || event == NULL ||
+    if (store == NULL) {
+        return -1;
+    }
+    oldest = gsh_history_oldest_event(store);
+    if (prefix == NULL || event == NULL ||
         prefix_length >= GSH_HISTORY_ENTRY_CAP || oldest == 0) {
         errno = EINVAL;
         return -1;
@@ -269,97 +219,4 @@ int gsh_history_find_prefix(const gsh_history_store *store,
     }
     errno = ENOENT;
     return -1;
-}
-
-size_t gsh_history_serialize(const gsh_history_store *store,
-                             unsigned char *output, size_t capacity)
-{
-    size_t used = 20;
-    size_t index;
-
-    if (store == NULL || output == NULL || store->count > GSH_HISTORY_CAP ||
-        store->next_event == 0 || store->next_event <= store->count ||
-        capacity < used) {
-        errno = EINVAL;
-        return 0;
-    }
-    (void)memcpy(output, history_magic_v2, sizeof(history_magic_v2));
-    encode_u32(output + 8, (uint32_t)store->count);
-    encode_u64(output + 12, store->next_event);
-    for (index = 0; index < store->count; index++) {
-        size_t slot = physical_index(store, index);
-        size_t length = store->lengths[slot];
-
-        if (length == 0 || length >= GSH_HISTORY_ENTRY_CAP ||
-            length + 4U > capacity - used) {
-            errno = ENOBUFS;
-            return 0;
-        }
-        encode_u32(output + used, (uint32_t)length);
-        used += 4U;
-        (void)memcpy(output + used, store->entries[slot], length);
-        used += length;
-    }
-    return used;
-}
-
-int gsh_history_deserialize(gsh_history_store *store,
-                            const unsigned char *input, size_t length)
-{
-    uint32_t count;
-    uint64_t restored_next = 0;
-    size_t offset;
-    size_t index;
-
-    if (store == NULL || input == NULL || length < 12U ||
-        (memcmp(input, history_magic_v1, sizeof(history_magic_v1)) != 0 &&
-         memcmp(input, history_magic_v2, sizeof(history_magic_v2)) != 0)) {
-        errno = EPROTO;
-        return -1;
-    }
-    count = decode_u32(input + 8);
-    if (count > GSH_HISTORY_CAP) {
-        errno = EOVERFLOW;
-        return -1;
-    }
-    offset = memcmp(input, history_magic_v2, sizeof(history_magic_v2)) == 0
-                 ? 20U : 12U;
-    if (length < offset) {
-        errno = EPROTO;
-        return -1;
-    }
-    gsh_history_initialize(store);
-    if (offset == 20U) {
-        restored_next = decode_u64(input + 12);
-        if (restored_next == 0 || restored_next <= count) {
-            errno = EPROTO;
-            return -1;
-        }
-    }
-    for (index = 0; index < count; index++) {
-        uint32_t entry_length;
-
-        if (offset + 4U > length) {
-            errno = EPROTO;
-            return -1;
-        }
-        entry_length = decode_u32(input + offset);
-        offset += 4U;
-        if (entry_length == 0 || entry_length >= GSH_HISTORY_ENTRY_CAP ||
-            entry_length > length - offset ||
-            gsh_history_add(store, (const char *)input + offset,
-                            entry_length, false) == -1) {
-            errno = EPROTO;
-            return -1;
-        }
-        offset += entry_length;
-    }
-    if (offset != length) {
-        errno = EPROTO;
-        return -1;
-    }
-    store->next_event = restored_next != 0
-                            ? restored_next
-                            : (uint64_t)store->count + 1U;
-    return 0;
 }
