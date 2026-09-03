@@ -1,6 +1,9 @@
 #ifndef _POSIX_C_SOURCE
 #define _POSIX_C_SOURCE 202405L
 #endif
+#ifndef _XOPEN_SOURCE
+#define _XOPEN_SOURCE 700
+#endif
 #if _POSIX_C_SOURCE < 202405L
 #error "gsh requires the POSIX.1-2024 feature-test baseline"
 #endif

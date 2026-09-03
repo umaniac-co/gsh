@@ -17,6 +17,7 @@ typedef struct {
     size_t row;
     size_t column;
     size_t visual_column;
+    uint32_t image_protocol;
     const char *base_directory;
     bool navigable_root;
 } gsh_builtin_resource_sink;

@@ -235,6 +235,18 @@ static bool capture_contains(const pty_session *session, const char *text)
     return find_bytes(session->capture, session->capture_length, text) != NULL;
 }
 
+static bool capture_ordered(const pty_session *session, const char *first,
+                            const char *second)
+{
+    const unsigned char *first_at;
+    const unsigned char *second_at;
+
+    if (session == NULL || first == NULL || second == NULL) return false;
+    first_at = find_bytes(session->capture, session->capture_length, first);
+    second_at = find_bytes(session->capture, session->capture_length, second);
+    return first_at != NULL && second_at != NULL && first_at < second_at;
+}
+
 static void dump_capture(const pty_session *session)
 {
     if (session == NULL) return;
@@ -327,6 +339,8 @@ static int configure_child_limits(void)
 
 static void configure_child_environment(shell_kind kind)
 {
+    const char *features = getenv("GSH_HARNESS_TERM_FEATURES");
+    const char *home = getenv("GSH_HARNESS_HOME");
     const char *managed;
     const char *history;
     const char *path = getenv("GSH_HARNESS_PATH");
@@ -336,11 +350,17 @@ static void configure_child_environment(shell_kind kind)
         return;
     }
     (void)setenv("PATH", path == NULL ? "/usr/bin:/bin" : path, 1);
+    if (home != NULL) (void)setenv("HOME", home, 1);
     (void)setenv("TERM", "xterm-256color", 1);
     (void)setenv("PS1", "gsh$ ", 1);
     (void)setenv("PS2", "GSH_MORE> ", 1);
     (void)setenv("PROMPT", "gsh$ ", 1);
     (void)setenv("RPROMPT", "", 1);
+    (void)unsetenv("TERM_PROGRAM");
+    (void)unsetenv("ITERM_SESSION_ID");
+    (void)unsetenv("KITTY_WINDOW_ID");
+    if (features == NULL) (void)unsetenv("TERM_FEATURES");
+    else (void)setenv("TERM_FEATURES", features, 1);
     if (kind != SHELL_GSH) {
         return;
     }
@@ -932,6 +952,27 @@ static int write_text_file(const char *path, const char *text, mode_t mode)
     return status;
 }
 
+static int write_binary_file(const char *path, const unsigned char *bytes,
+                             size_t length, mode_t mode)
+{
+    size_t offset = 0U;
+    int descriptor;
+    int status = 0;
+
+    if (path == NULL || bytes == NULL || length == 0U) return -1;
+    descriptor = open(path, O_WRONLY | O_CREAT | O_EXCL, mode);
+    if (descriptor < 0) return -1;
+    for (size_t attempt = 0U; offset < length && attempt <= length;
+         attempt++) {
+        ssize_t count = write(descriptor, bytes + offset, length - offset);
+
+        if (count > 0) offset += (size_t)count;
+        else if (!(count == -1 && errno == EINTR)) { status = -1; break; }
+    }
+    if (offset != length || close(descriptor) == -1) status = -1;
+    return status;
+}
+
 static void remove_fixture(const char *root)
 {
     char path[1024];
@@ -1201,7 +1242,7 @@ static int history_session_failure(pty_session *session, const char *stage)
 static int run_initial_history_session(const char *executable,
                                        const char *home)
 {
-    pty_session session;
+    pty_session session = {0};
     int failed = 0;
 
     if (start_session(&session, executable, home, SHELL_GSH) == -1) {
@@ -2199,6 +2240,174 @@ static int managed_detected_action_flow(const char *executable)
     }
     if (stop_session(&session) == -1) failed = 1;
     (void)unlink(path);
+    (void)rmdir(fixture);
+    return failed;
+}
+
+static int exercise_markdown_preview(pty_session *session)
+{
+    static const char frame[] =
+        "MultipartFile=name=Z3NoLXByZXZpZXcucG5n;";
+    static const char wheel_down[] = "\033[<65;80;2M";
+
+    if (session == NULL) return -1;
+    if (resize_session(session, 24U, 110U) == -1 ||
+        consume_through(session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
+        send_text(session, "view -- document.md\r") == -1 ||
+        wait_for_output(session, "\033[1;38;5;81m>\033[0m ",
+                        TEST_TIMEOUT_MS) == -1 ||
+        wait_for_output(session, "Preview title", TEST_TIMEOUT_MS) == -1 ||
+        wait_for_output(session, "(1)/(2)", TEST_TIMEOUT_MS) == -1 ||
+        wait_for_output(session, "Name", TEST_TIMEOUT_MS) == -1 ||
+        wait_for_output(session, "image preview unavailable",
+                        TEST_TIMEOUT_MS) == -1 ||
+        wait_for_output(session, frame,
+                        TEST_TIMEOUT_MS) == -1 ||
+        wait_for_output(session, "FileEnd\a\033" "8",
+                        TEST_TIMEOUT_MS) == -1 ||
+        !capture_ordered(session, "image preview unavailable", frame))
+        return -1;
+    session->capture_length = 0U;
+    if (send_text(session, wheel_down) == -1 ||
+        wait_for_output(session, "4/", TEST_TIMEOUT_MS) == -1 ||
+        capture_contains(session, "jjj") ||
+        send_text(session, "q") == -1 ||
+        consume_through(session, "\033[?1006l", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(session, "gsh$ ", TEST_TIMEOUT_MS) == -1) return -1;
+    (void)poll(NULL, 0U, 100);
+    return 0;
+}
+
+static int exercise_generic_pdf_viewer(pty_session *session)
+{
+    if (session == NULL ||
+        send_text(session, "view -- document.pdf\r") == -1 ||
+        wait_for_output(session, "hex 1/1", TEST_TIMEOUT_MS) == -1 ||
+        capture_contains(session, "PDF · page") ||
+        send_text(session, "q") == -1 ||
+        consume_through(session, "\033[?1006l", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(session, "gsh$ ", TEST_TIMEOUT_MS) == -1) return -1;
+    (void)poll(NULL, 0U, 100);
+    return 0;
+}
+
+static int managed_markdown_preview_flow(const char *executable)
+{
+    static const char markdown[] =
+        "# Preview title\n\nEquation: $\\alpha + \\sqrt{x}$\n\n"
+        "$$\\frac{1}{2} \\le 1$$\n\n"
+        "| Name | Value |\n| --- | ---: |\n| answer | 42 |\n\n"
+        "```python\ndef answer():\n    return 42\n```\n\n"
+        "![diagram](image.png)\n![missing](missing.png)\n";
+    static const unsigned char png[] = {
+        0x89U, 0x50U, 0x4eU, 0x47U, 0x0dU, 0x0aU, 0x1aU, 0x0aU,
+        0x00U, 0x00U, 0x00U, 0x0dU, 0x49U, 0x48U, 0x44U, 0x52U,
+        0x00U, 0x00U, 0x00U, 0x01U, 0x00U, 0x00U, 0x00U, 0x01U,
+        0x08U, 0x06U, 0x00U, 0x00U, 0x00U, 0x1fU, 0x15U, 0xc4U,
+        0x89U, 0x00U, 0x00U, 0x00U, 0x0dU, 0x49U, 0x44U, 0x41U,
+        0x54U, 0x08U, 0xd7U, 0x63U, 0xf8U, 0xcfU, 0xc0U, 0xf0U,
+        0x1fU, 0x00U, 0x05U, 0x00U, 0x01U, 0xffU, 0x89U, 0x99U,
+        0x3dU, 0x1dU, 0x00U, 0x00U, 0x00U, 0x00U, 0x49U, 0x45U,
+        0x4eU, 0x44U, 0xaeU, 0x42U, 0x60U, 0x82U,
+    };
+    static const unsigned char pdf[] = {
+        '%', 'P', 'D', 'F', '-', '1', '.', '7', '\n', 0U,
+    };
+    char fixture[] = "/tmp/gsh-markdown-preview-XXXXXX";
+    char markdown_path[PATH_MAX] = {0};
+    char pdf_path[PATH_MAX] = {0};
+    char image_path[PATH_MAX] = {0};
+    pty_session session = {0};
+    int failed = 0;
+
+    if (executable == NULL || mkdtemp(fixture) == NULL ||
+        snprintf(markdown_path, sizeof(markdown_path), "%s/document.md",
+                 fixture) >= (int)sizeof(markdown_path) ||
+        snprintf(pdf_path, sizeof(pdf_path), "%s/document.pdf", fixture) >=
+            (int)sizeof(pdf_path) ||
+        snprintf(image_path, sizeof(image_path), "%s/image.png", fixture) >=
+            (int)sizeof(image_path) ||
+        write_text_file(markdown_path, markdown, 0600) == -1 ||
+        write_binary_file(pdf_path, pdf, sizeof(pdf), 0600) == -1 ||
+        write_binary_file(image_path, png, sizeof(png), 0600) == -1 ||
+        setenv("GSH_HARNESS_TERM_FEATURES", "F", 1) == -1 ||
+        start_managed_session(&session, executable, fixture) == -1) {
+        perror("pty markdown preview: setup");
+        failed = 1;
+    }
+    (void)unsetenv("GSH_HARNESS_TERM_FEATURES");
+    if (!failed && exercise_markdown_preview(&session) == -1) {
+        (void)fputs("pty markdown preview: flow failed\n", stderr);
+        failed = 1;
+    }
+    if (!failed && exercise_generic_pdf_viewer(&session) == -1) {
+        (void)fputs("pty generic PDF viewer: flow failed\n", stderr);
+        failed = 1;
+    }
+    if (failed && session.pid > 0) {
+        perror("pty markdown preview: flow");
+        dump_capture(&session);
+    }
+    if (session.pid > 0 && stop_session(&session) == -1) failed = 1;
+    if (markdown_path[0] != '\0') (void)unlink(markdown_path);
+    if (pdf_path[0] != '\0') (void)unlink(pdf_path);
+    if (image_path[0] != '\0') (void)unlink(image_path);
+    (void)rmdir(fixture);
+    return failed;
+}
+
+static int managed_image_probe_flow(const char *executable)
+{
+    static const char configuration[] =
+        "config.version = 1\n"
+        "shell.history.enabled = false\n"
+        "terminal.images = on\n";
+    static const char markdown[] = "![probe](probe.png)\n";
+    static const unsigned char png[] = {
+        0x89U, 0x50U, 0x4eU, 0x47U, 0x0dU, 0x0aU, 0x1aU, 0x0aU,
+        0x00U, 0x00U, 0x00U, 0x0dU, 0x49U, 0x48U, 0x44U, 0x52U,
+        0x00U, 0x00U, 0x00U, 0x01U, 0x00U, 0x00U, 0x00U, 0x01U,
+    };
+    static const char kitty_reply[] = "\033_Gi=31;OK\033\\";
+    char fixture[] = "/tmp/gsh-image-probe-XXXXXX";
+    char config_path[PATH_MAX] = {0};
+    char markdown_path[PATH_MAX] = {0};
+    char image_path[PATH_MAX] = {0};
+    pty_session session = {0};
+    int failed = 0;
+
+    if (executable == NULL || mkdtemp(fixture) == NULL ||
+        snprintf(config_path, sizeof(config_path), "%s/.gshrc", fixture) >=
+            (int)sizeof(config_path) ||
+        snprintf(markdown_path, sizeof(markdown_path), "%s/probe.md", fixture) >=
+            (int)sizeof(markdown_path) ||
+        snprintf(image_path, sizeof(image_path), "%s/probe.png", fixture) >=
+            (int)sizeof(image_path) ||
+        write_text_file(config_path, configuration, 0600) == -1 ||
+        write_text_file(markdown_path, markdown, 0600) == -1 ||
+        write_binary_file(image_path, png, sizeof(png), 0600) == -1 ||
+        setenv("GSH_HARNESS_HOME", fixture, 1) == -1 ||
+        setenv("GSH_HARNESS_HISTORY", "1", 1) == -1 ||
+        start_managed_session(&session, executable, fixture) == -1) {
+        failed = 1;
+    }
+    (void)unsetenv("GSH_HARNESS_HOME");
+    (void)unsetenv("GSH_HARNESS_HISTORY");
+    if (!failed &&
+        (wait_for_output(&session, "\033_Gi=31", TEST_TIMEOUT_MS) == -1 ||
+         send_text(&session, kitty_reply) == -1 ||
+         consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
+         send_text(&session, "view -- probe.md\r") == -1 ||
+         wait_for_output(&session, "\033_Ga=T,f=100", TEST_TIMEOUT_MS) == -1 ||
+         send_text(&session, "q") == -1 ||
+         consume_through(&session, "\033[?1006l", TEST_TIMEOUT_MS) == -1 ||
+         consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1))
+        failed = 1;
+    if (failed && session.pid > 0) dump_capture(&session);
+    if (session.pid > 0 && stop_session(&session) == -1) failed = 1;
+    (void)unlink(image_path);
+    (void)unlink(markdown_path);
+    (void)unlink(config_path);
     (void)rmdir(fixture);
     return failed;
 }
@@ -4453,7 +4662,14 @@ static int fault_injection_flow(const char *executable)
          "if true; then exec /usr/bin/true; fi\r",
          "gsh: exec descriptor socket:"},
         {"exec-owner-descriptor-relocation",
-         "exec 3>/dev/null\r",
+         "exec 3>/dev/null 4>/dev/null 5>/dev/null 6>/dev/null "
+         "7>/dev/null 8>/dev/null 9>/dev/null 10>/dev/null "
+         "11>/dev/null 12>/dev/null 13>/dev/null 14>/dev/null "
+         "15>/dev/null 16>/dev/null 17>/dev/null 18>/dev/null "
+         "19>/dev/null 20>/dev/null 21>/dev/null 22>/dev/null "
+         "23>/dev/null 24>/dev/null 25>/dev/null 26>/dev/null "
+         "27>/dev/null 28>/dev/null 29>/dev/null 30>/dev/null "
+         "31>/dev/null 32>/dev/null 33>/dev/null 34>/dev/null\r",
          "gsh: exec descriptor protection:"},
         {"transaction-descriptor-relocation",
          "if true; then exec 3>/dev/null 4>/dev/null 5>/dev/null "
@@ -7439,6 +7655,12 @@ static int run_primary_smoke_flows(const char *executable)
     }
     if (managed_detected_action_flow(executable) != 0) {
         return smoke_flow_failure("managed detected action");
+    }
+    if (managed_markdown_preview_flow(executable) != 0) {
+        return smoke_flow_failure("managed Markdown preview");
+    }
+    if (managed_image_probe_flow(executable) != 0) {
+        return smoke_flow_failure("managed image capability probe");
     }
     if (managed_scroll_flow(executable) != 0) {
         return smoke_flow_failure("managed wheel scrolling");

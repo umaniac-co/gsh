@@ -117,6 +117,13 @@ typedef enum {
     MODE_WAIT,
 } run_mode;
 
+typedef enum {
+    GSH_TERMINAL_IMAGE_NONE = GSH_RESOURCE_IMAGE_NONE,
+    GSH_TERMINAL_IMAGE_KITTY = GSH_RESOURCE_IMAGE_KITTY,
+    GSH_TERMINAL_IMAGE_ITERM = GSH_RESOURCE_IMAGE_ITERM,
+    GSH_TERMINAL_IMAGE_SIXEL = GSH_RESOURCE_IMAGE_SIXEL,
+} gsh_terminal_image_protocol;
+
 typedef struct {
     bool active;
     bool foreground;
@@ -240,6 +247,7 @@ typedef struct {
     unsigned char *history_snapshot;
     gsh_history_client history_client;
     gsh_shell_config config;
+    gsh_terminal_image_protocol image_protocol;
     bool config_error;
     bool history_persistent;
     bool history_navigation;
@@ -1323,6 +1331,153 @@ static bool terminal_actions_requested(const gsh_shell_config *config,
            strcmp(terminal, "dumb") != 0;
 }
 
+static bool terminal_feature_present(const char *features,
+                                     const char *wanted)
+{
+    size_t wanted_length;
+    size_t length;
+
+    if (features == NULL || wanted == NULL) return false;
+    wanted_length = strlen(wanted);
+    length = strnlen(features, 256U);
+    if (wanted_length == 0U || length == 256U) return false;
+    for (size_t offset = 0U; offset + wanted_length <= length; offset++) {
+        bool before = offset == 0U || features[offset - 1U] == ',' ||
+                      features[offset - 1U] == ';' ||
+                      features[offset - 1U] == ':' ||
+                      features[offset - 1U] == ' ';
+        size_t after_offset = offset + wanted_length;
+        bool after = after_offset == length || features[after_offset] == ',' ||
+                     features[after_offset] == ';' ||
+                     features[after_offset] == ':' ||
+                     features[after_offset] == ' ';
+
+        if (before && after &&
+            memcmp(features + offset, wanted, wanted_length) == 0)
+            return true;
+    }
+    return false;
+}
+
+static bool local_terminal_identity(const char *program, const char *session)
+{
+    if (program == NULL || session == NULL || session[0] == '\0') return false;
+    if (getenv("SSH_CONNECTION") != NULL || getenv("TMUX") != NULL ||
+        getenv("STY") != NULL) return false;
+    return strcmp(getenv("TERM_PROGRAM") == NULL ? "" :
+                  getenv("TERM_PROGRAM"), program) == 0;
+}
+
+/* ── Graphics Require End-To-End Evidence ───────────────────────
+ * Terminal names once enabled image escapes optimistically, which corrupted
+ * remote and multiplexer sessions that filtered the corresponding replies.
+ * TERM_FEATURES represents a completed capability exchange and is therefore
+ * authoritative across a chain.  A local emulator identity is accepted only
+ * when neither SSH nor a multiplexer can stand between gsh and that emulator.
+ * Unknown sessions retain the same geometry through ordinary text frames.
+ * ─────────────────────────────────────────────────────────────── */
+static gsh_terminal_image_protocol terminal_image_protocol(
+    const gsh_shell_config *config)
+{
+    const char *features;
+
+    if (config == NULL ||
+        config->terminal_images == GSH_TERMINAL_IMAGES_OFF)
+        return GSH_TERMINAL_IMAGE_NONE;
+    features = getenv("TERM_FEATURES");
+    if (terminal_feature_present(features, "K"))
+        return GSH_TERMINAL_IMAGE_KITTY;
+    if (terminal_feature_present(features, "F"))
+        return GSH_TERMINAL_IMAGE_ITERM;
+    if (terminal_feature_present(features, "Sx"))
+        return GSH_TERMINAL_IMAGE_SIXEL;
+    if (local_terminal_identity("iTerm.app", getenv("ITERM_SESSION_ID")))
+        return GSH_TERMINAL_IMAGE_ITERM;
+    if (local_terminal_identity("kitty", getenv("KITTY_WINDOW_ID")))
+        return GSH_TERMINAL_IMAGE_KITTY;
+    if (local_terminal_identity("ghostty", getenv("TERM_PROGRAM_VERSION")))
+        return GSH_TERMINAL_IMAGE_KITTY;
+    return GSH_TERMINAL_IMAGE_NONE;
+}
+
+static bool terminal_reply_contains(const char *reply, size_t length,
+                                    const char *wanted)
+{
+    size_t wanted_length;
+
+    if (reply == NULL || wanted == NULL) return false;
+    wanted_length = strlen(wanted);
+    if (wanted_length == 0U || wanted_length > length) return false;
+    for (size_t offset = 0U; offset <= length - wanted_length; offset++) {
+        if (memcmp(reply + offset, wanted, wanted_length) == 0) return true;
+    }
+    return false;
+}
+
+static bool terminal_reply_has_sixel_da(const char *reply, size_t length)
+{
+    if (reply == NULL) return false;
+    for (size_t begin = 0U; begin + 3U < length; begin++) {
+        if (reply[begin] != '\033' || reply[begin + 1U] != '[' ||
+            reply[begin + 2U] != '?') continue;
+        for (size_t offset = begin + 3U; offset < length; offset++) {
+            size_t value = 0U;
+            bool digits = false;
+
+            while (offset < length && reply[offset] >= '0' &&
+                   reply[offset] <= '9') {
+                if (value <= 10000U) {
+                    value = value * 10U +
+                            (size_t)(reply[offset] - '0');
+                }
+                digits = true;
+                offset++;
+            }
+            if (digits && value == 4U) return true;
+            if (offset >= length || reply[offset] == 'c') break;
+            if (reply[offset] != ';') break;
+        }
+    }
+    return false;
+}
+
+static gsh_terminal_image_protocol terminal_image_active_probe(
+    shell_state *state)
+{
+    static const char query[] =
+        "\033_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\033\\"
+        "\033]1337;ReportCellSize\a\033[c";
+    char reply[1024];
+    size_t used = 0U;
+    size_t sent = 0U;
+
+    if (state == NULL || state->tty_fd < 0 ||
+        state->config.terminal_images != GSH_TERMINAL_IMAGES_ON)
+        return GSH_TERMINAL_IMAGE_NONE;
+    while (sent < sizeof(query) - 1U) {
+        ssize_t count = write(state->tty_fd, query + sent,
+                              sizeof(query) - 1U - sent);
+        if (count > 0) sent += (size_t)count;
+        else if (count == -1 && errno == EINTR) continue;
+        else return GSH_TERMINAL_IMAGE_NONE;
+    }
+    for (size_t turn = 0U; turn < 5U && used < sizeof(reply); turn++) {
+        struct pollfd input = {state->tty_fd, POLLIN, 0};
+        int ready = poll(&input, 1U, 20);
+        if (ready == -1 && errno == EINTR) { turn--; continue; }
+        if (ready <= 0 || (input.revents & POLLIN) == 0) continue;
+        { ssize_t count = read(state->tty_fd, reply + used,
+                               sizeof(reply) - used);
+          if (count > 0) used += (size_t)count; }
+    }
+    if (terminal_reply_contains(reply, used, "\033_Gi=31;OK"))
+        return GSH_TERMINAL_IMAGE_KITTY;
+    if (terminal_reply_contains(reply, used, "\033[4;"))
+        return GSH_TERMINAL_IMAGE_ITERM;
+    return terminal_reply_has_sixel_da(reply, used)
+               ? GSH_TERMINAL_IMAGE_SIXEL : GSH_TERMINAL_IMAGE_NONE;
+}
+
 static void initialize_repl_size(shell_state *state)
 {
     if (state == NULL) return;
@@ -1466,6 +1621,7 @@ static int initialize_interactive_stores(shell_state *state,
         state->async_repl,
         terminal_actions_requested(&state->config, state->async_desired),
         state->config.path_detection);
+    state->image_protocol = terminal_image_protocol(&state->config);
     state->variable_generation = 1;
     state->alias_generation = 1;
     state->function_generation = 1;
@@ -1564,9 +1720,11 @@ static int initialize_interactive(shell_state *state,
         return -1;
     }
     initialize_interactive_paths(state);
-    return claim_interactive_terminal(state) == -1
-               ? -1
-               : activate_interactive_signals(state);
+    if (claim_interactive_terminal(state) == -1 ||
+        activate_interactive_signals(state) == -1) return -1;
+    if (state->image_protocol == GSH_TERMINAL_IMAGE_NONE)
+        state->image_protocol = terminal_image_active_probe(state);
+    return 0;
 }
 
 static void reset_child_signals(void)
@@ -7668,7 +7826,7 @@ static void execute_external_child(shell_state *state, simple_command *direct,
     }
     if (gsh_fault_should_fail(GSH_FAULT_EXEC, EIO)) child_exec_error("/bin/sh", errno);
     execve("/bin/sh", shell_arguments, environment);
-    (void)write(STDERR_FILENO, "gsh: cannot execute /bin/sh\n", 28U);
+    child_write_text("gsh: cannot execute /bin/sh\n");
     _exit(127);
 }
 
@@ -10284,11 +10442,11 @@ static void handle_mouse_event(shell_state *state, unsigned char final)
     if (final == 'M' && (values[0] & 64U) != 0U) {
         if (preview >= 0 && focused == preview &&
             values[1] > separator_column) {
-            static const char up[] = "kkk";
-            static const char down[] = "jjj";
-            const char *motion = (values[0] & 1U) == 0U ? up : down;
+            static const char up = 0x10;
+            static const char down = 0x0e;
+            const char *motion = (values[0] & 1U) == 0U ? &up : &down;
             (void)gsh_async_repl_queue_input(state->async_repl, preview,
-                                             motion, sizeof(up) - 1U);
+                                             motion, 1U);
         } else {
             gsh_async_repl_scroll(state->async_repl,
                                   (values[0] & 1U) == 0U ? 3L : -3L);
@@ -11252,6 +11410,32 @@ static void read_managed_output(shell_state *state, struct pollfd *descriptor)
     }
 }
 
+static bool drain_managed_output_before_frame(shell_state *state,
+                                               int cell_index)
+{
+    struct pollfd descriptor;
+    gsh_async_cell *cell;
+
+    if (state == NULL || state->async_repl == NULL || cell_index < 0 ||
+        cell_index >= GSH_ASYNC_CELL_CAP) return false;
+    cell = &state_async_repl(state)->cells[cell_index];
+    for (size_t turn = 0U; turn < 16U && cell->pty_fd >= 0; turn++) {
+        int ready;
+
+        descriptor = (struct pollfd){cell->pty_fd, POLLIN, 0};
+        ready = poll(&descriptor, 1U, 0);
+        if (ready == 0) return true;
+        if (ready == -1 && errno == EINTR) { turn--; continue; }
+        if (ready < 0) return false;
+        read_managed_output(state, &descriptor);
+        if (state->output_len > OUTPUT_CAP / 2U) flush_output(state);
+        if (state->output_len > OUTPUT_CAP / 2U) return false;
+    }
+    if (cell->pty_fd < 0) return false;
+    descriptor = (struct pollfd){cell->pty_fd, POLLIN, 0};
+    return poll(&descriptor, 1U, 0) == 0;
+}
+
 static bool accept_view_datagram(shell_state *state, int cell_index,
                                  const char *message, size_t length)
 {
@@ -11281,13 +11465,363 @@ static bool accept_view_datagram(shell_state *state, int cell_index,
     return true;
 }
 
+static size_t preview_base64(const unsigned char *input, size_t length,
+                             char *output, size_t capacity)
+{
+    static const char alphabet[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    size_t used = 0U;
+
+    if (input == NULL || output == NULL ||
+        length > GSH_PREVIEW_FRAME_CHUNK_CAP) return 0U;
+    for (size_t offset = 0U; offset < length;
+         offset += 3U) {
+        uint32_t value = (uint32_t)input[offset] << 16U;
+        size_t remaining = length - offset;
+
+        if (remaining > 1U) value |= (uint32_t)input[offset + 1U] << 8U;
+        if (remaining > 2U) value |= input[offset + 2U];
+        if (capacity - used < 4U) return 0U;
+        output[used++] = alphabet[(value >> 18U) & 63U];
+        output[used++] = alphabet[(value >> 12U) & 63U];
+        output[used++] = remaining > 1U ? alphabet[(value >> 6U) & 63U] : '=';
+        output[used++] = remaining > 2U ? alphabet[value & 63U] : '=';
+    }
+    return used;
+}
+
+static bool preview_frame_format_supported(
+    gsh_terminal_image_protocol protocol, uint32_t format)
+{
+    if (protocol == GSH_TERMINAL_IMAGE_ITERM)
+        return format == GSH_RESOURCE_PROTOCOL_FRAME_PNG ||
+               format == GSH_RESOURCE_PROTOCOL_FRAME_JPEG ||
+               format == GSH_RESOURCE_PROTOCOL_FRAME_GIF;
+    if (protocol == GSH_TERMINAL_IMAGE_KITTY)
+        return format == GSH_RESOURCE_PROTOCOL_FRAME_PNG;
+    if (protocol == GSH_TERMINAL_IMAGE_SIXEL)
+        return format == GSH_RESOURCE_PROTOCOL_FRAME_SIXEL;
+    return false;
+}
+
+static void reset_preview_frame(gsh_async_cell *cell)
+{
+    if (cell == NULL) return;
+    cell->preview_frame_active = false;
+    cell->preview_frame_placed = false;
+    cell->preview_frame_format = 0U;
+    cell->preview_frame_total = 0U;
+    cell->preview_frame_received = 0U;
+    cell->preview_frame_row = 0U;
+    cell->preview_frame_column = 0U;
+    cell->preview_frame_rows = 0U;
+    cell->preview_frame_columns = 0U;
+}
+
+static void erase_iterm_preview_rectangle(shell_state *state,
+                                           const gsh_async_cell *cell)
+{
+    static const char save[] = "\033" "7";
+    static const char restore[] = "\033" "8";
+    char sequence[96];
+
+    if (state == NULL || cell == NULL) return;
+    if (!raw_output_push(state, save, sizeof(save) - 1U)) return;
+    for (uint32_t row = 0U; row < cell->preview_frame_rows; row++) {
+        int length = snprintf(sequence, sizeof(sequence),
+            "\033[%u;%uH\033[%uX", cell->preview_frame_row + row,
+            cell->preview_frame_column, cell->preview_frame_columns);
+
+        if (length < 0 || (size_t)length >= sizeof(sequence) ||
+            !raw_output_push(state, sequence, (size_t)length)) break;
+    }
+    (void)raw_output_push(state, restore, sizeof(restore) - 1U);
+}
+
+static void delete_preview_frame(shell_state *state, gsh_async_cell *cell)
+{
+    static const char iterm_end[] = "\033]1337;FileEnd\a\033" "8";
+    static const char sixel_end[] = "\033\\\033" "8";
+    char sequence[96];
+    int length;
+
+    if (state == NULL || cell == NULL) return;
+    if ((cell->preview_frame_active || cell->preview_frame_placed) &&
+        state->image_protocol == GSH_TERMINAL_IMAGE_KITTY) {
+        length = snprintf(sequence, sizeof(sequence),
+                          "\033_Ga=d,d=i,i=%u,q=2\033\\",
+                          cell->preview_frame_id);
+        if (length > 0 && (size_t)length < sizeof(sequence))
+            (void)raw_output_push(state, sequence, (size_t)length);
+    } else if ((cell->preview_frame_active || cell->preview_frame_placed) &&
+               state->image_protocol == GSH_TERMINAL_IMAGE_ITERM) {
+        if (cell->preview_frame_active)
+            (void)raw_output_push(state, iterm_end, sizeof(iterm_end) - 1U);
+        erase_iterm_preview_rectangle(state, cell);
+    } else if (cell->preview_frame_active &&
+               state->image_protocol == GSH_TERMINAL_IMAGE_SIXEL) {
+        (void)raw_output_push(state, sixel_end, sizeof(sixel_end) - 1U);
+    }
+    reset_preview_frame(cell);
+}
+
+static bool preview_frame_rectangle_valid(const shell_state *state,
+                                           const gsh_preview_frame_record *frame)
+{
+    size_t rows;
+    size_t columns;
+
+    if (state == NULL || frame == NULL || state->async_repl == NULL)
+        return false;
+    rows = state_async_repl(state)->terminal_rows;
+    columns = state_async_repl(state)->terminal_columns;
+    return frame->cell_row > 0U && frame->cell_column > 0U &&
+           frame->cell_rows > 0U && frame->cell_columns > 0U &&
+           frame->cell_row <= rows && frame->cell_column <= columns &&
+           frame->cell_rows <= rows - frame->cell_row + 1U &&
+           frame->cell_columns <= columns - frame->cell_column + 1U;
+}
+
+static bool begin_preview_frame(shell_state *state, int cell_index,
+                                const gsh_preview_frame_record *frame)
+{
+    char sequence[256];
+    gsh_async_cell *cell;
+    int length = 0;
+
+    if (state == NULL || frame == NULL || cell_index < 0 ||
+        cell_index >= GSH_ASYNC_CELL_CAP || !preview_frame_rectangle_valid(
+            state, frame)) return false;
+    cell = &state_async_repl(state)->cells[cell_index];
+    if (frame->generation <= cell->preview_frame_generation) return false;
+    delete_preview_frame(state, cell);
+    if (!drain_managed_output_before_frame(state, cell_index)) return false;
+    cell->preview_frame_active = true;
+    cell->preview_frame_generation = frame->generation;
+    cell->preview_frame_id = frame->frame_id;
+    cell->preview_frame_format = frame->format;
+    cell->preview_frame_total = frame->total_length;
+    cell->preview_frame_row = frame->cell_row;
+    cell->preview_frame_column = frame->cell_column;
+    cell->preview_frame_rows = frame->cell_rows;
+    cell->preview_frame_columns = frame->cell_columns;
+    if (!preview_frame_format_supported(state->image_protocol,
+                                        frame->format)) return true;
+    if (state->image_protocol == GSH_TERMINAL_IMAGE_ITERM) {
+        const char *name = frame->format == GSH_RESOURCE_PROTOCOL_FRAME_JPEG
+                               ? "Z3NoLXByZXZpZXcuanBn"
+                           : frame->format == GSH_RESOURCE_PROTOCOL_FRAME_GIF
+                               ? "Z3NoLXByZXZpZXcuZ2lm"
+                               : "Z3NoLXByZXZpZXcucG5n";
+        length = snprintf(sequence, sizeof(sequence),
+            "\033" "7\033[%u;%uH\033]1337;MultipartFile=name=%s;size=%u;inline=1;"
+            "width=%u;height=%u;preserveAspectRatio=1\a",
+            frame->cell_row, frame->cell_column, name, frame->total_length,
+            frame->cell_columns, frame->cell_rows);
+    } else if (state->image_protocol == GSH_TERMINAL_IMAGE_SIXEL) {
+        length = snprintf(sequence, sizeof(sequence),
+                          "\033" "7\033[%u;%uH\033Pq",
+                          frame->cell_row, frame->cell_column);
+    }
+    if (length != 0 && ((size_t)length >= sizeof(sequence) ||
+        !raw_output_push(state, sequence, (size_t)length))) {
+        reset_preview_frame(cell);
+        return false;
+    }
+    return true;
+}
+
+static bool preview_frame_matches(const gsh_async_cell *cell,
+                                  const gsh_preview_frame_record *frame)
+{
+    if (cell == NULL || frame == NULL) return false;
+    return cell->preview_frame_generation == frame->generation &&
+           cell->preview_frame_id == frame->frame_id &&
+           cell->preview_frame_format == frame->format &&
+           cell->preview_frame_row == frame->cell_row &&
+           cell->preview_frame_column == frame->cell_column &&
+           cell->preview_frame_rows == frame->cell_rows &&
+           cell->preview_frame_columns == frame->cell_columns;
+}
+
+static bool preview_sixel_payload_valid(const unsigned char *bytes,
+                                        size_t length)
+{
+    if (bytes == NULL || length > GSH_PREVIEW_FRAME_CHUNK_CAP) return false;
+    for (size_t index = 0U; index < length; index++) {
+        if (bytes[index] < 0x20U || bytes[index] > 0x7eU ||
+            bytes[index] == 0x1bU) return false;
+    }
+    return true;
+}
+
+static bool emit_preview_chunk(shell_state *state, gsh_async_cell *cell,
+                               const unsigned char *bytes, size_t length,
+                               bool final)
+{
+    char encoded[(GSH_PREVIEW_FRAME_CHUNK_CAP + 2U) / 3U * 4U];
+    char sequence[sizeof(encoded) + 256U];
+    size_t encoded_length;
+    int prefix;
+    size_t used;
+
+    if (state == NULL || cell == NULL || bytes == NULL) return false;
+    if (!preview_frame_format_supported(state->image_protocol,
+                                        cell->preview_frame_format))
+        return true;
+    if (state->image_protocol == GSH_TERMINAL_IMAGE_SIXEL)
+        return preview_sixel_payload_valid(bytes, length) &&
+               raw_output_push(state, (const char *)bytes, length);
+    encoded_length = preview_base64(bytes, length, encoded, sizeof(encoded));
+    if (encoded_length == 0U) return false;
+    if (state->image_protocol == GSH_TERMINAL_IMAGE_ITERM) {
+        prefix = snprintf(sequence, sizeof(sequence),
+                          "\033]1337;FilePart=");
+        if (prefix < 0) return false;
+        used = (size_t)prefix;
+        if (sizeof(sequence) - used < encoded_length + 1U) return false;
+        (void)memcpy(sequence + used, encoded, encoded_length);
+        used += encoded_length;
+        sequence[used++] = '\a';
+    } else {
+        prefix = snprintf(sequence, sizeof(sequence),
+            "\033[%u;%uH\033_Ga=T,f=100,t=d,i=%u,q=2,m=%u,c=%u,r=%u;",
+            cell->preview_frame_row, cell->preview_frame_column,
+            cell->preview_frame_id, final ? 0U : 1U,
+            cell->preview_frame_columns, cell->preview_frame_rows);
+        if (prefix < 0) return false;
+        used = (size_t)prefix;
+        if (sizeof(sequence) - used < encoded_length + 2U) return false;
+        (void)memcpy(sequence + used, encoded, encoded_length);
+        used += encoded_length;
+        sequence[used++] = '\033';
+        sequence[used++] = '\\';
+    }
+    return raw_output_push(state, sequence, used);
+}
+
+static bool accept_preview_chunk(shell_state *state, int cell_index,
+                                 const gsh_preview_frame_record *frame,
+                                 const unsigned char *bytes)
+{
+    gsh_async_cell *cell;
+    bool final;
+
+    if (state == NULL || frame == NULL || bytes == NULL || cell_index < 0 ||
+        cell_index >= GSH_ASYNC_CELL_CAP) return false;
+    cell = &state_async_repl(state)->cells[cell_index];
+    if (!cell->preview_frame_active ||
+        !preview_frame_matches(cell, frame) ||
+        cell->preview_frame_received != frame->offset ||
+        cell->preview_frame_received > cell->preview_frame_total ||
+        frame->chunk_length == 0U ||
+        frame->chunk_length > GSH_PREVIEW_FRAME_CHUNK_CAP ||
+        frame->chunk_length > cell->preview_frame_total -
+            cell->preview_frame_received) return false;
+    final = frame->chunk_length == cell->preview_frame_total -
+                                  cell->preview_frame_received;
+    if (!emit_preview_chunk(state, cell, bytes, frame->chunk_length, final)) {
+        delete_preview_frame(state, cell);
+        return false;
+    }
+    cell->preview_frame_received += frame->chunk_length;
+    return true;
+}
+
+static bool end_preview_frame(shell_state *state, int cell_index,
+                              const gsh_preview_frame_record *frame)
+{
+    static const char iterm_end[] = "\033]1337;FileEnd\a\033" "8";
+    static const char sixel_end[] = "\033\\\033" "8";
+    gsh_async_cell *cell;
+    bool emitted = true;
+
+    if (state == NULL || frame == NULL || cell_index < 0 ||
+        cell_index >= GSH_ASYNC_CELL_CAP) return false;
+    cell = &state_async_repl(state)->cells[cell_index];
+    if (!cell->preview_frame_active ||
+        !preview_frame_matches(cell, frame) ||
+        cell->preview_frame_received != cell->preview_frame_total)
+        return false;
+    if (preview_frame_format_supported(state->image_protocol,
+                                       cell->preview_frame_format)) {
+        if (state->image_protocol == GSH_TERMINAL_IMAGE_ITERM)
+            emitted = raw_output_push(state, iterm_end,
+                                      sizeof(iterm_end) - 1U);
+        else if (state->image_protocol == GSH_TERMINAL_IMAGE_SIXEL)
+            emitted = raw_output_push(state, sixel_end,
+                                      sizeof(sixel_end) - 1U);
+    }
+    if (!emitted) {
+        delete_preview_frame(state, cell);
+        return false;
+    }
+    cell->preview_frame_active = false;
+    cell->preview_frame_placed = emitted &&
+        preview_frame_format_supported(state->image_protocol,
+                                       cell->preview_frame_format);
+    return true;
+}
+
+/* ── Typed Frames Keep Escape Ownership In The Compositor ────────
+ * A preview worker can decode an untrusted document, but it never earns the
+ * right to write a terminal graphics protocol.  It sends bounded raw chunks
+ * on the already authenticated first-party datagram channel.  The reactor
+ * validates generation, rectangle, format, offsets, and total size before it
+ * wraps those bytes in complete protocol records.  Saturation drops one frame
+ * while the canonical text placeholder and the shell continue unchanged.
+ * ─────────────────────────────────────────────────────────────── */
+static bool accept_preview_datagram(shell_state *state, int cell_index,
+                                    const char *message, size_t length)
+{
+    gsh_preview_frame_record frame;
+    gsh_async_cell *cell;
+
+    if (state == NULL || message == NULL || cell_index < 0 ||
+        length < sizeof(frame)) return false;
+    (void)memcpy(&frame, message, sizeof(frame));
+    if (frame.version != GSH_RESOURCE_PROTOCOL_VERSION ||
+        frame.size != length || frame.reserved != 0U ||
+        frame.generation == 0U || frame.frame_id == 0U ||
+        frame.format < GSH_RESOURCE_PROTOCOL_FRAME_PNG ||
+        frame.format > GSH_RESOURCE_PROTOCOL_FRAME_SIXEL ||
+        frame.pixel_width == 0U || frame.pixel_height == 0U ||
+        frame.pixel_width > 16384U || frame.pixel_height > 16384U)
+        return false;
+    cell = &state_async_repl(state)->cells[cell_index];
+    if (frame.event == GSH_RESOURCE_PROTOCOL_FRAME_DELETE &&
+        length == sizeof(frame) && frame.total_length == 0U &&
+        frame.offset == 0U && frame.chunk_length == 0U) {
+        if (preview_frame_matches(cell, &frame))
+            delete_preview_frame(state, cell);
+        return true;
+    }
+    if (frame.event == GSH_RESOURCE_PROTOCOL_FRAME_BEGIN &&
+        length == sizeof(frame) && frame.total_length > 0U &&
+        frame.total_length <= GSH_PREVIEW_FRAME_TOTAL_CAP &&
+        frame.chunk_length == 0U && frame.offset == 0U)
+        return begin_preview_frame(state, cell_index, &frame);
+    if (frame.event == GSH_RESOURCE_PROTOCOL_FRAME_CHUNK &&
+        frame.total_length == 0U &&
+        frame.chunk_length <= GSH_PREVIEW_FRAME_CHUNK_CAP &&
+        sizeof(frame) + frame.chunk_length == length)
+        return accept_preview_chunk(state, cell_index, &frame,
+            (const unsigned char *)message + sizeof(frame));
+    if (frame.event == GSH_RESOURCE_PROTOCOL_FRAME_END &&
+        length == sizeof(frame) && frame.total_length == 0U &&
+        frame.offset == 0U && frame.chunk_length == 0U)
+        return end_preview_frame(state, cell_index, &frame);
+    return false;
+}
+
 static void accept_resource_datagram(shell_state *state, int cell_index,
                                      const char *message, size_t length)
 {
     gsh_resource_record_header header;
     const char *path;
     const char *label;
-    if (accept_view_datagram(state, cell_index, message, length)) return;
+    if (accept_view_datagram(state, cell_index, message, length) ||
+        accept_preview_datagram(state, cell_index, message, length)) return;
     if (state == NULL || message == NULL ||
         length < sizeof(header) || cell_index < 0) return;
     (void)memcpy(&header, message, sizeof(header));
@@ -11342,8 +11876,11 @@ static void read_managed_resources(shell_state *state,
     }
     if ((descriptor->revents & (POLLERR | POLLHUP | POLLNVAL)) != 0)
         close_channel = true;
-    if (close_channel)
+    if (close_channel) {
+        delete_preview_frame(state,
+            &state_async_repl(state)->cells[cell_index]);
         gsh_async_repl_close_resource(state->async_repl, cell_index);
+    }
 }
 
 static void process_managed_descriptors(
@@ -19202,6 +19739,8 @@ static void managed_pipeline_child(
     initialize_interactive_evaluator(&evaluator, state, state->variables);
     if (resource_write >= 0) {
         evaluator.file_resource_sink.descriptor = resource_write;
+        evaluator.file_resource_sink.image_protocol =
+            (uint32_t)state->image_protocol;
         evaluator.file_builtin_io = descriptor_builtin_io;
         evaluator.file_builtin_io.resources =
             &evaluator.file_resource_sink;
@@ -20536,6 +21075,8 @@ static void initialize_compound_evaluator(
            evaluator->exec_descriptor_count *
                sizeof(evaluator->exec_descriptors[0]));
     evaluator->file_resource_sink.descriptor = launch->resource[1];
+    evaluator->file_resource_sink.image_protocol =
+        (uint32_t)state->image_protocol;
     evaluator->file_builtin_io = descriptor_builtin_io;
     if (launch->resource[1] >= 0) {
         evaluator->file_resources_enabled = true;

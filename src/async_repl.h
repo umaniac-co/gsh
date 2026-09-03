@@ -53,6 +53,8 @@ typedef struct {
     bool fullscreen_recorded;
     bool native_preview;
     bool preview_split;
+    bool preview_frame_active;
+    bool preview_frame_placed;
     bool autofocus_suppressed;
     unsigned char escape_state;
     unsigned char passthrough_state;
@@ -69,6 +71,15 @@ typedef struct {
     char command[GSH_ASYNC_COMMAND_CAP];
     size_t command_length;
     size_t preview_separator_column;
+    uint32_t preview_frame_generation;
+    uint32_t preview_frame_id;
+    uint32_t preview_frame_format;
+    uint32_t preview_frame_total;
+    uint32_t preview_frame_received;
+    uint32_t preview_frame_row;
+    uint32_t preview_frame_column;
+    uint32_t preview_frame_rows;
+    uint32_t preview_frame_columns;
     char launch_directory[4096];
     char input[GSH_ASYNC_CELL_INPUT_CAP];
     size_t input_offset;

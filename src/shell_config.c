@@ -34,6 +34,7 @@ static const char initial_config[] =
     "shell.async_repl.enabled = true\n"
     "terminal.actions = auto\n"
     "terminal.actions.path_detection = safe\n"
+    "terminal.images = auto\n"
     "shell.preview.editor = auto\n"
     "shell.history.enabled = true\n"
     "shell.history.max_entries = 1024\n"
@@ -49,7 +50,7 @@ typedef struct {
     size_t length;
     size_t line;
     bool version_seen;
-    bool seen[12];
+    bool seen[13];
 } config_parser;
 
 /* ── Configuration Is Parsed Before It Can Mutate State ───────
@@ -88,6 +89,7 @@ void gsh_config_defaults(gsh_shell_config *config)
     config->history_reminder_min_ns = GSH_HISTORY_REMINDER_MIN_NS;
     config->history_reminder_max_ns = GSH_HISTORY_REMINDER_MAX_NS;
     config->terminal_actions = GSH_TERMINAL_ACTIONS_AUTO;
+    config->terminal_images = GSH_TERMINAL_IMAGES_AUTO;
     config->path_detection = GSH_PATH_DETECTION_SAFE;
     config->preview_editor_auto = true;
 }
@@ -291,6 +293,7 @@ static int field_index(const char *key)
         "shell.async_repl.enabled",
         "terminal.actions",
         "terminal.actions.path_detection",
+        "terminal.images",
         "shell.preview.editor",
     };
     size_t index;
@@ -321,6 +324,17 @@ static int parse_detection_mode(const char *value,
     if (strcmp(value, "off") == 0) *mode = GSH_PATH_DETECTION_OFF;
     else if (strcmp(value, "known") == 0) *mode = GSH_PATH_DETECTION_KNOWN;
     else if (strcmp(value, "safe") == 0) *mode = GSH_PATH_DETECTION_SAFE;
+    else { errno = EINVAL; return -1; }
+    return 0;
+}
+
+static int parse_images_mode(const char *value,
+                             gsh_terminal_images_mode *mode)
+{
+    if (value == NULL || mode == NULL) return -1;
+    if (strcmp(value, "auto") == 0) *mode = GSH_TERMINAL_IMAGES_AUTO;
+    else if (strcmp(value, "on") == 0) *mode = GSH_TERMINAL_IMAGES_ON;
+    else if (strcmp(value, "off") == 0) *mode = GSH_TERMINAL_IMAGES_OFF;
     else { errno = EINVAL; return -1; }
     return 0;
 }
@@ -432,6 +446,8 @@ static int apply_history_field(gsh_shell_config *config, int field,
     case 10:
         return parse_detection_mode(value, &config->path_detection);
     case 11:
+        return parse_images_mode(value, &config->terminal_images);
+    case 12:
         return parse_editor_argv(value, config);
     default:
         errno = EINVAL;

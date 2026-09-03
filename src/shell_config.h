@@ -18,6 +18,12 @@ typedef enum {
 } gsh_terminal_actions_mode;
 
 typedef enum {
+    GSH_TERMINAL_IMAGES_AUTO = 0,
+    GSH_TERMINAL_IMAGES_ON,
+    GSH_TERMINAL_IMAGES_OFF,
+} gsh_terminal_images_mode;
+
+typedef enum {
     GSH_PATH_DETECTION_OFF = 0,
     GSH_PATH_DETECTION_KNOWN,
     GSH_PATH_DETECTION_SAFE,
@@ -34,6 +40,7 @@ typedef struct {
     uint64_t history_reminder_min_ns;
     uint64_t history_reminder_max_ns;
     gsh_terminal_actions_mode terminal_actions;
+    gsh_terminal_images_mode terminal_images;
     gsh_path_detection_mode path_detection;
     bool preview_editor_auto;
     size_t preview_editor_argc;

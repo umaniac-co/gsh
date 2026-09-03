@@ -77,6 +77,7 @@ static bool initial_file_has_action_defaults(const char *home)
 {
     static const char actions[] = "terminal.actions = auto";
     static const char detection[] = "terminal.actions.path_detection = safe";
+    static const char images[] = "terminal.images = auto";
     static const char editor[] = "shell.preview.editor = auto";
     char path[4096];
     char contents[4096];
@@ -92,6 +93,7 @@ static bool initial_file_has_action_defaults(const char *home)
     contents[(size_t)count] = '\0';
     return strstr(contents, actions) != NULL &&
            strstr(contents, detection) != NULL &&
+           strstr(contents, images) != NULL &&
            strstr(contents, editor) != NULL;
 }
 
@@ -102,6 +104,7 @@ static int action_configuration_cases(const char *home,
         "config.version = 1\n"
         "terminal.actions = off\n"
         "terminal.actions.path_detection = known\n"
+        "terminal.images = off\n"
         "shell.preview.editor = [\"nvim\", \"--\", \"{file}\"]\n";
     static const char invalid[] =
         "config.version = 1\n"
@@ -110,6 +113,7 @@ static int action_configuration_cases(const char *home,
     if (write_configuration(home, explicit) == -1 ||
         gsh_config_load(config, home, false) == -1 ||
         config->terminal_actions != GSH_TERMINAL_ACTIONS_OFF ||
+        config->terminal_images != GSH_TERMINAL_IMAGES_OFF ||
         config->path_detection != GSH_PATH_DETECTION_KNOWN ||
         config->preview_editor_auto || config->preview_editor_argc != 3U ||
         strcmp(gsh_config_editor_argument(config, 0U), "nvim") != 0 ||
@@ -150,6 +154,7 @@ int main(void)
         gsh_config_load(&config, home, true) == -1 ||
         !config.async_repl_enabled ||
         config.terminal_actions != GSH_TERMINAL_ACTIONS_AUTO ||
+        config.terminal_images != GSH_TERMINAL_IMAGES_AUTO ||
         config.path_detection != GSH_PATH_DETECTION_SAFE ||
         !config.preview_editor_auto ||
         !initial_file_has_async_default(home) ||

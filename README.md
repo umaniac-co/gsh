@@ -665,6 +665,7 @@ The corresponding optional schema-version-1 settings are:
 ```text
 terminal.actions = auto
 terminal.actions.path_detection = safe
+terminal.images = auto
 shell.preview.editor = auto
 
 # Exact override; one element must be {file}.
@@ -676,6 +677,19 @@ shell.preview.editor = ["nvim", "--", "{file}"]
 (plus conservative universal detection). Editor auto-discovery tries `nvim`,
 then `vim`, then `nano`; automatic Vim/Neovim sessions show absolute line
 numbers, while an explicit vector is never overridden and has no fallback.
+`terminal.images` accepts `auto`, `on`, or `off`. `auto` uses only a graphics
+protocol confirmed by terminal capability reporting, `on` permits active
+bounded probes, and `off` skips probing and always reserves the image area with
+a bordered diagonal placeholder.
+
+Markdown files use a semantic preview for headings, lists, quotes, emphasis,
+links, tables, fenced source blocks, formulas, and local images. Remote images
+are never fetched. Local image paths are resolved relative to the document and
+must remain regular files below that directory. `e` edits the Markdown source
+at the selected source line and reloads it on return. When a confirmed image
+protocol is absent, the same layout is retained as a bordered placeholder.
+PDF files return to the existing generic, content-based text/hex viewer;
+source, plain-text, and other binary previews are unchanged.
 
 The future `?` steering and `??` AI queue described by specification 0008 are
 not implemented yet; ordinary shell operation does not depend on an LLM.
@@ -842,3 +856,26 @@ jobs have actually run for the same revision; the workflow file alone is not
 evidence of a passing platform. The current ignored suspension record is
 `dev/status/posix-2024-notes.md` when present; its global percentage remains a
 planning estimate, not a conformance or release score.
+
+## Terminal compatibility
+
+Graphics are an optional Markdown preview enhancement, not a prerequisite for
+using gsh. The compositor emits Kitty Graphics or iTerm2 inline-image data only
+after that capability has been confirmed across the active terminal, SSH, and
+multiplexer chain. An unconfirmed or unavailable protocol degrades to a
+bordered placeholder with diagonals; it never changes command output.
+
+| Functionality | Classic VT/ANSI and SSH behavior |
+| --- | --- |
+| Shell language, builtins, pipelines, redirections and scripts | Independent from image protocols |
+| `ls`, `ll`, text/source/hex `view` | Available normally; keyboard and commands remain available without mouse |
+| Clickable resource actions | Enabled when mouse reporting survives the terminal or SSH/multiplexer chain |
+| Markdown formatting | Textual formatting remains available |
+| Markdown images | Kitty or iTerm2 when confirmed; bordered diagonal placeholder otherwise |
+| Pipes, redirects and non-interactive SSH | Canonical output without graphics or terminal-control metadata |
+
+Older terminals therefore lose only images, mouse interaction, and some visual
+richness. The normal shell remains compatible over SSH. An interactive SSH
+session normally needs a PTY (for example, `ssh -t host gsh`), while
+`ssh host gsh -c ...` remains non-interactive and emits neither graphics nor
+terminal-control metadata. gsh never sends an unconfirmed graphics protocol.

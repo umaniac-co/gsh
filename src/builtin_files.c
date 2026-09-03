@@ -4,6 +4,9 @@
 #ifndef _POSIX_C_SOURCE
 #define _POSIX_C_SOURCE 202405L
 #endif
+#ifndef _XOPEN_SOURCE
+#define _XOPEN_SOURCE 700
+#endif
 #if _POSIX_C_SOURCE < 202405L
 #error "gsh requires the POSIX.1-2024 feature-test baseline"
 #endif
@@ -18,15 +21,19 @@
 #include <grp.h>
 #include <limits.h>
 #include <pwd.h>
+#include <stdarg.h>
+#include <stdio.h>
 #include <stdlib.h> /* CANON-INCLUDE: macos */
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
+#include <time.h>
 #if !defined(__APPLE__)
 #include <sys/sysmacros.h> /* CANON-INCLUDE: linux */
 #endif
 #include <unistd.h>
 #include <wchar.h>
+#include <wctype.h>
 
 enum {
     GSH_FILE_MEMORY_CAP = 384,
@@ -828,6 +835,7 @@ static void send_resource_record(const gsh_builtin_io *io,
     gsh_resource_type type;
     size_t path_length;
     size_t label_columns;
+    ssize_t sent;
 
     if (io == NULL || io->resources == NULL || record == NULL ||
         label == NULL ||
@@ -859,7 +867,9 @@ static void send_resource_record(const gsh_builtin_io *io,
     (void)memcpy(message, &header, sizeof(header));
     (void)memcpy(message + sizeof(header), path, path_length);
     (void)memcpy(message + sizeof(header) + path_length, label, label_length);
-    (void)write(resources->descriptor, message, header.size);
+    do {
+        sent = write(resources->descriptor, message, header.size);
+    } while (sent == -1 && errno == EINTR);
 }
 
 static resource_scope enter_resource_scope(const gsh_builtin_io *io,
