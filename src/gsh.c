@@ -5221,6 +5221,20 @@ static int emit_verbose_input(const gsh_builtin_io *io, const char *text,
                : gsh_builtin_output(io, STDERR_FILENO, "\n", 1U);
 }
 
+static bool input_line_continues(const char *input, size_t length)
+{
+    size_t end;
+    size_t slashes;
+
+    if (input == NULL || length == 0U) return false;
+    end = input[length - 1U] == '\n' ? length - 1U : length;
+    for (slashes = 0U;
+         slashes < end && input[end - slashes - 1U] == '\\';
+         slashes++) {
+    }
+    return (slashes & 1U) != 0U;
+}
+
 static bool trace_word_is_safe(const char *word)
 {
     size_t index;
@@ -10280,6 +10294,10 @@ static void accept_line(shell_state *state)
            state->line_len);
     state->pending_line[candidate_length] = '\0';
     parsed = parse_pending_line(state, candidate_length);
+    if (parsed.status == GSH_PARSE_OK &&
+        input_line_continues(state->pending_line, candidate_length)) {
+        parsed.status = GSH_PARSE_INCOMPLETE;
+    }
     state->pending_parse = parsed;
     state->line_len = 0;
     state->line[0] = '\0';
@@ -21812,7 +21830,8 @@ static int execute_native_script(
                 session, input + offset, end - offset,
                 evaluator_source_workspaces(evaluator)->root_alias_expansion,
                 GSH_ALIAS_EXPANSION_CAP, &parsed_input, &parsed_length);
-            if (parsed.status != GSH_PARSE_INCOMPLETE ||
+            if ((parsed.status != GSH_PARSE_INCOMPLETE &&
+                 !input_line_continues(input + offset, end - offset)) ||
                 end == input_length) {
                 break;
             }
@@ -22522,7 +22541,9 @@ static int read_native_input_command(
         if (parse_native_input_command(command, session) == -1) {
             return -1;
         }
-        if (command->parsed.status == GSH_PARSE_INCOMPLETE &&
+        if ((command->parsed.status == GSH_PARSE_INCOMPLETE ||
+             input_line_continues(command->source_view.memory,
+                                  command->length)) &&
             read_status != NATIVE_INPUT_EOF) {
             if (release_native_input_views(command) == -1) {
                 return -1;

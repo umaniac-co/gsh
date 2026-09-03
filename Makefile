@@ -457,6 +457,12 @@ quality-dependencies: $(QUALITY_TARGETS)
 quality-includes:
 	@include_dir=$$(mktemp -d /tmp/gsh-includes.XXXXXX); \
 	trap 'rm -rf "$$include_dir"' EXIT HUP INT TERM; \
+	compiler_family=$$($(CC) --version 2>/dev/null | sed -n '1p'); \
+	case "$$compiler_family" in \
+		*clang*) compiler_family=clang ;; \
+		*GCC*|*gcc*) compiler_family=gcc ;; \
+		*) compiler_family=unknown ;; \
+	esac; \
 	failed=0; checked=0; deferred=0; inactive=0; \
 	for source in $$(printf '%s\n' $(CANON_C_SOURCES) | sort -u); do \
 		sequence=0; source_flags=; \
@@ -467,19 +473,25 @@ quality-includes:
 			"$$source"); do \
 			sequence=$$((sequence + 1)); \
 			declaration=$$(sed -n "$${line}p" "$$source"); \
-			platform=$$(printf '%s\n' "$$declaration" | sed -n \
+			ownership=$$(printf '%s\n' "$$declaration" | sed -n \
 				's/.*CANON-INCLUDE: \([a-z][a-z]*\).*/\1/p'); \
-			if test -n "$$platform" && test "$$platform" != linux && \
-			   test "$$platform" != macos; then \
-				printf 'unknown include platform: %s:%s (%s)\n' \
-					"$$source" "$$line" "$$platform"; \
+			if test -n "$$ownership" && test "$$ownership" != linux && \
+			   test "$$ownership" != macos && \
+			   test "$$ownership" != gcc && \
+			   test "$$ownership" != clang; then \
+				printf 'unknown include ownership: %s:%s (%s)\n' \
+					"$$source" "$$line" "$$ownership"; \
 				failed=1; continue; \
 			fi; \
 			target_system=; \
-			if test "$$platform" = linux; then target_system=Linux; fi; \
-			if test "$$platform" = macos; then target_system=Darwin; fi; \
+			if test "$$ownership" = linux; then target_system=Linux; fi; \
+			if test "$$ownership" = macos; then target_system=Darwin; fi; \
 			if test -n "$$target_system" && \
 			   test '$(UNAME_SYSTEM)' != "$$target_system"; then \
+				deferred=$$((deferred + 1)); continue; \
+			fi; \
+			if { test "$$ownership" = gcc || test "$$ownership" = clang; } && \
+			   test "$$compiler_family" != "$$ownership"; then \
 				deferred=$$((deferred + 1)); continue; \
 			fi; \
 			active="$$include_dir/active-$$sequence.c"; \
@@ -506,7 +518,7 @@ quality-includes:
 		done; \
 	done; \
 	if test "$$failed" -ne 0; then exit 1; fi; \
-	printf 'include isolation: %s active direct includes are necessary; %s platform-owned and %s inactive checks deferred\n' \
+	printf 'include isolation: %s active direct includes are necessary; %s platform/toolchain-owned and %s inactive checks deferred\n' \
 		"$$checked" "$$deferred" "$$inactive"
 
 $(QUALITY_MAPS): %.map: %

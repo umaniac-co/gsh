@@ -46,7 +46,7 @@ enum {
     BENCH_EXEC_SAMPLES = 300,
     BENCH_MEMORY_SAMPLES = 20,
     BENCH_MEMORY_WORKLOADS = 26,
-    BENCH_LATENCY_WORKLOADS = 36,
+    BENCH_LATENCY_WORKLOADS = 37,
     PTY_DESCRIPTOR_CLOSE_PASS_CAP = 1024,
     PTY_WAIT_ATTEMPT_CAP = 65536,
     PTY_DRAIN_ATTEMPT_CAP = CAPTURE_CAP,
@@ -1386,6 +1386,11 @@ static int ordinary_flow(const char *executable)
     if (consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "/usr/bin/true\r") == -1 ||
         consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
+        send_text(&session, "/usr/bin/printf '<%s>\\n' one\\\r") == -1 ||
+        consume_through(&session, "GSH_MORE> ", TEST_TIMEOUT_MS) == -1 ||
+        send_text(&session, "two\r") == -1 ||
+        consume_through(&session, "<onetwo>\r\n", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session,
                   "/usr/bin/printf X | /usr/bin/tr X Y\r") == -1 ||
         consume_through(&session, "\nY", TEST_TIMEOUT_MS) == -1 ||
@@ -1476,7 +1481,7 @@ static int ordinary_flow(const char *executable)
         consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "rt\r") == -1 ||
         wait_for_output(&session,
-                        "direct=3 native=16 shell=0 parsed=19 parse_failures=0 "
+                        "direct=3 native=17 shell=0 parsed=20 parse_failures=0 "
                         "job=idle worker=on",
                         TEST_TIMEOUT_MS) == -1 ||
         consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
@@ -6839,6 +6844,7 @@ typedef struct {
     uint64_t nounset_lookup[BENCH_SHELLS][BENCH_EXEC_SAMPLES];
     uint64_t pattern_removal[BENCH_SHELLS][BENCH_EXEC_SAMPLES];
     uint64_t pattern_multistar[BENCH_SHELLS][BENCH_EXEC_SAMPLES];
+    uint64_t pathname_expansion[BENCH_SHELLS][BENCH_EXEC_SAMPLES];
     uint64_t noglob_expansion[BENCH_SHELLS][BENCH_EXEC_SAMPLES];
     uint64_t noclobber_redirection[BENCH_SHELLS][BENCH_EXEC_SAMPLES];
     uint64_t async_launch[BENCH_SHELLS][BENCH_EXEC_SAMPLES];
@@ -7115,6 +7121,9 @@ static int benchmark_command_group_three(
             ": \"${GSH_BENCH_PATTERN_MULTI#*a*d}\"\r",
             "parameter multi-star removal") == -1 ||
         benchmark_prompt_command(
+            sessions, specs, latency->pathname_expansion, "set +aCuf\r",
+            ": /dev/n[uo]ll\r", "pathname expansion") == -1 ||
+        benchmark_prompt_command(
             sessions, specs, latency->noglob_expansion, "set +aCu -f\r",
             "/usr/bin/printf '' /dev/n[uo]ll\r", "noglob expansion") == -1 ||
         benchmark_prompt_command(
@@ -7273,6 +7282,8 @@ static int write_latency_group_three(
         {"parameter-pattern-removal", &latency->pattern_removal[0][0],
          BENCH_EXEC_SAMPLES},
         {"parameter-pattern-multistar", &latency->pattern_multistar[0][0],
+         BENCH_EXEC_SAMPLES},
+        {"pathname-expansion", &latency->pathname_expansion[0][0],
          BENCH_EXEC_SAMPLES},
         {"noglob-expansion", &latency->noglob_expansion[0][0],
          BENCH_EXEC_SAMPLES},

@@ -871,6 +871,15 @@ static int invocation_option_cases(const char *executable)
         run_case(executable, &test, false) != 0) {
         return 1;
     }
+    test.name = "standard input retains escaped-newline continuation";
+    test.diagnostic = "\001<onetwo>\n";
+    if (snprintf(command, sizeof(command),
+                 "'%s' -s <<'GSH_INPUT'\n"
+                 "/usr/bin/printf '<%%s>\\n' one\\\n"
+                 "two\nGSH_INPUT\n", executable) >= (int)sizeof(command) ||
+        run_case(executable, &test, false) != 0) {
+        return 1;
+    }
     return 0;
 }
 
@@ -2482,6 +2491,115 @@ static int native_pattern_stress_cases(const char *executable)
     return failed;
 }
 
+enum {
+    PATHNAME_SUBDIR = 4,
+    PATHNAME_FIXTURE_COUNT = 7,
+};
+
+static int initialize_pathname_fixture(
+    const char *directory, char paths[PATHNAME_FIXTURE_COUNT][1024])
+{
+    static const char *const names[PATHNAME_FIXTURE_COUNT] = {
+        "visible-a", "visible-b", ".hidden", "literal*", "sub",
+        "sub/alpha.c", "é.txt",
+    };
+    size_t index;
+
+    if (directory == NULL || paths == NULL) return -1;
+    for (index = 0U; index < PATHNAME_FIXTURE_COUNT; index++) {
+        if (snprintf(paths[index], 1024, "%s/%s", directory, names[index]) >=
+            1024) return -1;
+    }
+    if (mkdir(paths[PATHNAME_SUBDIR], 0700) == -1) return -1;
+    for (index = 0U; index < PATHNAME_FIXTURE_COUNT; index++) {
+        if (index != PATHNAME_SUBDIR &&
+            create_source_fixture(paths[index], "", 0600) == -1) return -1;
+    }
+    return 0;
+}
+
+static void destroy_pathname_fixture(
+    const char *directory, char paths[PATHNAME_FIXTURE_COUNT][1024])
+{
+    size_t index;
+
+    if (directory == NULL || paths == NULL) return;
+    for (index = 0U; index < PATHNAME_FIXTURE_COUNT; index++) {
+        if (index != PATHNAME_SUBDIR) (void)unlink(paths[index]);
+    }
+    (void)rmdir(paths[PATHNAME_SUBDIR]);
+    (void)rmdir(directory);
+}
+
+static int run_pathname_fixture_case(const char *executable,
+                                     syntax_case *test, char *command,
+                                     size_t capacity, const char *format,
+                                     const char *directory)
+{
+    if (executable == NULL || test == NULL || command == NULL ||
+        format == NULL || directory == NULL) return 1;
+    if (snprintf(command, capacity, format, directory, directory,
+                 directory) >= (int)capacity) return 1;
+    return run_case(executable, test, false);
+}
+
+static int native_pathname_atomic_cases(const char *executable)
+{
+    char directory[] = "/tmp/gsh-pathname-XXXXXX";
+    char paths[PATHNAME_FIXTURE_COUNT][1024] = {{0}};
+    char command[4096];
+    syntax_case test = {"2.6.6", "wildcard excludes leading-dot names",
+                        command, 0, "\001"};
+    int failed = 0;
+
+    if (executable == NULL || mkdtemp(directory) == NULL ||
+        initialize_pathname_fixture(directory, paths) == -1) {
+        destroy_pathname_fixture(directory, paths);
+        return 1;
+    }
+    failed |= run_pathname_fixture_case(
+        executable, &test, command, sizeof(command),
+        "set -- '%s'/*; /bin/test \"$#\" -eq 5; "
+        "/bin/test \"$1\" = '%s/literal*'", directory);
+    test.name = "explicit leading dot enables hidden-name matching";
+    failed |= run_pathname_fixture_case(
+        executable, &test, command, sizeof(command),
+        "set -- '%s'/.h*; /bin/test \"$#\" -eq 1; "
+        "/bin/test \"$1\" = '%s/.hidden'", directory);
+    test.name = "pathname bracket range selects bounded candidates";
+    failed |= run_pathname_fixture_case(
+        executable, &test, command, sizeof(command),
+        "set -- '%s'/visible-[a-b]; /bin/test \"$#\" -eq 2; "
+        "/bin/test \"$2\" = '%s/visible-b'", directory);
+    test.name = "pathname bracket negation excludes selected byte";
+    failed |= run_pathname_fixture_case(
+        executable, &test, command, sizeof(command),
+        "set -- '%s'/visible-[!a]; /bin/test \"$#\" -eq 1; "
+        "/bin/test \"$1\" = '%s/visible-b'", directory);
+    test.name = "pathname matching crosses literal directory components";
+    failed |= run_pathname_fixture_case(
+        executable, &test, command, sizeof(command),
+        "set -- '%s'/sub/*.[ch]; /bin/test \"$#\" -eq 1; "
+        "/bin/test \"$1\" = '%s/sub/alpha.c'", directory);
+    test.name = "escaped pathname metacharacter remains literal";
+    failed |= run_pathname_fixture_case(
+        executable, &test, command, sizeof(command),
+        "set -- '%s'/literal\\*; /bin/test \"$#\" -eq 1; "
+        "/bin/test \"$1\" = '%s/literal*'", directory);
+    test.name = "pathname character class follows the active locale";
+    failed |= run_pathname_fixture_case(
+        executable, &test, command, sizeof(command),
+        "set -- '%s'/visible-[[:lower:]]; /bin/test \"$#\" -eq 2; "
+        "/bin/test \"$2\" = '%s/visible-b'", directory);
+    test.name = "pathname question mark consumes one multibyte character";
+    failed |= run_pathname_fixture_case(
+        executable, &test, command, sizeof(command),
+        "set -- '%s'/?.txt; /bin/test \"$#\" -eq 1; "
+        "/bin/test \"$1\" = '%s/é.txt'", directory);
+    destroy_pathname_fixture(directory, paths);
+    return failed != 0 ? 1 : 0;
+}
+
 static int finish_loop_fixture(const char *directory, const char *target,
                                int failed)
 {
@@ -3480,6 +3598,8 @@ static int run_native_builtin_groups(const char *executable,
     *execution_passed += 2U;
     if (native_pattern_stress_cases(executable) != 0) return 1;
     *execution_passed += 2U;
+    if (native_pathname_atomic_cases(executable) != 0) return 1;
+    *execution_passed += 8U;
     return 0;
 }
 
@@ -3561,6 +3681,55 @@ int main(int argc, char **argv)
          "/usr/bin/printf '<%s>\\n' $'a\\nb'", 0, "<a\nb>\n"},
         {"2.2.4", "native dollar-single numeric escapes",
          "/usr/bin/printf '<%s>\\n' $'\\x41\\101'", 0, "<AA>\n"},
+        {"2.2.1", "escaped newline is removed before tokenization",
+         "/usr/bin/printf '<%s>\\n' one\\\ntwo", 0,
+         "\001<onetwo>\n"},
+        {"2.2.2", "single quotes preserve metacharacters",
+         "/usr/bin/printf '<%s>\\n' '/ $ ? * \" \\'", 0,
+         "\001</ $ ? * \" \\>\n"},
+        {"2.2.3", "double quote backslash escapes dollar",
+         "/usr/bin/printf '<%s>\\n' \"a\\$b\"", 0,
+         "\001<a$b>\n"},
+        {"2.2.3", "double quote retains nonspecial backslash",
+         "/usr/bin/printf '<%s>\\n' \"a\\\\qb\"", 0,
+         "\001<a\\qb>\n"},
+        {"2.2", "adjacent quote forms concatenate one field",
+         "/usr/bin/printf '<%s>\\n' 'a b'c\"d\"", 0,
+         "\001<a bcd>\n"},
+        {"2.2", "empty quotes preserve an empty argument",
+         "/usr/bin/printf '<%s><%s>\\n' before \"\"", 0,
+         "\001<before><>\n"},
+        {"2.2.3", "quoted command substitution trims trailing newlines",
+         "/usr/bin/printf '<%s>\\n' "
+         "\"$(/usr/bin/printf 'value\\n\\n')\"", 0,
+         "\001<value>\n"},
+        {"2.2.3", "escaped newline is removed inside double quotes",
+         "/usr/bin/printf '<%s>\\n' \"one\\\ntwo\"", 0,
+         "\001<onetwo>\n"},
+        {"2.3", "operators delimit tokens without surrounding blanks",
+         "/usr/bin/printf A&&/usr/bin/printf B||/usr/bin/printf C", 0,
+         "\001AB"},
+        {"2.3.4", "comment marker inside a word remains literal",
+         "/usr/bin/printf '<%s>' word#tail; /usr/bin/printf Z # ignored",
+         0, "\001<word#tail>Z"},
+        {"2.3.4", "quoted comment marker remains literal",
+         "/usr/bin/printf '<%s>' '# literal'", 0,
+         "\001<# literal>"},
+        {"2.3", "linebreak is accepted after AND-IF",
+         "/usr/bin/true &&\n/usr/bin/printf joined", 0,
+         "\001joined"},
+        {"2.3", "AND-OR operators use maximal token recognition",
+         "/usr/bin/false&&/usr/bin/printf BAD||/usr/bin/printf OK", 0,
+         "\001OK"},
+        {"2.3.1", "reserved words remain ordinary command operands",
+         "/usr/bin/printf '<%s>' if then do done", 0,
+         "\001<if><then><do><done>"},
+        {"2.3.2", "IO number requires adjacency to redirection",
+         "/usr/bin/printf '<%s>' 2>/dev/null; "
+         "/usr/bin/printf '<%s>' 2 >/dev/null", 0, "\001<>"},
+        {"2.3.1", "reserved punctuation remains an ordinary operand",
+         "/usr/bin/printf '<%s><%s>' ! '{'", 0,
+         "\001<!><{>"},
         {"2.2.3", "dollar-single marker literal in double quotes",
          "/usr/bin/printf '<%s>\\n' \"$'x'\"", 0, "<$'x'>\n"},
         {"2.2.4", "dollar-single NUL policy rejected",

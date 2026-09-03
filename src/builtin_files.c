@@ -21,6 +21,7 @@
 #include <grp.h>
 #include <limits.h>
 #include <pwd.h>
+#include <stdarg.h> /* CANON-INCLUDE: gcc */
 #include <stdio.h> /* CANON-INCLUDE: linux */
 #include <stdlib.h> /* CANON-INCLUDE: macos */
 #include <string.h>

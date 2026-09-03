@@ -110,13 +110,21 @@ arguments to `$0` and the positional parameters, with native
 `$#`, numbered parameters, `$@`, `$*`, and `$-`; quoted `$@` retains its
 multi-field semantics. `set --` and operand forms replace or clear positional
 parameters in a bounded zero-fill arena; `shift` validates an unsigned decimal
-operand and advances its live window in O(1). `set -a`/`+a` (`allexport`),
-`set -C`/`+C` (`noclobber`), `set -f`/`+f` (`noglob`), and `set -u`/`+u`
-(`nounset`), their `-o` forms, `$-`, sorted variable output, and reusable
-`set +o` output are native. Allexport marks assignments for descendant
-environments without changing command-local scope. Nounset rejects unset
-parameter expansion while preserving the POSIX default, alternative, assign,
-and error modifier rules. The four POSIX parameter pattern-removal operators
+operand and advances its live window in O(1). The native option state supports
+`allexport`, `errexit`, `noclobber`, `noglob`, `nounset`, `notify`, `noexec`,
+`verbose`, `xtrace`, `hashall`, `ignoreeof`, `nolog`, and `pipefail`, including
+their short forms where defined, `$-`, sorted `set -o` output, and reusable
+`set +o` output. Allexport marks assignments for descendant environments
+without changing command-local scope. Nounset rejects unset parameter
+expansion while preserving the POSIX default, alternative, assign, and error
+modifier rules. Noexec parses complete commands without executing them.
+Verbose emits input at command boundaries; xtrace emits bounded, shell-quoted
+expanded words with the current `PS4`. Pipefail captures stage statuses and
+selects the rightmost failure in O(stage count), while the default retains
+last-stage status. Errexit carries explicit syntactic context across lists,
+functions, substitutions, subshells, pipelines, `eval`, and dot scripts, so
+conditional and negated contexts suppress termination without global
+heuristics. The four POSIX parameter pattern-removal operators
 `#`, `##`, `%`, and `%%` are native and retain quote provenance. Literal and
 fixed-width patterns use allocation-free specialized paths; shortest fixed
 multi-star patterns use directional greedy segment matching under a bounded
@@ -136,8 +144,10 @@ directory descriptor for rollback, so a failed compound commit can restore the
 previous directory even if its pathname was renamed; directory state crosses
 the evaluator boundary through a bounded `SCM_RIGHTS` transaction rather than
 path reconstruction.
-Asynchronous AND-OR lists, `$!`, and `wait` are native. A unified bounded
-service tracks at most 128 user jobs across classic and managed modes, retaining
+Asynchronous AND-OR lists, `$!`, and `wait` are native. `notify` selects
+immediate versus prompt-boundary completion reports without consuming job
+state. A unified bounded service tracks at most 128 user jobs across classic
+and managed modes, retaining
 stable job IDs, PGIDs, members, commands, running/stopped/done state,
 current/previous selection, notification, and consumption state. Sequential
 and `&&`/`||` continuations keep `wait` in the owning reactor, Ctrl-C cancels
@@ -229,10 +239,10 @@ environment mutation, `return`, redefinition, and `unset -f` have native
 bounded implementations. Definition/call redirections and function execution
 inside pipelines, subshells, command substitutions, and asynchronous lists are
 also native and bounded. The complete Issue 8 error/search semantics,
-performance gate, and platform evidence remain incomplete. The remaining
-`set` options beyond
-`a`/`C`/`f`/`u`, monitor-mode terminal/notification edge cases, and the
-remaining nested expansion forms are still incomplete. The interactive
+performance gate, and platform evidence remain incomplete. Interactive
+invocation and monitor options, `vi` editing semantics, startup-environment
+rules, monitor-mode terminal edge cases, and the remaining nested expansion
+forms are still incomplete. The interactive
 unsupported-syntax bridge must disappear from
 normal shell-language execution before `gsh` can claim POSIX.1-2024
 shell-language conformance.
@@ -375,12 +385,12 @@ from concealing a source or header that no longer compiles. The aggregate also r
 unit in isolation and requires compilation in its reachable target
 configuration, with the same strict flags, to fail;
 a unit that still compiles has a redundant include and fails the gate.
-An unconditional include whose declarations are exposed transitively on one
-platform but required by the other is marked `CANON-INCLUDE: linux` or
-`CANON-INCLUDE: macos`. The non-owning pass defers that one removal, while the
-owning platform must prove it necessary; includes in inactive preprocessor
-branches are likewise left to the configuration that reaches them. Unknown
-platform tags fail the gate.
+An unconditional include whose declarations are exposed transitively in one
+configuration but required by another is marked `CANON-INCLUDE: linux`,
+`macos`, `gcc`, or `clang`. The non-owning pass defers that one removal, while
+the owning platform or toolchain must prove it necessary; includes in inactive
+preprocessor branches are likewise left to the configuration that reaches
+them. Unknown ownership tags fail the gate.
 `policy` is the concise form used by the wider verification gate.
 `quality-callgraph` runs the same policy but also lists every unreachable
 function, direct recursive call, recursive call-cycle member, and the direct
@@ -501,10 +511,10 @@ assignment, a mutating expansion in a two-stage pipeline, `ulimit -S -n`,
 finite explicit-list `for`,
 `set -- a b c`, `shift`,
 `set -Cf; set +Cf`, controlled `allexport` assignment and `nounset` lookup,
-simple and fixed multi-star parameter pattern removal, disabled pathname
-expansion, a non-regular output redirection under `noclobber`, asynchronous
-builtin and external launch, `wait` for a completed job, and alias definition,
-lookup/expansion, and removal.
+simple and fixed multi-star parameter pattern removal, enabled and disabled
+pathname expansion, a non-regular output redirection under `noclobber`,
+asynchronous builtin and external launch, `wait` for a completed job, and alias
+definition, lookup/expansion, and removal.
 Per-sample setup is outside the timed window, including the positional reset
 before each `shift`. `command -v` selects the local comparison shells; override
 them with `BASH_BIN=/path` or `ZSH_BIN=/path`.
@@ -523,31 +533,35 @@ systems. Final same-revision matrices and their raw output belong in
 the ignored local `dev/performance/` directory, separately from `build/`.
 
 The current local worktree snapshot below is evidence for this machine, not a
-release or cross-platform performance claim. It was measured on 2026-09-01 with
-Darwin 25.5.0 arm64 (18 CPUs), Apple Clang 21.0.0, Bash 5.3.3, and Zsh 5.9.
-The complete record contains 36 latency and 26 command-memory workloads; this
-compact view shows startup, idle input, `exec`, and the alias paths. Cells are
+release or cross-platform performance claim. It was measured on 2026-09-03 with
+Darwin 25.6.0 arm64 (18 CPUs), Apple Clang 21.0.0, Bash 5.3.3, and Zsh 5.9.
+The complete record contains 37 latency and 26 command-memory workloads; this
+compact view shows startup, idle input, `exec`, alias paths, and the newly
+explicit pathname-expansion cost. Cells are
 p50 / p99 milliseconds over 120 startup, 500 key, or 300 command samples:
 
 | Workload | `gsh` | Bash | Zsh |
 | --- | ---: | ---: | ---: |
-| startup | 3.582 / 4.540 | 6.356 / 7.215 | 6.644 / 7.516 |
-| idle key | 0.011 / 0.014 | 0.011 / 0.015 | 0.010 / 0.015 |
-| `exec` descriptor commit | 0.054 / 0.106 | 0.096 / 0.145 | 0.108 / 0.149 |
-| alias define/update | 0.023 / 0.030 | 0.072 / 0.084 | 0.087 / 0.105 |
-| alias lookup/expand | 0.020 / 0.028 | 0.058 / 0.070 | 0.067 / 0.083 |
-| `unalias` | 0.022 / 0.032 | 0.066 / 0.079 | 0.080 / 0.097 |
+| startup | 6.047 / 8.804 | 4.666 / 6.380 | 4.944 / 7.413 |
+| idle key | 0.011 / 0.014 | 0.011 / 0.015 | 0.010 / 0.014 |
+| `exec` descriptor commit | 0.027 / 0.055 | 0.061 / 0.099 | 0.074 / 0.097 |
+| alias define/update | 0.025 / 0.031 | 0.062 / 0.077 | 0.080 / 0.103 |
+| alias lookup/expand | 0.020 / 0.028 | 0.052 / 0.065 | 0.059 / 0.077 |
+| `unalias` | 0.023 / 0.029 | 0.059 / 0.073 | 0.074 / 0.098 |
+| pathname expansion | 1.339 / 1.852 | 0.119 / 0.141 | 0.135 / 0.162 |
 
-The current full repeat puts gsh below both comparison shells at p50 and p99
-for the displayed command workloads. Its main process uses 3.094 MiB at idle,
-versus 2.344 MiB for Bash and 1.875 MiB for Zsh. Its complete 3.969 MiB process
-tree is still 1.625 MiB and 2.094 MiB larger respectively because of the
-persistent worker and preallocated language workspaces; that fixed cost remains
-an explicit optimization target. Re-run `make bench` after every affected
-implementation change; never carry a result across revisions as if it were
-fresh evidence. The full methodology, ordered raw values, percentiles, and
-first-use memory growth are in the ignored local file
-`dev/performance/current.csv` when that evidence is present.
+The direct-builtin majority gate passed at 899/900 paired wins against each
+comparison shell, and the median p50 change across the 36 workloads shared with
+the starting revision was -3.57%. Startup p50 was effectively unchanged from
+that revision, but remains slower than Bash and Zsh in this sample. Pathname
+enumeration is deliberately isolated from the reactor and is also materially
+slower; a bounded persistent-service design is the next performance step.
+The main process uses 56.55 MiB at idle and its persistent process tree uses
+57.44 MiB, effectively unchanged from the starting revision but still a clear
+footprint target. Re-run `make bench` after every affected implementation
+change; never carry a result across revisions as if it were fresh evidence.
+The full methodology, ordered raw values, percentiles, and first-use memory
+growth are in the ignored local CSV named by the benchmark summary.
 
 ## Run
 
@@ -765,6 +779,11 @@ evaluator and preserve `$0` plus the positional operands:
 ./build/gsh script.sh first 'second value'
 ```
 
+Invocation accepts native `-a`, `-b`, `-C`, `-e`, `-f`, `-h`, `-n`, `-u`,
+`-v`, and `-x`, their `+` forms, combined flags, and named `-o`/`+o` options.
+Parsing is bounded and atomic: invalid combinations execute nothing and cannot
+leave partially changed option state.
+
 Descriptor input is streamed and committed one complete command at a time, so
 the total source length is no longer capped. Command-file input uses a 16 KiB
 read window. Standard input that shares its open file description with child
@@ -788,8 +807,9 @@ interactive `eval` and dot, non-interactive top-level input, and external
 ## Current scope
 
 The largest missing shell-language layer is the complete POSIX.1-2024 expansion
-and evaluation runtime: the remaining `set` options beyond `a`/`C`/`f`/`u`,
-the remaining special parameters, shell-variable attributes and scopes,
+and evaluation runtime: interactive/monitor and `vi` option semantics, startup
+environment processing, the remaining special parameters, shell-variable
+attributes and scopes,
 advanced operators on `$@`/`$*`, and the remaining expansion forms needed to
 compose every valid word. Positional replacement and
 shifting are native, but do not imply
@@ -804,9 +824,11 @@ interactive error behavior. Mutations are transactional and preserve pipeline,
 subshell and command-substitution isolation.
 Field splitting and globbing retain per-byte expansion and quote provenance,
 including mixed literal/expanded words, quoted metacharacters, and the distinct
-fields produced by quoted `$@`. Nested advanced parameter operators remain
-delegated. Here-document parameter, command, and arithmetic expansion are
-native.
+fields produced by quoted `$@`. Pathname component matching uses the active
+locale for POSIX bracket classes and multibyte characters, preserves escaping
+and leading-dot rules, and retains explicit directory-entry and candidate
+ceilings. Nested advanced parameter operators remain delegated. Here-document
+parameter, command, and arithmetic expansion are native.
 
 Function definition redirects, invocation redirects, and execution in
 pipelines, subshells, command substitutions, and asynchronous lists are native.
@@ -843,11 +865,12 @@ This is soft real-time engineering, not hard real-time or mission-grade status.
 The repository has executable conformance tranches, bounded fuzz/property
 checks, sanitizer builds, 89 deterministic fault cases, resource-pressure
 scenarios, and a configurable soak runner. The current native tranche contains
-616 execution cases, 30 syntax cases, and 18 deterministic limit cases with
+640 execution cases, 30 syntax cases, and 18 deterministic limit cases with
 one explicitly unsupported case and no delegated cases. The current same-source
-tranche passes the local macOS matrix, but does not gain same-revision remote
-evidence until the macOS arm64 and Ubuntu x86-64 GCC/Clang jobs run after
-publication. Present coverage is also not yet complete.
+tranche passes the local macOS matrix and the pinned Linux x86-64 GCC/Clang
+quality/conformance container. It does not gain same-revision release evidence
+until the macOS arm64 and Ubuntu x86-64 GCC/Clang jobs run after publication.
+Present coverage is also not yet complete.
 
 The normative checklist and evidence-state rules live in
 [`specs/0007.verification.md`](specs/0007.verification.md). CI defines macOS Clang

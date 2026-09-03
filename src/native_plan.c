@@ -5551,133 +5551,6 @@ static bool pathname_component_has_magic(const char *pattern,
     return false;
 }
 
-static bool pathname_component_exposes_dot(const char *pattern,
-                                           size_t length)
-{
-    if (pattern == NULL) {
-        return false;
-    }
-    return length != 0U &&
-           (pattern[0] == '.' ||
-            (length > 1U && pattern[0] == '\\' && pattern[1] == '.'));
-}
-
-static unsigned char pathname_pattern_byte(const char *pattern,
-                                           size_t length, size_t *offset)
-{
-    if (pattern == NULL || offset == NULL) return '\0';
-    if (pattern[*offset] == '\\' && *offset + 1U < length) {
-        (*offset)++;
-    }
-    return (unsigned char)pattern[(*offset)++];
-}
-
-static bool pathname_bracket_match(const char *pattern, size_t length,
-                                   unsigned char byte, size_t *consumed)
-{
-    if (pattern == NULL) return false;
-    if (consumed == NULL) {
-        return false;
-    }
-    size_t cursor = 1U;
-    bool negate = false;
-    bool matched = false;
-    bool has_item = false;
-
-    if (cursor < length &&
-        (pattern[cursor] == '!' || pattern[cursor] == '^')) {
-        negate = true;
-        cursor++;
-    }
-    while (cursor < length &&
-           (pattern[cursor] != ']' || !has_item)) {
-        unsigned char first = pathname_pattern_byte(
-            pattern, length, &cursor);
-
-        has_item = true;
-        if (cursor + 1U < length && pattern[cursor] == '-' &&
-            pattern[cursor + 1U] != ']') {
-            unsigned char last;
-
-            cursor++;
-            last = pathname_pattern_byte(pattern, length, &cursor);
-            matched = matched || (first <= byte && byte <= last);
-        } else {
-            matched = matched || first == byte;
-        }
-    }
-    if (cursor >= length || pattern[cursor] != ']') {
-        *consumed = 1U;
-        return byte == '[';
-    }
-    *consumed = cursor + 1U;
-    return negate ? !matched : matched;
-}
-
-static bool pathname_atom_match(const char *pattern, size_t length,
-                                unsigned char byte, size_t *consumed)
-{
-    if (pattern == NULL) return false;
-    if (consumed == NULL) {
-        return false;
-    }
-    if (pattern[0] == '?') {
-        *consumed = 1U;
-        return true;
-    }
-    if (pattern[0] == '[') {
-        return pathname_bracket_match(pattern, length, byte, consumed);
-    }
-    *consumed = pattern[0] == '\\' && length > 1U ? 2U : 1U;
-    return byte == (unsigned char)pattern[*consumed - 1U];
-}
-
-static bool pathname_component_matches(const char *pattern,
-                                       size_t pattern_length,
-                                       const char *name)
-{
-    if (pattern == NULL) return false;
-    if (name == NULL) {
-        return false;
-    }
-    size_t pattern_offset = 0;
-    size_t name_offset = 0;
-    size_t star_pattern = SIZE_MAX;
-    size_t star_name = SIZE_MAX;
-    size_t name_length = strlen(name);
-
-    while (name_offset < name_length) {
-        size_t consumed = 0;
-
-        if (pattern_offset < pattern_length &&
-            pattern[pattern_offset] == '*') {
-            star_pattern = ++pattern_offset;
-            star_name = name_offset;
-            continue;
-        }
-        if (pattern_offset < pattern_length &&
-            pathname_atom_match(pattern + pattern_offset,
-                                pattern_length - pattern_offset,
-                                (unsigned char)name[name_offset],
-                                &consumed)) {
-            pattern_offset += consumed;
-            name_offset++;
-            continue;
-        }
-        if (star_pattern != SIZE_MAX && star_name < name_length) {
-            pattern_offset = star_pattern;
-            name_offset = ++star_name;
-            continue;
-        }
-        return false;
-    }
-    while (pattern_offset < pattern_length &&
-           pattern[pattern_offset] == '*') {
-        pattern_offset++;
-    }
-    return pattern_offset == pattern_length;
-}
-
 static bool pathname_literal_component(const char *pattern, size_t length,
                                        char output[PATH_MAX])
 {
@@ -5783,8 +5656,14 @@ static gsh_native_plan_status append_pattern_component(
     if (next_count == NULL || workspace == NULL) {
         return GSH_NATIVE_PLAN_LIMIT;
     }
+    char matcher[PATH_MAX];
     size_t candidate;
 
+    if (component == NULL || component_length >= sizeof(matcher)) {
+        return GSH_NATIVE_PLAN_LIMIT;
+    }
+    (void)memcpy(matcher, component, component_length);
+    matcher[component_length] = '\0';
     *next_count = 0;
     for (candidate = 0; candidate < current_count; candidate++) {
         const char *base = workspace->current[candidate];
@@ -5803,13 +5682,13 @@ static gsh_native_plan_status append_pattern_component(
             if (entry == NULL) {
                 break;
             }
-            if (entry->d_name[0] == '.' &&
-                !pathname_component_exposes_dot(component,
-                                                component_length)) {
-                continue;
-            }
-            if (!pathname_component_matches(component, component_length,
-                                            entry->d_name)) {
+            /* ── libc Owns Locale-Aware Component Semantics ──
+             * Keep traversal and capacity under gsh control, but delegate the
+             * POSIX bracket, escaping, and multibyte rules to fnmatch(3).
+             * FNM_PERIOD preserves the rule that wildcards do not implicitly
+             * expose a leading dot in each traversed pathname component.
+             */
+            if (fnmatch(matcher, entry->d_name, FNM_PERIOD) != 0) {
                 continue;
             }
             if (*next_count == GSH_PATHNAME_CANDIDATE_CAP) {
