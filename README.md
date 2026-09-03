@@ -532,8 +532,8 @@ results are comparable between shells on the same host, not across operating
 systems. Final same-revision matrices and their raw output belong in
 the ignored local `dev/performance/` directory, separately from `build/`.
 
-The current local worktree snapshot below is evidence for this machine, not a
-release or cross-platform performance claim. It was measured on 2026-09-03 with
+The `6917664` code candidate below is evidence for this machine, not a release
+or cross-platform performance claim. It was measured on 2026-09-03 with
 Darwin 25.6.0 arm64 (18 CPUs), Apple Clang 21.0.0, Bash 5.3.3, and Zsh 5.9.
 The complete record contains 37 latency and 26 command-memory workloads; this
 compact view shows startup, idle input, `exec`, alias paths, and the newly
@@ -542,17 +542,17 @@ p50 / p99 milliseconds over 120 startup, 500 key, or 300 command samples:
 
 | Workload | `gsh` | Bash | Zsh |
 | --- | ---: | ---: | ---: |
-| startup | 6.047 / 8.804 | 4.666 / 6.380 | 4.944 / 7.413 |
+| startup | 5.953 / 6.729 | 4.535 / 5.357 | 4.820 / 5.449 |
 | idle key | 0.011 / 0.014 | 0.011 / 0.015 | 0.010 / 0.014 |
 | `exec` descriptor commit | 0.027 / 0.055 | 0.061 / 0.099 | 0.074 / 0.097 |
 | alias define/update | 0.025 / 0.031 | 0.062 / 0.077 | 0.080 / 0.103 |
 | alias lookup/expand | 0.020 / 0.028 | 0.052 / 0.065 | 0.059 / 0.077 |
 | `unalias` | 0.023 / 0.029 | 0.059 / 0.073 | 0.074 / 0.098 |
-| pathname expansion | 1.339 / 1.852 | 0.119 / 0.141 | 0.135 / 0.162 |
+| pathname expansion | 1.418 / 1.722 | 0.119 / 0.203 | 0.141 / 0.199 |
 
-The direct-builtin majority gate passed at 899/900 paired wins against each
+The direct-builtin majority gate passed at 900/900 paired wins against each
 comparison shell, and the median p50 change across the 36 workloads shared with
-the starting revision was -3.57%. Startup p50 was effectively unchanged from
+the starting revision was 0.00%. Startup p50 was effectively unchanged from
 that revision, but remains slower than Bash and Zsh in this sample. Pathname
 enumeration is deliberately isolated from the reactor and is also materially
 slower; a bounded persistent-service design is the next performance step.
