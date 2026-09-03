@@ -21,19 +21,17 @@
 #include <grp.h>
 #include <limits.h>
 #include <pwd.h>
-#include <stdarg.h>
-#include <stdio.h>
+#include <stdio.h> /* CANON-INCLUDE: linux */
 #include <stdlib.h> /* CANON-INCLUDE: macos */
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
-#include <time.h>
+#include <time.h> /* CANON-INCLUDE: linux */
 #if !defined(__APPLE__)
 #include <sys/sysmacros.h> /* CANON-INCLUDE: linux */
 #endif
 #include <unistd.h>
 #include <wchar.h>
-#include <wctype.h>
 
 enum {
     GSH_FILE_MEMORY_CAP = 384,
