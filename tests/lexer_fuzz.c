@@ -558,7 +558,7 @@ static bool fuzz_resource_actions(const uint8_t *data, size_t size)
                                       (const char *)data, length) == 0);
     gsh_async_repl_finish(&workspace->repl, cell, 0, true);
     require(gsh_async_repl_prepare_render(&workspace->repl, "gsh$ ",
-                                          "", 0U) == 0);
+                                          "", 0U, 0U) == 0);
     require(gsh_async_repl_render_length(&workspace->repl) <=
             GSH_ASYNC_RENDER_CAP);
     require(workspace->repl.resource_count <= GSH_ASYNC_RESOURCE_CAP);

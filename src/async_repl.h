@@ -217,7 +217,8 @@ int gsh_async_repl_previous_status(const gsh_async_repl *repl,
                                    int cell_index, int *status);
 int gsh_async_repl_prepare_render(gsh_async_repl *repl,
                                   const char *active_prompt,
-                                  const char *editor, size_t editor_length);
+                                  const char *editor, size_t editor_length,
+                                  size_t editor_cursor);
 const char *gsh_async_repl_render_data(const gsh_async_repl *repl);
 size_t gsh_async_repl_render_length(const gsh_async_repl *repl);
 void gsh_async_repl_rendered(gsh_async_repl *repl);

@@ -274,10 +274,11 @@ standalone invocation of either environment builtin changes the current shell,
 while a pipeline stage remains isolated. `times` reports the four `times()`
 counters using `_SC_CLK_TCK` precision and locale-neutral formatting; compound
 evaluators rebase their counters on the owning shell, while true subshells
-remain isolated. The editor is intentionally limited
-to insertion at the end of the line, bounded multiline input with `PS2`,
-UTF-8-aware backspace, history arrows, incremental `Ctrl-R`, `Ctrl-U`,
-`Ctrl-L`, `Ctrl-C`, and `Ctrl-D`. The managed
+remain isolated. The bounded editor supports UTF-8-aware left/right cursor
+movement, insertion and backspace at the cursor, multiline input with `PS2`,
+and bracketed multiline paste that preserves every pasted line until an
+explicit Enter submits the complete buffer. It also supports history arrows,
+incremental `Ctrl-R`, `Ctrl-U`, `Ctrl-L`, `Ctrl-C`, and `Ctrl-D`. The managed
 REPL retains 16 bounded cells and runs at most 8 PTY command jobs concurrently.
 A job that disables terminal echo for private input is focused automatically;
 the preserved editor remains intact and subsequent bytes are routed to that
@@ -708,8 +709,9 @@ source, plain-text, and other binary previews are unchanged.
 The future `?` steering and `??` AI queue described by specification 0008 are
 not implemented yet; ordinary shell operation does not depend on an LLM.
 
-Interactive command history retains at most 1024 accepted commands. Use the up
-and down arrows to navigate it and `Ctrl-R` for incremental reverse search. A
+Interactive command history retains at most 1024 accepted commands. Use the
+left and right arrows to move through the current command, the up and down
+arrows to navigate history, and `Ctrl-R` for incremental reverse search. A
 complete command whose first and last bytes are ASCII spaces executes normally
 but is not recorded. History is stored in `~/.gsh/history.vault`, encrypted
 with a passphrase-derived Argon2id key and XChaCha20-Poly1305; the passphrase

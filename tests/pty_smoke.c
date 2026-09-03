@@ -1345,6 +1345,76 @@ static int history_flow(const char *executable)
     return failed;
 }
 
+static int exercise_editor_navigation(pty_session *session)
+{
+    static const char paste[] =
+        "\033[200~value=ONE\nvalue=\"${value}_TWO\"\n"
+        "printf 'GSH_PASTE_RESULT=<%s>\\n' \"$value\"\033[201~";
+
+    if (session == NULL ||
+        consume_through(session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
+        send_text(session, "printf 'GSH_CURSOR=<%s>\\n' ac") == -1 ||
+        send_bytes(session, "\033[D\033[D\033[C", 9U) == -1 ||
+        send_text(session, "b\r") == -1 ||
+        consume_through(session, "GSH_CURSOR=<abc>\r\n",
+                        TEST_TIMEOUT_MS) == -1 ||
+        consume_through(session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
+        send_text(session, "printf 'GSH_DELETE=<%s>\\n' axbc") == -1 ||
+        send_bytes(session, "\033[D\033[D\177", 7U) == -1 ||
+        send_text(session, "\r") == -1 ||
+        consume_through(session, "GSH_DELETE=<abc>\r\n",
+                        TEST_TIMEOUT_MS) == -1 ||
+        consume_through(session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
+        send_text(session, "printf 'GSH_UTF8=<%s>\\n' aé") == -1 ||
+        send_bytes(session, "\033[D", 3U) == -1 ||
+        send_text(session, "x\r") == -1 ||
+        consume_through(session, "GSH_UTF8=<axé>\r\n",
+                        TEST_TIMEOUT_MS) == -1 ||
+        consume_through(session, "gsh$ ", TEST_TIMEOUT_MS) == -1) {
+        return -1;
+    }
+    session->capture_length = 0U;
+    if (send_text(session, paste) == -1 ||
+        wait_for_output(session, "printf 'GSH_PASTE_RESULT=<%s>\\n'",
+                        TEST_TIMEOUT_MS) == -1 ||
+        !capture_contains(session, "value=ONE") ||
+        !capture_contains(session, "value=\"${value}_TWO\"") ||
+        capture_contains(session, "GSH_PASTE_RESULT=<ONE_TWO>\r\n") ||
+        send_text(session, "\r") == -1 ||
+        consume_through(session, "GSH_PASTE_RESULT=<ONE_TWO>\r\n",
+                        TEST_TIMEOUT_MS) == -1 ||
+        consume_through(session, "gsh$ ", TEST_TIMEOUT_MS) == -1) {
+        return -1;
+    }
+    return 0;
+}
+
+static int editor_navigation_flow(const char *executable)
+{
+    char fixture[] = "/tmp/gsh-editor-flow-XXXXXX";
+    pty_session session;
+    int failed = 0;
+
+    if (executable == NULL || mkdtemp(fixture) == NULL) return 1;
+    if (start_session(&session, executable, fixture, SHELL_GSH) == -1 ||
+        exercise_editor_navigation(&session) == -1) {
+        perror("pty editor: classic flow");
+        dump_capture(&session);
+        failed = 1;
+    }
+    if (session.master >= 0 && stop_session(&session) == -1) failed = 1;
+    if (!failed &&
+        (start_managed_session(&session, executable, fixture) == -1 ||
+         exercise_editor_navigation(&session) == -1)) {
+        perror("pty editor: managed flow");
+        dump_capture(&session);
+        failed = 1;
+    }
+    if (session.master >= 0 && stop_session(&session) == -1) failed = 1;
+    remove_fixture(fixture);
+    return failed;
+}
+
 static int ordinary_flow(const char *executable)
 {
     char fixture[] = "/tmp/gsh-pty-flow-XXXXXX";
@@ -7730,6 +7800,9 @@ static int run_primary_smoke_flows(const char *executable)
     if (history_flow(executable) != 0) {
         return smoke_flow_failure("history");
     }
+    if (editor_navigation_flow(executable) != 0) {
+        return smoke_flow_failure("editor navigation/paste");
+    }
     if (managed_async_repl_flow(executable) != 0) {
         return smoke_flow_failure("managed async REPL");
     }
@@ -7880,7 +7953,7 @@ int main(int argc, char **argv)
         return 1;
     }
     (void)puts("pty smoke: exec paths, native fc, protected bridge, encrypted history, "
-         "editor recall/search, managed async REPL, job control, "
+         "editor cursor/paste/recall/search, managed async REPL, job control, "
          "async prompt/redirection and cancellation passed");
     return 0;
 }

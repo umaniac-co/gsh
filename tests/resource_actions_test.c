@@ -126,7 +126,7 @@ static int compositor_cases(gsh_async_repl *repl)
             repl, cell, 0U, 0U, sizeof(label) - 1U,
             0U, sizeof(label) - 1U, label, sizeof(label) - 1U,
             path, sizeof(path) - 1U, GSH_RESOURCE_REGULAR, true) == -1 ||
-        gsh_async_repl_prepare_render(repl, "$ ", "", 0U) == -1 ||
+        gsh_async_repl_prepare_render(repl, "$ ", "", 0U, 0U) == -1 ||
         strstr(gsh_async_repl_render_data(repl), "\033[?1000h") == NULL ||
         strstr(gsh_async_repl_render_data(repl), "\033[4;38;5;81m") == NULL ||
         gsh_async_repl_resource_at(repl, 2U, 2U, &action) == -1 ||
@@ -162,7 +162,7 @@ static int structured_resource_case(gsh_async_repl *repl)
             0U, sizeof(label) - 1U, label,
             sizeof(label) - 1U, path, sizeof(path) - 1U,
             GSH_RESOURCE_REGULAR, true) == -1 ||
-        gsh_async_repl_prepare_render(repl, "$ ", "", 0U) == -1 ||
+        gsh_async_repl_prepare_render(repl, "$ ", "", 0U, 0U) == -1 ||
         gsh_async_repl_resource_at(repl, 2U, 2U, &action) == -1 ||
         strcmp(action.path, path) != 0 ||
         action.type != GSH_RESOURCE_REGULAR || !action.navigable_root ||
@@ -195,7 +195,7 @@ static int unicode_hitbox_case(gsh_async_repl *repl)
             repl, cell, 0U, 0U, sizeof(label) - 1U, 0U, 4U,
             label, sizeof(label) - 1U, path, sizeof(path) - 1U,
             GSH_RESOURCE_REGULAR, true) == -1 ||
-        gsh_async_repl_prepare_render(repl, "$ ", "", 0U) == -1 ||
+        gsh_async_repl_prepare_render(repl, "$ ", "", 0U, 0U) == -1 ||
         gsh_async_repl_resource_at(repl, 2U, 4U, &action) == -1 ||
         gsh_async_repl_resource_at(repl, 2U, 5U, &action) != -1) {
         (void)fputs("resource actions: Unicode hitbox mismatch\n", stderr);
@@ -225,7 +225,7 @@ static int hostile_terminal_case(gsh_async_repl *repl)
         gsh_async_repl_append(repl, cell, second, sizeof(second) - 1U) == -1 ||
         gsh_async_repl_append(repl, cell, third, sizeof(third) - 1U) == -1 ||
         gsh_async_repl_append(repl, cell, c1, sizeof(c1)) == -1 ||
-        gsh_async_repl_prepare_render(repl, "$ ", "", 0U) == -1 ||
+        gsh_async_repl_prepare_render(repl, "$ ", "", 0U, 0U) == -1 ||
         repl->resource_count != 0U ||
         strstr(gsh_async_repl_render_data(repl), "./hidden") != NULL ||
         strstr(gsh_async_repl_render_data(repl), "./also") != NULL ||
@@ -254,20 +254,46 @@ static int compositor_scroll_case(gsh_async_repl *repl)
     if (cell < 0) return 1;
     gsh_async_repl_starting(repl, cell);
     if (gsh_async_repl_append(repl, cell, rows, sizeof(rows) - 1U) == -1 ||
-        gsh_async_repl_prepare_render(repl, "$ ", "", 0U) == -1)
+        gsh_async_repl_prepare_render(repl, "$ ", "", 0U, 0U) == -1)
         return 1;
     render = gsh_async_repl_render_data(repl);
     if (strstr(render, "five") == NULL || strstr(render, "one") != NULL ||
         strstr(render, "\033[?1000h") == NULL) return 1;
     gsh_async_repl_scroll(repl, 2L);
-    if (gsh_async_repl_prepare_render(repl, "$ ", "", 0U) == -1)
+    if (gsh_async_repl_prepare_render(repl, "$ ", "", 0U, 0U) == -1)
         return 1;
     render = gsh_async_repl_render_data(repl);
     if (strstr(render, "two") == NULL || strstr(render, "five") != NULL)
         return 1;
     gsh_async_repl_scroll(repl, -2L);
-    if (gsh_async_repl_prepare_render(repl, "$ ", "", 0U) == -1 ||
+    if (gsh_async_repl_prepare_render(repl, "$ ", "", 0U, 0U) == -1 ||
         strstr(gsh_async_repl_render_data(repl), "five") == NULL) return 1;
+    gsh_async_repl_close(repl);
+    return 0;
+}
+
+static int multiline_editor_case(gsh_async_repl *repl)
+{
+    static const char editor[] = "ab\ncd";
+    const char *render;
+
+    if (repl == NULL) return 1;
+    gsh_async_repl_initialize(repl, true);
+    gsh_async_repl_resize(repl, 6U, 8U);
+    if (gsh_async_repl_prepare_render(repl, "$ ", editor,
+                                      sizeof(editor) - 1U, 4U) == -1) {
+        return 1;
+    }
+    render = gsh_async_repl_render_data(repl);
+    if (strstr(render, "$ ab\ncd") == NULL ||
+        strstr(render, "\033[2;2H") == NULL ||
+        strstr(render, "\033[?2004h") == NULL ||
+        gsh_async_repl_prepare_render(repl, "$ ", editor,
+                                      sizeof(editor) - 1U,
+                                      sizeof(editor)) != -1) {
+        (void)fputs("resource actions: multiline editor mismatch\n", stderr);
+        return 1;
+    }
     gsh_async_repl_close(repl);
     return 0;
 }
@@ -281,6 +307,7 @@ int main(void)
         structured_resource_case(&repl) != 0 ||
         unicode_hitbox_case(&repl) != 0 || hostile_terminal_case(&repl) != 0;
     if (!failed) failed = compositor_scroll_case(&repl) != 0;
+    if (!failed) failed = multiline_editor_case(&repl) != 0;
     if (failed) {
         (void)fputs("resource actions: failed\n", stderr);
         return 1;

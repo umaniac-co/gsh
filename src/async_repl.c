@@ -1,6 +1,9 @@
 #ifndef _POSIX_C_SOURCE
 #define _POSIX_C_SOURCE 202405L
 #endif
+#ifndef _XOPEN_SOURCE
+#define _XOPEN_SOURCE 700
+#endif
 #if _POSIX_C_SOURCE < 202405L
 #error "gsh requires the POSIX.1-2024 feature-test baseline"
 #endif
@@ -9,10 +12,11 @@
 
 #include <errno.h>
 #include <signal.h> /* CANON-INCLUDE: macos */
-#include <stdio.h>
+#include <stdio.h> /* CANON-INCLUDE: linux */
 #include <string.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <wchar.h>
 
 /* ── Cells Separate Output From Editor Ownership ─────────────────
  * Direct terminal output made the next prompt depend on job completion.
@@ -125,7 +129,7 @@ void gsh_async_repl_configure_actions(gsh_async_repl *repl, bool enabled,
 void gsh_async_repl_resize(gsh_async_repl *repl, size_t rows,
                            size_t columns)
 {
-    if (repl == NULL || !repl->enabled) {
+    if (repl == NULL) {
         return;
     }
     repl->terminal_rows = rows == 0 ? 1 : rows;
@@ -136,7 +140,7 @@ void gsh_async_repl_resize(gsh_async_repl *repl, size_t rows,
     if (repl->terminal_columns > GSH_ASYNC_VIEW_COLUMNS) {
         repl->terminal_columns = GSH_ASYNC_VIEW_COLUMNS;
     }
-    repl->render_pending = true;
+    repl->render_pending = repl->enabled;
 }
 
 void gsh_async_repl_scroll(gsh_async_repl *repl, long rows)
@@ -1440,6 +1444,25 @@ static size_t utf8_token_length(const char *text, size_t length,
     return wanted;
 }
 
+static size_t display_token_width(const char *text, size_t length,
+                                  size_t offset, size_t column,
+                                  size_t token_length)
+{
+    mbstate_t state;
+    wchar_t character;
+    size_t bytes;
+    int columns;
+
+    if (text == NULL || offset >= length || token_length == 0U) return 0U;
+    if (text[offset] == '\t') return 8U - column % 8U;
+    (void)memset(&state, 0, sizeof(state));
+    bytes = mbrtowc(&character, text + offset, token_length, &state);
+    if (bytes == (size_t)-1 || bytes == (size_t)-2 || bytes == 0U)
+        return 1U;
+    columns = wcwidth(character);
+    return columns < 0 ? 1U : (size_t)columns;
+}
+
 static void discard_row_resources(gsh_async_repl *repl, size_t row)
 {
     size_t source;
@@ -1483,7 +1506,8 @@ static size_t push_view_row(gsh_async_repl *repl, const char *text,
             if (token == 0) {
                 break;
             }
-            width = 1;
+            width = display_token_width(text, length, source, columns,
+                                        token);
             if (columns + width > repl->view_columns) {
                 break;
             }
@@ -1682,26 +1706,86 @@ static void push_resource_row(gsh_async_repl *repl, int cell_index,
     }
 }
 
-static void push_prefixed_row(gsh_async_repl *repl, const char *prefix,
-                              const char *text, size_t length)
-{
-    if (prefix == NULL || repl == NULL || text == NULL) {
-        return;
-    }
-    char row[GSH_ASYNC_PROMPT_CAP + GSH_ASYNC_COMMAND_CAP] = {0};
-    size_t prefix_length = strlen(prefix);
+typedef struct {
+    size_t view_row;
+    size_t column;
+} editor_render_cursor;
 
-    if (prefix_length > sizeof(row)) {
-        prefix_length = sizeof(row);
-    }
-    (void)memcpy(row, prefix, prefix_length);
-    if (length > sizeof(row) - prefix_length) {
-        length = sizeof(row) - prefix_length;
-    }
-    if (length != 0) {
-        (void)memcpy(row + prefix_length, text, length);
-    }
-    (void)push_view_row(repl, row, prefix_length + length);
+/* ── Editor Text Becomes Physical Rows Before Composition ───────
+ * The mutable command is one bounded byte buffer, but explicit newlines and
+ * terminal-width wrapping are physical rows. Splitting here keeps every row
+ * in the same ring as job output and records the cursor before scrolling.
+ * The compositor can repaint and position atomically without rescanning the
+ * editor or depending on a terminal's implicit wrap state.
+ * ─────────────────────────────────────────────────────────────── */
+static int push_editor_rows(gsh_async_repl *repl, const char *prefix,
+                            const char *text, size_t length,
+                            size_t editor_cursor,
+                            editor_render_cursor *cursor)
+{
+    char combined[GSH_ASYNC_PROMPT_CAP + GSH_ASYNC_COMMAND_CAP];
+    size_t prefix_length;
+    size_t total;
+    size_t wanted_cursor;
+    size_t source = 0U;
+    bool cursor_recorded = false;
+
+    if (prefix == NULL || repl == NULL || text == NULL || cursor == NULL ||
+        editor_cursor > length) return -1;
+    prefix_length = strnlen(prefix, GSH_ASYNC_PROMPT_CAP);
+    if (prefix_length == GSH_ASYNC_PROMPT_CAP ||
+        length > sizeof(combined) - prefix_length) return -1;
+    (void)memcpy(combined, prefix, prefix_length);
+    if (length != 0U)
+        (void)memcpy(combined + prefix_length, text, length);
+    total = prefix_length + length;
+    wanted_cursor = prefix_length + editor_cursor;
+
+    do {
+        size_t begin = source;
+        size_t columns = 0U;
+        size_t cursor_column = SIZE_MAX;
+        bool newline = false;
+        size_t row;
+
+        if (source == wanted_cursor) cursor_column = 0U;
+        while (source < total) {
+            size_t token;
+            size_t width;
+
+            if (combined[source] == '\n') {
+                newline = true;
+                break;
+            }
+            token = utf8_token_length(combined, total, source);
+            if (token == 0U) break;
+            width = display_token_width(combined, total, source, columns,
+                                        token);
+            if (width > repl->view_columns) width = repl->view_columns;
+            if (columns != 0U &&
+                columns + width > repl->view_columns) break;
+            source += token;
+            columns += width;
+            if (source == wanted_cursor) cursor_column = columns;
+            if (columns >= repl->view_columns) break;
+        }
+        if (!newline && source < total && source == wanted_cursor)
+            cursor_column = SIZE_MAX;
+        if (!newline && source == total && columns >= repl->view_columns &&
+            source == wanted_cursor)
+            cursor_column = SIZE_MAX;
+        row = push_view_row(repl, combined + begin, source - begin);
+        if (row == SIZE_MAX) return -1;
+        if (cursor_column != SIZE_MAX) {
+            cursor->view_row = row;
+            cursor->column = cursor_column < repl->view_columns
+                                 ? cursor_column
+                                 : repl->view_columns - 1U;
+            cursor_recorded = true;
+        }
+        if (newline) source++;
+    } while (source < total || !cursor_recorded);
+    return cursor_recorded ? 0 : -1;
 }
 
 static void push_output_rows(gsh_async_repl *repl,
@@ -1845,7 +1929,8 @@ static bool visible_resource_exists(const gsh_async_repl *repl, size_t skip,
     return false;
 }
 
-static int compose_render(gsh_async_repl *repl)
+static int compose_render(gsh_async_repl *repl,
+                          const editor_render_cursor *editor_cursor)
 {
     if (repl == NULL) {
         return -1;
@@ -1866,8 +1951,9 @@ static int compose_render(gsh_async_repl *repl)
      * Unsupported child control sequences degrade to contained plain text.
      * ─────────────────────────────────────────────────────────────── */
     repl->render_length = 0;
-    if (!repl->alternate_screen_entered &&
-        render_append(repl, "\033[?1049h", 8) == -1) {
+    if (render_append(repl, "\033[?2004h", 8U) == -1 ||
+        (!repl->alternate_screen_entered &&
+         render_append(repl, "\033[?1049h", 8U) == -1)) {
         return -1;
     }
     split = gsh_async_repl_split_preview(repl, &separator_column) >= 0;
@@ -1882,6 +1968,16 @@ static int compose_render(gsh_async_repl *repl)
     if (repl->scroll_offset > maximum_offset)
         repl->scroll_offset = maximum_offset;
     skip = maximum_offset - repl->scroll_offset;
+    if (editor_cursor != NULL && repl->scroll_offset == 0U) {
+        size_t cursor_position =
+            (editor_cursor->view_row + GSH_ASYNC_VIEW_ROWS -
+             repl->view_start) % GSH_ASYNC_VIEW_ROWS;
+
+        if (cursor_position < repl->view_count && cursor_position < skip) {
+            skip = cursor_position;
+            repl->scroll_offset = maximum_offset - skip;
+        }
+    }
     have_visible_resource = visible_resource_exists(repl, skip, visible);
     if (have_visible_resource || maximum_offset != 0U || split) {
         if (render_append(repl, "\033[?1000h\033[?1006h", 16U) == -1)
@@ -1901,24 +1997,34 @@ static int compose_render(gsh_async_repl *repl)
             render_append(repl, repl->view[row], repl->view_lengths[row]) ==
                 -1 ||
             (!split && row_index + 1U < skip + visible &&
-             render_append(repl, "\n", 1) == -1)) {
+             render_append(repl, "\n", 1U) == -1)) {
             return -1;
         }
+    }
+    if (editor_cursor != NULL) {
+        size_t screen_row = repl->screen_row_by_view[editor_cursor->view_row];
+
+        if (screen_row != 0U &&
+            render_cursor(repl, screen_row, editor_cursor->column + 1U) ==
+                -1) return -1;
     }
     return 0;
 }
 
 int gsh_async_repl_prepare_render(gsh_async_repl *repl,
                                   const char *active_prompt,
-                                  const char *editor, size_t editor_length)
+                                  const char *editor, size_t editor_length,
+                                  size_t editor_cursor)
 {
     int ordered[GSH_ASYNC_CELL_CAP];
+    editor_render_cursor cursor;
     size_t count;
     size_t index;
     size_t separator_column = 0U;
 
     if (repl == NULL || active_prompt == NULL || editor == NULL ||
-        editor_length >= GSH_ASYNC_COMMAND_CAP || !repl->enabled) {
+        editor_length >= GSH_ASYNC_COMMAND_CAP ||
+        editor_cursor > editor_length || !repl->enabled) {
         errno = EINVAL;
         return -1;
     }
@@ -1930,8 +2036,9 @@ int gsh_async_repl_prepare_render(gsh_async_repl *repl,
     for (index = 0; index < count; index++) {
         push_cell(repl, &repl->cells[ordered[index]], ordered[index]);
     }
-    push_prefixed_row(repl, active_prompt, editor, editor_length);
-    if (compose_render(repl) == -1) {
+    if (push_editor_rows(repl, active_prompt, editor, editor_length,
+                         editor_cursor, &cursor) == -1 ||
+        compose_render(repl, &cursor) == -1) {
         return -1;
     }
     repl->alternate_screen_entered = true;

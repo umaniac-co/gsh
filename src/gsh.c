@@ -18,8 +18,8 @@
 #include <locale.h>
 #include <poll.h>
 #include <signal.h> /* CANON-INCLUDE: macos */
-#include <stdarg.h> /* CANON-INCLUDE: macos */
-#include <stdio.h>
+#include <stdarg.h> /* CANON-INCLUDE: linux */
+#include <stdio.h> /* CANON-INCLUDE: linux */
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
@@ -29,6 +29,7 @@
 #include <termios.h>
 #include <time.h> /* CANON-INCLUDE: linux */
 #include <unistd.h>
+#include <wchar.h>
 
 #if defined(__APPLE__)
 #endif
@@ -68,7 +69,6 @@ enum {
     SIMPLE_ARG_CAP = 128,
     EXEC_PATH_CAP = 4096,
     PATH_SCAN_CAP = 32768,
-    SECONDARY_PROMPT_CAP = 128,
     REDIRECTION_WORKER_PROTOCOL_VERSION = 1,
     NONINTERACTIVE_INPUT_FAST_CAP = GSH_SOURCE_INPUT_CAP,
     GSH_NATIVE_JOB_MEMBER_CAP =
@@ -236,7 +236,14 @@ typedef struct {
 
     char line[LINE_CAP];
     size_t line_len;
+    size_t line_cursor;
     unsigned int escape_state;
+    char editor_sequence[16];
+    size_t editor_sequence_length;
+    bool bracketed_paste;
+    unsigned int paste_end_match;
+    bool paste_last_was_cr;
+    bool paste_overflow_reported;
     char mouse_sequence[64];
     size_t mouse_sequence_length;
     int focus_escape_cell;
@@ -263,6 +270,8 @@ typedef struct {
     uint64_t history_reminder_deadline_ns;
     bool classic_redraw_pending;
     bool classic_clear_pending;
+    size_t classic_cursor_row;
+    size_t classic_cursor_column;
     char pending_line[LINE_CAP];
     size_t pending_len;
     const char *pending_input;
@@ -503,6 +512,8 @@ static bool native_list_node_is_wait(const shell_state *state,
                                      size_t node_index);
 static void abandon_pending_list(shell_state *state);
 static void queue_redraw(shell_state *state);
+static size_t active_prompt_text(shell_state *state,
+                                 char prompt[GSH_ASYNC_PROMPT_CAP]);
 static bool async_transition_can_start_now(const shell_state *state);
 static void leave_managed_fullscreen(shell_state *state, int cell_index);
 static void handle_mouse_event(shell_state *state, unsigned char final);
@@ -1100,50 +1111,26 @@ static void emit_deferred_job_notifications(shell_state *state)
 
 static void queue_prompt(shell_state *state)
 {
+    char prompt[GSH_ASYNC_PROMPT_CAP];
+    size_t length;
+    size_t columns;
+
     if (state == NULL) return;
     if (state->async_repl != NULL && state_async_repl(state)->enabled) {
         state_async_repl(state)->render_pending = true;
         return;
     }
     emit_deferred_job_notifications(state);
+    (void)output_text(state, "\033[?2004h");
     state->classic_redraw_pending = false;
     state->classic_clear_pending = false;
-    if (state->history_search) {
-        size_t length = state->history_search_query_length;
-
-        if (length > 96U) {
-            length = 96U;
-        }
-        (void)output_text(state, "(reverse-i-search)`");
-        (void)output_push(state, state->history_search_query, length);
-        (void)output_text(state, "': ");
-        return;
-    }
-    if (state->continuation_prompt) {
-        const char *secondary = getenv("PS2");
-        size_t length = 0;
-
-        if (secondary == NULL) {
-            secondary = "> ";
-        }
-        while (length < SECONDARY_PROMPT_CAP &&
-               secondary[length] != '\0') {
-            length++;
-        }
-        if (length == SECONDARY_PROMPT_CAP) {
-            secondary = "> ";
-            length = 2;
-        }
-        (void)output_push(state, secondary, length);
-        return;
-    }
-    {
-        char prompt[GSH_ASYNC_PROMPT_CAP];
-        size_t length = primary_prompt_text(state, prompt, sizeof(prompt),
-                                            false);
-
-        (void)output_push(state, prompt, length);
-    }
+    length = active_prompt_text(state, prompt);
+    (void)output_push(state, prompt, length);
+    columns = state->async_repl == NULL
+                  ? 80U : state_async_repl(state)->terminal_columns;
+    if (columns == 0U) columns = 1U;
+    state->classic_cursor_row = length / columns;
+    state->classic_cursor_column = length % columns;
 }
 
 static void queue_redraw(shell_state *state)
@@ -1167,6 +1154,135 @@ static void queue_clear_redraw(shell_state *state)
     state->classic_redraw_pending = true;
 }
 
+typedef struct {
+    size_t row;
+    size_t column;
+} classic_editor_position;
+
+static size_t classic_character_width(const char *text, size_t length,
+                                      size_t offset, size_t column,
+                                      size_t *bytes)
+{
+    mbstate_t conversion;
+    wchar_t character;
+    size_t converted;
+    int width;
+
+    if (text == NULL || bytes == NULL || offset >= length) return 0U;
+    if (text[offset] == '\t') {
+        *bytes = 1U;
+        return 8U - column % 8U;
+    }
+    (void)memset(&conversion, 0, sizeof(conversion));
+    converted = mbrtowc(&character, text + offset, length - offset,
+                        &conversion);
+    if (converted == (size_t)-1 || converted == (size_t)-2 ||
+        converted == 0U) {
+        *bytes = 1U;
+        return 1U;
+    }
+    *bytes = converted;
+    width = wcwidth(character);
+    return width < 0 ? 1U : (size_t)width;
+}
+
+static void advance_classic_position(const char *text, size_t length,
+                                     size_t columns,
+                                     classic_editor_position *position)
+{
+    size_t offset = 0U;
+
+    if (text == NULL || position == NULL || columns == 0U) return;
+    while (offset < length) {
+        size_t bytes;
+        size_t width;
+
+        if (text[offset] == '\n') {
+            position->row++;
+            position->column = 0U;
+            offset++;
+            continue;
+        }
+        width = classic_character_width(text, length, offset,
+                                        position->column, &bytes);
+        if (width > columns) width = columns;
+        if (position->column != 0U &&
+            position->column + width > columns) {
+            position->row++;
+            position->column = 0U;
+        } else if (position->column >= columns) {
+            position->row++;
+            position->column = 0U;
+        }
+        position->column += width;
+        offset += bytes;
+    }
+}
+
+static classic_editor_position classic_editor_position_at(
+    shell_state *state, size_t editor_offset)
+{
+    classic_editor_position position = {0U, 0U};
+    char prompt[GSH_ASYNC_PROMPT_CAP];
+    size_t columns;
+    size_t prompt_length;
+
+    if (state == NULL || editor_offset > state->line_len) return position;
+    columns = state->async_repl == NULL
+                  ? 80U : state_async_repl(state)->terminal_columns;
+    if (columns == 0U) columns = 1U;
+    prompt_length = active_prompt_text(state, prompt);
+    advance_classic_position(prompt, prompt_length, columns, &position);
+    advance_classic_position(state->line, editor_offset, columns, &position);
+    return position;
+}
+
+static void output_classic_vertical(shell_state *state, size_t rows,
+                                    unsigned char direction)
+{
+    char sequence[32];
+    int length;
+
+    if (state == NULL || rows == 0U) return;
+    length = snprintf(sequence, sizeof(sequence), "\033[%zu%c", rows,
+                      direction);
+    if (length > 0 && (size_t)length < sizeof(sequence))
+        (void)output_push(state, sequence, (size_t)length);
+}
+
+static void position_classic_cursor(shell_state *state,
+                                    classic_editor_position target)
+{
+    size_t column;
+
+    if (state == NULL || state->async_repl == NULL ||
+        state_async_repl(state)->enabled) return;
+    column = target.column;
+    if (column >= state_async_repl(state)->terminal_columns && column != 0U)
+        column = state_async_repl(state)->terminal_columns - 1U;
+    if (state->classic_cursor_row == target.row &&
+        state->classic_cursor_column == column) return;
+    (void)output_text(state, "\r");
+    if (state->classic_cursor_row > target.row) {
+        output_classic_vertical(state,
+                                state->classic_cursor_row - target.row, 'A');
+    } else if (target.row > state->classic_cursor_row) {
+        output_classic_vertical(state,
+                                target.row - state->classic_cursor_row, 'B');
+    }
+    if (column != 0U) output_classic_vertical(state, column, 'C');
+    state->classic_cursor_row = target.row;
+    state->classic_cursor_column = column;
+}
+
+static void finish_classic_editor(shell_state *state)
+{
+    if (state == NULL || state->async_repl == NULL ||
+        state_async_repl(state)->enabled) return;
+    position_classic_cursor(
+        state, classic_editor_position_at(state, state->line_len));
+}
+
 /* ── Classic Redraws Are Latest-State Frames ─────────────────────
  * Editing controls can request hundreds of redraws in one ready input burst.
  * Materializing every intermediate frame wastes work and can crowd the final
@@ -1177,6 +1293,10 @@ static void queue_clear_redraw(shell_state *state)
 static void prepare_classic_redraw(shell_state *state)
 {
     if (state == NULL) return;
+    char prompt[GSH_ASYNC_PROMPT_CAP];
+    classic_editor_position cursor;
+    classic_editor_position end;
+    size_t prompt_length;
     bool clear;
 
     if (!state->classic_redraw_pending ||
@@ -1188,10 +1308,24 @@ static void prepare_classic_redraw(shell_state *state)
     state->classic_clear_pending = false;
     if (clear) {
         (void)output_text(state, "\033[2J\033[H");
+        state->classic_cursor_row = 0U;
+        state->classic_cursor_column = 0U;
+    } else {
+        (void)output_text(state, "\r");
+        output_classic_vertical(state, state->classic_cursor_row, 'A');
+        (void)output_text(state, "\033[2K\033[J");
+        state->classic_cursor_row = 0U;
+        state->classic_cursor_column = 0U;
     }
-    (void)output_text(state, "\r\033[2K");
-    queue_prompt(state);
+    prompt_length = active_prompt_text(state, prompt);
+    (void)output_text(state, "\033[?2004h");
+    (void)output_push(state, prompt, prompt_length);
     (void)output_push(state, state->line, state->line_len);
+    end = classic_editor_position_at(state, state->line_len);
+    state->classic_cursor_row = end.row;
+    state->classic_cursor_column = end.column;
+    cursor = classic_editor_position_at(state, state->line_cursor);
+    position_classic_cursor(state, cursor);
 }
 
 static size_t active_prompt_text(shell_state *state,
@@ -1217,8 +1351,9 @@ static size_t active_prompt_text(shell_state *state,
         if (secondary == NULL) {
             secondary = "> ";
         }
-        length = strlen(secondary);
-        if (length >= GSH_ASYNC_PROMPT_CAP) {
+        while (length < GSH_ASYNC_PROMPT_CAP && secondary[length] != '\0')
+            length++;
+        if (length == GSH_ASYNC_PROMPT_CAP) {
             secondary = "> ";
             length = 2;
         }
@@ -1251,7 +1386,8 @@ static void prepare_managed_render(shell_state *state)
     }
     (void)active_prompt_text(state, prompt);
     if (gsh_async_repl_prepare_render(state->async_repl, prompt,
-                                      state->line, state->line_len) == -1) {
+                                      state->line, state->line_len,
+                                      state->line_cursor) == -1) {
         state->last_status = 1;
         state->running = false;
         return;
@@ -1302,8 +1438,21 @@ static int enter_editor(shell_state *state)
 static void restore_terminal(shell_state *state)
 {
     if (state == NULL) return;
+    static const char disable_paste[] = "\033[?2004l";
+    size_t offset = 0U;
+    unsigned int attempts;
+
     if (state->tty_fd < 0 || !state->terminal_changed) {
         return;
+    }
+    for (attempts = 0U;
+         attempts < 4U && offset < sizeof(disable_paste) - 1U;
+         attempts++) {
+        ssize_t written = write(state->tty_fd, disable_paste + offset,
+                                sizeof(disable_paste) - 1U - offset);
+
+        if (written > 0) offset += (size_t)written;
+        else if (written != -1 || errno != EINTR) break;
     }
     (void)tcsetpgrp(state->tty_fd, state->shell_pgid);
     (void)tcsetattr(state->tty_fd, TCSANOW, &state->original_modes);
@@ -3563,6 +3712,7 @@ static bool load_history_position(shell_state *state, size_t position)
     (void)memcpy(state->line, entry, length);
     state->line[length] = '\0';
     state->line_len = length;
+    state->line_cursor = length;
     return true;
 }
 
@@ -3622,6 +3772,7 @@ static void history_next(shell_state *state)
         (void)memcpy(state->line, state->history_draft,
                state->history_draft_length + 1U);
         state->line_len = state->history_draft_length;
+        state->line_cursor = state->line_len;
         state->history_navigation = false;
     }
     queue_redraw(state);
@@ -3683,6 +3834,7 @@ static void cancel_history_search(shell_state *state)
     (void)memcpy(state->line, state->history_search_draft,
            state->history_search_draft_length + 1U);
     state->line_len = state->history_search_draft_length;
+    state->line_cursor = state->line_len;
     state->history_search = false;
     state->history_search_query_length = 0;
     state->history_search_query[0] = '\0';
@@ -3706,13 +3858,20 @@ static void cancel_editor_line(shell_state *state)
     if (state == NULL) {
         return;
     }
+    finish_classic_editor(state);
     state->line_len = 0;
+    state->line_cursor = 0U;
     state->line[0] = '\0';
     state->pending_len = 0;
     state->pending_line[0] = '\0';
     reset_pending_input(state);
     state->continuation_prompt = false;
     state->escape_state = 0;
+    state->editor_sequence_length = 0U;
+    state->bracketed_paste = false;
+    state->paste_end_match = 0U;
+    state->paste_last_was_cr = false;
+    state->paste_overflow_reported = false;
     reset_history_editor(state);
     if (state->async_repl == NULL || !state_async_repl(state)->enabled) {
         (void)output_text(state, "^C\r\n");
@@ -10257,6 +10416,7 @@ static bool accept_managed_line(shell_state *state, size_t length,
         if (memchr(state->pending_line, '\n', length) == NULL) {
             (void)memcpy(state->line, state->pending_line, length + 1U);
             state->line_len = length;
+            state->line_cursor = length;
         }
     } else {
         record_history_submission(state, length, parse_status);
@@ -10277,12 +10437,15 @@ static void accept_line(shell_state *state)
     size_t accepted_length = state->line_len;
     gsh_parse_result parsed;
 
+    finish_classic_editor(state);
+
     if (candidate_length >= sizeof(state->pending_line)) {
         state->overloads++;
         state->pending_len = 0;
         state->pending_line[0] = '\0';
         reset_pending_input(state);
         state->line_len = 0;
+        state->line_cursor = 0U;
         state->line[0] = '\0';
         state->continuation_prompt = false;
         (void)output_text(state,
@@ -10300,8 +10463,14 @@ static void accept_line(shell_state *state)
     }
     state->pending_parse = parsed;
     state->line_len = 0;
+    state->line_cursor = 0U;
     state->line[0] = '\0';
     state->escape_state = 0;
+    state->editor_sequence_length = 0U;
+    state->bracketed_paste = false;
+    state->paste_end_match = 0U;
+    state->paste_last_was_cr = false;
+    state->paste_overflow_reported = false;
     reset_history_editor(state);
     (void)output_text(state, "\r\n");
     emit_accepted_verbose_line(state, accepted_offset, accepted_length);
@@ -10331,19 +10500,62 @@ static void accept_line(shell_state *state)
     state->mode = MODE_DISPATCH;
 }
 
-static void erase_last_character(shell_state *state)
+static size_t previous_editor_character(const char *line, size_t cursor)
 {
+    if (line == NULL || cursor == 0U) return 0U;
+    cursor--;
+    while (cursor > 0U &&
+           ((unsigned char)line[cursor] & 0xc0U) == 0x80U) cursor--;
+    return cursor;
+}
+
+static size_t next_editor_character(const char *line, size_t length,
+                                    size_t cursor)
+{
+    if (line == NULL || cursor >= length) return length;
+    cursor++;
+    while (cursor < length &&
+           ((unsigned char)line[cursor] & 0xc0U) == 0x80U) cursor++;
+    return cursor;
+}
+
+static void move_editor_cursor(shell_state *state, bool right)
+{
+    size_t next;
+
     if (state == NULL) return;
-    if (state->line_len == 0) {
+    next = right ? next_editor_character(state->line, state->line_len,
+                                         state->line_cursor)
+                 : previous_editor_character(state->line,
+                                             state->line_cursor);
+    if (next == state->line_cursor) {
         (void)output_text(state, "\a");
         return;
     }
-    state->line_len--;
-    while (state->line_len > 0 &&
-           ((unsigned char)state->line[state->line_len] & 0xc0U) == 0x80U) {
-        state->line_len--;
+    state->line_cursor = next;
+    if (state->async_repl != NULL)
+        state_async_repl(state)->scroll_offset = 0U;
+    queue_redraw(state);
+}
+
+static void erase_previous_character(shell_state *state)
+{
+    size_t begin;
+    size_t removed;
+
+    if (state == NULL) return;
+    if (state->line_cursor == 0U) {
+        (void)output_text(state, "\a");
+        return;
     }
-    state->line[state->line_len] = '\0';
+    begin = previous_editor_character(state->line, state->line_cursor);
+    removed = state->line_cursor - begin;
+    (void)memmove(state->line + begin, state->line + state->line_cursor,
+                  state->line_len - state->line_cursor + 1U);
+    state->line_len -= removed;
+    state->line_cursor = begin;
+    if (state->async_repl != NULL)
+        state_async_repl(state)->scroll_offset = 0U;
     queue_redraw(state);
 }
 
@@ -10703,6 +10915,31 @@ static bool process_managed_editor_signal(shell_state *state,
     return false;
 }
 
+static void finish_editor_sequence(shell_state *state, unsigned char byte)
+{
+    if (state == NULL) return;
+    if (byte == '~' && strcmp(state->editor_sequence, "200") == 0) {
+        state->bracketed_paste = true;
+        state->paste_end_match = 0U;
+        state->paste_last_was_cr = false;
+        state->paste_overflow_reported = false;
+    } else if (state->editor_sequence_length == 0U && byte == 'A') {
+        if (state->history_search) search_history(state);
+        else history_previous(state);
+    } else if (state->editor_sequence_length == 0U && byte == 'B') {
+        if (state->history_search) accept_history_search(state);
+        else history_next(state);
+    } else if (state->editor_sequence_length == 0U && byte == 'C') {
+        if (state->history_search) accept_history_search(state);
+        else move_editor_cursor(state, true);
+    } else if (state->editor_sequence_length == 0U && byte == 'D' &&
+               !state->history_search) {
+        move_editor_cursor(state, false);
+    }
+    state->editor_sequence_length = 0U;
+    state->editor_sequence[0] = '\0';
+}
+
 static bool process_escape_input(shell_state *state, unsigned char byte)
 {
     if (state == NULL) return false;
@@ -10710,6 +10947,8 @@ static bool process_escape_input(shell_state *state, unsigned char byte)
         state->editor_escape_deadline_ns = 0U;
         if (byte == '[' || byte == 'O') {
             state->escape_state = 2U;
+            state->editor_sequence_length = 0U;
+            state->editor_sequence[0] = '\0';
         } else {
             state->escape_state = 0;
             if (state->history_search) {
@@ -10719,28 +10958,26 @@ static bool process_escape_input(shell_state *state, unsigned char byte)
         return true;
     }
     if (state->escape_state == 2) {
-        if (byte == '<') {
+        if (byte == '<' && state->editor_sequence_length == 0U) {
             state->escape_state = 3U;
             state->mouse_sequence_length = 0U;
             return true;
         }
+        if (byte >= 0x20U && byte <= 0x3fU) {
+            if (state->editor_sequence_length <
+                sizeof(state->editor_sequence) - 1U) {
+                state->editor_sequence[state->editor_sequence_length++] =
+                    (char)byte;
+                state->editor_sequence[state->editor_sequence_length] = '\0';
+            } else {
+                state->escape_state = 0U;
+                state->editor_sequence_length = 0U;
+            }
+            return true;
+        }
         if (byte >= 0x40U && byte <= 0x7eU) {
             state->escape_state = 0;
-            if (byte == 'A') {
-                if (state->history_search) {
-                    search_history(state);
-                } else {
-                    history_previous(state);
-                }
-            } else if (byte == 'B') {
-                if (state->history_search) {
-                    accept_history_search(state);
-                } else {
-                    history_next(state);
-                }
-            } else if (byte == 'C' && state->history_search) {
-                accept_history_search(state);
-            }
+            finish_editor_sequence(state, byte);
         }
         return true;
     }
@@ -10852,12 +11089,15 @@ static bool process_editor_control(shell_state *state, unsigned char byte)
         return true;
     }
     if (byte == 0x7fU || byte == 0x08U) {
-        erase_last_character(state);
+        erase_previous_character(state);
         return true;
     }
     if (byte == 0x15U) {
         state->line_len = 0;
+        state->line_cursor = 0U;
         state->line[0] = '\0';
+        if (state->async_repl != NULL)
+            state_async_repl(state)->scroll_offset = 0U;
         queue_redraw(state);
         return true;
     }
@@ -10870,20 +11110,100 @@ static bool process_editor_control(shell_state *state, unsigned char byte)
 
 static void insert_editor_byte(shell_state *state, unsigned char byte)
 {
+    bool direct;
+
     if (state == NULL) return;
-    if ((byte >= 0x20U || byte == '\t') && state->line_len < LINE_CAP - 1) {
-        state->line[state->line_len++] = (char)byte;
+    if ((byte >= 0x20U || byte == '\t' ||
+         (state->bracketed_paste && byte == '\n')) &&
+        state->line_len < LINE_CAP - 1U) {
+        direct = !state->bracketed_paste &&
+                 state->line_cursor == state->line_len;
+        if (!direct)
+            (void)memmove(state->line + state->line_cursor + 1U,
+                          state->line + state->line_cursor,
+                          state->line_len - state->line_cursor + 1U);
+        state->line[state->line_cursor++] = (char)byte;
+        state->line_len++;
         state->line[state->line_len] = '\0';
         if (state->async_repl != NULL && state_async_repl(state)->enabled) {
             state_async_repl(state)->scroll_offset = 0U;
             state_async_repl(state)->render_pending = true;
-        } else {
+        } else if (direct) {
             (void)output_push(state, (const char *)&byte, 1);
+            if (byte < 0x80U) {
+                size_t columns = state_async_repl(state)->terminal_columns;
+                size_t width = byte == '\t'
+                                   ? 8U - state->classic_cursor_column % 8U
+                                   : 1U;
+
+                if (state->classic_cursor_column >= columns ||
+                    state->classic_cursor_column + width > columns) {
+                    state->classic_cursor_row++;
+                    state->classic_cursor_column = 0U;
+                }
+                state->classic_cursor_column += width;
+            } else {
+                classic_editor_position position =
+                    classic_editor_position_at(state, state->line_cursor);
+
+                state->classic_cursor_row = position.row;
+                state->classic_cursor_column = position.column;
+            }
+        } else {
+            queue_redraw(state);
         }
     } else if (state->line_len >= LINE_CAP - 1) {
-        state->overloads++;
-        (void)output_text(state, "\a");
+        if (!state->bracketed_paste || !state->paste_overflow_reported) {
+            state->overloads++;
+            state->paste_overflow_reported = state->bracketed_paste;
+            (void)output_text(state, "\a");
+        }
     }
+}
+
+/* ── A Paste Is One Bounded Editor Transaction Boundary ─────────
+ * Bracketed-paste markers keep embedded newlines in the editor instead of
+ * dispatching partially received commands. The six-byte terminator is matched
+ * incrementally across reactor turns; a mismatch returns through the normal
+ * editor control-byte filter. CRLF is normalized once and overflow is reported
+ * once while the remaining record is still drained deterministically.
+ * ─────────────────────────────────────────────────────────────── */
+static bool process_bracketed_paste_input(shell_state *state,
+                                          unsigned char byte)
+{
+    static const unsigned char end[] = {'\033', '[', '2', '0', '1', '~'};
+    unsigned int prefix;
+
+    if (state == NULL || !state->bracketed_paste) return false;
+    if (byte == end[state->paste_end_match]) {
+        state->paste_end_match++;
+        if (state->paste_end_match == sizeof(end)) {
+            state->bracketed_paste = false;
+            state->paste_end_match = 0U;
+            state->paste_last_was_cr = false;
+            queue_redraw(state);
+        }
+        return true;
+    }
+    for (prefix = 0U; prefix < state->paste_end_match; prefix++)
+        insert_editor_byte(state, end[prefix]);
+    state->paste_end_match = 0U;
+    if (byte == end[0]) {
+        state->paste_end_match = 1U;
+        return true;
+    }
+    if (byte == '\n' && state->paste_last_was_cr) {
+        state->paste_last_was_cr = false;
+        return true;
+    }
+    if (byte == '\r') {
+        byte = '\n';
+        state->paste_last_was_cr = true;
+    } else {
+        state->paste_last_was_cr = false;
+    }
+    insert_editor_byte(state, byte);
+    return true;
 }
 
 static void process_input(shell_state *state)
@@ -10920,12 +11240,15 @@ static void process_input(shell_state *state)
         }
         if (!(route_focused_input(state, byte) ||
               process_managed_editor_signal(state, byte) ||
+              process_bracketed_paste_input(state, byte) ||
               process_escape_input(state, byte) ||
               process_history_search_input(state, byte) ||
               process_editor_control(state, byte))) {
             insert_editor_byte(state, byte);
         }
-        if (!state->running || byte == '\r' || byte == '\n') {
+        if (!state->running ||
+            ((byte == '\r' || byte == '\n') &&
+             !state->bracketed_paste)) {
             break;
         }
     }
@@ -11460,7 +11783,8 @@ static bool push_managed_preview_base(shell_state *state)
     if (state == NULL || state->async_repl == NULL) return false;
     (void)active_prompt_text(state, prompt);
     if (gsh_async_repl_prepare_render(state->async_repl, prompt,
-                                      state->line, state->line_len) == -1)
+                                      state->line, state->line_len,
+                                      state->line_cursor) == -1)
         return false;
     render = gsh_async_repl_render_data(state->async_repl);
     length = gsh_async_repl_render_length(state->async_repl);
