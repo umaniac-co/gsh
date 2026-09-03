@@ -1361,11 +1361,14 @@ static bool terminal_feature_present(const char *features,
 
 static bool local_terminal_identity(const char *program, const char *session)
 {
+    const char *terminal_program;
+
     if (program == NULL || session == NULL || session[0] == '\0') return false;
     if (getenv("SSH_CONNECTION") != NULL || getenv("TMUX") != NULL ||
         getenv("STY") != NULL) return false;
-    return strcmp(getenv("TERM_PROGRAM") == NULL ? "" :
-                  getenv("TERM_PROGRAM"), program) == 0;
+    terminal_program = getenv("TERM_PROGRAM");
+    return terminal_program != NULL &&
+           strcmp(terminal_program, program) == 0;
 }
 
 /* ── Graphics Require End-To-End Evidence ───────────────────────
