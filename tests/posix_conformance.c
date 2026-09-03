@@ -324,6 +324,23 @@ static int wait_case_capture(pid_t pid, int descriptor,
     return 0;
 }
 
+static bool case_diagnostic_matches(const syntax_case *test,
+                                    const char *diagnostic, size_t length)
+{
+    if (test == NULL || diagnostic == NULL) return false;
+    if (test->diagnostic == NULL) return true;
+    if (test->diagnostic[0] == '\001') {
+        size_t expected_length = strlen(test->diagnostic + 1U);
+
+        return length == expected_length &&
+               memcmp(diagnostic, test->diagnostic + 1U,
+                      expected_length) == 0;
+    }
+    return strcmp(test->name, "printf hexadecimal floating conversions") == 0
+               ? valid_hexadecimal_float_output(diagnostic, length)
+               : bytes_contain(diagnostic, length, test->diagnostic);
+}
+
 static int verify_case_capture(const syntax_case *test,
                                const char diagnostic[static 65536],
                                size_t diagnostic_length, int status)
@@ -338,13 +355,8 @@ static int verify_case_capture(const syntax_case *test,
          WEXITSTATUS(status) == test->status) ||
         (test->status < 0 && WIFSIGNALED(status) &&
          WTERMSIG(status) == -test->status);
-    diagnostic_matches =
-        test->diagnostic == NULL ||
-        (strcmp(test->name, "printf hexadecimal floating conversions") == 0
-             ? valid_hexadecimal_float_output(diagnostic,
-                                              diagnostic_length)
-             : bytes_contain(diagnostic, diagnostic_length,
-                             test->diagnostic));
+    diagnostic_matches = case_diagnostic_matches(
+        test, diagnostic, diagnostic_length);
     if (status_matches && diagnostic_matches) return 0;
     (void)fprintf(stderr,
             "conformance: %s (%s): expected status %d and diagnostic %s\n",
@@ -798,6 +810,100 @@ static int native_nonblocking_input_case(const char *executable)
                : 1;
 }
 
+static int invocation_option_cases(const char *executable)
+{
+    char command[4096];
+    syntax_case test = {"sh", "combined invocation options seed shell state",
+                        command, 0, "<ah>\nvisible\n"};
+
+    if (executable == NULL ||
+        snprintf(command, sizeof(command),
+                 "'%s' -ahc 'printf \"<%%s>\\n\" \"$-\"; "
+                 "GSH_INVOCATION_VISIBLE=visible; "
+                 "/usr/bin/printenv GSH_INVOCATION_VISIBLE'",
+                 executable) >= (int)sizeof(command) ||
+        run_case(executable, &test, false) != 0) {
+        return 1;
+    }
+    test.name = "named invocation option controls pipeline status";
+    test.status = 1;
+    test.diagnostic = NULL;
+    if (snprintf(command, sizeof(command),
+                 "'%s' -opipefail -c 'false | true'", executable) >=
+            (int)sizeof(command) ||
+        run_case(executable, &test, false) != 0) {
+        return 1;
+    }
+    test.name = "invocation plus option disables an earlier option";
+    test.status = 0;
+    test.diagnostic = "<>\n";
+    if (snprintf(command, sizeof(command),
+                 "'%s' -a +a -c 'printf \"<%%s>\\n\" \"$-\"'",
+                 executable) >= (int)sizeof(command) ||
+        run_case(executable, &test, false) != 0) {
+        return 1;
+    }
+    test.name = "verbose invocation writes input before execution";
+    test.diagnostic = "\001printf V\nV";
+    if (snprintf(command, sizeof(command),
+                 "'%s' -v -c 'printf V'", executable) >=
+            (int)sizeof(command) ||
+        run_case(executable, &test, false) != 0) {
+        return 1;
+    }
+    test.name = "xtrace invocation writes expanded command";
+    test.diagnostic =
+        "\001+ value=traced\n+ printf '<%s>\\n' traced\n<traced>\n";
+    if (snprintf(command, sizeof(command),
+                 "'%s' -x -c 'value=traced; "
+                 "printf \"<%%s>\\\\n\" \"$value\"'", executable) >=
+            (int)sizeof(command) ||
+        run_case(executable, &test, false) != 0) {
+        return 1;
+    }
+    test.name = "verbose set option follows descriptor input boundaries";
+    test.diagnostic =
+        "\001printf DYNAMIC\nDYNAMICset +v\nQUIET";
+    if (snprintf(command, sizeof(command),
+                 "/usr/bin/printf 'set -v\\nprintf DYNAMIC\\n"
+                 "set +v\\nprintf QUIET\\n' | '%s' -s", executable) >=
+            (int)sizeof(command) ||
+        run_case(executable, &test, false) != 0) {
+        return 1;
+    }
+    return 0;
+}
+
+static int invocation_noexec_cases(const char *executable, const char *path)
+{
+    char command[4096];
+    syntax_case test = {"sh", "noexec applies to command files", command,
+                        0, NULL};
+
+    if (executable == NULL || path == NULL ||
+        snprintf(command, sizeof(command), "'%s' -n '%s'", executable,
+                 path) >= (int)sizeof(command) ||
+        run_case(executable, &test, false) != 0) {
+        return 1;
+    }
+    test.name = "noexec applies to standard input";
+    if (snprintf(command, sizeof(command),
+                 "/usr/bin/printf 'printf BAD\\n' | '%s' -ns",
+                 executable) >= (int)sizeof(command) ||
+        run_case(executable, &test, false) != 0) {
+        return 1;
+    }
+    test.name = "invalid invocation option is rejected";
+    test.status = 2;
+    test.diagnostic = "usage: gsh";
+    if (snprintf(command, sizeof(command), "'%s' -z -c :", executable) >=
+            (int)sizeof(command) ||
+        run_case(executable, &test, false) != 0) {
+        return 1;
+    }
+    return 0;
+}
+
 static int native_invocation_cases(const char *executable)
 {
     static const char script[] =
@@ -865,6 +971,15 @@ static int native_invocation_cases(const char *executable)
          run_case(executable, &test, false) != 0)) {
         failed = 1;
     }
+    test.name = "verbose command file writes source input";
+    test.diagnostic =
+        "GSH_INVOCATION=file\nalias gsh_invocation=/usr/bin/printf\n";
+    if (!failed &&
+        (snprintf(command, sizeof(command), "'%s' -v '%s' first second",
+                  executable, path) >= (int)sizeof(command) ||
+         run_case(executable, &test, false) != 0)) {
+        failed = 1;
+    }
     test.name = "non-seekable standard input is not read ahead";
     test.diagnostic = "streamed payload\n";
     if (!failed &&
@@ -873,6 +988,10 @@ static int native_invocation_cases(const char *executable)
                   "'streamed payload' | '%s' -s",
                   executable) >= (int)sizeof(command) ||
          run_case(executable, &test, false) != 0)) {
+        failed = 1;
+    }
+    if (!failed && (invocation_option_cases(executable) != 0 ||
+                    invocation_noexec_cases(executable, path) != 0)) {
         failed = 1;
     }
     if (!failed && native_large_input_case(executable, directory) != 0) {
@@ -2699,12 +2818,103 @@ static int native_set_option_cases(const char *executable)
          "\"$-\" \"$#\" \"$1\"", 0, "aCfu|2|a\n"},
         {"set", "named options enable and disable",
          "set -o allexport -o noclobber -o noglob -o nounset; "
-         "set +o allexport +o noclobber +o noglob +o nounset; "
+         "set -o pipefail; "
+         "set +o allexport +o noclobber +o noglob +o nounset +o pipefail; "
          "/usr/bin/printf '<%s>\\n' \"$-\"", 0, "<>\n"},
         {"set", "option status report",
          "set -aC; set -o", 0, "allexport\ton\n"},
         {"set", "nounset option status report",
          "set -u; set -o", 0, "nounset\ton\n"},
+        {"set", "pipefail option status report",
+         "set -o pipefail; set -o", 0, "pipefail\ton\n"},
+        {"2.9.2", "pipefail disabled uses the last command",
+         "set +o pipefail; false | true", 0, NULL},
+        {"2.9.2", "pipefail selects a failing command",
+         "set -o pipefail; false | true", 1, NULL},
+        {"2.9.2", "pipefail selects the rightmost failure",
+         "set -o pipefail; false | /bin/sh -c 'exit 3' | true", 3,
+         NULL},
+        {"2.9.2", "pipefail preserves an all-zero pipeline",
+         "set -o pipefail; true | true | true", 0, NULL},
+        {"2.9.2", "pipeline negation follows pipefail selection",
+         "set -o pipefail; ! false | true", 0, NULL},
+        {"2.9.2", "pipefail setting is captured before launch",
+         "set -o pipefail; false | set +o pipefail", 1, NULL},
+        {"2.9.2", "enabling pipefail in a stage is not retroactive",
+         "set +o pipefail; false | set -o pipefail", 0, NULL},
+        {"2.9.3", "asynchronous pipeline retains pipefail status",
+         "set -o pipefail; false | true & child=$!; wait \"$child\"",
+         1, NULL},
+        {"2.13", "subshell pipeline retains pipefail status",
+         "(set -o pipefail; false | true)", 1, NULL},
+        {"set -h", "hashall short option is reflected in flags",
+         "set -h; case \"$-\" in *h*) set +h;; *) false;; esac; "
+         "case \"$-\" in *h*) false;; *) true;; esac", 0, NULL},
+        {"set -o", "nolog compatibility option can be toggled",
+         "set -o nolog; set +o nolog; set -o", 0, "nolog\toff\n"},
+        {"set -o", "ignoreeof option can be toggled",
+         "set -o ignoreeof; set +o", 0, "set -o ignoreeof\n"},
+        {"set -b", "notify short option is reflected in flags",
+         "set -b; case \"$-\" in *b*) set +b;; *) false;; esac; "
+         "case \"$-\" in *b*) false;; *) true;; esac", 0, NULL},
+        {"set -o", "notify option status report",
+         "set -o notify; set +o notify; set -o", 0, "notify\toff\n"},
+        {"set -e", "errexit short option is reflected in flags",
+         "set -e; case \"$-\" in *e*) set +e;; *) false;; esac; "
+         "case \"$-\" in *e*) false;; *) true;; esac", 0, NULL},
+        {"set -o", "errexit option status report",
+         "set -o errexit; set +o errexit; set -o", 0,
+         "errexit\toff\n"},
+        {"2.8.1", "errexit stops an ordinary failing list",
+         "set -e; false; printf BAD", 1, "\001"},
+        {"2.8.1", "errexit can be disabled before failure",
+         "set -e; set +e; false; printf enabled", 0, "\001enabled"},
+        {"2.8.1", "errexit ignores non-final AND-OR commands",
+         "set -e; false && printf BAD; false || printf OR; printf AFTER",
+         0, "\001ORAFTER"},
+        {"2.8.1", "errexit applies to the final AND-OR command",
+         "set -e; true && false; printf BAD", 1, "\001"},
+        {"2.8.1", "errexit ignores every negated pipeline status",
+         "set -e; ! false; ! true; printf AFTER", 0, "\001AFTER"},
+        {"2.8.1", "errexit ignores if and loop condition lists",
+         "set -e; if false; then printf BAD; fi; "
+         "while false; do printf BAD; done; "
+         "until true; do printf BAD; done; printf AFTER", 0, "\001AFTER"},
+        {"2.8.1", "errexit applies inside a selected compound body",
+         "set -e; if true; then false; printf BAD; fi; printf BAD", 1,
+         "\001"},
+        {"2.8.1", "suppressed function invocation inherits context",
+         "set -e; f(){ false; printf FUNCTION; }; "
+         "f || printf OR; printf AFTER", 0, "\001FUNCTIONAFTER"},
+        {"2.8.1", "ordinary function invocation retains errexit",
+         "set -e; f(){ false; printf BAD; }; f; printf BAD", 1, "\001"},
+        {"2.8.1", "suppressed pipeline context reaches function stage",
+         "set -e; f(){ false; printf PIPE; }; "
+         "f | /bin/cat || printf OR; printf AFTER", 0, "\001PIPEAFTER"},
+        {"2.8.1", "pipefail result participates in errexit",
+         "set -e -o pipefail; false | true; printf BAD", 1, "\001"},
+        {"2.8.1", "subshell inherits native errexit",
+         "set -e; (false; printf BAD); printf BAD", 1, "\001"},
+        {"2.8.1", "command substitution inherits POSIX errexit",
+         "set -e; value=$(false; printf BAD); printf BAD", 1, "\001"},
+        {"2.8.1", "errexit preserves EXIT trap execution",
+         "set -e; trap 'printf EXIT' 0; false; printf BAD", 1, "\001EXIT"},
+        {"set -vx", "verbose and xtrace short options are reflected in flags",
+         "set -vx; case \"$-\" in *v*x*) set +vx;; *) false;; esac; "
+         "case \"$-\" in *v*|*x*) false;; *) true;; esac", 0, NULL},
+        {"set -x", "xtrace writes assignments and expanded arguments",
+         "set -x; value='two words'; printf '<%s>\\n' \"$value\"; set +x",
+         0, "+ value='two words'\n+ printf '<%s>\\n' 'two words'\n"},
+        {"set -x", "xtrace uses the current PS4 prefix",
+         "PS4='TRACE> '; set -x; printf '%s\\n' traced; set +x", 0,
+         "TRACE> printf '%s\\n' traced\ntraced\nTRACE> set +x\n"},
+        {"set -n", "noexec suppresses following commands",
+         "set -n; /usr/bin/printf BAD", 0, NULL},
+        {"set -n", "noexec suppresses complete compound commands",
+         "set -n; f(){ /usr/bin/printf BAD; }; "
+         "if true; then /usr/bin/printf BAD; fi", 0, NULL},
+        {"set -n", "one set invocation can leave noexec disabled",
+         "set -n +n; /usr/bin/printf enabled", 0, "enabled"},
         {"set", "reusable option status report",
          "set -f; set +o", 0, "set -o noglob\n"},
         {"set", "reusable allexport and nounset status report",

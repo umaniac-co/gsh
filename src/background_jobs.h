@@ -33,6 +33,16 @@ typedef enum {
 } gsh_jobspec_status;
 
 typedef struct {
+    size_t command_count;
+    size_t rightmost_nonzero;
+    int selected_wait_status;
+    int last_wait_status;
+    bool pipefail;
+    bool selected_known;
+    bool last_known;
+} gsh_pipeline_status;
+
+typedef struct {
     pid_t pid;
     pid_t pgid;
     pid_t status_pid;
@@ -51,6 +61,7 @@ typedef struct {
     bool terminal_owned;
     bool notified;
     bool consumed;
+    gsh_pipeline_status pipeline_status;
     size_t command_length;
     char command[GSH_BACKGROUND_COMMAND_CAP];
 } gsh_background_entry;
@@ -71,9 +82,16 @@ int gsh_background_add(gsh_background_table *table, pid_t pid,
                        uint32_t *job_id);
 int gsh_background_add_job(gsh_background_table *table, pid_t pgid,
                            pid_t status_pid, const pid_t *members,
-                           size_t member_count, const char *command,
+                           size_t member_count, size_t command_count,
+                           bool pipefail, const char *command,
                            size_t command_length, gsh_job_origin origin,
                            uint32_t *job_id);
+void gsh_pipeline_status_initialize(gsh_pipeline_status *status,
+                                    size_t command_count, bool pipefail);
+bool gsh_pipeline_status_record(gsh_pipeline_status *status,
+                                size_t command_index, int wait_status);
+bool gsh_pipeline_status_result(const gsh_pipeline_status *status,
+                                int *wait_status);
 bool gsh_background_record(gsh_background_table *table, pid_t pid,
                            int wait_status);
 bool gsh_background_update_member(gsh_background_table *table, pid_t pid,

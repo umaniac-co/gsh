@@ -37,6 +37,7 @@ src/shell_aliases.c gsh,fault,fuzz,alias-test dependency
 src/shell_config.c gsh,fault,config-test,file-builtins-test dependency
 src/shell_functions.c gsh,fault,fuzz,function-test dependency
 src/shell_options.c gsh,fault dependency
+src/shell_invocation.c gsh,fault dependency
 src/shell_traps.c gsh,fault,trap-test dependency
 src/shell_variables.c gsh,fault,fuzz,variable-test dependency
 src/source_workspace.c gsh,fault,source-workspace-test dependency

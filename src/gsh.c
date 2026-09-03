@@ -53,6 +53,7 @@
 #include "history_client.h"
 #include "history_protocol.h"
 #include "resource_protocol.h"
+#include "shell_invocation.h"
 #include "source_workspace.h"
 
 #define require(condition) (condition)
@@ -137,8 +138,7 @@ typedef struct {
     unsigned char member_states[GSH_NATIVE_JOB_MEMBER_CAP];
     size_t member_count;
     size_t remaining;
-    int pipeline_wait_status;
-    bool pipeline_status_known;
+    gsh_pipeline_status pipeline_status;
     struct termios modes;
 } job;
 
@@ -1060,6 +1060,44 @@ static size_t primary_prompt_text(const shell_state *state, char *prompt,
     return length;
 }
 
+/* ── Deferred Job Notices Precede The Next Prompt ────────────────
+ * Without `set -b`, POSIX lets a completed background job remain quiet only
+ * until the next prompt. The reactor retains that state in the bounded job
+ * table, then reports it here without polling, allocation, or command-path
+ * lookup. Enabling notify moves the same emission to the SIGCHLD path.
+ * ────────────────────────────────────────────────────────── */
+static void emit_job_notification(shell_state *state,
+                                  const gsh_background_entry *entry)
+{
+    if (state == NULL || entry == NULL || entry->state != GSH_JOB_DONE ||
+        entry->notified) {
+        return;
+    }
+    output_format(state, "\r\n[%u]%c Done ", entry->job_id,
+                  gsh_background_marker(&state->background_jobs,
+                                        entry->job_id));
+    (void)output_push(state,
+                      entry->command_length == 0 ? "(command)"
+                                                 : entry->command,
+                      entry->command_length == 0 ? sizeof("(command)") - 1U
+                                                 : entry->command_length);
+    (void)output_text(state, "\r\n");
+    (void)gsh_background_mark_notified(&state->background_jobs,
+                                       entry->job_id);
+}
+
+static void emit_deferred_job_notifications(shell_state *state)
+{
+    size_t index;
+
+    if (state == NULL || state->background_jobs.used > GSH_BACKGROUND_CAP) {
+        return;
+    }
+    for (index = 0; index < state->background_jobs.used; index++) {
+        emit_job_notification(state, &state->background_jobs.entries[index]);
+    }
+}
+
 static void queue_prompt(shell_state *state)
 {
     if (state == NULL) return;
@@ -1067,6 +1105,7 @@ static void queue_prompt(shell_state *state)
         state_async_repl(state)->render_pending = true;
         return;
     }
+    emit_deferred_job_notifications(state);
     state->classic_redraw_pending = false;
     state->classic_clear_pending = false;
     if (state->history_search) {
@@ -2005,6 +2044,7 @@ enum {
 
 static void initialize_job(job *current, pid_t pgid, pid_t status_pid,
                            const pid_t *members, size_t member_count,
+                           size_t command_count, bool pipefail,
                            bool foreground, bool negated)
 {
     if (current == NULL || members == NULL) {
@@ -2021,6 +2061,8 @@ static void initialize_job(job *current, pid_t pgid, pid_t status_pid,
     current->member_count = member_count;
     current->remaining = member_count;
     current->negated = negated;
+    gsh_pipeline_status_initialize(&current->pipeline_status,
+                                   command_count, pipefail);
     for (index = 0; index < member_count; index++) {
         current->members[index] = members[index];
         current->member_states[index] = JOB_MEMBER_RUNNING;
@@ -3133,10 +3175,10 @@ static void finish_job(shell_state *state)
     }
     bool was_foreground = state->current_job.foreground;
     pid_t pid = state->current_job.pid;
-    int wait_status = state->current_job.pipeline_wait_status;
-    int status = state->current_job.pipeline_status_known
-                     ? wait_status_value(wait_status)
-                     : 1;
+    int wait_status = 0;
+    bool pipeline_status_known = gsh_pipeline_status_result(
+        &state->current_job.pipeline_status, &wait_status);
+    int status = pipeline_status_known ? wait_status_value(wait_status) : 1;
     bool silent = state->current_job.silent;
     int exec_outcome = finish_exec_outcome(state);
     bool overlaid = exec_outcome == GSH_EXEC_OUTCOME_OVERLAID;
@@ -3148,7 +3190,7 @@ static void finish_job(shell_state *state)
 
     if (overlaid) {
         close_variable_commit(state);
-    } else if (state->current_job.pipeline_status_known) {
+    } else if (pipeline_status_known) {
         bool commit_active = state->variable_commit_active;
 
         if (!finish_variable_commit(state, wait_status)) {
@@ -3196,8 +3238,7 @@ static void finish_job(shell_state *state)
 
     if (was_foreground) {
         reclaim_terminal(state, false);
-        if (state->current_job.pipeline_status_known &&
-            WIFSIGNALED(wait_status)) {
+        if (pipeline_status_known && WIFSIGNALED(wait_status)) {
             (void)output_text(state, "\r\n");
             if (WTERMSIG(wait_status) != SIGINT) {
                 output_format(state, "[terminated by signal %d]\r\n",
@@ -3252,24 +3293,27 @@ static void update_job_state(shell_state *state, pid_t pid, int status)
                            state->current_job.status_pid,
                            state->current_job.members,
                            state->current_job.member_count,
+                           state->current_job.pipeline_status.command_count,
+                           state->current_job.pipeline_status.pipefail,
                            state->pending_input,
                            state->pending_input_length,
                            GSH_JOB_ORIGIN_CLASSIC, &job_id) == -1) {
                 (void)output_text(state,
                             "gsh: stopped job registry exhausted\r\n");
             } else {
-                size_t stopped_member;
+                gsh_background_entry *entry =
+                    gsh_background_mutable_entry_for_id(
+                        &state->background_jobs, job_id);
 
-                for (stopped_member = 0;
-                     stopped_member < state->current_job.member_count;
-                     stopped_member++) {
-                    if (state->current_job.member_states[stopped_member] ==
-                        JOB_MEMBER_STOPPED) {
-                        (void)gsh_background_update_member(
-                            &state->background_jobs,
-                            state->current_job.members[stopped_member],
-                            status);
-                    }
+                if (entry != NULL) {
+                    (void)memcpy(entry->member_states,
+                           state->current_job.member_states,
+                           state->current_job.member_count *
+                               sizeof(entry->member_states[0]));
+                    entry->remaining = state->current_job.remaining;
+                    entry->pipeline_status =
+                        state->current_job.pipeline_status;
+                    entry->state = GSH_JOB_STOPPED;
                 }
             }
         }
@@ -3299,9 +3343,9 @@ static void update_job_state(shell_state *state, pid_t pid, int status)
                 state->current_job.remaining--;
             }
         }
-        if (pid == state->current_job.status_pid) {
-            state->current_job.pipeline_wait_status = status;
-            state->current_job.pipeline_status_known = true;
+        if (member < state->current_job.pipeline_status.command_count) {
+            (void)gsh_pipeline_status_record(
+                &state->current_job.pipeline_status, member, status);
         }
         if (state->current_job.remaining == 0) {
             finish_job(state);
@@ -3423,16 +3467,10 @@ static void reap_children(shell_state *state)
                     if (state->mode == MODE_EDITOR) queue_redraw(state);
                 } else if (tracked != NULL &&
                            tracked->state == GSH_JOB_DONE &&
-                           state->mode != MODE_WAIT) {
-                    output_format(state, "\r\n[%u]%c Done %s\r\n",
-                                  tracked->job_id,
-                                  gsh_background_marker(
-                                      &state->background_jobs,
-                                      tracked->job_id),
-                                  tracked->command_length == 0
-                                      ? "(command)" : tracked->command);
-                    (void)gsh_background_mark_notified(
-                        &state->background_jobs, tracked->job_id);
+                           state->mode != MODE_WAIT &&
+                           gsh_options_enabled(&state->options,
+                                               GSH_OPTION_NOTIFY)) {
+                    emit_job_notification(state, tracked);
                     if (state->mode == MODE_EDITOR) queue_redraw(state);
                 }
                 (void)finish_background_wait(state);
@@ -5172,6 +5210,129 @@ static const gsh_builtin_io descriptor_builtin_io = {
     .kind = GSH_BUILTIN_SINK_DESCRIPTORS,
     .descriptors = {STDOUT_FILENO, STDERR_FILENO},
 };
+
+static int emit_verbose_input(const gsh_builtin_io *io, const char *text,
+                              size_t length)
+{
+    if (!require(io != NULL && text != NULL)) return -1;
+    if (gsh_builtin_output(io, STDERR_FILENO, text, length) != 0) return -1;
+    return length == 0U || text[length - 1U] == '\n'
+               ? 0
+               : gsh_builtin_output(io, STDERR_FILENO, "\n", 1U);
+}
+
+static bool trace_word_is_safe(const char *word)
+{
+    size_t index;
+
+    if (!require(word != NULL)) return false;
+    if (word[0] == '\0') return false;
+    for (index = 0U; index < GSH_NATIVE_TEXT_CAP && word[index] != '\0';
+         index++) {
+        unsigned char byte = (unsigned char)word[index];
+        bool safe = (byte >= 'a' && byte <= 'z') ||
+                    (byte >= 'A' && byte <= 'Z') ||
+                    (byte >= '0' && byte <= '9') ||
+                    strchr("_@%+=:,./-", byte) != NULL;
+
+        if (!safe) return false;
+    }
+    return index < GSH_NATIVE_TEXT_CAP;
+}
+
+static int emit_trace_word(const gsh_builtin_io *io, const char *word)
+{
+    static const char escaped_quote[] = "'\\''";
+    size_t begin = 0U;
+    size_t index;
+
+    if (!require(io != NULL && word != NULL)) return -1;
+    if (trace_word_is_safe(word)) {
+        return gsh_builtin_output(io, STDERR_FILENO, word, strlen(word));
+    }
+    if (gsh_builtin_output(io, STDERR_FILENO, "'", 1U) != 0) return -1;
+    for (index = 0U; index < GSH_NATIVE_TEXT_CAP && word[index] != '\0';
+         index++) {
+        if (word[index] != '\'') continue;
+        if (gsh_builtin_output(io, STDERR_FILENO, word + begin,
+                               index - begin) != 0 ||
+            gsh_builtin_output(io, STDERR_FILENO, escaped_quote,
+                               sizeof(escaped_quote) - 1U) != 0) return -1;
+        begin = index + 1U;
+    }
+    if (index == GSH_NATIVE_TEXT_CAP ||
+        gsh_builtin_output(io, STDERR_FILENO, word + begin,
+                           index - begin) != 0) return -1;
+    return gsh_builtin_output(io, STDERR_FILENO, "'", 1U);
+}
+
+static int emit_trace_assignment(const gsh_builtin_io *io,
+                                 const char *assignment)
+{
+    size_t equals;
+
+    if (!require(io != NULL && assignment != NULL)) return -1;
+    for (equals = 0U;
+         equals < GSH_NATIVE_TEXT_CAP && assignment[equals] != '=' &&
+         assignment[equals] != '\0';
+         equals++) {
+    }
+    if (equals == GSH_NATIVE_TEXT_CAP || assignment[equals] != '=') {
+        errno = EINVAL;
+        return -1;
+    }
+    if (gsh_builtin_output(io, STDERR_FILENO, assignment, equals + 1U) != 0) {
+        return -1;
+    }
+    return emit_trace_word(io, assignment + equals + 1U);
+}
+
+static int emit_command_trace(const gsh_builtin_io *io,
+                              const gsh_native_command *command,
+                              const char *prefix)
+{
+    size_t field = 0U;
+    size_t index;
+
+    if (!require(io != NULL && command != NULL && prefix != NULL)) return -1;
+    if (gsh_builtin_output(io, STDERR_FILENO, prefix, strlen(prefix)) != 0) {
+        return -1;
+    }
+    for (index = 0U; index < command->assignment_count; index++) {
+        if ((field++ != 0U && gsh_builtin_output(
+                io, STDERR_FILENO, " ", 1U) != 0) ||
+            emit_trace_assignment(io, command->assignments[index]) != 0) {
+            return -1;
+        }
+    }
+    for (index = 0U; index < command->argc; index++) {
+        if ((field++ != 0U && gsh_builtin_output(
+                io, STDERR_FILENO, " ", 1U) != 0) ||
+            emit_trace_word(io, command->argv[index]) != 0) return -1;
+    }
+    return gsh_builtin_output(io, STDERR_FILENO, "\n", 1U);
+}
+
+static int emit_pipeline_trace(const gsh_builtin_io *io,
+                               const gsh_native_pipeline *pipeline,
+                               const gsh_variable_store *variables)
+{
+    const char *prefix;
+    bool found;
+    size_t index;
+
+    if (!require(io != NULL && pipeline != NULL && variables != NULL)) {
+        return -1;
+    }
+    prefix = gsh_variables_lookup(variables, "PS4", 3U, &found);
+    if (!found) prefix = "+ ";
+    for (index = 0U; index < pipeline->command_count; index++) {
+        if (emit_command_trace(io, &pipeline->commands[index], prefix) != 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
 
 static void child_write_descriptor(int descriptor, const char *text,
                                    size_t length)
@@ -7328,7 +7489,8 @@ static void reject_native_pipeline_fork(
         (void)kill(-launch->pgid, SIGKILL);
         initialize_job(&state->current_job, launch->pgid,
                        launch->members[launch->launched - 1U],
-                       launch->members, launch->launched, false, false);
+                       launch->members, launch->launched,
+                       launch->launched, false, false, false);
         state->current_job.silent = true;
         state->current_job.modes = state->original_modes;
     }
@@ -7444,7 +7606,11 @@ static void handoff_native_pipeline(
                               launch->created_heredocs);
     (void)close(launch->gate[0]);
     initialize_job(&state->current_job, launch->pgid, launch->status_pid,
-                   launch->members, launch->launched, true,
+                   launch->members, launch->launched,
+                   pipeline->command_count,
+                   gsh_options_enabled(&state->options,
+                                       GSH_OPTION_PIPEFAIL),
+                   true,
                    pipeline->negated);
     state->current_job.modes = state->original_modes;
     if (gsh_fault_should_fail(GSH_FAULT_TERMINAL_HANDOFF, EIO) ||
@@ -7691,7 +7857,7 @@ static int register_managed_job(shell_state *state, int cell_index,
     }
     cell = &state_async_repl(state)->cells[cell_index];
     return gsh_background_add_job(
-        &state->background_jobs, pgid, pid, &pid, 1U,
+        &state->background_jobs, pgid, pid, &pid, 1U, 1U, false,
         cell->command, cell->command_length, GSH_JOB_ORIGIN_MANAGED, NULL);
 }
 
@@ -7851,7 +8017,8 @@ static bool handoff_external_job(shell_state *state, pid_t pid,
 {
     if (!require(state != NULL && previous != NULL)) return false;
     if (!require(pid > 0 && gate_write >= 0)) return false;
-    initialize_job(&state->current_job, pid, pid, &pid, 1U, true, false);
+    initialize_job(&state->current_job, pid, pid, &pid, 1U, 1U,
+                   false, true, false);
     state->current_job.modes = state->original_modes;
     (void)setpgid(pid, pid);
     if (gsh_fault_should_fail(GSH_FAULT_TERMINAL_HANDOFF, EIO) ||
@@ -8772,22 +8939,15 @@ static void load_current_job_from_service(
     if (entry == NULL || state == NULL) {
         return;
     }
-    size_t member;
-
     initialize_job(&state->current_job, entry->pgid, entry->status_pid,
-                   entry->members, entry->member_count, true, negated);
+                   entry->members, entry->member_count,
+                   entry->pipeline_status.command_count,
+                   entry->pipeline_status.pipefail, true, negated);
     (void)memcpy(state->current_job.member_states, entry->member_states,
            entry->member_count * sizeof(entry->member_states[0]));
     state->current_job.remaining = entry->remaining;
     state->current_job.stopped = entry->state == GSH_JOB_STOPPED;
-    state->current_job.pipeline_wait_status = entry->wait_status;
-    for (member = 0; member < entry->member_count; member++) {
-        if (entry->members[member] == entry->status_pid &&
-            entry->member_states[member] == JOB_MEMBER_DONE) {
-            state->current_job.pipeline_status_known = true;
-            break;
-        }
-    }
+    state->current_job.pipeline_status = entry->pipeline_status;
     state->current_job.modes = state->original_modes;
 }
 
@@ -9419,7 +9579,8 @@ static bool plan_pending_native_dispatch(shell_state *state,
     if (pending->parsed.status == GSH_PARSE_OK) {
         state->parsed_dispatches++;
         if (run_function_definition(state) || begin_native_list(state) ||
-            try_native_reactor_compound(state)) {
+            (!gsh_options_enabled(&state->options, GSH_OPTION_XTRACE) &&
+             try_native_reactor_compound(state))) {
             state->native_pipeline_dispatches++;
             return true;
         }
@@ -9429,6 +9590,13 @@ static bool plan_pending_native_dispatch(shell_state *state,
         if (pending->plan_status == GSH_NATIVE_PLAN_OK) {
             normalize_command_invocations(state->native_pipeline,
                                           state->functions);
+            if (!pending->deferred_work &&
+                gsh_options_enabled(&state->options, GSH_OPTION_XTRACE) &&
+                emit_pipeline_trace(&pending->diagnostic_io,
+                                    state->native_pipeline,
+                                    state->variables) == -1) {
+                pending->plan_status = GSH_NATIVE_PLAN_ERROR;
+            }
         }
     } else {
         state->parse_failures++;
@@ -10051,12 +10219,48 @@ static gsh_parse_result parse_pending_line(shell_state *state,
     return parsed;
 }
 
+static void emit_accepted_verbose_line(shell_state *state, size_t offset,
+                                       size_t length)
+{
+    if (state == NULL ||
+        !gsh_options_enabled(&state->options, GSH_OPTION_VERBOSE)) return;
+    gsh_builtin_io io = reactor_builtin_sink(state);
+
+    (void)emit_verbose_input(&io, state->pending_line + offset, length);
+}
+
+static bool accept_managed_line(shell_state *state, size_t length,
+                                gsh_parse_status parse_status)
+{
+    if (state == NULL || state->async_repl == NULL ||
+        !state_async_repl(state)->enabled) return false;
+    if (length == 0U) {
+        queue_prompt(state);
+        return true;
+    }
+    if (accept_managed_submission(state, length) == -1) {
+        (void)raw_output_push(state, "\a", 1);
+        if (memchr(state->pending_line, '\n', length) == NULL) {
+            (void)memcpy(state->line, state->pending_line, length + 1U);
+            state->line_len = length;
+        }
+    } else {
+        record_history_submission(state, length, parse_status);
+    }
+    state->pending_line[0] = '\0';
+    reset_pending_input(state);
+    queue_prompt(state);
+    return true;
+}
+
 static void accept_line(shell_state *state)
 {
     if (state == NULL) {
         return;
     }
     size_t candidate_length = state->pending_len + state->line_len;
+    size_t accepted_offset = state->pending_len;
+    size_t accepted_length = state->line_len;
     gsh_parse_result parsed;
 
     if (candidate_length >= sizeof(state->pending_line)) {
@@ -10082,6 +10286,7 @@ static void accept_line(shell_state *state)
     state->escape_state = 0;
     reset_history_editor(state);
     (void)output_text(state, "\r\n");
+    emit_accepted_verbose_line(state, accepted_offset, accepted_length);
     if (parsed.status == GSH_PARSE_INCOMPLETE) {
         if (candidate_length + 1U >= sizeof(state->pending_line)) {
             state->overloads++;
@@ -10103,27 +10308,7 @@ static void accept_line(shell_state *state)
     }
     state->pending_len = 0;
     state->continuation_prompt = false;
-    if (state->async_repl != NULL && state_async_repl(state)->enabled) {
-        if (candidate_length == 0) {
-            queue_prompt(state);
-            return;
-        }
-        if (accept_managed_submission(state, candidate_length) == -1) {
-            (void)raw_output_push(state, "\a", 1);
-            if (memchr(state->pending_line, '\n', candidate_length) == NULL) {
-                (void)memcpy(state->line, state->pending_line,
-                       candidate_length + 1U);
-                state->line_len = candidate_length;
-            }
-        } else {
-            record_history_submission(state, candidate_length,
-                                      parsed.status);
-        }
-        state->pending_line[0] = '\0';
-        reset_pending_input(state);
-        queue_prompt(state);
-        return;
-    }
+    if (accept_managed_line(state, candidate_length, parsed.status)) return;
     record_history_submission(state, candidate_length, parsed.status);
     state->mode = MODE_DISPATCH;
 }
@@ -10637,6 +10822,10 @@ static bool process_editor_control(shell_state *state, unsigned char byte)
             if (state->current_job.active ||
                 gsh_async_repl_job_count(state->async_repl) != 0) {
                 (void)output_text(state, "\r\ngsh: a job is still active\r\n");
+                queue_prompt(state);
+            } else if (gsh_options_enabled(
+                           &state->options, GSH_OPTION_IGNOREEOF)) {
+                (void)output_text(state, "\r\n");
                 queue_prompt(state);
             } else {
                 state->running = false;
@@ -12448,12 +12637,15 @@ static void print_usage(FILE *stream)
         return;
     }
     (void)fprintf(stream,
-            "usage: gsh [command_file [argument ...]]\n"
-            "       gsh -s [argument ...]\n"
-            "       gsh -c command_string [command_name [argument ...]]\n"
-            "       gsh -n -c command_string\n"
+            "usage: gsh [options] [command_file [argument ...]]\n"
+            "       gsh [options] -s [argument ...]\n"
+            "       gsh [options] -c command_string "
+            "[command_name [argument ...]]\n"
             "       gsh --native-only -c command_string "
             "[command_name [argument ...]]\n\n"
+            "Options: -a -b -C -f -h -n -u -v -x, their + forms, and "
+            "-o/+o option.\n"
+            "Use --help for this text.\n\n"
             "Run the interactive reactor, a command file, standard input, "
             "or one command string.\n"
             "The async REPL is enabled by default; set GSH_REPL=classic or "
@@ -12548,7 +12740,7 @@ enum {
 static int run_pipeline_isolated_command(
     native_evaluator *parent, gsh_native_pipeline *pipeline,
     size_t command_index, gsh_variable_store *variables,
-    pipeline_isolated_kind kind, bool *handled);
+    pipeline_isolated_kind kind, bool errexit_suppressed, bool *handled);
 static int request_pipeline_exit(native_evaluator *evaluator, int status);
 static int evaluate_loop_control(native_evaluator *evaluator,
                                  const gsh_native_pipeline *pipeline);
@@ -12777,11 +12969,12 @@ typedef struct {
     size_t created_pipes;
     size_t created_heredocs;
     size_t launched;
-    pid_t status_pid;
+    gsh_pipeline_status pipeline_status;
 } noninteractive_pipeline_launch;
 
 static void initialize_noninteractive_launch(
-    noninteractive_pipeline_launch *launch, size_t command_count)
+    noninteractive_pipeline_launch *launch, size_t command_count,
+    bool pipefail)
 {
     if (!require(launch != NULL)) return;
     (void)memset(launch->members, 0, sizeof(launch->members));
@@ -12791,7 +12984,8 @@ static void initialize_noninteractive_launch(
     launch->created_pipes = 0U;
     launch->created_heredocs = 0U;
     launch->launched = 0U;
-    launch->status_pid = -1;
+    gsh_pipeline_status_initialize(&launch->pipeline_status,
+                                   command_count, pipefail);
     if (!require(command_count > 0U)) return;
 }
 
@@ -13179,8 +13373,7 @@ static int wait_for_noninteractive_pipeline(
     const gsh_native_pipeline *pipeline,
     noninteractive_pipeline_launch *launch)
 {
-    int last_wait_status = 0;
-    bool last_status_known = false;
+    int selected_wait_status = 0;
     size_t index;
 
     if (!require(pipeline != NULL)) return 125;
@@ -13199,13 +13392,15 @@ static int wait_for_noninteractive_pipeline(
             perror("gsh: waitpid");
             return 125;
         }
-        if (launch->members[index] == launch->status_pid) {
-            last_wait_status = status;
-            last_status_known = true;
+        if (index < pipeline->command_count &&
+            !gsh_pipeline_status_record(
+                &launch->pipeline_status, index, status)) {
+            return 125;
         }
     }
-    return last_status_known
-               ? native_wait_status_value(last_wait_status,
+    return gsh_pipeline_status_result(
+               &launch->pipeline_status, &selected_wait_status)
+               ? native_wait_status_value(selected_wait_status,
                                           pipeline->negated)
                : 125;
 }
@@ -13222,6 +13417,7 @@ typedef struct {
     gsh_variable_store *scratch;
     native_evaluator *evaluator;
     noninteractive_pipeline_launch *launch;
+    bool errexit_suppressed;
 } noninteractive_child_context;
 
 static gsh_native_pipeline *noninteractive_context_pipeline(
@@ -13248,7 +13444,7 @@ static int run_noninteractive_pipeline_child(
         context->options, context->evaluator, context->launch, index);
     status = run_pipeline_isolated_command(
         context->evaluator, context->pipeline, index, context->variables,
-        PIPELINE_ISOLATED_FUNCTION, &handled);
+        PIPELINE_ISOLATED_FUNCTION, context->errexit_suppressed, &handled);
     if (handled) {
         return status == GSH_EVALUATOR_PIPELINE_CHILD_REQUEST
                    ? status
@@ -13271,7 +13467,7 @@ static int run_noninteractive_pipeline_child(
 
         status = run_pipeline_isolated_command(
             context->evaluator, context->pipeline, index,
-            context->variables, kind, &handled);
+            context->variables, kind, context->errexit_suppressed, &handled);
         if (!handled) return 125;
         return status == GSH_EVALUATOR_PIPELINE_CHILD_REQUEST
                    ? status
@@ -13302,7 +13498,7 @@ static int run_native_noninteractive_pipeline(
     const pipeline_expansion_scope *scope,
     gsh_positional_store *positionals, gsh_shell_options *options,
     gsh_function_store *functions, gsh_variable_store *scratch,
-    native_evaluator *evaluator)
+    native_evaluator *evaluator, bool errexit_suppressed)
 {
     if (aliases == NULL || default_path == NULL || evaluator == NULL ||
         functions == NULL || options == NULL || pipeline == NULL ||
@@ -13312,12 +13508,15 @@ static int run_native_noninteractive_pipeline(
     noninteractive_pipeline_launch launch;
     noninteractive_child_context child_context = {
         pipeline, default_path, variables, aliases, scope, positionals,
-        options, functions, scratch, evaluator, &launch};
+        options, functions, scratch, evaluator, &launch,
+        errexit_suppressed};
     size_t index;
 
     if (!require(pipeline != NULL && variables != NULL)) return 125;
     if (!require(options != NULL)) return 125;
-    initialize_noninteractive_launch(&launch, pipeline->command_count);
+    initialize_noninteractive_launch(
+        &launch, pipeline->command_count,
+        gsh_options_enabled(options, GSH_OPTION_PIPEFAIL));
 
     if (scope == NULL && evaluator_command_cache(evaluator) != NULL) {
         for (index = 0; index < pipeline->command_count; index++) {
@@ -13357,7 +13556,6 @@ static int run_native_noninteractive_pipeline(
             return 125;
         }
         launch.members[launch.launched++] = pid;
-        launch.status_pid = pid;
     }
     if (!launch_noninteractive_heredocs(pipeline, &launch)) return 125;
     return wait_for_noninteractive_pipeline(pipeline, &launch);
@@ -13579,6 +13777,7 @@ typedef struct pipeline_child_request {
     pipeline_source_evaluation source;
     gsh_background_table *backgrounds;
     size_t root;
+    bool errexit_suppressed;
     bool used;
 } pipeline_child_request;
 
@@ -16675,7 +16874,8 @@ static bool evaluator_status_is_fatal(native_evaluator *evaluator,
 }
 
 static int native_evaluate_pipeline(native_evaluator *evaluator,
-                                    size_t node_index)
+                                    size_t node_index,
+                                    bool errexit_suppressed)
 {
     if (evaluator == NULL) {
         return -1;
@@ -16707,6 +16907,12 @@ static int native_evaluate_pipeline(native_evaluator *evaluator,
     }
     if (plan_status != GSH_NATIVE_PLAN_OK) {
         return plan_status == GSH_NATIVE_PLAN_ERROR ? 1 : 125;
+    }
+    if (gsh_options_enabled(&evaluator->options, GSH_OPTION_XTRACE) &&
+        emit_pipeline_trace(&descriptor_builtin_io,
+                            evaluator->pipeline,
+                            evaluator->variables) == -1) {
+        return 125;
     }
     function = evaluator_pipeline(evaluator)->command_count == 1U
                    ? evaluator_function(
@@ -16769,7 +16975,7 @@ static int native_evaluate_pipeline(native_evaluator *evaluator,
             evaluator->aliases, evaluator->alias_journal,
             scoped ? &scope : NULL, evaluator->positionals,
             &evaluator->options, evaluator->functions,
-            evaluator->scope_base, evaluator);
+            evaluator->scope_base, evaluator, errexit_suppressed);
     }
     if (evaluator_status_is_fatal(evaluator, status)) {
         evaluator->fatal_error = true;
@@ -17030,6 +17236,7 @@ typedef struct {
     size_t next_child;
     size_t depth;
     int status;
+    bool errexit_suppressed;
 } sequence_evaluation_frame;
 
 enum { SEQUENCE_EVALUATION_CAP = 129 };
@@ -17059,7 +17266,7 @@ static bool evaluator_sequence_kind(gsh_ast_kind kind)
  * ─────────────────────────────────────────────────────────────── */
 static bool initialize_sequence_evaluation(
     native_evaluator *evaluator, size_t node_index, size_t depth,
-    sequence_evaluation *evaluation)
+    bool errexit_suppressed, sequence_evaluation *evaluation)
 {
     if (!require(evaluator != NULL && evaluator->storage != NULL)) return false;
     if (!require(node_index < evaluator_storage(evaluator)->node_count &&
@@ -17068,18 +17275,33 @@ static bool initialize_sequence_evaluation(
     evaluation->frame_count = 1U;
     evaluation->frames[0] = (sequence_evaluation_frame){
         node_index, evaluator_storage(evaluator)->nodes[node_index].first_child,
-        depth, 0};
+        depth, 0, errexit_suppressed};
     return true;
+}
+
+/* ── Errexit Context Travels With Scheduled Work ────────────────
+ * Failure policy belongs to the syntactic command context, not to a global
+ * status check. Each bounded machine task therefore carries the inherited
+ * suppression bit through functions, sources, subshells, and pipeline-local
+ * evaluators. AND-OR tests, conditions, and `!` set it before any child runs.
+ * ─────────────────────────────────────────────────────────────── */
+static bool sequence_child_suppresses_errexit(
+    const gsh_ast_node *parent, const gsh_ast_node *child)
+{
+    if (!require(parent != NULL && child != NULL)) return true;
+    return parent->kind == GSH_AST_AND_OR &&
+           child->next_sibling != GSH_AST_NONE;
 }
 
 static bool next_sequence_evaluation(
     native_evaluator *evaluator, sequence_evaluation *evaluation,
     bool completed, int *status, size_t *child_index, size_t *child_depth,
-    bool *finished)
+    bool *child_errexit_suppressed, bool *finished)
 {
     if (!require(evaluator != NULL && evaluation != NULL)) return false;
     if (!require(status != NULL && child_index != NULL &&
-                 child_depth != NULL && finished != NULL)) return false;
+                 child_depth != NULL && child_errexit_suppressed != NULL &&
+                 finished != NULL)) return false;
 
     *finished = false;
     if (completed) {
@@ -17124,10 +17346,15 @@ static bool next_sequence_evaluation(
             evaluation->frames[evaluation->frame_count++] =
                 (sequence_evaluation_frame){
                     *child_index, child->first_child,
-                    frame->depth + 1U, 0};
+                    frame->depth + 1U, 0,
+                    frame->errexit_suppressed ||
+                        sequence_child_suppresses_errexit(parent, child)};
             continue;
         }
         *child_depth = frame->depth + 1U;
+        *child_errexit_suppressed =
+            frame->errexit_suppressed ||
+            sequence_child_suppresses_errexit(parent, child);
         evaluation->waiting = true;
         return true;
     }
@@ -17137,7 +17364,8 @@ static bool next_sequence_evaluation(
 }
 
 static int native_evaluate_leaf(native_evaluator *evaluator,
-                                size_t node_index, size_t depth)
+                                size_t node_index, size_t depth,
+                                bool errexit_suppressed)
 {
     const gsh_ast_node *node;
     int status = 0;
@@ -17150,7 +17378,8 @@ static int native_evaluate_leaf(native_evaluator *evaluator,
     if (evaluate_definition_node(evaluator, node_index, &status)) return status;
     if (static_for_pipeline_status(evaluator, node, &status)) return status;
     if (node->kind == GSH_AST_PIPELINE) {
-        return native_evaluate_pipeline(evaluator, node_index);
+        return native_evaluate_pipeline(
+            evaluator, node_index, errexit_suppressed);
     }
     if (node->kind == GSH_AST_SUBSHELL) return 125;
     if (node->kind == GSH_AST_IF || node->kind == GSH_AST_CASE) return 125;
@@ -17185,6 +17414,7 @@ typedef struct {
     size_t auxiliary;
     unsigned int phase;
     bool fallthrough;
+    bool errexit_suppressed;
     int result_status;
     char *text;
     char *items[GSH_NATIVE_ARGUMENT_CAP];
@@ -17341,6 +17571,7 @@ static native_machine_process_result start_native_machine_subshell(
             .kind = NATIVE_MACHINE_NODE,
             .node_index = node->first_child,
             .depth = task->depth + 1U,
+            .errexit_suppressed = task->errexit_suppressed,
         };
 
         initialize_native_subshell_evaluator(*evaluator, child);
@@ -17364,12 +17595,17 @@ static native_machine_process_result start_native_machine_subshell(
 
 static int schedule_native_machine_request(
     native_evaluator *evaluator, native_machine_workspace *workspace,
-    int *status)
+    int *status, bool errexit_suppressed)
 {
     if (!require(evaluator != NULL && workspace != NULL)) return -1;
     if (!require(status != NULL)) return -1;
     native_machine_task finish = {0};
-    native_machine_task body = {.kind = NATIVE_MACHINE_NODE};
+    native_machine_task body = {
+        .kind = NATIVE_MACHINE_NODE,
+        .errexit_suppressed = errexit_suppressed,
+    };
+
+    finish.errexit_suppressed = errexit_suppressed;
 
     if (*status == GSH_EVALUATOR_FUNCTION_REQUEST) {
         finish.kind = NATIVE_MACHINE_FUNCTION_FINISH;
@@ -17396,9 +17632,22 @@ static int schedule_native_machine_request(
     return 1;
 }
 
+static void apply_native_errexit(native_evaluator *evaluator, int status,
+                                 bool suppressed)
+{
+    if (evaluator == NULL || suppressed || status == 0 ||
+        evaluator->exiting || evaluator->returning ||
+        gsh_options_enabled(&evaluator->options, GSH_OPTION_INTERACTIVE)) {
+        return;
+    }
+    if (gsh_options_enabled(&evaluator->options, GSH_OPTION_ERREXIT)) {
+        evaluator->fatal_error = true;
+    }
+}
+
 static bool complete_native_machine_node(
     native_evaluator *evaluator, native_machine_workspace *workspace,
-    int *status)
+    int *status, bool errexit_suppressed)
 {
     if (!require(evaluator != NULL && workspace != NULL)) return false;
     if (!require(status != NULL && *status >= 0 && *status <= 255)) {
@@ -17407,11 +17656,14 @@ static bool complete_native_machine_node(
     *status = run_native_traps(
         evaluator, *status, NATIVE_TRAPS_PENDING);
     if (*status == GSH_EVALUATOR_TRAP_REQUEST) {
-        native_machine_task task = {0};
+        native_machine_task task = {
+            .errexit_suppressed = errexit_suppressed,
+        };
 
         return take_native_trap_request(evaluator, workspace, &task);
     }
     evaluator->last_status = *status;
+    apply_native_errexit(evaluator, *status, errexit_suppressed);
     return true;
 }
 
@@ -17473,6 +17725,7 @@ static bool run_native_machine_if(
         if (*status == 0) {
             task.kind = NATIVE_MACHINE_COMPLETE;
             child.node_index = task.auxiliary;
+            child.errexit_suppressed = task.errexit_suppressed;
             return push_native_machine_task(workspace, &task) &&
                    push_native_machine_task(workspace, &child);
         }
@@ -17491,6 +17744,7 @@ static bool run_native_machine_if(
         task.auxiliary = evaluator_storage(evaluator)->nodes[first].next_sibling;
         task.cursor = branch->next_sibling;
         child.node_index = first;
+        child.errexit_suppressed = true;
     }
     return push_native_machine_task(workspace, &task) &&
            push_native_machine_task(workspace, &child);
@@ -17540,6 +17794,7 @@ static bool run_native_machine_case(
                 .kind = NATIVE_MACHINE_NODE,
                 .node_index = item->first_child,
                 .depth = task.depth + 1U,
+                .errexit_suppressed = task.errexit_suppressed,
             };
 
             return push_native_machine_task(workspace, &task) &&
@@ -17673,6 +17928,7 @@ static bool run_native_machine_for(
             .kind = NATIVE_MACHINE_NODE,
             .node_index = node->first_child,
             .depth = task.depth + 1U,
+            .errexit_suppressed = task.errexit_suppressed,
         };
 
         return push_native_machine_task(workspace, &task) &&
@@ -17705,6 +17961,7 @@ static bool schedule_native_machine_while_condition(
         .kind = NATIVE_MACHINE_NODE,
         .node_index = node->first_child,
         .depth = task->depth + 1U,
+        .errexit_suppressed = true,
     };
 
     task->kind = NATIVE_MACHINE_WHILE_CONDITION;
@@ -17769,6 +18026,7 @@ static bool run_native_machine_while(
             .kind = NATIVE_MACHINE_NODE,
             .node_index = body,
             .depth = task.depth + 1U,
+            .errexit_suppressed = task.errexit_suppressed,
         };
 
         return push_native_machine_task(workspace, &task) &&
@@ -17785,20 +18043,23 @@ static bool run_native_machine_sequence(
                  task.kind == NATIVE_MACHINE_SEQUENCE)) return false;
     size_t child;
     size_t child_depth;
+    bool child_errexit_suppressed;
     bool finished;
     bool completed = task.sequence.waiting;
 
     if (completed && (evaluator->fatal_error || evaluator->exiting ||
                       evaluator->returning ||
                       evaluator->loop_levels != 0U)) {
-        return complete_native_machine_node(evaluator, workspace, status);
+        return complete_native_machine_node(
+            evaluator, workspace, status, task.errexit_suppressed);
     }
     if (!next_sequence_evaluation(
             evaluator, &task.sequence, completed, status, &child,
-            &child_depth, &finished)) {
+            &child_depth, &child_errexit_suppressed, &finished)) {
         if (!finished) *status = 125;
         return !finished ||
-               complete_native_machine_node(evaluator, workspace, status);
+               complete_native_machine_node(
+                   evaluator, workspace, status, task.errexit_suppressed);
     }
     if (!push_native_machine_task(workspace, &task)) {
         *status = 125;
@@ -17808,6 +18069,7 @@ static bool run_native_machine_sequence(
         .kind = NATIVE_MACHINE_NODE,
         .node_index = child,
         .depth = child_depth,
+        .errexit_suppressed = child_errexit_suppressed,
     };
     return push_native_machine_task(workspace, &task);
 }
@@ -17823,10 +18085,12 @@ static bool run_native_machine_continuation(
 
     if (task.kind == NATIVE_MACHINE_NEGATE) {
         *status = *status == 0 ? 1 : 0;
-        return complete_native_machine_node(evaluator, workspace, status);
+        return complete_native_machine_node(
+            evaluator, workspace, status, task.errexit_suppressed);
     }
     if (task.kind == NATIVE_MACHINE_COMPLETE) {
-        return complete_native_machine_node(evaluator, workspace, status);
+        return complete_native_machine_node(
+            evaluator, workspace, status, task.errexit_suppressed);
     }
     if (task.kind == NATIVE_MACHINE_IF) {
         return run_native_machine_if(evaluator, workspace, task, status);
@@ -17849,23 +18113,29 @@ static bool run_native_machine_continuation(
         return true;
     }
     if (task.kind == NATIVE_MACHINE_TRAP_FINISH) {
+        bool errexit_suppressed = task.errexit_suppressed;
+
         *status = finish_native_trap_request(
             evaluator, task.trap_request, *status);
         if (*status != GSH_EVALUATOR_TRAP_REQUEST) {
-            evaluator->last_status = *status;
-            return true;
+            return complete_native_machine_node(
+                evaluator, workspace, status, errexit_suppressed);
         }
-        task = (native_machine_task){0};
+        task = (native_machine_task){
+            .errexit_suppressed = errexit_suppressed,
+        };
         return take_native_trap_request(evaluator, workspace, &task);
     }
     if (task.kind == NATIVE_MACHINE_FUNCTION_FINISH) {
         *status = finish_evaluator_function(
             evaluator, task.function, *status);
-        return complete_native_machine_node(evaluator, workspace, status);
+        return complete_native_machine_node(
+            evaluator, workspace, status, task.errexit_suppressed);
     }
     if (task.kind == NATIVE_MACHINE_SOURCE_FINISH) {
         *status = leave_source_frame(evaluator, &task.source, *status);
-        return complete_native_machine_node(evaluator, workspace, status);
+        return complete_native_machine_node(
+            evaluator, workspace, status, task.errexit_suppressed);
     }
     return task.kind == NATIVE_MACHINE_SEQUENCE &&
            run_native_machine_sequence(evaluator, workspace, task, status);
@@ -17930,6 +18200,9 @@ static native_machine_step_result schedule_native_machine_compound(
             .kind = NATIVE_MACHINE_NODE,
             .node_index = node->first_child,
             .depth = task->depth + 1U,
+            .errexit_suppressed =
+                task->errexit_suppressed ||
+                (node->flags & GSH_AST_FLAG_NEGATED) != 0U,
         };
         bool scheduled = true;
 
@@ -17942,6 +18215,14 @@ static native_machine_step_result schedule_native_machine_compound(
                    : NATIVE_MACHINE_STEP_ERROR;
     }
     return NATIVE_MACHINE_STEP_LEAF;
+}
+
+static bool evaluator_noexec(const native_evaluator *evaluator)
+{
+    if (!require(evaluator != NULL)) return false;
+    return (evaluator->options.enabled &
+            (GSH_OPTION_NOEXEC | GSH_OPTION_INTERACTIVE)) ==
+           GSH_OPTION_NOEXEC;
 }
 
 static native_machine_step_result run_native_machine_node_task(
@@ -17958,9 +18239,18 @@ static native_machine_step_result run_native_machine_node_task(
     int control_status;
     bool async_consumed;
 
+    if (node->kind == GSH_AST_PIPELINE &&
+        (node->flags & GSH_AST_FLAG_NEGATED) != 0U) {
+        task->errexit_suppressed = true;
+    }
+
     if (evaluator_control_status(
             *evaluator, task->depth, &control_status)) {
         *status = control_status;
+        return NATIVE_MACHINE_STEP_STATUS;
+    }
+    if (evaluator_noexec(*evaluator)) {
+        *status = 0;
         return NATIVE_MACHINE_STEP_STATUS;
     }
     async_consumed = (*evaluator)->suppress_async_once;
@@ -17989,7 +18279,7 @@ static native_machine_step_result run_native_machine_node_task(
         task->kind = NATIVE_MACHINE_SEQUENCE;
         return initialize_sequence_evaluation(
                    *evaluator, task->node_index, task->depth,
-                   &task->sequence) &&
+                   task->errexit_suppressed, &task->sequence) &&
                        push_native_machine_task(workspace, task)
                    ? NATIVE_MACHINE_STEP_SCHEDULED
                    : NATIVE_MACHINE_STEP_ERROR;
@@ -18007,7 +18297,8 @@ static native_machine_step_result run_native_machine_node_task(
 
     if (result != NATIVE_MACHINE_STEP_LEAF) return result;
     *status = native_evaluate_leaf(
-        *evaluator, task->node_index, task->depth);
+        *evaluator, task->node_index, task->depth,
+        task->errexit_suppressed);
     return NATIVE_MACHINE_STEP_STATUS;
 }
 
@@ -18033,6 +18324,7 @@ static bool finish_native_machine_status(
     if ((*evaluator)->substitution_child_execution != NULL) {
         size_t child_node = 0U;
         size_t child_depth = 0U;
+        bool errexit_suppressed = task->errexit_suppressed;
 
         if (!take_substitution_child(
                 evaluator, &child_node, &child_depth)) return false;
@@ -18041,17 +18333,19 @@ static bool finish_native_machine_status(
             .kind = NATIVE_MACHINE_NODE,
             .node_index = child_node,
             .depth = child_depth,
+            .errexit_suppressed = errexit_suppressed,
         };
         *child_process = true;
         return push_native_machine_task(workspace, task);
     }
     {
         int scheduled = schedule_native_machine_request(
-            *evaluator, workspace, status);
+            *evaluator, workspace, status, task->errexit_suppressed);
 
         return scheduled > 0 ||
                (scheduled == 0 && complete_native_machine_node(
-                                      *evaluator, workspace, status));
+                                      *evaluator, workspace, status,
+                                      task->errexit_suppressed));
     }
 }
 
@@ -18515,7 +18809,12 @@ static bool take_pipeline_child_request(
     if (!require(workspace != NULL && task != NULL &&
                  child_process != NULL)) return false;
     pipeline_child_request *request = (*evaluator)->pipeline_child_request;
-    native_machine_task body = {.kind = NATIVE_MACHINE_NODE};
+    native_machine_task body = {
+        .kind = NATIVE_MACHINE_NODE,
+        .errexit_suppressed = request != NULL
+                                  ? request->errexit_suppressed
+                                  : false,
+    };
 
     if (request == NULL || !request->used) return false;
     (*evaluator)->pipeline_child_request = NULL;
@@ -18564,7 +18863,8 @@ static int finish_pipeline_child_request(
  * ─────────────────────────────────────────────────────────────── */
 static int request_pipeline_isolated_function(
     native_evaluator *parent, gsh_native_pipeline *pipeline,
-    size_t command_index, gsh_variable_store *variables, bool *handled)
+    size_t command_index, gsh_variable_store *variables,
+    bool errexit_suppressed, bool *handled)
 {
     if (!require(parent != NULL && pipeline != NULL)) return 125;
     if (!require(variables != NULL && handled != NULL)) return 125;
@@ -18578,6 +18878,7 @@ static int request_pipeline_isolated_function(
     request = acquire_pipeline_child_request(parent);
     if (request == NULL) return 125;
     request->kind = PIPELINE_CHILD_FUNCTION;
+    request->errexit_suppressed = errexit_suppressed;
     request->backgrounds = allocate_isolated_job_table();
     if (request->backgrounds == NULL) {
         release_pipeline_child_request(parent, request);
@@ -18612,7 +18913,7 @@ static int request_pipeline_isolated_function(
 static int request_pipeline_isolated_source(
     native_evaluator *parent, gsh_native_pipeline *pipeline,
     size_t command_index, gsh_variable_store *variables,
-    pipeline_isolated_kind kind)
+    pipeline_isolated_kind kind, bool errexit_suppressed)
 {
     if (!require(parent != NULL && pipeline != NULL)) return 125;
     if (!require(variables != NULL)) return 125;
@@ -18623,6 +18924,7 @@ static int request_pipeline_isolated_source(
 
     if (request == NULL) return 125;
     request->kind = PIPELINE_CHILD_SOURCE;
+    request->errexit_suppressed = errexit_suppressed;
     status = prepare_pipeline_source_evaluation(
         parent, pipeline, command_index, variables,
         kind == PIPELINE_ISOLATED_FC, &request->source, &ready);
@@ -18641,7 +18943,7 @@ static int request_pipeline_isolated_source(
 static int run_pipeline_isolated_command(
     native_evaluator *parent, gsh_native_pipeline *pipeline,
     size_t command_index, gsh_variable_store *variables,
-    pipeline_isolated_kind kind, bool *handled)
+    pipeline_isolated_kind kind, bool errexit_suppressed, bool *handled)
 {
     if (!require(parent != NULL && pipeline != NULL)) return 125;
     if (!require(variables != NULL && handled != NULL)) return 125;
@@ -18649,7 +18951,8 @@ static int run_pipeline_isolated_command(
     if (command_index >= pipeline->command_count) return 125;
     if (kind == PIPELINE_ISOLATED_FUNCTION) {
         return request_pipeline_isolated_function(
-            parent, pipeline, command_index, variables, handled);
+            parent, pipeline, command_index, variables,
+            errexit_suppressed, handled);
     }
     if (kind != PIPELINE_ISOLATED_FC &&
         kind != PIPELINE_ISOLATED_SOURCE) {
@@ -18657,7 +18960,8 @@ static int run_pipeline_isolated_command(
     }
     *handled = true;
     return request_pipeline_isolated_source(
-        parent, pipeline, command_index, variables, kind);
+        parent, pipeline, command_index, variables, kind,
+        errexit_suppressed);
 }
 
 static bool bounded_job_command(const char *input, size_t input_length,
@@ -18752,7 +19056,7 @@ static native_async_start start_native_async(
     }
     (void)setpgid(pid, pid);
     if (gsh_background_add_job(
-            evaluator->backgrounds, pid, pid, &pid, 1U,
+            evaluator->backgrounds, pid, pid, &pid, 1U, 1U, false,
             command, command_length, GSH_JOB_ORIGIN_EVALUATOR,
             NULL) == -1) {
         int saved_errno = errno;
@@ -19756,7 +20060,7 @@ static void managed_pipeline_child(
         (gsh_native_pipeline *)pipeline, state->default_path,
         state->variables, NULL, state->aliases, NULL, scope,
         state->positionals, &options, state->functions,
-        state->pipeline_variables, &evaluator);
+        state->pipeline_variables, &evaluator, false);
     _exit(status & 255);
 }
 
@@ -20026,7 +20330,7 @@ static bool register_background_node(
     }
     (void)setpgid(pid, pid);
     if (gsh_background_add_job(
-            &state->background_jobs, pid, pid, &pid, 1U, command,
+            &state->background_jobs, pid, pid, &pid, 1U, 1U, false, command,
             command_length, GSH_JOB_ORIGIN_ASYNC_LIST, &job_id) == -1) {
         int saved_errno = errno;
 
@@ -21330,7 +21634,7 @@ static void start_native_compound(shell_state *state, size_t node_index)
 
     initialize_compound_parent_commit(state, &launch);
     initialize_job(&state->current_job, launch.pid, launch.pid,
-                   &launch.pid, 1, true, false);
+                   &launch.pid, 1, 1, false, true, false);
     state->current_job.modes = state->original_modes;
     if (managed) {
         (void)handoff_managed_compound(state, &launch);
@@ -21520,6 +21824,12 @@ static int execute_native_script(
             status = 2;
             break;
         }
+        if (gsh_options_enabled(&evaluator->options, GSH_OPTION_VERBOSE) &&
+            emit_verbose_input(&descriptor_builtin_io, input + offset,
+                               end - offset) == -1) {
+            status = 125;
+            break;
+        }
         if (native_parsed_script_is_empty(session, parsed.root)) {
             offset = end;
             continue;
@@ -21623,9 +21933,10 @@ static int initialize_native_script_resources(
 static int execute_native_noninteractive(
     const char *input, size_t input_length,
     const char *parameter_zero, char *const *positional_parameters,
-    size_t positional_count)
+    size_t positional_count, const gsh_shell_options *options)
 {
-    if (input == NULL) {
+    if (input == NULL || options == NULL ||
+        !gsh_options_validate(options)) {
         return -1;
     }
     static native_script_resources resources;
@@ -21638,6 +21949,7 @@ static int execute_native_noninteractive(
         perror("gsh: native allocation");
         return 125;
     }
+    resources.session.evaluator.options = *options;
     status = execute_native_script(
         input, input_length, &resources.session, resources.storage,
         resources.variables, resources.scratch, 0);
@@ -22257,10 +22569,57 @@ static int finish_native_descriptor_session(
     return status;
 }
 
+static int evaluate_native_input_command(
+    native_script_resources *resources,
+    const native_input_command *command,
+    const gsh_shell_options *options, int preceding_status)
+{
+    if (!require(resources != NULL && command != NULL)) return 125;
+    if (!require(options != NULL)) return 125;
+    if (gsh_options_enabled(options, GSH_OPTION_NOEXEC)) {
+        return preceding_status;
+    }
+    return execute_native_parsed(
+        &resources->session, command->parsed_text, command->parsed_length,
+        command->parsed.root, resources->variables, resources->scratch);
+}
+
+static bool emit_native_input_verbose(const gsh_shell_options *options,
+                                      native_input_command *command,
+                                      int *status)
+{
+    if (!require(options != NULL && command != NULL && status != NULL)) {
+        return false;
+    }
+    if (!gsh_options_enabled(options, GSH_OPTION_VERBOSE) ||
+        emit_verbose_input(&descriptor_builtin_io,
+                           command->source_view.memory,
+                           command->length) == 0) return true;
+    *status = 125;
+    (void)release_native_input_command(command);
+    return false;
+}
+
+static bool accept_native_input_parse(const char *source,
+                                      native_input_command *command,
+                                      int *status)
+{
+    if (!require(source != NULL && command != NULL && status != NULL)) {
+        return false;
+    }
+    if (command->parsed.status == GSH_PARSE_OK) return true;
+    (void)fprintf(stderr, "gsh: %s at byte %zu\n",
+                  gsh_parse_status_name(command->parsed.status),
+                  command->source_offset + command->parsed.error_offset);
+    *status = 2;
+    (void)release_native_input_command(command);
+    return false;
+}
+
 static int execute_native_descriptor(
     int descriptor, const char *source, const char *parameter_zero,
     char *const *positional_parameters, size_t positional_count,
-    bool shares_command_input)
+    bool shares_command_input, const gsh_shell_options *options)
 {
     static native_script_resources resources;
     static native_script_storage storage;
@@ -22270,7 +22629,8 @@ static int execute_native_descriptor(
     size_t complete_commands;
     int status = 0;
 
-    if (descriptor < 0 || source == NULL || parameter_zero == NULL) {
+    if (descriptor < 0 || source == NULL || parameter_zero == NULL ||
+        options == NULL || !gsh_options_validate(options)) {
         errno = EINVAL;
         return 125;
     }
@@ -22280,6 +22640,7 @@ static int execute_native_descriptor(
         perror("gsh: native allocation");
         return 125;
     }
+    resources.session.evaluator.options = *options;
     if (!initialize_native_input_command(
             &command, resources.source_workspaces->root_input,
             &input_storage)) {
@@ -22325,14 +22686,10 @@ static int execute_native_descriptor(
                                                input_errno);
             break;
         }
-        if (command.parsed.status != GSH_PARSE_OK) {
-            (void)fprintf(stderr, "gsh: %s at byte %zu\n",
-                    gsh_parse_status_name(command.parsed.status),
-                    command.source_offset + command.parsed.error_offset);
-            status = 2;
-            (void)release_native_input_command(&command);
-            break;
-        }
+        if (!accept_native_input_parse(source, &command, &status)) break;
+        if (!emit_native_input_verbose(
+                &resources.session.evaluator.options,
+                &command, &status)) break;
         if (native_parsed_script_is_empty(
                 &resources.session, command.parsed.root)) {
             if (release_native_input_command(&command) == -1) {
@@ -22350,10 +22707,8 @@ static int execute_native_descriptor(
             (void)release_native_input_command(&command);
             break;
         }
-        status = execute_native_parsed(
-            &resources.session, command.parsed_text,
-            command.parsed_length, command.parsed.root,
-            resources.variables, resources.scratch);
+        status = evaluate_native_input_command(
+            &resources, &command, options, status);
         if (release_native_input_command(&command) == -1) {
             (void)fprintf(stderr, "gsh: %s input cleanup: %s\n", source,
                     strerror(errno));
@@ -22371,9 +22726,10 @@ static int execute_native_descriptor(
 
 static int execute_native_file(
     const char *path, char *const *positional_parameters,
-    size_t positional_count)
+    size_t positional_count, const gsh_shell_options *options)
 {
-    if (positional_count != 0U && positional_parameters == NULL) {
+    if ((positional_count != 0U && positional_parameters == NULL) ||
+        options == NULL) {
         return -1;
     }
     int descriptor;
@@ -22390,7 +22746,7 @@ static int execute_native_file(
     }
     status = execute_native_descriptor(
         descriptor, path, path, positional_parameters, positional_count,
-        false);
+        false, options);
     if (close(descriptor) == -1 && status == 0) {
         (void)fprintf(stderr, "gsh: %s: %s\n", path, strerror(errno));
         status = 125;
@@ -22398,39 +22754,37 @@ static int execute_native_file(
     return status;
 }
 
-static int exec_noninteractive(int argc, char **argv)
+static int exec_noninteractive(int argc, char **argv,
+                               const gsh_invocation *invocation)
 {
-    if (argv == NULL) return -1;
-    if (argc >= 3 && strcmp(argv[1], "-c") == 0) {
-        const char *parameter_zero = argc >= 4 ? argv[3] : argv[0];
-        char **positionals = argc >= 5 ? argv + 4 : NULL;
-        size_t positional_count = argc >= 5 ? (size_t)argc - 4U : 0;
+    const char *parameter_zero;
+    char **positionals;
+    size_t positional_count;
 
+    if (argc <= 0 || argv == NULL || invocation == NULL) return -1;
+    parameter_zero = invocation->parameter_zero_index < (size_t)argc
+                         ? argv[invocation->parameter_zero_index] : argv[0];
+    positionals = invocation->positional_index < (size_t)argc
+                      ? argv + invocation->positional_index : NULL;
+    positional_count = invocation->positional_index < (size_t)argc
+                           ? (size_t)argc - invocation->positional_index : 0U;
+    if (invocation->mode == GSH_INVOCATION_COMMAND) {
+        if (gsh_options_enabled(&invocation->options, GSH_OPTION_NOEXEC)) {
+            return check_native_syntax(argv[invocation->source_index]);
+        }
         return execute_native_noninteractive(
-            argv[2], strlen(argv[2]), parameter_zero, positionals,
-            positional_count);
+            argv[invocation->source_index],
+            strlen(argv[invocation->source_index]), parameter_zero,
+            positionals, positional_count, &invocation->options);
     }
-    if (argc >= 2 && argv[1][0] == '-' &&
-        strcmp(argv[1], "-s") != 0 && strcmp(argv[1], "-") != 0 &&
-        strcmp(argv[1], "--") != 0) {
-        print_usage(stderr);
-        return 2;
-    }
-    if (argc >= 2 && strcmp(argv[1], "--") == 0 && argc >= 3) {
+    if (invocation->mode == GSH_INVOCATION_FILE) {
         return execute_native_file(
-            argv[2], argc >= 4 ? argv + 3 : NULL,
-            argc >= 4 ? (size_t)argc - 3U : 0U);
-    }
-    if (argc >= 2 && strcmp(argv[1], "-s") != 0 &&
-        strcmp(argv[1], "-") != 0 && strcmp(argv[1], "--") != 0) {
-        return execute_native_file(
-            argv[1], argc >= 3 ? argv + 2 : NULL,
-            argc >= 3 ? (size_t)argc - 2U : 0U);
+            argv[invocation->source_index], positionals, positional_count,
+            &invocation->options);
     }
     return execute_native_descriptor(
-        STDIN_FILENO, "standard input", argv[0],
-        argc >= 3 ? argv + 2 : NULL,
-        argc >= 3 ? (size_t)argc - 2U : 0U, true);
+        STDIN_FILENO, "standard input", argv[0], positionals,
+        positional_count, true, &invocation->options);
 }
 
 /* ── Process ABI Is Converted at the Entry Boundary ─────────────
@@ -22444,18 +22798,15 @@ int main(int argc, char **argv)
 {
     static shell_state state;
     static interactive_storage storage;
+    gsh_invocation invocation;
+    gsh_shell_options native_only_options;
     int status;
 
     (void)setlocale(LC_ALL, "");
     gsh_fault_initialize();
-    if (argc == 2 &&
-        (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0)) {
+    if (argc == 2 && strcmp(argv[1], "--help") == 0) {
         print_usage(stdout);
         return 0;
-    }
-    if (argc == 4 && strcmp(argv[1], "-n") == 0 &&
-        strcmp(argv[2], "-c") == 0) {
-        return check_native_syntax(argv[3]);
     }
     if (gsh_fault_should_fail(GSH_FAULT_SHELL_EXECUTABLE_RESOLUTION, EIO) ||
         initialize_shell_executable(argv[0]) == -1) {
@@ -22468,18 +22819,26 @@ int main(int argc, char **argv)
         char **positionals = argc >= 6 ? argv + 5 : NULL;
         size_t positional_count = argc >= 6 ? (size_t)argc - 5U : 0;
 
+        gsh_options_initialize(&native_only_options, false);
         return execute_native_noninteractive(
             argv[3], strlen(argv[3]), parameter_zero, positionals,
-            positional_count);
+            positional_count, &native_only_options);
     }
-    if (argc != 1 || !isatty(STDIN_FILENO)) {
-        return exec_noninteractive(argc, argv);
+    if (gsh_invocation_parse(argc, argv, isatty(STDIN_FILENO) != 0,
+                             &invocation) == -1) {
+        print_usage(stderr);
+        return 2;
+    }
+    if (invocation.mode != GSH_INVOCATION_INTERACTIVE) {
+        return exec_noninteractive(argc, argv, &invocation);
     }
     if (initialize_interactive(&state, &storage, argv[0]) == -1) {
         perror("gsh: interactive initialization");
         cleanup(&state);
         return 1;
     }
+    state.options = invocation.options;
+    state.options.enabled |= GSH_OPTION_INTERACTIVE;
     initialize_history(&state);
     if (start_redirection_worker(&state) == -1) {
         state.redirection_worker_failures++;

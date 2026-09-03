@@ -11,6 +11,64 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* ── Pipeline Status Is Captured, Not Reconstructed ──────────────
+ * Children can finish in any order, while pipefail selects by command order.
+ * This accumulator records only terminal command statuses in constant time.
+ * Heredoc helpers never enter the command domain and cannot affect results.
+ * The option bit is sampled before launch, so later mutations cannot race it.
+ * The same value follows a stopped pipeline into the bounded job service.
+ * ─────────────────────────────────────────────────────────────── */
+static bool wait_status_nonzero(int wait_status)
+{
+    return WIFSIGNALED(wait_status) ||
+           (WIFEXITED(wait_status) && WEXITSTATUS(wait_status) != 0);
+}
+
+void gsh_pipeline_status_initialize(gsh_pipeline_status *status,
+                                    size_t command_count, bool pipefail)
+{
+    if (status == NULL) return;
+    (void)memset(status, 0, sizeof(*status));
+    status->command_count = command_count;
+    status->pipefail = pipefail;
+}
+
+bool gsh_pipeline_status_record(gsh_pipeline_status *status,
+                                size_t command_index, int wait_status)
+{
+    if (status == NULL || status->command_count == 0 ||
+        command_index >= status->command_count ||
+        (!WIFEXITED(wait_status) && !WIFSIGNALED(wait_status))) {
+        errno = EINVAL;
+        return false;
+    }
+    if (command_index + 1U == status->command_count) {
+        status->last_wait_status = wait_status;
+        status->last_known = true;
+    }
+    if (status->pipefail && wait_status_nonzero(wait_status) &&
+        (!status->selected_known ||
+         command_index > status->rightmost_nonzero)) {
+        status->selected_wait_status = wait_status;
+        status->rightmost_nonzero = command_index;
+        status->selected_known = true;
+    }
+    return true;
+}
+
+bool gsh_pipeline_status_result(const gsh_pipeline_status *status,
+                                int *wait_status)
+{
+    if (status == NULL || wait_status == NULL ||
+        status->command_count == 0 || !status->last_known) {
+        return false;
+    }
+    *wait_status = status->pipefail && status->selected_known
+                       ? status->selected_wait_status
+                       : status->last_wait_status;
+    return true;
+}
+
 void gsh_background_initialize(gsh_background_table *table)
 {
     if (table == NULL) return;
@@ -173,7 +231,8 @@ static bool member_in_use(const gsh_background_table *table, pid_t pid)
 
 int gsh_background_add_job(gsh_background_table *table, pid_t pgid,
                            pid_t status_pid, const pid_t *members,
-                           size_t member_count, const char *command,
+                           size_t member_count, size_t command_count,
+                           bool pipefail, const char *command,
                            size_t command_length, gsh_job_origin origin,
                            uint32_t *job_id)
 {
@@ -183,6 +242,7 @@ int gsh_background_add_job(gsh_background_table *table, pid_t pgid,
 
     if (table == NULL || pgid <= 0 || status_pid <= 0 || members == NULL ||
         member_count == 0 || member_count > GSH_BACKGROUND_MEMBER_CAP ||
+        command_count == 0 || command_count > member_count ||
         command_length >= GSH_BACKGROUND_COMMAND_CAP ||
         (command_length != 0 && command == NULL) ||
         table->used > GSH_BACKGROUND_CAP) {
@@ -222,6 +282,8 @@ int gsh_background_add_job(gsh_background_table *table, pid_t pgid,
     free_entry->terminal_owned = false;
     free_entry->notified = false;
     free_entry->consumed = false;
+    gsh_pipeline_status_initialize(&free_entry->pipeline_status,
+                                   command_count, pipefail);
     if (command_length != 0) {
         (void)memcpy(free_entry->command, command, command_length);
     }
@@ -239,7 +301,7 @@ int gsh_background_add(gsh_background_table *table, pid_t pid,
                        uint32_t *job_id)
 {
     return gsh_background_add_job(
-        table, pid, pid, &pid, 1U, NULL, 0,
+        table, pid, pid, &pid, 1U, 1U, false, NULL, 0,
         GSH_JOB_ORIGIN_ASYNC_LIST, job_id);
 }
 
@@ -290,13 +352,19 @@ bool gsh_background_update_member(gsh_background_table *table, pid_t pid,
                     entry->member_states[member] = 2U;
                     if (entry->remaining > 0) entry->remaining--;
                 }
-                if (pid == entry->status_pid) {
-                    entry->wait_status = wait_status;
+                if (member < entry->pipeline_status.command_count) {
+                    (void)gsh_pipeline_status_record(
+                        &entry->pipeline_status, member, wait_status);
                 }
                 if (entry->remaining == 0) {
                     entry->state = GSH_JOB_DONE;
                     entry->done = true;
                     entry->notified = false;
+                    if (!gsh_pipeline_status_result(
+                            &entry->pipeline_status,
+                            &entry->wait_status)) {
+                        entry->wait_status = 125 << 8;
+                    }
                 }
             }
             return true;

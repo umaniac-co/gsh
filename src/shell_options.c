@@ -19,9 +19,18 @@ typedef struct {
 
 static const option_descriptor descriptors[] = {
     {"allexport", GSH_OPTION_ALLEXPORT, 'a'},
+    {"errexit", GSH_OPTION_ERREXIT, 'e'},
+    {"hashall", GSH_OPTION_HASHALL, 'h'},
+    {"ignoreeof", GSH_OPTION_IGNOREEOF, '\0'},
     {"noclobber", GSH_OPTION_NOCLOBBER, 'C'},
+    {"noexec", GSH_OPTION_NOEXEC, 'n'},
     {"noglob", GSH_OPTION_NOGLOB, 'f'},
+    {"nolog", GSH_OPTION_NOLOG, '\0'},
+    {"notify", GSH_OPTION_NOTIFY, 'b'},
     {"nounset", GSH_OPTION_NOUNSET, 'u'},
+    {"pipefail", GSH_OPTION_PIPEFAIL, '\0'},
+    {"verbose", GSH_OPTION_VERBOSE, 'v'},
+    {"xtrace", GSH_OPTION_XTRACE, 'x'},
 };
 
 void gsh_options_initialize(gsh_shell_options *options, bool interactive)
@@ -51,6 +60,11 @@ bool gsh_options_validate(const gsh_shell_options *options)
     }
     const unsigned int known = GSH_OPTION_NOCLOBBER | GSH_OPTION_NOGLOB |
                                GSH_OPTION_ALLEXPORT | GSH_OPTION_NOUNSET |
+                               GSH_OPTION_PIPEFAIL |
+                               GSH_OPTION_HASHALL | GSH_OPTION_NOEXEC |
+                               GSH_OPTION_NOLOG | GSH_OPTION_IGNOREEOF |
+                               GSH_OPTION_NOTIFY | GSH_OPTION_VERBOSE |
+                               GSH_OPTION_XTRACE | GSH_OPTION_ERREXIT |
                                GSH_OPTION_INTERACTIVE;
 
     return options != NULL && (options->enabled & ~known) == 0U &&

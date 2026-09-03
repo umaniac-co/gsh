@@ -41,7 +41,8 @@ CORE_SOURCES := src/gsh.c src/async_repl.c src/posix_lexer.c \
 	src/builtin_umask.c src/builtin_variables.c src/shell_aliases.c \
 	src/alias_expansion.c src/builtin_alias.c src/builtin_unalias.c \
 	src/shell_functions.c src/shell_traps.c src/builtin_trap.c \
-	src/positional_parameters.c src/shell_options.c src/builtin_set.c \
+	src/positional_parameters.c src/shell_options.c src/shell_invocation.c \
+	src/builtin_set.c \
 	src/builtin_shift.c src/background_jobs.c
 SOURCES := $(CORE_SOURCES) src/fault_injection_disabled.c
 FAULT_SOURCES := $(CORE_SOURCES) src/fault_injection_enabled.c

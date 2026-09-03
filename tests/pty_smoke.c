@@ -1677,6 +1677,69 @@ static int job_service_control_flow(const char *executable)
     return failed;
 }
 
+static int job_notification_flow(const char *executable)
+{
+    char fixture[] = "/tmp/gsh-job-notify-XXXXXX";
+    pty_session session;
+    int failed = 0;
+
+    if (executable == NULL || mkdtemp(fixture) == NULL ||
+        start_session(&session, executable, fixture, SHELL_GSH) == -1) {
+        perror("pty notify: setup");
+        (void)rmdir(fixture);
+        return 1;
+    }
+    if (consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
+        send_text(&session, "/bin/sleep .1 &\r") == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
+        wait_for_output(&session, " Done ", 300) != -1 ||
+        errno != ETIMEDOUT || send_text(&session, ":\r") == -1 ||
+        consume_through(&session, " Done ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
+        send_text(&session, "set -b\r") == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
+        send_text(&session, "/bin/sleep .1 &\r") == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, " Done ", TEST_TIMEOUT_MS) == -1) {
+        perror("pty notify: flow");
+        dump_capture(&session);
+        failed = 1;
+    }
+    if (stop_session(&session) == -1) failed = 1;
+    (void)rmdir(fixture);
+    return failed;
+}
+
+static int interactive_errexit_flow(const char *executable)
+{
+    char fixture[] = "/tmp/gsh-errexit-XXXXXX";
+    pty_session session;
+    int failed = 0;
+
+    if (executable == NULL || mkdtemp(fixture) == NULL ||
+        start_session(&session, executable, fixture, SHELL_GSH) == -1) {
+        perror("pty errexit: setup");
+        (void)rmdir(fixture);
+        return 1;
+    }
+    if (consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
+        send_text(&session, "set -e\r") == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
+        send_text(&session, "false\r") == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
+        send_text(&session, "printf GSH_ERREXIT_ALIVE\r") == -1 ||
+        consume_through(&session, "GSH_ERREXIT_ALIVE",
+                        TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1) {
+        perror("pty errexit: recovery");
+        dump_capture(&session);
+        failed = 1;
+    }
+    if (stop_session(&session) == -1) failed = 1;
+    (void)rmdir(fixture);
+    return failed;
+}
+
 static int fc_builtin_flow(const char *executable)
 {
     static const char editor_body[] =
@@ -2944,6 +3007,12 @@ static int variable_builtin_flow(const char *executable)
         consume_through(&session, "<iu>\r\n", TEST_TIMEOUT_MS) == -1 ||
         consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "set +u\r") == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
+        send_text(&session, "set -o ignoreeof\r") == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
+        send_bytes(&session, "\004", 1) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
+        send_text(&session, "set +o ignoreeof\r") == -1 ||
         consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, "GSH_PTY_ARITH=1\r") == -1 ||
         consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
@@ -7634,6 +7703,12 @@ static int run_primary_smoke_flows(const char *executable)
     }
     if (job_service_control_flow(executable) != 0) {
         return smoke_flow_failure("job service control");
+    }
+    if (job_notification_flow(executable) != 0) {
+        return smoke_flow_failure("job notification");
+    }
+    if (interactive_errexit_flow(executable) != 0) {
+        return smoke_flow_failure("interactive errexit");
     }
     if (fc_builtin_flow(executable) != 0) {
         return smoke_flow_failure("fc builtin");

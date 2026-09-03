@@ -9,6 +9,44 @@
 #include <stdio.h>
 #include <string.h>
 
+static int pipeline_status_cases(void)
+{
+    gsh_pipeline_status status;
+    gsh_background_table table;
+    const pid_t members[] = {4001, 4002, 4003};
+    int selected = -1;
+    int wait_status = -1;
+
+    gsh_pipeline_status_initialize(&status, 3U, true);
+    if (!gsh_pipeline_status_record(&status, 2U, 0) ||
+        !gsh_pipeline_status_record(&status, 0U, 7 << 8) ||
+        !gsh_pipeline_status_record(&status, 1U, 3 << 8) ||
+        !gsh_pipeline_status_result(&status, &selected) ||
+        selected != 3 << 8) {
+        return 1;
+    }
+    gsh_pipeline_status_initialize(&status, 3U, false);
+    if (!gsh_pipeline_status_record(&status, 0U, 7 << 8) ||
+        !gsh_pipeline_status_record(&status, 1U, 3 << 8) ||
+        !gsh_pipeline_status_record(&status, 2U, 0) ||
+        !gsh_pipeline_status_result(&status, &selected) || selected != 0) {
+        return 1;
+    }
+    gsh_background_initialize(&table);
+    if (gsh_background_add_job(
+            &table, 4001, 4003, members, 3U, 3U, true,
+            "pipeline", strlen("pipeline"), GSH_JOB_ORIGIN_CLASSIC,
+            NULL) == -1 ||
+        !gsh_background_update_member(&table, 4003, 0) ||
+        !gsh_background_update_member(&table, 4001, 7 << 8) ||
+        !gsh_background_update_member(&table, 4002, 3 << 8) ||
+        !gsh_background_get(&table, 4003, NULL, &wait_status) ||
+        wait_status != 3 << 8) {
+        return 1;
+    }
+    return 0;
+}
+
 int main(void)
 {
     gsh_background_table table;
@@ -21,6 +59,7 @@ int main(void)
     int wait_status;
     size_t index;
 
+    if (pipeline_status_cases() != 0) return 1;
     gsh_background_initialize(&table);
     {
         const pid_t alpha_members[] = {2001, 2002};
@@ -29,11 +68,11 @@ int main(void)
         int stopped = (SIGTSTP << 8) | 0x7f;
 
         if (gsh_background_add_job(
-                &table, 2001, 2002, alpha_members, 2U,
+                &table, 2001, 2002, alpha_members, 2U, 2U, false,
                 "sleep alpha", strlen("sleep alpha"),
                 GSH_JOB_ORIGIN_CLASSIC, &alpha_job) == -1 ||
             gsh_background_add_job(
-                &table, 3001, 3001, beta_members, 1U,
+                &table, 3001, 3001, beta_members, 1U, 1U, false,
                 "sleep beta", strlen("sleep beta"),
                 GSH_JOB_ORIGIN_MANAGED, &beta_job) == -1 ||
             gsh_background_resolve(&table, "%%", &job) != GSH_JOBSPEC_OK ||
@@ -118,7 +157,7 @@ int main(void)
         !gsh_background_has_capacity(&table)) {
         return 1;
     }
-    (void)puts("background jobs: jobspec, transitions, notification, capacity, "
-         "identity, completion, atomic wait-all and reuse passed");
+    (void)puts("background jobs: pipefail, jobspec, transitions, notification, "
+         "capacity, identity, completion, atomic wait-all and reuse passed");
     return 0;
 }
