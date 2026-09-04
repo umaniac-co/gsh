@@ -20,6 +20,7 @@
 #include <limits.h> /* CANON-INCLUDE: linux */
 #include <locale.h>
 #include <poll.h>
+#include <pwd.h>
 #include <signal.h> /* CANON-INCLUDE: macos */
 #include <stdio.h>
 #include <stdlib.h>
@@ -47,6 +48,9 @@ enum {
     BENCH_MEMORY_SAMPLES = 20,
     BENCH_MEMORY_WORKLOADS = 26,
     BENCH_LATENCY_WORKLOADS = 37,
+    TEST_PROMPT_IDENTITY_CAP = 256,
+    TEST_PROMPT_CAP = PATH_MAX + 640,
+    TEST_SHELL_PROMPT_CAP = 2 * (PATH_MAX + 640),
     PTY_DESCRIPTOR_CLOSE_PASS_CAP = 1024,
     PTY_WAIT_ATTEMPT_CAP = 65536,
     PTY_DRAIN_ATTEMPT_CAP = CAPTURE_CAP,
@@ -101,6 +105,151 @@ typedef struct {
     const char *prompt;
     shell_kind kind;
 } shell_spec;
+
+static size_t test_sgr_length(const unsigned char *text,
+                              const unsigned char *limit);
+
+static const char TEST_PROMPT_GREEN[] = "\033[38;5;114m";
+static const char TEST_PROMPT_BLUE[] = "\033[38;5;75m";
+static const char TEST_PROMPT_MUTED[] = "\033[38;5;245m";
+static const char TEST_PROMPT_YELLOW[] = "\033[38;5;221m";
+static const char TEST_PROMPT_RESET[] = "\033[0m";
+
+static void sanitize_expected_prompt_text(char *text, size_t capacity)
+{
+    size_t index;
+
+    if (text == NULL || capacity == 0U) return;
+    for (index = 0U; index < capacity; index++) {
+        unsigned char byte = (unsigned char)text[index];
+
+        if (byte == '\0') return;
+        if (byte < 0x20U || byte == 0x7fU) text[index] = '?';
+    }
+    text[capacity - 1U] = '\0';
+}
+
+static void expected_prompt_identity(
+    char user[TEST_PROMPT_IDENTITY_CAP],
+    char host[TEST_PROMPT_IDENTITY_CAP])
+{
+    struct passwd *account = getpwuid(geteuid());
+    size_t length;
+    size_t index;
+
+    length = account == NULL || account->pw_name == NULL ||
+                     account->pw_name[0] == '\0'
+                 ? TEST_PROMPT_IDENTITY_CAP
+                 : strnlen(account->pw_name, TEST_PROMPT_IDENTITY_CAP);
+    if (length < TEST_PROMPT_IDENTITY_CAP)
+        (void)memcpy(user, account->pw_name, length + 1U);
+    else
+        (void)snprintf(user, TEST_PROMPT_IDENTITY_CAP, "uid%lu",
+                       (unsigned long)geteuid());
+    sanitize_expected_prompt_text(user, TEST_PROMPT_IDENTITY_CAP);
+    if (gethostname(host, TEST_PROMPT_IDENTITY_CAP - 1U) == -1) host[0] = '\0';
+    host[TEST_PROMPT_IDENTITY_CAP - 1U] = '\0';
+    for (index = 0U; index < TEST_PROMPT_IDENTITY_CAP; index++) {
+        if (host[index] == '.' || host[index] == '\0') {
+            host[index] = '\0';
+            break;
+        }
+    }
+    if (host[0] == '\0') (void)memcpy(host, "unknown", sizeof("unknown"));
+    sanitize_expected_prompt_text(host, TEST_PROMPT_IDENTITY_CAP);
+}
+
+static bool expected_home_suffix(const char *directory, const char *home,
+                                 const char **suffix)
+{
+    size_t length;
+
+    if (directory == NULL || home == NULL || suffix == NULL || home[0] != '/')
+        return false;
+    length = strlen(home);
+    while (length > 1U && home[length - 1U] == '/') length--;
+    if (strncmp(directory, home, length) != 0 ||
+        (length != 1U && directory[length] != '\0' &&
+         directory[length] != '/')) return false;
+    *suffix = length == 1U && directory[1] != '\0'
+                  ? directory : directory + length;
+    return true;
+}
+
+static int format_expected_prompt(const char *directory, const char *home,
+                                  bool busy, char output[TEST_PROMPT_CAP])
+{
+    char user[TEST_PROMPT_IDENTITY_CAP];
+    char host[TEST_PROMPT_IDENTITY_CAP];
+    char shown_directory[PATH_MAX + 2U];
+    const char *suffix;
+    int written;
+
+    if (directory == NULL || output == NULL) return -1;
+    if (expected_home_suffix(directory, home, &suffix)) {
+        if (snprintf(shown_directory, sizeof(shown_directory), "~%s", suffix) >=
+            (int)sizeof(shown_directory)) return -1;
+    } else if (snprintf(shown_directory, sizeof(shown_directory), "%s",
+                        directory) >= (int)sizeof(shown_directory)) {
+        return -1;
+    }
+    sanitize_expected_prompt_text(shown_directory, sizeof(shown_directory));
+    expected_prompt_identity(user, host);
+    written = busy
+                  ? snprintf(output, TEST_PROMPT_CAP,
+                             "%s%s@%s%s %s%s%s %sgsh%s*%s> ",
+                             TEST_PROMPT_GREEN, user, host, TEST_PROMPT_RESET,
+                             TEST_PROMPT_BLUE, shown_directory,
+                             TEST_PROMPT_RESET, TEST_PROMPT_MUTED,
+                             TEST_PROMPT_YELLOW, TEST_PROMPT_RESET)
+                  : snprintf(output, TEST_PROMPT_CAP,
+                             "%s%s@%s%s %s%s%s %sgsh$%s> ",
+                             TEST_PROMPT_GREEN, user, host, TEST_PROMPT_RESET,
+                             TEST_PROMPT_BLUE, shown_directory,
+                             TEST_PROMPT_RESET, TEST_PROMPT_MUTED,
+                             TEST_PROMPT_RESET);
+    return written > 0 && written < TEST_PROMPT_CAP ? 0 : -1;
+}
+
+static int encode_shell_prompt(const char *prompt, shell_kind kind,
+                               char output[TEST_SHELL_PROMPT_CAP])
+{
+    size_t source = 0U;
+    size_t used = 0U;
+    size_t length;
+
+    if (prompt == NULL || output == NULL ||
+        (kind != SHELL_BASH && kind != SHELL_ZSH)) return -1;
+    length = strlen(prompt);
+    while (source < length) {
+        size_t sequence = test_sgr_length(
+            (const unsigned char *)prompt + source,
+            (const unsigned char *)prompt + length);
+        const char *begin = kind == SHELL_BASH ? "\\[" : "%{";
+        const char *end = kind == SHELL_BASH ? "\\]" : "%}";
+
+        if (sequence != 0U) {
+            if (used + sequence + 4U >= TEST_SHELL_PROMPT_CAP) return -1;
+            (void)memcpy(output + used, begin, 2U);
+            used += 2U;
+            (void)memcpy(output + used, prompt + source, sequence);
+            used += sequence;
+            (void)memcpy(output + used, end, 2U);
+            used += 2U;
+            source += sequence;
+        } else {
+            bool quote = (kind == SHELL_BASH && prompt[source] == '\\') ||
+                         (kind == SHELL_ZSH && prompt[source] == '%');
+
+            if (used + (quote ? 2U : 1U) >= TEST_SHELL_PROMPT_CAP) return -1;
+            output[used++] = prompt[source];
+            if (quote) output[used++] = prompt[source];
+            source++;
+        }
+    }
+    output[used] = '\0';
+    return 0;
+}
 
 static int close_inherited_descriptors(void)
 {
@@ -227,24 +376,235 @@ static const unsigned char *find_bytes(const unsigned char *haystack,
     return NULL;
 }
 
+typedef struct {
+    const unsigned char *begin;
+    const unsigned char *end;
+} output_match;
+
+static const unsigned char *consume_colored_prompt_text(
+    const unsigned char *cursor, const unsigned char *limit,
+    const char *style)
+{
+    static const char reset[] = "\033[0m";
+    size_t style_length;
+    size_t turn;
+
+    if (cursor == NULL || limit == NULL || style == NULL || cursor > limit)
+        return NULL;
+    style_length = strlen(style);
+    if ((size_t)(limit - cursor) < style_length ||
+        memcmp(cursor, style, style_length) != 0) return NULL;
+    cursor += style_length;
+    for (turn = 0U; turn < CAPTURE_CAP && cursor < limit; turn++) {
+        if ((size_t)(limit - cursor) >= sizeof(reset) - 1U &&
+            memcmp(cursor, reset, sizeof(reset) - 1U) == 0)
+            return cursor + sizeof(reset) - 1U;
+        cursor++;
+    }
+    return NULL;
+}
+
+static const unsigned char *consume_prompt_suffix(
+    const unsigned char *cursor, const unsigned char *limit, bool busy)
+{
+    static const char muted[] = "\033[38;5;245m";
+    static const char yellow[] = "\033[38;5;221m";
+    static const char reset[] = "\033[0m";
+
+    if (cursor == NULL || limit == NULL || cursor > limit ||
+        (size_t)(limit - cursor) < sizeof(muted) - 1U + 4U ||
+        memcmp(cursor, muted, sizeof(muted) - 1U) != 0) return NULL;
+    cursor += sizeof(muted) - 1U;
+    if (memcmp(cursor, "gsh", 3U) != 0) return NULL;
+    cursor += 3U;
+    if (busy) {
+        if ((size_t)(limit - cursor) < sizeof(yellow) ||
+            memcmp(cursor, yellow, sizeof(yellow) - 1U) != 0) return NULL;
+        cursor += sizeof(yellow) - 1U;
+        if (*cursor++ != '*') return NULL;
+    } else if (*cursor++ != '$') {
+        return NULL;
+    }
+    if ((size_t)(limit - cursor) < sizeof(reset) - 1U + 2U ||
+        memcmp(cursor, reset, sizeof(reset) - 1U) != 0) return NULL;
+    cursor += sizeof(reset) - 1U;
+    return cursor[0] == '>' && cursor[1] == ' ' ? cursor + 2U : NULL;
+}
+
+static const unsigned char *consume_prompt_alias(
+    const unsigned char *cursor, const unsigned char *limit, bool busy)
+{
+    static const char green[] = "\033[38;5;114m";
+    static const char blue[] = "\033[38;5;75m";
+    const unsigned char *suffix;
+
+    suffix = consume_prompt_suffix(cursor, limit, busy);
+    if (suffix != NULL) return suffix;
+    cursor = consume_colored_prompt_text(cursor, limit, green);
+    if (cursor == NULL || cursor >= limit || *cursor++ != ' ') return NULL;
+    cursor = consume_colored_prompt_text(cursor, limit, blue);
+    if (cursor == NULL || cursor >= limit || *cursor++ != ' ') return NULL;
+    return consume_prompt_suffix(cursor, limit, busy);
+}
+
+static size_t test_sgr_length(const unsigned char *text,
+                              const unsigned char *limit)
+{
+    size_t turn;
+
+    if (text == NULL || limit == NULL || text >= limit ||
+        (size_t)(limit - text) < 3U || text[0] != 0x1bU || text[1] != '[')
+        return 0U;
+    for (turn = 2U; turn < 64U && text + turn < limit; turn++) {
+        unsigned char byte = text[turn];
+
+        if (byte == 'm') return turn + 1U;
+        if (!((byte >= '0' && byte <= '9') || byte == ';')) return 0U;
+    }
+    return 0U;
+}
+
+static bool output_start_possible(unsigned char byte, const char *needle)
+{
+    if (needle == NULL || needle[0] == '\0') return false;
+    if (byte == (unsigned char)needle[0]) return true;
+    return byte == 0x1bU && strlen(needle) >= 5U &&
+           (memcmp(needle, "gsh$ ", 5U) == 0 ||
+            memcmp(needle, "gsh* ", 5U) == 0);
+}
+
+static output_match find_output(const unsigned char *haystack,
+                                size_t haystack_length,
+                                const char *needle)
+{
+    output_match match = {NULL, NULL};
+    size_t needle_length;
+    size_t start;
+
+    if (haystack == NULL || needle == NULL || strchr(needle, '\033') != NULL)
+        return match;
+    needle_length = strlen(needle);
+    if (needle_length == 0U || haystack_length > CAPTURE_CAP) return match;
+    for (start = 0U; start < haystack_length; start++) {
+        const unsigned char *cursor = haystack + start;
+        const unsigned char *limit = haystack + haystack_length;
+        size_t wanted = 0U;
+        size_t turn;
+
+        if (!output_start_possible(haystack[start], needle)) continue;
+        for (turn = 0U; turn < CAPTURE_CAP && wanted < needle_length; turn++) {
+            const unsigned char *prompt_end = NULL;
+            size_t sgr;
+
+            if (needle_length - wanted >= 5U &&
+                memcmp(needle + wanted, "gsh$ ", 5U) == 0)
+                prompt_end = consume_prompt_alias(cursor, limit, false);
+            else if (needle_length - wanted >= 5U &&
+                     memcmp(needle + wanted, "gsh* ", 5U) == 0)
+                prompt_end = consume_prompt_alias(cursor, limit, true);
+            if (prompt_end != NULL) {
+                cursor = prompt_end;
+                wanted += 5U;
+                continue;
+            }
+            sgr = test_sgr_length(cursor, limit);
+            if (sgr != 0U) { cursor += sgr; continue; }
+            if (cursor >= limit || *cursor++ != (unsigned char)needle[wanted++])
+                break;
+        }
+        if (wanted == needle_length) {
+            match.begin = haystack + start;
+            match.end = cursor;
+            if (strstr(needle, "gsh$ ") == NULL &&
+                strstr(needle, "gsh* ") == NULL) return match;
+        }
+    }
+    return match;
+}
+
+static output_match find_latest_canonical_prompt(
+    const unsigned char *haystack, size_t haystack_length, bool wanted_busy)
+{
+    output_match latest = {NULL, NULL};
+    bool latest_busy = false;
+    size_t offset;
+
+    if (haystack == NULL || haystack_length > CAPTURE_CAP) return latest;
+    for (offset = 0U; offset < haystack_length; offset++) {
+        const unsigned char *begin = haystack + offset;
+        const unsigned char *limit = haystack + haystack_length;
+        const unsigned char *end = consume_prompt_suffix(begin, limit, false);
+
+        if (end != NULL) {
+            latest.begin = begin;
+            latest.end = end;
+            latest_busy = false;
+        } else {
+            end = consume_prompt_suffix(begin, limit, true);
+            if (end != NULL) {
+                latest.begin = begin;
+                latest.end = end;
+                latest_busy = true;
+            }
+        }
+    }
+    if (latest.begin != NULL && latest_busy != wanted_busy) {
+        latest.begin = NULL;
+        latest.end = NULL;
+    }
+    return latest;
+}
+
+static output_match find_terminal_output(const unsigned char *haystack,
+                                         size_t haystack_length,
+                                         const char *needle)
+{
+    output_match match = {NULL, NULL};
+    const unsigned char *raw;
+
+    if (needle != NULL && strcmp(needle, "gsh$ ") == 0) {
+        match = find_latest_canonical_prompt(haystack, haystack_length, false);
+        if (match.begin != NULL) return match;
+        if (find_latest_canonical_prompt(haystack, haystack_length, true).begin !=
+            NULL) return match;
+    } else if (needle != NULL && strcmp(needle, "gsh* ") == 0) {
+        match = find_latest_canonical_prompt(haystack, haystack_length, true);
+        if (match.begin != NULL) return match;
+        if (find_latest_canonical_prompt(haystack, haystack_length, false).begin !=
+            NULL) return match;
+    }
+    raw = find_bytes(haystack, haystack_length, needle);
+
+    if (raw != NULL) {
+        match.begin = raw;
+        match.end = raw + strlen(needle);
+        return match;
+    }
+    return find_output(haystack, haystack_length, needle);
+}
+
 static bool capture_contains(const pty_session *session, const char *text)
 {
     if (session == NULL || text == NULL) {
         return false;
     }
-    return find_bytes(session->capture, session->capture_length, text) != NULL;
+    return find_terminal_output(session->capture, session->capture_length,
+                                text).begin != NULL;
 }
 
 static bool capture_ordered(const pty_session *session, const char *first,
                             const char *second)
 {
-    const unsigned char *first_at;
-    const unsigned char *second_at;
+    output_match first_at;
+    output_match second_at;
 
     if (session == NULL || first == NULL || second == NULL) return false;
-    first_at = find_bytes(session->capture, session->capture_length, first);
-    second_at = find_bytes(session->capture, session->capture_length, second);
-    return first_at != NULL && second_at != NULL && first_at < second_at;
+    first_at = find_terminal_output(session->capture,
+                                    session->capture_length, first);
+    second_at = find_terminal_output(session->capture,
+                                     session->capture_length, second);
+    return first_at.begin != NULL && second_at.begin != NULL &&
+           first_at.begin < second_at.begin;
 }
 
 static void dump_capture(const pty_session *session)
@@ -345,6 +705,9 @@ static void configure_child_environment(shell_kind kind)
     const char *history;
     const char *path = getenv("GSH_HARNESS_PATH");
     const char *repl;
+    char directory[PATH_MAX];
+    char prompt[TEST_PROMPT_CAP];
+    char shell_prompt[TEST_SHELL_PROMPT_CAP];
 
     if (!require(kind >= SHELL_GSH) || !require(kind <= SHELL_ZSH)) {
         return;
@@ -352,9 +715,21 @@ static void configure_child_environment(shell_kind kind)
     (void)setenv("PATH", path == NULL ? "/usr/bin:/bin" : path, 1);
     if (home != NULL) (void)setenv("HOME", home, 1);
     (void)setenv("TERM", "xterm-256color", 1);
-    (void)setenv("PS1", "gsh$ ", 1);
+    if (getcwd(directory, sizeof(directory)) != NULL &&
+        format_expected_prompt(directory, getenv("HOME"), false, prompt) == 0 &&
+        kind == SHELL_BASH &&
+        encode_shell_prompt(prompt, kind, shell_prompt) == 0)
+        (void)setenv("PS1", shell_prompt, 1);
+    else
+        (void)setenv("PS1", "gsh$ ", 1);
     (void)setenv("PS2", "GSH_MORE> ", 1);
-    (void)setenv("PROMPT", "gsh$ ", 1);
+    if (getcwd(directory, sizeof(directory)) != NULL &&
+        format_expected_prompt(directory, getenv("HOME"), false, prompt) == 0 &&
+        kind == SHELL_ZSH &&
+        encode_shell_prompt(prompt, kind, shell_prompt) == 0)
+        (void)setenv("PROMPT", shell_prompt, 1);
+    else
+        (void)setenv("PROMPT", "gsh$ ", 1);
     (void)setenv("RPROMPT", "", 1);
     (void)unsetenv("TERM_PROGRAM");
     (void)unsetenv("ITERM_SESSION_ID");
@@ -557,13 +932,14 @@ static int wait_for_output(pty_session *session, const char *marker,
 
     for (attempt = 0; attempt < PTY_WAIT_ATTEMPT_CAP; attempt++) {
         struct pollfd descriptor;
-        const unsigned char *found;
+        output_match found;
         uint64_t now;
         int remaining_ms;
         int result;
 
-        found = find_bytes(session->capture, session->capture_length, marker);
-        if (found != NULL) {
+        found = find_terminal_output(session->capture,
+                                     session->capture_length, marker);
+        if (found.begin != NULL) {
             return 0;
         }
         now = monotonic_ns();
@@ -612,14 +988,15 @@ static int wait_for_output(pty_session *session, const char *marker,
 static int consume_through(pty_session *session, const char *marker,
                            int timeout_ms)
 {
-    const unsigned char *found;
+    output_match found;
     size_t consumed;
 
     if (wait_for_output(session, marker, timeout_ms) == -1) {
         return -1;
     }
-    found = find_bytes(session->capture, session->capture_length, marker);
-    consumed = (size_t)(found - session->capture) + strlen(marker);
+    found = find_terminal_output(session->capture, session->capture_length,
+                                 marker);
+    consumed = (size_t)(found.end - session->capture);
     (void)memmove(session->capture, session->capture + consumed,
             session->capture_length - consumed);
     session->capture_length -= consumed;
@@ -950,6 +1327,45 @@ static int write_text_file(const char *path, const char *text, mode_t mode)
         status = -1;
     }
     return status;
+}
+
+static int start_managed_actions_session(pty_session *session,
+                                         const char *executable,
+                                         const char *directory)
+{
+    static const char configuration[] =
+        "config.version = 1\n"
+        "shell.history.enabled = false\n"
+        "terminal.actions = on\n";
+    char path[PATH_MAX];
+    int result;
+
+    if (!require(session != NULL) || !require(executable != NULL) ||
+        !require(directory != NULL) || !require(directory[0] == '/'))
+        return -1;
+    if (snprintf(path, sizeof(path), "%s/.gshrc", directory) >=
+            (int)sizeof(path) ||
+        write_text_file(path, configuration, 0600) == -1) return -1;
+    if (setenv("GSH_HARNESS_HOME", directory, 1) == -1 ||
+        setenv("GSH_HARNESS_HISTORY", "1", 1) == -1) {
+        (void)unlink(path);
+        return -1;
+    }
+    result = start_managed_session(session, executable, directory);
+    (void)unsetenv("GSH_HARNESS_HOME");
+    (void)unsetenv("GSH_HARNESS_HISTORY");
+    if (result == -1) (void)unlink(path);
+    return result;
+}
+
+static void remove_managed_actions_config(const char *directory)
+{
+    char path[PATH_MAX];
+
+    if (!require(directory != NULL)) return;
+    if (!require(directory[0] == '/')) return;
+    if (snprintf(path, sizeof(path), "%s/.gshrc", directory) <
+        (int)sizeof(path)) (void)unlink(path);
 }
 
 static int write_binary_file(const char *path, const unsigned char *bytes,
@@ -1349,7 +1765,29 @@ static int history_flow(const char *executable)
     return failed;
 }
 
-static int exercise_editor_navigation(pty_session *session)
+static int exercise_completion_menu(pty_session *session)
+{
+    if (session == NULL ||
+        send_text(session, "cd ") == -1 ||
+        send_bytes(session, "\t", 1U) == -1 ||
+        consume_through(session, "completion-dir/", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(session, "cycle-alpha/", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(session, "cycle-beta\\ space/",
+                        TEST_TIMEOUT_MS) == -1 ||
+        send_bytes(session, "\t", 1U) == -1 ||
+        consume_through(session, "\033[7mcompletion-dir/\033[0m",
+                        TEST_TIMEOUT_MS) == -1 ||
+        send_bytes(session, "\t", 1U) == -1 ||
+        consume_through(session, "\033[7mcycle-alpha/\033[0m",
+                        TEST_TIMEOUT_MS) == -1 ||
+        send_bytes(session, "\025", 1U) == -1 ||
+        consume_through(session, "gsh$ ", TEST_TIMEOUT_MS) == -1)
+        return -1;
+    return 0;
+}
+
+static int exercise_editor_navigation(pty_session *session,
+                                      bool extended_completion)
 {
     static const char paste[] =
         "\033[200~value=ONE\nvalue=\"${value}_TWO\"\n"
@@ -1417,53 +1855,36 @@ static int exercise_editor_navigation(pty_session *session)
         consume_through(session, "cd ~/", TEST_TIMEOUT_MS) == -1 ||
         send_bytes(session, "\025", 1U) == -1 ||
         consume_through(session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
-        send_text(session, "cd ") == -1 ||
-        send_bytes(session, "\t", 1U) == -1 ||
-        consume_through(session, "completion-dir/", TEST_TIMEOUT_MS) == -1 ||
-        consume_through(session, "cycle-alpha/", TEST_TIMEOUT_MS) == -1 ||
-        consume_through(session, "cycle-beta\\ space/",
-                        TEST_TIMEOUT_MS) == -1 ||
-        send_bytes(session, "\t", 1U) == -1 ||
-        consume_through(session, "cd completion-dir/",
-                        TEST_TIMEOUT_MS) == -1 ||
-        consume_through(session, "\033[7mcompletion-dir/\033[0m",
-                        TEST_TIMEOUT_MS) == -1 ||
-        send_bytes(session, "\t", 1U) == -1 ||
-        consume_through(session, "cd cycle-alpha/", TEST_TIMEOUT_MS) == -1 ||
-        consume_through(session, "\033[7mcycle-alpha/\033[0m",
-                        TEST_TIMEOUT_MS) == -1 ||
-        send_bytes(session, "\t", 1U) == -1 ||
-        consume_through(session, "cd cycle-beta\\ space/",
-                        TEST_TIMEOUT_MS) == -1 ||
-        consume_through(session, "\033[7mcycle-beta\\ space/\033[0m",
-                        TEST_TIMEOUT_MS) == -1 ||
-        send_bytes(session, "\025", 1U) == -1 ||
-        consume_through(session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
-        send_text(session, "echo $PA") == -1 ||
-        send_bytes(session, "\t", 1U) == -1 ||
-        consume_through(session, "$PAGER", TEST_TIMEOUT_MS) == -1 ||
-        consume_through(session, "$PATH", TEST_TIMEOUT_MS) == -1 ||
-        send_bytes(session, "\t", 1U) == -1 ||
-        consume_through(session, "echo $PAGER", TEST_TIMEOUT_MS) == -1 ||
-        send_bytes(session, "\t", 1U) == -1 ||
-        consume_through(session, "echo $PATH", TEST_TIMEOUT_MS) == -1 ||
-        send_bytes(session, "\025", 1U) == -1 ||
-        consume_through(session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
-        send_text(session, "git sta") == -1 ||
-        send_bytes(session, "\t", 1U) == -1 ||
-        consume_through(session, "stash", TEST_TIMEOUT_MS) == -1 ||
-        consume_through(session, "status", TEST_TIMEOUT_MS) == -1 ||
-        send_bytes(session, "\t", 1U) == -1 ||
-        consume_through(session, "git stash ", TEST_TIMEOUT_MS) == -1 ||
-        send_bytes(session, "\t", 1U) == -1 ||
-        consume_through(session, "git status ", TEST_TIMEOUT_MS) == -1 ||
-        send_bytes(session, "\025", 1U) == -1 ||
-        consume_through(session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
-        send_text(session, "ls -A") == -1 ||
-        send_bytes(session, "\t", 1U) == -1 ||
-        consume_through(session, "ls -A ", TEST_TIMEOUT_MS) == -1 ||
-        send_bytes(session, "\025", 1U) == -1 ||
+        send_text(session, ":\r") == -1 ||
         consume_through(session, "gsh$ ", TEST_TIMEOUT_MS) == -1) {
+        return -1;
+    }
+    if (extended_completion &&
+        (send_text(session, "echo $PA") == -1 ||
+         send_bytes(session, "\t", 1U) == -1 ||
+         consume_through(session, "$PAGER", TEST_TIMEOUT_MS) == -1 ||
+         consume_through(session, "$PATH", TEST_TIMEOUT_MS) == -1 ||
+         send_bytes(session, "\t", 1U) == -1 ||
+         consume_through(session, "echo $PAGER", TEST_TIMEOUT_MS) == -1 ||
+         send_bytes(session, "\t", 1U) == -1 ||
+         consume_through(session, "echo $PATH", TEST_TIMEOUT_MS) == -1 ||
+         send_bytes(session, "\025", 1U) == -1 ||
+         consume_through(session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
+         send_text(session, "git sta") == -1 ||
+         send_bytes(session, "\t", 1U) == -1 ||
+         consume_through(session, "stash", TEST_TIMEOUT_MS) == -1 ||
+         consume_through(session, "status", TEST_TIMEOUT_MS) == -1 ||
+         send_bytes(session, "\t", 1U) == -1 ||
+         consume_through(session, "git stash ", TEST_TIMEOUT_MS) == -1 ||
+         send_bytes(session, "\t", 1U) == -1 ||
+         consume_through(session, "git status ", TEST_TIMEOUT_MS) == -1 ||
+         send_bytes(session, "\025", 1U) == -1 ||
+         consume_through(session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
+         send_text(session, "ls -A") == -1 ||
+         send_bytes(session, "\t", 1U) == -1 ||
+         consume_through(session, "ls -A ", TEST_TIMEOUT_MS) == -1 ||
+         send_bytes(session, "\025", 1U) == -1 ||
+         consume_through(session, "gsh$ ", TEST_TIMEOUT_MS) == -1)) {
         return -1;
     }
     session->capture_length = 0U;
@@ -1542,7 +1963,8 @@ static int editor_navigation_flow(const char *executable)
         return 1;
     }
     if (start_session(&session, executable, fixture, SHELL_GSH) == -1 ||
-        exercise_editor_navigation(&session) == -1) {
+        exercise_editor_navigation(&session, true) == -1 ||
+        exercise_completion_menu(&session) == -1) {
         perror("pty editor: classic flow");
         dump_capture(&session);
         failed = 1;
@@ -1550,7 +1972,7 @@ static int editor_navigation_flow(const char *executable)
     if (session.master >= 0 && stop_session(&session) == -1) failed = 1;
     if (!failed &&
         (start_managed_session(&session, executable, fixture) == -1 ||
-         exercise_editor_navigation(&session) == -1)) {
+         exercise_editor_navigation(&session, false) == -1)) {
         perror("pty editor: managed flow");
         dump_capture(&session);
         failed = 1;
@@ -1558,6 +1980,131 @@ static int editor_navigation_flow(const char *executable)
     if (session.master >= 0 && stop_session(&session) == -1) failed = 1;
     remove_editor_fixture(fixture, completion, amber_one, amber_two,
                           completion_directory, cycle_alpha, cycle_beta);
+    return failed;
+}
+
+static void remove_prompt_fixture(const char *root, const char *home,
+                                  const char *child, const char *sibling)
+{
+    if (child != NULL) (void)rmdir(child);
+    if (sibling != NULL) (void)rmdir(sibling);
+    if (home != NULL) (void)rmdir(home);
+    if (root != NULL) (void)rmdir(root);
+}
+
+static int exercise_prompt_directories(pty_session *session,
+                                       const char *home, const char *child,
+                                       const char *sibling, bool managed)
+{
+    char home_prompt[TEST_PROMPT_CAP];
+    char child_prompt[TEST_PROMPT_CAP];
+    char sibling_prompt[TEST_PROMPT_CAP];
+    char command[PATH_MAX + 8U];
+
+    if (session == NULL || home == NULL || child == NULL || sibling == NULL ||
+        format_expected_prompt(home, home, false, home_prompt) == -1 ||
+        format_expected_prompt(child, home, false, child_prompt) == -1 ||
+        format_expected_prompt(sibling, home, false, sibling_prompt) == -1 ||
+        wait_for_output(session, home_prompt, TEST_TIMEOUT_MS) == -1)
+        return -1;
+    session->capture_length = 0U;
+    if (snprintf(command, sizeof(command), "cd %s\r", child) >=
+            (int)sizeof(command) ||
+        send_text(session, command) == -1 ||
+        wait_for_output(session, child_prompt, TEST_TIMEOUT_MS) == -1 ||
+        (managed && !capture_ordered(session, home_prompt, child_prompt)))
+        return -1;
+    if (snprintf(command, sizeof(command), "cd %s\r", sibling) >=
+            (int)sizeof(command) ||
+        send_text(session, command) == -1 ||
+        wait_for_output(session, sibling_prompt, TEST_TIMEOUT_MS) == -1 ||
+        snprintf(command, sizeof(command), "cd %s\r", home) >=
+            (int)sizeof(command) ||
+        send_text(session, command) == -1 ||
+        wait_for_output(session, home_prompt, TEST_TIMEOUT_MS) == -1)
+        return -1;
+    return 0;
+}
+
+static int exercise_managed_prompt_state(pty_session *session,
+                                         const char *home)
+{
+    static const char command[] =
+        "/bin/sh -c 'sleep .3; printf PROMPT_CONTRACT_DONE'\r";
+    char settled[TEST_PROMPT_CAP];
+    char busy[TEST_PROMPT_CAP];
+
+    if (session == NULL || home == NULL ||
+        format_expected_prompt(home, home, false, settled) == -1 ||
+        format_expected_prompt(home, home, true, busy) == -1) return -1;
+    session->capture_length = 0U;
+    if (send_text(session, command) == -1 ||
+        wait_for_output(session, "gsh* ", TEST_TIMEOUT_MS) == -1 ||
+        !capture_contains(session, busy) ||
+        wait_for_output(session, "PROMPT_CONTRACT_DONE",
+                        TEST_TIMEOUT_MS) == -1 ||
+        wait_for_output(session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
+        !capture_contains(session, settled)) return -1;
+    return 0;
+}
+
+static int prompt_mode_flow(const char *executable, const char *home,
+                            const char *child, const char *sibling,
+                            bool managed)
+{
+    pty_session session;
+    int failed;
+
+    (void)memset(&session, 0, sizeof(session));
+    session.master = -1;
+    if (setenv("GSH_HARNESS_HOME", home, 1) == -1) return -1;
+    failed = managed
+                 ? start_managed_session(&session, executable, home)
+                 : start_session(&session, executable, home, SHELL_GSH);
+    (void)unsetenv("GSH_HARNESS_HOME");
+    if (failed == -1) return -1;
+    if (managed && resize_session(&session, 24U, 512U) == -1) {
+        (void)stop_session(&session);
+        return -1;
+    }
+    failed = exercise_prompt_directories(&session, home, child, sibling,
+                                         managed);
+    if (!failed && managed)
+        failed = exercise_managed_prompt_state(&session, home);
+    if (failed) {
+        perror(managed ? "pty prompt: managed" : "pty prompt: classic");
+        dump_capture(&session);
+    }
+    if (stop_session(&session) == -1) failed = -1;
+    return failed;
+}
+
+static int prompt_contract_flow(const char *executable)
+{
+    char fixture[] = "/tmp/gsh-pty-prompt-XXXXXX";
+    char root[PATH_MAX] = {0};
+    char home[PATH_MAX] = {0};
+    char child[PATH_MAX] = {0};
+    char sibling[PATH_MAX] = {0};
+    int failed = 0;
+
+    if (executable == NULL || mkdtemp(fixture) == NULL ||
+        realpath(fixture, root) == NULL ||
+        snprintf(home, sizeof(home), "%s/home", root) >= (int)sizeof(home) ||
+        snprintf(child, sizeof(child), "%s/child", home) >=
+            (int)sizeof(child) ||
+        snprintf(sibling, sizeof(sibling), "%s/home-other", root) >=
+            (int)sizeof(sibling) ||
+        mkdir(home, 0700) == -1 || mkdir(child, 0700) == -1 ||
+        mkdir(sibling, 0700) == -1) {
+        remove_prompt_fixture(root[0] == '\0' ? fixture : root,
+                              home, child, sibling);
+        return 1;
+    }
+    if (prompt_mode_flow(executable, home, child, sibling, false) == -1 ||
+        prompt_mode_flow(executable, home, child, sibling, true) == -1)
+        failed = 1;
+    remove_prompt_fixture(root, home, child, sibling);
     return failed;
 }
 
@@ -2076,9 +2623,7 @@ static int managed_repl_concurrency(pty_session *session)
     uint64_t start;
 
     if (send_text(session, "/bin/sleep 1\r") == -1 ||
-        consume_through(session,
-                        "/bin/sleep 1\r\ngsh* ",
-                        TEST_TIMEOUT_MS) == -1) {
+        consume_through(session, "gsh* ", TEST_TIMEOUT_MS) == -1) {
         return -1;
     }
     start = monotonic_ns();
@@ -2154,10 +2699,9 @@ static int managed_repl_compound_overtake(pty_session *session)
         "echo \"TICK $GSH_ASYNC_I\"; done\r";
     uint64_t start;
 
-    if (send_text(session, loop) == -1 ||
-        consume_through(session,
-                        "done\r\ngsh* ",
-                        TEST_TIMEOUT_MS) == -1) {
+    if (resize_session(session, 24U, 200U) == -1 ||
+        send_text(session, loop) == -1 ||
+        consume_through(session, "gsh* ", TEST_TIMEOUT_MS) == -1) {
         return -1;
     }
     start = monotonic_ns();
@@ -2166,7 +2710,8 @@ static int managed_repl_compound_overtake(pty_session *session)
                         "/usr/bin/printf COMPOUND_FAST\r\nCOMPOUND_FAST",
                         TEST_TIMEOUT_MS) == -1 ||
         monotonic_ns() - start >= 800000000ULL ||
-        consume_through(session, "TICK 1", TEST_TIMEOUT_MS) == -1) {
+        consume_through(session, "TICK 1", TEST_TIMEOUT_MS) == -1 ||
+        resize_session(session, 24U, 80U) == -1) {
         errno = ETIMEDOUT;
         return -1;
     }
@@ -2179,15 +2724,16 @@ static int managed_repl_launch_state_fence(pty_session *session)
         "for GSH_ASYNC_J in 1; do /bin/sleep 1; cd .; done\r";
     uint64_t start;
 
+    if (session == NULL) return -1;
+    session->capture_length = 0U;
     if (send_text(session, loop) == -1 ||
-        consume_through(session,
-                        "done\r\ngsh* ",
-                        TEST_TIMEOUT_MS) == -1) {
+        consume_through(session, "gsh* ", TEST_TIMEOUT_MS) == -1) {
         return -1;
     }
     start = monotonic_ns();
-    if (send_text(session, "/bin/pwd\r") == -1 ||
-        consume_through(session, "gsh-pty-managed-", TEST_TIMEOUT_MS) == -1 ||
+    if (send_text(session, "/usr/bin/basename \"$PWD\"\r") == -1 ||
+        consume_through(session, "\r\ngsh-pty-managed-",
+                        JOB_TRANSITION_TIMEOUT_MS) == -1 ||
         monotonic_ns() - start < 700000000ULL) {
         errno = ETIMEDOUT;
         return -1;
@@ -2197,13 +2743,14 @@ static int managed_repl_launch_state_fence(pty_session *session)
 
 static int managed_repl_native_resources(pty_session *session)
 {
-    static const char styled[] =
-        "\033[4;38;5;81mname with space.py\033[0m";
+    static const char filename[] = "name with space.py";
+    static const char mouse_capture[] = "\033[?1000h";
     if (session == NULL) return -1;
     session->capture_length = 0U;
     if (send_text(session, "ls -1\r") == -1 ||
-        wait_for_output(session, styled, TEST_TIMEOUT_MS) == -1 ||
-        wait_for_output(session, "gsh$ ", TEST_TIMEOUT_MS) == -1) return -1;
+        wait_for_output(session, filename, TEST_TIMEOUT_MS) == -1 ||
+        wait_for_output(session, "gsh$", TEST_TIMEOUT_MS) == -1 ||
+        capture_contains(session, mouse_capture)) return -1;
     return 0;
 }
 
@@ -2223,6 +2770,8 @@ static void cleanup_resource_action_fixture(resource_action_fixture *fixture)
     if (fixture->second[0] != '\0') (void)unlink(fixture->second);
     if (fixture->editor[0] != '\0') (void)unlink(fixture->editor);
     if (fixture->tools[0] != '\0') (void)rmdir(fixture->tools);
+    if (fixture->directory[0] != '\0')
+        remove_managed_actions_config(fixture->directory);
     if (fixture->directory[0] != '\0') (void)rmdir(fixture->directory);
 }
 
@@ -2254,8 +2803,8 @@ static int setup_resource_action_fixture(resource_action_fixture *fixture,
         snprintf(test_path, sizeof(test_path), "%s:/usr/bin:/bin",
                  fixture->tools) >= (int)sizeof(test_path) ||
         setenv("GSH_HARNESS_PATH", test_path, 1) == -1 ||
-        start_managed_session(&fixture->session, executable,
-                              fixture->directory) == -1) {
+        start_managed_actions_session(&fixture->session, executable,
+                                      fixture->directory) == -1) {
         (void)unsetenv("GSH_HARNESS_PATH");
         return -1;
     }
@@ -2268,7 +2817,7 @@ static int open_and_replace_resource_preview(pty_session *session, int *stage)
     static const char styled[] =
         "\033[4;38;5;81mname with space.py\033[0m";
     static const char click[] = "\033[<0;2;2M";
-    static const char replacement_click[] = "\033[<0;2;3M";
+    static const char replacement_click[] = "\033[<0;2;4M";
     static const char split_origin[] = "\033[1;50H";
     if (session == NULL || stage == NULL) return -1;
     if (resize_session(session, 24U, 110U) == -1 ||
@@ -2373,8 +2922,8 @@ static int managed_directory_action_flow(const char *executable)
     static const char nested_back_styled[] =
         "\033[4;38;5;75m<-  \033[0m";
     static const char first_click[] = "\033[<0;2;3M";
-    static const char second_click[] = "\033[<0;2;6M";
-    static const char back_click[] = "\033[<0;2;8M";
+    static const char second_click[] = "\033[<0;2;7M";
+    static const char back_click[] = "\033[<0;2;10M";
     char fixture[] = "/tmp/gsh-directory-action-XXXXXX";
     char child[PATH_MAX] = {0};
     char nested[PATH_MAX] = {0};
@@ -2401,7 +2950,7 @@ static int managed_directory_action_flow(const char *executable)
                  "/usr/bin/touch committed && "
                  "/usr/bin/printf '%%s%%s\\n' GSH_DIRECTORY_ACTION_ OK\r",
                  canonical, canonical) >= (int)sizeof(probe) ||
-        start_managed_session(&session, executable, fixture) == -1) {
+        start_managed_actions_session(&session, executable, fixture) == -1) {
         perror("pty directory action: setup");
         if (nested[0] != '\0') (void)rmdir(nested);
         if (child[0] != '\0') (void)rmdir(child);
@@ -2420,8 +2969,8 @@ static int managed_directory_action_flow(const char *executable)
         wait_for_output(&session, nested_back_styled,
                         TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, back_click) == -1 ||
-        wait_for_output(&session, "/child' && ll",
-                        TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh* ", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, probe) == -1 ||
         wait_for_output(&session, "GSH_DIRECTORY_ACTION_OK",
                         TEST_TIMEOUT_MS) == -1) {
@@ -2432,6 +2981,7 @@ static int managed_directory_action_flow(const char *executable)
     if (stop_session(&session) == -1 || access(committed, F_OK) == -1)
         failed = 1;
     (void)unlink(committed);
+    remove_managed_actions_config(fixture);
     (void)rmdir(nested);
     (void)rmdir(child);
     (void)rmdir(fixture);
@@ -2444,8 +2994,9 @@ static int managed_scroll_flow(const char *executable)
         "/usr/bin/printf 'SCROLL_01\\nSCROLL_02\\nSCROLL_03\\n"
         "SCROLL_04\\nSCROLL_05\\nSCROLL_06\\nSCROLL_07\\n"
         "SCROLL_08\\nSCROLL_09\\nSCROLL_10\\n'\r";
-    static const char wheel_up[] = "\033[<64;1;1M";
-    static const char wheel_down[] = "\033[<65;1;1M";
+    static const char page_up[] = "\033[5~";
+    static const char page_down[] = "\033[6~";
+    static const char mouse_capture[] = "\033[?1000h";
     char fixture[] = "/tmp/gsh-scroll-action-XXXXXX";
     pty_session session;
     int failed = 0;
@@ -2459,17 +3010,18 @@ static int managed_scroll_flow(const char *executable)
     if (resize_session(&session, 6U, 80U) == -1 ||
         consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, output) == -1 ||
-        wait_for_output(&session, "SCROLL_10", TEST_TIMEOUT_MS) == -1) {
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
+        capture_contains(&session, mouse_capture)) {
         failed = 1;
     }
     session.capture_length = 0U;
     if (!failed &&
-        (send_text(&session, wheel_up) == -1 ||
-         wait_for_output(&session, "SCROLL_03", TEST_TIMEOUT_MS) == -1 ||
-         capture_contains(&session, "SCROLL_10"))) failed = 1;
+        (send_text(&session, page_up) == -1 ||
+         wait_for_output(&session, "SCROLL_03", TEST_TIMEOUT_MS) == -1))
+        failed = 1;
     session.capture_length = 0U;
     if (!failed &&
-        (send_text(&session, wheel_down) == -1 ||
+        (send_text(&session, page_down) == -1 ||
          wait_for_output(&session, "SCROLL_10", TEST_TIMEOUT_MS) == -1))
         failed = 1;
     if (failed) {
@@ -2485,7 +3037,7 @@ static int managed_detected_action_flow(const char *executable)
 {
     static const char styled[] =
         "\033[4;38;5;81m./detected.py\033[0m:2:3";
-    static const char click[] = "\033[<0;2;2M";
+    static const char click[] = "\033[<0;2;3M";
     char fixture[] = "/tmp/gsh-detected-action-XXXXXX";
     char path[PATH_MAX] = {0};
     pty_session session;
@@ -2495,7 +3047,7 @@ static int managed_detected_action_flow(const char *executable)
         snprintf(path, sizeof(path), "%s/detected.py", fixture) >=
             (int)sizeof(path) ||
         write_text_file(path, "first\nprint('detected')", 0600) == -1 ||
-        start_managed_session(&session, executable, fixture) == -1) {
+        start_managed_actions_session(&session, executable, fixture) == -1) {
         perror("pty detected action: setup");
         if (path[0] != '\0') (void)unlink(path);
         (void)rmdir(fixture);
@@ -2524,6 +3076,7 @@ static int managed_detected_action_flow(const char *executable)
     }
     if (stop_session(&session) == -1) failed = 1;
     (void)unlink(path);
+    remove_managed_actions_config(fixture);
     (void)rmdir(fixture);
     return failed;
 }
@@ -2615,7 +3168,7 @@ static int managed_markdown_preview_flow(const char *executable)
         write_binary_file(pdf_path, pdf, sizeof(pdf), 0600) == -1 ||
         write_binary_file(image_path, png, sizeof(png), 0600) == -1 ||
         setenv("GSH_HARNESS_TERM_FEATURES", "F", 1) == -1 ||
-        start_managed_session(&session, executable, fixture) == -1) {
+        start_managed_actions_session(&session, executable, fixture) == -1) {
         perror("pty markdown preview: setup");
         failed = 1;
     }
@@ -2636,6 +3189,7 @@ static int managed_markdown_preview_flow(const char *executable)
     if (markdown_path[0] != '\0') (void)unlink(markdown_path);
     if (pdf_path[0] != '\0') (void)unlink(pdf_path);
     if (image_path[0] != '\0') (void)unlink(image_path);
+    remove_managed_actions_config(fixture);
     (void)rmdir(fixture);
     return failed;
 }
@@ -2645,6 +3199,7 @@ static int managed_image_probe_flow(const char *executable)
     static const char configuration[] =
         "config.version = 1\n"
         "shell.history.enabled = false\n"
+        "terminal.actions = on\n"
         "terminal.images = on\n";
     static const char markdown[] = "![probe](probe.png)\n";
     static const unsigned char png[] = {
@@ -2698,15 +3253,15 @@ static int managed_image_probe_flow(const char *executable)
 
 static int managed_repl_preserves_edit(pty_session *session)
 {
-    if (send_text(session,
+    if (resize_session(session, 24U, 200U) == -1 ||
+        send_text(session,
                   "/bin/sh -c 'sleep 0.2; printf LATE'\r") == -1 ||
-        consume_through(session,
-                        "printf LATE'\r\ngsh* ",
-                        TEST_TIMEOUT_MS) == -1 ||
+        consume_through(session, "gsh* ", TEST_TIMEOUT_MS) == -1 ||
         send_text(session, "PRESERVED") == -1 ||
         consume_through(session, "LATE", TEST_TIMEOUT_MS) == -1 ||
         consume_through(session, "gsh$ PRESERVED", TEST_TIMEOUT_MS) == -1 ||
-        send_bytes(session, "\025", 1) == -1) {
+        send_bytes(session, "\025", 1) == -1 ||
+        resize_session(session, 24U, 80U) == -1) {
         return -1;
     }
     return 0;
@@ -2718,9 +3273,7 @@ static int managed_repl_focus(pty_session *session)
         consume_through(session, "\r\n1\r\n2\r\n3\r\n4\r\n5\r\n6",
                         TEST_TIMEOUT_MS) == -1 ||
         send_text(session, "/bin/cat\r") == -1 ||
-        consume_through(session,
-                        "/bin/cat\r\ngsh* ",
-                        TEST_TIMEOUT_MS) == -1 ||
+        consume_through(session, "gsh* ", TEST_TIMEOUT_MS) == -1 ||
         send_text(session, "fg\r") == -1 ||
         consume_through(session, "[focused cell ", TEST_TIMEOUT_MS) == -1 ||
         send_text(session, "BEFORE_STOP\r") == -1 ||
@@ -2756,9 +3309,7 @@ static int managed_repl_private_input_autofocus(pty_session *session)
 
     session->capture_length = 0;
     if (send_text(session, command) == -1 ||
-        consume_through(session,
-                        "\r\ngsh* ",
-                        TEST_TIMEOUT_MS) == -1 ||
+        consume_through(session, "gsh* ", TEST_TIMEOUT_MS) == -1 ||
         send_text(session, "PRESERVED") == -1 ||
         wait_for_output(session, "\r\nPRIVATE_INPUT\r\n",
                         TEST_TIMEOUT_MS) == -1 ||
@@ -2826,12 +3377,11 @@ static int managed_repl_pipeline(pty_session *session)
 {
     uint64_t start;
 
-    if (send_text(session,
+    if (resize_session(session, 24U, 200U) == -1 ||
+        send_text(session,
                   "/bin/sh -c 'sleep 1; printf PIPE_SLOW' | /bin/cat\r") ==
             -1 ||
-        consume_through(session,
-                        "| /bin/cat\r\ngsh* ",
-                        TEST_TIMEOUT_MS) == -1) {
+        consume_through(session, "gsh* ", TEST_TIMEOUT_MS) == -1) {
         return -1;
     }
     start = monotonic_ns();
@@ -2839,7 +3389,8 @@ static int managed_repl_pipeline(pty_session *session)
         consume_through(session, "/usr/bin/printf PIPE_FAST\r\nPIPE_FAST",
                         TEST_TIMEOUT_MS) == -1 ||
         monotonic_ns() - start >= 800000000ULL ||
-        consume_through(session, "PIPE_SLOW", TEST_TIMEOUT_MS) == -1) {
+        consume_through(session, "PIPE_SLOW", TEST_TIMEOUT_MS) == -1 ||
+        resize_session(session, 24U, 80U) == -1) {
         errno = ETIMEDOUT;
         return -1;
     }
@@ -3018,6 +3569,53 @@ static int managed_repl_toggle(pty_session *session)
     return 0;
 }
 
+static int managed_repl_step_failed(const char *name)
+{
+    if (name == NULL) return -1;
+    (void)fprintf(stderr, "pty managed step: %s\n", name);
+    return -1;
+}
+
+static int run_managed_repl_steps(pty_session *session)
+{
+    if (session == NULL) return -1;
+    if (managed_repl_native_resources(session) == -1)
+        return managed_repl_step_failed("native resources");
+    if (managed_repl_prompt_state(session) == -1)
+        return managed_repl_step_failed("prompt state");
+    if (managed_repl_terminal_outcomes(session) == -1)
+        return managed_repl_step_failed("terminal outcomes");
+    if (managed_repl_concurrency(session) == -1)
+        return managed_repl_step_failed("concurrency");
+    if (managed_repl_compound_overtake(session) == -1)
+        return managed_repl_step_failed("compound overtake");
+    if (managed_repl_launch_state_fence(session) == -1)
+        return managed_repl_step_failed("launch state fence");
+    if (managed_repl_preserves_edit(session) == -1)
+        return managed_repl_step_failed("preserved edit");
+    if (managed_repl_private_input_autofocus(session) == -1)
+        return managed_repl_step_failed("private input");
+    if (managed_repl_fullscreen_focus(session) == -1)
+        return managed_repl_step_failed("fullscreen");
+    if (managed_repl_focus(session) == -1)
+        return managed_repl_step_failed("focus");
+    if (managed_repl_pipeline(session) == -1)
+        return managed_repl_step_failed("pipeline");
+    if (managed_repl_ordering(session) == -1)
+        return managed_repl_step_failed("ordering");
+    if (managed_repl_contains_output(session) == -1)
+        return managed_repl_step_failed("contained output");
+    if (managed_repl_rewrites_progress(session) == -1)
+        return managed_repl_step_failed("progress rewrite");
+    if (managed_repl_resize(session) == -1)
+        return managed_repl_step_failed("resize");
+    if (managed_repl_toggle(session) == -1)
+        return managed_repl_step_failed("toggle");
+    if (managed_repl_saturation(session) == -1)
+        return managed_repl_step_failed("saturation");
+    return 0;
+}
+
 static int managed_async_repl_flow(const char *executable)
 {
     char fixture[] = "/tmp/gsh-pty-managed-XXXXXX";
@@ -3034,25 +3632,8 @@ static int managed_async_repl_flow(const char *executable)
         (void)rmdir(fixture);
         return 1;
     }
-    if (consume_through(&session, "gsh$ ",
-                        TEST_TIMEOUT_MS) == -1 ||
-        managed_repl_native_resources(&session) == -1 ||
-        managed_repl_prompt_state(&session) == -1 ||
-        managed_repl_terminal_outcomes(&session) == -1 ||
-        managed_repl_concurrency(&session) == -1 ||
-        managed_repl_compound_overtake(&session) == -1 ||
-        managed_repl_launch_state_fence(&session) == -1 ||
-        managed_repl_preserves_edit(&session) == -1 ||
-        managed_repl_private_input_autofocus(&session) == -1 ||
-        managed_repl_fullscreen_focus(&session) == -1 ||
-        managed_repl_focus(&session) == -1 ||
-        managed_repl_pipeline(&session) == -1 ||
-        managed_repl_ordering(&session) == -1 ||
-        managed_repl_contains_output(&session) == -1 ||
-        managed_repl_rewrites_progress(&session) == -1 ||
-        managed_repl_resize(&session) == -1 ||
-        managed_repl_toggle(&session) == -1 ||
-        managed_repl_saturation(&session) == -1) {
+    if (consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
+        run_managed_repl_steps(&session) == -1) {
         perror("pty managed: flow");
         dump_capture(&session);
         failed = 1;
@@ -3072,6 +3653,47 @@ static int managed_async_repl_flow(const char *executable)
         }
     }
     (void)unlink(resource_path);
+    (void)rmdir(fixture);
+    return failed;
+}
+
+static int managed_caret_flow(const char *executable)
+{
+    static const char mark[] = "\342\227\217";
+    char fixture[] = "/tmp/gsh-pty-caret-XXXXXX";
+    pty_session session = {0};
+    uint64_t start;
+    uint64_t elapsed;
+    int failed = 0;
+
+    if (executable == NULL || mkdtemp(fixture) == NULL ||
+        start_managed_session(&session, executable, fixture) == -1 ||
+        consume_through(&session, mark, TEST_TIMEOUT_MS) == -1) {
+        perror("pty caret: setup");
+        failed = 1;
+    }
+    start = monotonic_ns();
+    if (!failed && wait_for_output(&session, mark, 1600) == -1) failed = 1;
+    elapsed = monotonic_ns() - start;
+    if (!failed && (elapsed < 700000000ULL || elapsed > 1500000000ULL))
+        failed = 1;
+    session.capture_length = 0U;
+    if (!failed &&
+        (send_text(&session, "abc") == -1 ||
+         wait_for_output(&session, "abc", TEST_TIMEOUT_MS) == -1 ||
+         wait_for_output(&session, mark, TEST_TIMEOUT_MS) == -1 ||
+         !capture_contains(&session, "\033[?25l") ||
+         send_bytes(&session, "\025", 1U) == -1 ||
+         consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1))
+        failed = 1;
+    if (!failed) {
+        session.capture_length = 0U;
+        if (send_text(&session, "exit 0\r") == -1 ||
+            wait_session_exit(&session, 0, TEST_TIMEOUT_MS) == -1 ||
+            !capture_contains(&session, "\033[?25h")) failed = 1;
+    }
+    if (failed && session.pid > 0) dump_capture(&session);
+    if (session.pid > 0 && stop_session(&session) == -1) failed = 1;
     (void)rmdir(fixture);
     return failed;
 }
@@ -7563,25 +8185,30 @@ static int latency_benchmark(const char *gsh, const char *bash,
         return -1;
     }
     shell_spec specs[BENCH_SHELLS] = {
-        {"gsh", gsh, "gsh$ ", SHELL_GSH},
-        {"bash", bash, "gsh$ ", SHELL_BASH},
-        {"zsh", zsh, "gsh$ ", SHELL_ZSH},
+        {"gsh", gsh, NULL, SHELL_GSH},
+        {"bash", bash, NULL, SHELL_BASH},
+        {"zsh", zsh, NULL, SHELL_ZSH},
     };
     static benchmark_latency latency;
     pty_session sessions[BENCH_SHELLS];
     bool started[BENCH_SHELLS] = {false, false, false};
     benchmark_memory memory_results;
     char directory[4096];
+    char prompt[TEST_PROMPT_CAP];
     size_t bash_wins;
     size_t zsh_wins;
 
     if (getcwd(directory, sizeof(directory)) == NULL ||
+        format_expected_prompt(directory, getenv("HOME"), false, prompt) ==
+            -1 ||
         setenv("GSH_BENCH_VALUE", "value", 1) == -1 ||
         setenv("GSH_BENCH_PATTERN", "abcabc", 1) == -1 ||
         setenv("GSH_BENCH_PATTERN_MULTI", "abacadTAIL", 1) == -1) {
         perror("pty benchmark: current directory");
         return 1;
     }
+    for (size_t shell = 0U; shell < BENCH_SHELLS; shell++)
+        specs[shell].prompt = prompt;
     if (prepare_benchmark_shells(specs, directory) == -1 ||
         measure_benchmark_startup(specs, directory, &latency) == -1) {
         return 1;
@@ -7635,9 +8262,9 @@ static int alias_benchmark(const char *gsh, const char *bash,
         return -1;
     }
     shell_spec specs[BENCH_SHELLS] = {
-        {"gsh", gsh, "gsh$ ", SHELL_GSH},
-        {"bash", bash, "gsh$ ", SHELL_BASH},
-        {"zsh", zsh, "gsh$ ", SHELL_ZSH},
+        {"gsh", gsh, NULL, SHELL_GSH},
+        {"bash", bash, NULL, SHELL_BASH},
+        {"zsh", zsh, NULL, SHELL_ZSH},
     };
     uint64_t definition[BENCH_SHELLS][BENCH_EXEC_SAMPLES];
     uint64_t expansion[BENCH_SHELLS][BENCH_EXEC_SAMPLES];
@@ -7647,12 +8274,17 @@ static int alias_benchmark(const char *gsh, const char *bash,
     benchmark_memory memory_results;
     benchmark_report report;
     char directory[4096];
+    char prompt[TEST_PROMPT_CAP];
     size_t shell;
     int failed = 0;
 
-    if (getcwd(directory, sizeof(directory)) == NULL) {
+    if (getcwd(directory, sizeof(directory)) == NULL ||
+        format_expected_prompt(directory, getenv("HOME"), false, prompt) ==
+            -1) {
         return 1;
     }
+    for (shell = 0U; shell < BENCH_SHELLS; shell++)
+        specs[shell].prompt = prompt;
     for (shell = 0; shell < BENCH_SHELLS; shell++) {
         if (access(specs[shell].executable, X_OK) == -1 ||
             start_benchmark_session(&sessions[shell], &specs[shell],
@@ -7925,6 +8557,9 @@ static int smoke_flow_failure(const char *name)
 static int run_primary_smoke_flows(const char *executable)
 {
     if (!require(executable != NULL)) return 1;
+    if (prompt_contract_flow(executable) != 0) {
+        return smoke_flow_failure("prompt contract");
+    }
     if (ordinary_flow(executable) != 0) {
         return smoke_flow_failure("ordinary");
     }
@@ -7948,6 +8583,9 @@ static int run_primary_smoke_flows(const char *executable)
     }
     if (editor_navigation_flow(executable) != 0) {
         return smoke_flow_failure("editor navigation/paste");
+    }
+    if (managed_caret_flow(executable) != 0) {
+        return smoke_flow_failure("managed software caret");
     }
     if (managed_async_repl_flow(executable) != 0) {
         return smoke_flow_failure("managed async REPL");

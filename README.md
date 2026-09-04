@@ -60,7 +60,7 @@ The MVP already follows the central shape described by
   `jobs`, `kill`, `fg`, `bg`, and `wait` use the process that owns the live
   PID/PGID state;
 - shell output uses a fixed-size nonblocking queue;
-- the base prompt is immediate and has no repository integration;
+- the Bash-style base prompt is immediate and has no repository integration;
 - a persistent process services eligible stateless output redirections
   through a bounded `socketpair()` protocol;
 - a redirection worker blocked in the kernel remains cancellable: `Ctrl-C`
@@ -277,7 +277,11 @@ evaluators rebase their counters on the owning shell, while true subshells
 remain isolated. The bounded editor supports UTF-8-aware left/right cursor
 movement, insertion and backspace at the cursor, multiline input with `PS2`,
 and bracketed multiline paste that preserves every pasted line until an
-explicit Enter submits the complete buffer. It also supports history arrows,
+explicit Enter submits the complete buffer. In the default managed REPL, a
+blinking `●` overlays the current single-column character without entering or
+shifting the command; its hidden phase restores that character. A locale that
+cannot render the mark in one column falls back to the terminal cursor, as does
+classic mode. The editor also supports history arrows,
 incremental `Ctrl-R`, and context-aware completion with `Tab` for commands,
 pathnames, directory-only `cd` operands, shell variables, aliases, builtin
 options, and Git subcommands. Ambiguous matches are shown in a bounded,
@@ -504,7 +508,7 @@ temporary report is written only after all measurements finish, synchronized,
 and atomically renamed, so report I/O cannot enter a timed interval and a
 failed run cannot replace the previous complete CSV.
 
-All three shells emit the same-length base prompt.
+All three shells emit the same prompt bytes and visible base-prompt content.
 Workloads currently cover startup, idle key echo,
 `/usr/bin/true`, variable, builtin-command, and cached `PATH` lookup, assignment,
 `${parameter:=word}`, arithmetic
@@ -576,19 +580,24 @@ Start the interactive shell from a terminal:
 For example:
 
 ```text
-gsh$ long-running-command
-gsh* printf 'hello\n' | tr a-z A-Z
+user@computer ~/directory gsh$> long-running-command
+user@computer ~/directory gsh*> printf 'hello\n' | tr a-z A-Z
 HELLO
-gsh* cd /tmp
-gsh* pwd
+user@computer ~/directory gsh*> cd /tmp
+user@computer ~/directory gsh*> pwd
 /tmp
-gsh* sleep 1 &
+user@computer /tmp gsh*> sleep 1 &
 [1] 12345
-gsh* wait "$!" && printf 'done\n'
+user@computer /tmp gsh*> wait "$!" && printf 'done\n'
 done
-gsh$ rt
+user@computer /tmp gsh$> rt
 reactor cycles=... async_jobs=... focus=editor ...
 ```
+
+`user@computer` is green, the physical current directory is blue (`HOME` is
+shown as `~` only for an exact match or descendant), and `gsh$` is muted. The
+reset before `>` leaves that marker in the terminal's default color. In managed
+mode only the busy `*` is yellow. Classic mode uses the same settled prompt.
 
 Enter freezes the submitted prompt and command into a cell. Output adds rows
 only when bytes arrive, so a silent command does not leave a blank row. The
@@ -631,8 +640,9 @@ processes are still live, the requested transition remains pending; entering
 
 ### Clickable files and native preview
 
-The managed REPL recognizes file and directory references without inserting
-terminal hyperlinks into command output. Native `ls` and `ll` send typed
+With `terminal.actions = on`, the managed REPL recognizes file and directory
+references without inserting terminal hyperlinks into command output. Native
+`ls` and `ll` send typed
 metadata over a private close-on-exec channel; adapters recognize the output of
 `/bin/ls`, `find`, `tree`, `fd`, `rg --files`, `git status`, `grep`, and `rg`;
 the conservative fallback recognizes path-shaped tokens but excludes URLs and
@@ -640,10 +650,14 @@ bare words. Pathname cells are styled and clickable; in `ll`, the underline
 and hitbox extend through the complete left-hand name field, including its
 alignment padding. Output-carried
 OSC, DCS, CSI, SOS, PM, and APC sequences cannot manufacture an action.
-Because the managed REPL owns an alternate screen, mouse-wheel events scroll
-its 10,240-line bounded viewport directly, including when the active prompt is
-on the last terminal row. This also handles SGR wheel reports emitted by
-iTerm2.
+The managed REPL leaves mouse reporting off by default, so ordinary dragging
+creates a native terminal selection that can be copied normally. `Page Up` and
+`Page Down` scroll its 10,240-line bounded viewport. With
+`terminal.actions = on`, mouse-wheel events scroll that viewport directly,
+including when the active prompt is on the last terminal row; this also handles
+SGR wheel reports emitted by iTerm2. While actions are enabled, use the
+terminal's mouse-reporting override (commonly Shift or Option) for a native
+selection.
 
 Clicking a regular file opens the native `view` builtin. At 100 columns or
 more it opens beside a 45-percent REPL pane whose minimum width is 48 columns;
@@ -706,7 +720,10 @@ shell.preview.editor = auto
 shell.preview.editor = ["nvim", "--", "{file}"]
 ```
 
-`terminal.actions` accepts `auto`, `on`, or `off`. Path detection accepts
+`terminal.actions` accepts `auto`, `on`, or `off`. `auto` is the selection-safe
+default and enables actions only when they do not require capturing ordinary
+mouse input; the current SGR mouse channel therefore requires an explicit
+`on`. Path detection accepts
 `off` (only native structured references), `known` (plus adapters), or `safe`
 (plus conservative universal detection). Editor auto-discovery tries `nvim`,
 then `vim`, then `nano`; automatic Vim/Neovim sessions show absolute line
@@ -747,12 +764,13 @@ automatically.
 
 `rt` exposes the bounded reactor's local service-time diagnostics. Its 5 ms
 deadline applies only to work performed by the interactive core after `poll()`
-wakes; it is not a guarantee about external commands or the host OS. `gsh$`
-means every prior command is terminal and its output source is closed. `gsh*`
-means at least one ordinary command is queued, running, stopped, has pending
-input or output, or still owns a PTY. A suspended native preview is excluded:
-it remains available to refocus but leaves the editable prompt as `gsh$`. The
-prompt changes automatically from `gsh*` to `gsh$` when the session settles.
+wakes; it is not a guarantee about external commands or the host OS. The
+`gsh$>` suffix means every prior command is terminal and its output source is
+closed. `gsh*>` means at least one ordinary command is queued, running,
+stopped, has pending input or output, or still owns a PTY. A suspended native
+preview is excluded:
+it remains available to refocus but leaves the editable prompt settled. The
+prompt changes automatically from `gsh*>` to `gsh$>` when the session settles.
 Progress output that uses carriage return,
 including Git's compression and object-writing counters, rewrites one retained
 row instead of turning every intermediate percentage into scrollback.

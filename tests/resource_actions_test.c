@@ -270,7 +270,8 @@ static int compositor_scroll_case(gsh_async_repl *repl)
         return 1;
     render = gsh_async_repl_render_data(repl);
     if (strstr(render, "five") == NULL || strstr(render, "one") != NULL ||
-        strstr(render, "\033[?1000h") == NULL) return 1;
+        strstr(render, "\033[?1000h") != NULL ||
+        strstr(render, "\033[?1006h") != NULL) return 1;
     gsh_async_repl_scroll(repl, 2L);
     if (gsh_async_repl_prepare_render(repl, "$ ", "", 0U, 0U) == -1)
         return 1;
@@ -336,6 +337,39 @@ static int completion_menu_case(gsh_async_repl *repl)
     return 0;
 }
 
+static int software_caret_case(gsh_async_repl *repl)
+{
+    static const char editor[] = "abc";
+    static const char mark[] = "\342\227\217";
+    const char *render;
+
+    if (repl == NULL) return 1;
+    gsh_async_repl_initialize(repl, true);
+    gsh_async_repl_resize(repl, 6U, 40U);
+    gsh_async_repl_configure_caret(repl, true, true);
+    if (gsh_async_repl_prepare_render(
+            repl, "$ ", editor, sizeof(editor) - 1U, 1U) == -1) return 1;
+    render = gsh_async_repl_render_data(repl);
+    if (strstr(render, "$ abc") == NULL || strstr(render, "\033[?25l") == NULL ||
+        strstr(render, mark) == NULL ||
+        gsh_async_repl_prepare_caret_patch(repl, false) == -1 ||
+        strstr(gsh_async_repl_render_data(repl), "\033[1;4Hb\033[1;4H") == NULL ||
+        gsh_async_repl_prepare_caret_patch(repl, true) == -1 ||
+        strstr(gsh_async_repl_render_data(repl), mark) == NULL) {
+        (void)fputs("resource actions: software caret mismatch\n", stderr);
+        return 1;
+    }
+    gsh_async_repl_configure_caret(repl, false, false);
+    if (gsh_async_repl_prepare_caret_patch(repl, false) == -1 ||
+        strstr(gsh_async_repl_render_data(repl), "\033[?25h") == NULL) {
+        (void)fputs("resource actions: native caret fallback mismatch\n",
+                    stderr);
+        return 1;
+    }
+    gsh_async_repl_close(repl);
+    return 0;
+}
+
 int main(void)
 {
     static gsh_async_repl repl;
@@ -347,6 +381,7 @@ int main(void)
     if (!failed) failed = compositor_scroll_case(&repl) != 0;
     if (!failed) failed = multiline_editor_case(&repl) != 0;
     if (!failed) failed = completion_menu_case(&repl) != 0;
+    if (!failed) failed = software_caret_case(&repl) != 0;
     if (failed) {
         (void)fputs("resource actions: failed\n", stderr);
         return 1;

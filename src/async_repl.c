@@ -126,6 +126,14 @@ void gsh_async_repl_configure_actions(gsh_async_repl *repl, bool enabled,
     repl->render_pending = repl->enabled;
 }
 
+void gsh_async_repl_configure_caret(gsh_async_repl *repl, bool enabled,
+                                    bool visible)
+{
+    if (repl == NULL) return;
+    repl->caret_enabled = enabled;
+    repl->caret_visible = visible;
+}
+
 void gsh_async_repl_resize(gsh_async_repl *repl, size_t rows,
                            size_t columns)
 {
@@ -1462,7 +1470,10 @@ static size_t ansi_token_length(const char *text, size_t length,
         text[offset + 1U] != '[') {
         return 0;
     }
-    for (cursor = offset + 2U; cursor < length; cursor++) {
+    for (cursor = offset + 2U;
+         cursor < length &&
+         cursor - offset < GSH_ASYNC_ESCAPE_SEQUENCE_CAP;
+         cursor++) {
         unsigned char byte = (unsigned char)text[cursor];
 
         if (byte >= 0x40U && byte <= 0x7eU) {
@@ -1784,12 +1795,83 @@ typedef struct {
     size_t column;
 } editor_render_cursor;
 
+static size_t editor_token_length(
+    const char *text, size_t length, size_t offset, size_t column,
+    size_t *width, char active_style[GSH_ASYNC_ESCAPE_SEQUENCE_CAP],
+    size_t *active_style_length)
+{
+    bool reset = false;
+    size_t token;
+
+    if (text == NULL || width == NULL || active_style == NULL ||
+        active_style_length == NULL) return 0U;
+    token = ansi_token_length(text, length, offset, &reset);
+    if (token == 0U) {
+        token = utf8_token_length(text, length, offset);
+        *width = display_token_width(text, length, offset, column, token);
+        return token;
+    }
+    *width = 0U;
+    if (reset) {
+        *active_style_length = 0U;
+    } else if (token <= GSH_ASYNC_ESCAPE_SEQUENCE_CAP) {
+        (void)memcpy(active_style, text + offset, token);
+        *active_style_length = token;
+    }
+    return token;
+}
+
+static size_t push_styled_editor_row(
+    gsh_async_repl *repl, const char *text, size_t length,
+    const char active_style[GSH_ASYNC_ESCAPE_SEQUENCE_CAP],
+    size_t active_style_length)
+{
+    char styled[GSH_ASYNC_VIEW_BYTES + GSH_ASYNC_ESCAPE_SEQUENCE_CAP];
+
+    if (repl == NULL || text == NULL || active_style == NULL ||
+        active_style_length > GSH_ASYNC_ESCAPE_SEQUENCE_CAP ||
+        length > sizeof(styled) - active_style_length) return SIZE_MAX;
+    if (active_style_length == 0U) return push_view_row(repl, text, length);
+    (void)memcpy(styled, active_style, active_style_length);
+    if (length != 0U)
+        (void)memcpy(styled + active_style_length, text, length);
+    return push_view_row(repl, styled, active_style_length + length);
+}
+
+static void record_editor_cursor(const gsh_async_repl *repl,
+                                 editor_render_cursor *cursor, size_t row,
+                                 size_t column, bool *recorded)
+{
+    if (repl == NULL || cursor == NULL || recorded == NULL ||
+        column == SIZE_MAX) return;
+    cursor->view_row = row;
+    cursor->column = column < repl->view_columns
+                         ? column : repl->view_columns - 1U;
+    *recorded = true;
+}
+
+static size_t combine_editor_text(const char *prefix, const char *text,
+                                  size_t length, char *combined,
+                                  size_t capacity)
+{
+    size_t prefix_length;
+
+    if (prefix == NULL || text == NULL || combined == NULL) return SIZE_MAX;
+    prefix_length = strnlen(prefix, GSH_ASYNC_PROMPT_CAP);
+    if (prefix_length == GSH_ASYNC_PROMPT_CAP || prefix_length > capacity ||
+        length > capacity - prefix_length) return SIZE_MAX;
+    (void)memcpy(combined, prefix, prefix_length);
+    if (length != 0U)
+        (void)memcpy(combined + prefix_length, text, length);
+    return prefix_length + length;
+}
+
 /* ── Editor Text Becomes Physical Rows Before Composition ───────
  * The mutable command is one bounded byte buffer, but explicit newlines and
- * terminal-width wrapping are physical rows. Splitting here keeps every row
- * in the same ring as job output and records the cursor before scrolling.
- * The compositor can repaint and position atomically without rescanning the
- * editor or depending on a terminal's implicit wrap state.
+ * terminal-width wrapping are physical rows. Prompt SGR tokens have no width,
+ * and an active color is repeated after a wrapped row's defensive reset.
+ * Splitting here keeps every row in the same ring as job output and records
+ * the cursor without depending on a terminal's implicit wrap state.
  * ─────────────────────────────────────────────────────────────── */
 static int push_editor_rows(gsh_async_repl *repl, const char *prefix,
                             const char *text, size_t length,
@@ -1797,22 +1879,19 @@ static int push_editor_rows(gsh_async_repl *repl, const char *prefix,
                             editor_render_cursor *cursor)
 {
     char combined[GSH_ASYNC_PROMPT_CAP + GSH_ASYNC_COMMAND_CAP];
-    size_t prefix_length;
     size_t total;
     size_t wanted_cursor;
     size_t source = 0U;
     bool cursor_recorded = false;
+    char active_style[GSH_ASYNC_ESCAPE_SEQUENCE_CAP] = {0};
+    size_t active_style_length = 0U;
 
     if (prefix == NULL || repl == NULL || text == NULL || cursor == NULL ||
         editor_cursor > length) return -1;
-    prefix_length = strnlen(prefix, GSH_ASYNC_PROMPT_CAP);
-    if (prefix_length == GSH_ASYNC_PROMPT_CAP ||
-        length > sizeof(combined) - prefix_length) return -1;
-    (void)memcpy(combined, prefix, prefix_length);
-    if (length != 0U)
-        (void)memcpy(combined + prefix_length, text, length);
-    total = prefix_length + length;
-    wanted_cursor = prefix_length + editor_cursor;
+    total = combine_editor_text(prefix, text, length, combined,
+                                sizeof(combined));
+    if (total == SIZE_MAX) return -1;
+    wanted_cursor = total - length + editor_cursor;
 
     do {
         size_t begin = source;
@@ -1820,6 +1899,11 @@ static int push_editor_rows(gsh_async_repl *repl, const char *prefix,
         size_t cursor_column = SIZE_MAX;
         bool newline = false;
         size_t row;
+        char row_style[GSH_ASYNC_ESCAPE_SEQUENCE_CAP] = {0};
+        size_t row_style_length = active_style_length;
+
+        if (row_style_length != 0U)
+            (void)memcpy(row_style, active_style, row_style_length);
 
         if (source == wanted_cursor) cursor_column = 0U;
         while (source < total) {
@@ -1830,10 +1914,10 @@ static int push_editor_rows(gsh_async_repl *repl, const char *prefix,
                 newline = true;
                 break;
             }
-            token = utf8_token_length(combined, total, source);
+            token = editor_token_length(
+                combined, total, source, columns, &width, active_style,
+                &active_style_length);
             if (token == 0U) break;
-            width = display_token_width(combined, total, source, columns,
-                                        token);
             if (width > repl->view_columns) width = repl->view_columns;
             if (columns != 0U &&
                 columns + width > repl->view_columns) break;
@@ -1847,15 +1931,11 @@ static int push_editor_rows(gsh_async_repl *repl, const char *prefix,
         if (!newline && source == total && columns >= repl->view_columns &&
             source == wanted_cursor)
             cursor_column = SIZE_MAX;
-        row = push_view_row(repl, combined + begin, source - begin);
+        row = push_styled_editor_row(repl, combined + begin, source - begin,
+                                     row_style, row_style_length);
         if (row == SIZE_MAX) return -1;
-        if (cursor_column != SIZE_MAX) {
-            cursor->view_row = row;
-            cursor->column = cursor_column < repl->view_columns
-                                 ? cursor_column
-                                 : repl->view_columns - 1U;
-            cursor_recorded = true;
-        }
+        record_editor_cursor(repl, cursor, row, cursor_column,
+                             &cursor_recorded);
         if (newline) source++;
     } while (source < total || !cursor_recorded);
     return cursor_recorded ? 0 : -1;
@@ -1890,23 +1970,14 @@ static void push_output_rows(gsh_async_repl *repl,
 static void push_cell(gsh_async_repl *repl, const gsh_async_cell *cell,
                       int cell_index)
 {
+    editor_render_cursor ignored;
+
     if (cell == NULL || repl == NULL) {
         return;
     }
-    char command_row[GSH_ASYNC_PROMPT_CAP + GSH_ASYNC_COMMAND_CAP] = {0};
-    size_t command_length = cell->prompt_length + cell->command_length;
-
-    if (command_length > sizeof(command_row) - 1U) {
-        command_length = sizeof(command_row) - 1U;
-    }
-    if (cell->prompt_length < sizeof(command_row)) {
-        (void)memcpy(command_row, cell->prompt, cell->prompt_length);
-    }
-    if (command_length > cell->prompt_length) {
-        (void)memcpy(command_row + cell->prompt_length, cell->command,
-               command_length - cell->prompt_length);
-    }
-    (void)push_view_row(repl, command_row, command_length);
+    (void)push_editor_rows(repl, cell->prompt, cell->command,
+                           cell->command_length, cell->command_length,
+                           &ignored);
     push_output_rows(repl, cell, cell_index);
     if (cell->output_truncated) {
         (void)push_view_row(repl, "[output truncated]", 18);
@@ -1968,6 +2039,77 @@ static int render_cursor(gsh_async_repl *repl, size_t row, size_t column)
     return render_append(repl, sequence, (size_t)length);
 }
 
+static int render_caret_mark(gsh_async_repl *repl, bool visible)
+{
+    static const char begin[] = "\033[0m\033[?25l";
+    static const char mark[] = "\342\227\217";
+    const char *text;
+    size_t length;
+
+    if (repl == NULL || !repl->caret_valid ||
+        repl->caret_screen_row == 0U || repl->caret_screen_column == 0U)
+        return -1;
+    text = visible ? mark : repl->caret_underlay;
+    length = visible ? sizeof(mark) - 1U : repl->caret_underlay_length;
+    if (render_append(repl, begin, sizeof(begin) - 1U) == -1 ||
+        render_cursor(repl, repl->caret_screen_row,
+                      repl->caret_screen_column) == -1 ||
+        render_append(repl, text, length) == -1 ||
+        render_cursor(repl, repl->caret_screen_row,
+                      repl->caret_screen_column) == -1) return -1;
+    return 0;
+}
+
+static void cache_editor_caret(gsh_async_repl *repl, const char *editor,
+                               size_t length, size_t offset,
+                               size_t column)
+{
+    size_t token;
+    size_t width;
+
+    if (repl == NULL || editor == NULL) return;
+    repl->caret_valid = false;
+    repl->caret_underlay_length = 0U;
+    if (!repl->caret_enabled || offset > length) return;
+    if (offset == length || editor[offset] == '\n' || editor[offset] == '\t') {
+        repl->caret_underlay[0] = ' ';
+        repl->caret_underlay_length = 1U;
+        repl->caret_valid = true;
+        return;
+    }
+    token = utf8_token_length(editor, length, offset);
+    width = display_token_width(editor, length, offset, column, token);
+    if (token == 0U || token > sizeof(repl->caret_underlay) || width != 1U)
+        return;
+    (void)memcpy(repl->caret_underlay, editor + offset, token);
+    repl->caret_underlay_length = token;
+    repl->caret_valid = true;
+}
+
+static int render_editor_caret(
+    gsh_async_repl *repl, const editor_render_cursor *editor_cursor)
+{
+    size_t screen_row;
+
+    if (repl == NULL || editor_cursor == NULL) return -1;
+    screen_row = repl->screen_row_by_view[editor_cursor->view_row];
+    repl->caret_screen_row = screen_row;
+    repl->caret_screen_column = editor_cursor->column + 1U;
+    if (!repl->caret_enabled || !repl->caret_valid) {
+        if (render_append(repl, "\033[?25h", 6U) == -1) return -1;
+        return screen_row == 0U
+                   ? 0 : render_cursor(repl, screen_row,
+                                       repl->caret_screen_column);
+    }
+    if (screen_row == 0U)
+        return render_append(repl, "\033[?25l", 6U);
+    if (!repl->caret_visible) {
+        if (render_append(repl, "\033[?25l", 6U) == -1) return -1;
+        return render_cursor(repl, screen_row, repl->caret_screen_column);
+    }
+    return render_caret_mark(repl, true);
+}
+
 static int render_clear_split(gsh_async_repl *repl,
                               size_t separator_column)
 {
@@ -2021,6 +2163,9 @@ static int compose_render(gsh_async_repl *repl,
      * Captured bytes become bounded logical rows before they reach this path.
      * Each refresh rebuilds one viewport from cells plus the mutable editor.
      * Alternate-screen ownership makes that redraw atomic to terminal users.
+     * Mouse reports prevent the terminal from creating native selections, so
+     * only an explicit actions setting may capture them.  With actions off,
+     * Page Up and Page Down retain access to the compositor's scrollback.
      * Unsupported child control sequences degrade to contained plain text.
      * ─────────────────────────────────────────────────────────────── */
     repl->render_length = 0;
@@ -2052,7 +2197,8 @@ static int compose_render(gsh_async_repl *repl,
         }
     }
     have_visible_resource = visible_resource_exists(repl, skip, visible);
-    if (have_visible_resource || maximum_offset != 0U || split) {
+    if (repl->actions_enabled &&
+        (have_visible_resource || maximum_offset != 0U || split)) {
         if (render_append(repl, "\033[?1000h\033[?1006h", 16U) == -1)
             return -1;
         repl->mouse_enabled = true;
@@ -2074,14 +2220,8 @@ static int compose_render(gsh_async_repl *repl,
             return -1;
         }
     }
-    if (editor_cursor != NULL) {
-        size_t screen_row = repl->screen_row_by_view[editor_cursor->view_row];
-
-        if (screen_row != 0U &&
-            render_cursor(repl, screen_row, editor_cursor->column + 1U) ==
-                -1) return -1;
-    }
-    return 0;
+    return editor_cursor == NULL ? 0
+                                 : render_editor_caret(repl, editor_cursor);
 }
 
 static int push_completion_rows(gsh_async_repl *repl,
@@ -2140,12 +2280,33 @@ int gsh_async_repl_prepare_render_with_completion(
     }
     if (push_editor_rows(repl, active_prompt, editor, editor_length,
                          editor_cursor, &cursor) == -1 ||
-        push_completion_rows(repl, completion, completion_length) == -1 ||
-        compose_render(repl, &cursor) == -1) {
+        push_completion_rows(repl, completion, completion_length) == -1) {
         return -1;
     }
+    cache_editor_caret(repl, editor, editor_length, editor_cursor,
+                       cursor.column);
+    if (compose_render(repl, &cursor) == -1) return -1;
     repl->alternate_screen_entered = true;
     return 0;
+}
+
+int gsh_async_repl_prepare_caret_patch(gsh_async_repl *repl,
+                                       bool visible)
+{
+    if (repl == NULL || !repl->enabled) {
+        errno = EINVAL;
+        return -1;
+    }
+    repl->render_length = 0U;
+    repl->caret_visible = visible;
+    if (!repl->caret_enabled) {
+        if (render_append(repl, "\033[?25h", 6U) == -1) return -1;
+        return repl->caret_screen_row == 0U
+                   ? 0 : render_cursor(repl, repl->caret_screen_row,
+                                       repl->caret_screen_column);
+    }
+    if (!repl->caret_valid || repl->caret_screen_row == 0U) return 0;
+    return render_caret_mark(repl, visible);
 }
 
 int gsh_async_repl_prepare_render(gsh_async_repl *repl,

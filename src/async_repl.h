@@ -1,6 +1,7 @@
 #ifndef GSH_ASYNC_REPL_H
 #define GSH_ASYNC_REPL_H
 
+#include <limits.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -12,7 +13,7 @@ enum {
     GSH_ASYNC_CELL_CAP = 16,
     GSH_ASYNC_JOB_CAP = 8,
     GSH_ASYNC_COMMAND_CAP = 4096,
-    GSH_ASYNC_PROMPT_CAP = 160,
+    GSH_ASYNC_PROMPT_CAP = PATH_MAX + 640,
     GSH_ASYNC_CELL_INPUT_CAP = 4096,
     GSH_ASYNC_CELL_OUTPUT_CAP = 65536,
     GSH_ASYNC_VIEW_ROWS = 10240,
@@ -21,6 +22,7 @@ enum {
     GSH_ASYNC_VIEW_BYTES = GSH_ASYNC_VIEW_COLUMNS * 4 + 64,
     GSH_ASYNC_ESCAPE_SEQUENCE_CAP = 64,
     GSH_ASYNC_PASSTHROUGH_SEQUENCE_CAP = 64,
+    GSH_ASYNC_CARET_UNDERLAY_CAP = 4,
     GSH_ASYNC_RESOURCE_CAP = 256,
     GSH_ASYNC_NATIVE_RESOURCE_CAP = 256,
     GSH_ASYNC_RENDER_CAP =
@@ -139,6 +141,9 @@ typedef struct {
     bool render_pending;
     bool actions_enabled;
     bool mouse_enabled;
+    bool caret_enabled;
+    bool caret_visible;
+    bool caret_valid;
     gsh_path_detection_mode path_detection;
     uint64_t next_id;
     size_t terminal_rows;
@@ -150,6 +155,10 @@ typedef struct {
     size_t view_start;
     size_t view_count;
     size_t scroll_offset;
+    size_t caret_screen_row;
+    size_t caret_screen_column;
+    size_t caret_underlay_length;
+    char caret_underlay[GSH_ASYNC_CARET_UNDERLAY_CAP];
     size_t screen_row_by_view[GSH_ASYNC_VIEW_ROWS];
     gsh_async_resource_action resources[GSH_ASYNC_RESOURCE_CAP];
     size_t resource_count;
@@ -162,6 +171,8 @@ typedef struct {
 void gsh_async_repl_initialize(gsh_async_repl *repl, bool enabled);
 void gsh_async_repl_configure_actions(gsh_async_repl *repl, bool enabled,
                                       gsh_path_detection_mode detection);
+void gsh_async_repl_configure_caret(gsh_async_repl *repl, bool enabled,
+                                    bool visible);
 void gsh_async_repl_resize(gsh_async_repl *repl, size_t rows,
                            size_t columns);
 void gsh_async_repl_scroll(gsh_async_repl *repl, long rows);
@@ -219,6 +230,9 @@ void gsh_async_repl_mark_stopped(gsh_async_repl *repl, int cell_index);
 void gsh_async_repl_mark_running(gsh_async_repl *repl, int cell_index);
 int gsh_async_repl_previous_status(const gsh_async_repl *repl,
                                    int cell_index, int *status);
+/* active_prompt may contain validated CSI-SGR tokens. They have zero display
+ * width; their style is preserved across physical wrapping and reset by the
+ * compositor at each rendered row boundary. */
 int gsh_async_repl_prepare_render(gsh_async_repl *repl,
                                   const char *active_prompt,
                                   const char *editor, size_t editor_length,
@@ -230,6 +244,8 @@ int gsh_async_repl_prepare_render_with_completion(
                                   size_t editor_cursor,
                                   const char *completion,
                                   size_t completion_length);
+int gsh_async_repl_prepare_caret_patch(gsh_async_repl *repl,
+                                       bool visible);
 const char *gsh_async_repl_render_data(const gsh_async_repl *repl);
 size_t gsh_async_repl_render_length(const gsh_async_repl *repl);
 void gsh_async_repl_rendered(gsh_async_repl *repl);

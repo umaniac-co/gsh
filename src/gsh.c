@@ -17,6 +17,7 @@
 #include <limits.h>
 #include <locale.h>
 #include <poll.h>
+#include <pwd.h>
 #include <signal.h> /* CANON-INCLUDE: macos */
 #include <stdarg.h> /* CANON-INCLUDE: linux */
 #include <stdio.h> /* CANON-INCLUDE: linux */
@@ -77,6 +78,8 @@ enum {
     CHILD_WRITE_ATTEMPT_CAP = OUTPUT_CAP,
     EVALUATOR_WAIT_RETRY_CAP = 1024,
     AST_WALK_STEP_CAP = GSH_PARSE_NODE_CAP + 1,
+    GSH_PROMPT_IDENTITY_CAP = 256,
+    GSH_CARET_BLINK_NS = 500U * 1000U * 1000U,
 };
 
 _Static_assert((unsigned int)GSH_POSITIONAL_CAP ==
@@ -87,9 +90,15 @@ _Static_assert((unsigned int)GSH_POSITIONAL_TEXT_CAP ==
                "positional and native text limits must match");
 _Static_assert(sizeof(off_t) >= sizeof(int64_t),
                "descriptor-backed source offsets require 64-bit off_t");
+_Static_assert(GSH_ASYNC_PROMPT_CAP >=
+                   PATH_MAX + (2 * GSH_PROMPT_IDENTITY_CAP) + 128,
+               "the prompt must hold PATH_MAX plus identity and SGR bytes");
 
-static const char PROMPT[] = "gsh$ ";
-static const char ASYNC_PENDING_PROMPT[] = "gsh* ";
+static const char PROMPT_GREEN[] = "\033[38;5;114m";
+static const char PROMPT_BLUE[] = "\033[38;5;75m";
+static const char PROMPT_MUTED[] = "\033[38;5;245m";
+static const char PROMPT_YELLOW[] = "\033[38;5;221m";
+static const char PROMPT_RESET[] = "\033[0m";
 static const uint64_t REACTOR_DEADLINE_NS = 5U * 1000U * 1000U;
 
 typedef struct {
@@ -297,6 +306,10 @@ typedef struct {
     size_t history_search_draft_length;
     bool classic_redraw_pending;
     bool classic_clear_pending;
+    bool caret_supported;
+    bool caret_visible;
+    bool caret_refresh_pending;
+    uint64_t caret_deadline_ns;
     size_t classic_cursor_row;
     size_t classic_cursor_column;
     char pending_line[LINE_CAP];
@@ -308,6 +321,8 @@ typedef struct {
     char default_path[EXEC_PATH_CAP];
     const char *parameter_zero;
     char current_directory[PATH_MAX];
+    char prompt_user[GSH_PROMPT_IDENTITY_CAP];
+    char prompt_host[GSH_PROMPT_IDENTITY_CAP];
 
     char output[OUTPUT_CAP];
     size_t output_offset;
@@ -421,6 +436,11 @@ typedef struct {
     uint64_t parse_failures;
     uint64_t redirection_worker_failures;
 } shell_state;
+
+typedef struct {
+    size_t row;
+    size_t column;
+} classic_editor_position;
 
 static gsh_async_repl *state_async_repl(const shell_state *state)
 {
@@ -543,6 +563,9 @@ static void abandon_pending_list(shell_state *state);
 static void queue_redraw(shell_state *state);
 static size_t active_prompt_text(shell_state *state,
                                  char prompt[GSH_ASYNC_PROMPT_CAP]);
+static void advance_classic_position(const char *text, size_t length,
+                                     size_t columns,
+                                     classic_editor_position *position);
 static bool async_transition_can_start_now(const shell_state *state);
 static void leave_managed_fullscreen(shell_state *state, int cell_index);
 static void handle_mouse_event(shell_state *state, unsigned char final);
@@ -627,6 +650,26 @@ static uint64_t monotonic_ns(void)
         return 0;
     }
     return (uint64_t)now.tv_sec * 1000000000ULL + (uint64_t)now.tv_nsec;
+}
+
+static bool managed_caret_available(const shell_state *state)
+{
+    if (state == NULL) return false;
+    return state->caret_supported && state->async_repl != NULL &&
+           state_async_repl(state)->enabled;
+}
+
+static void restart_managed_caret(shell_state *state)
+{
+    uint64_t now;
+
+    if (!managed_caret_available(state)) return;
+    now = monotonic_ns();
+    state->caret_visible = true;
+    state->caret_refresh_pending = true;
+    state->caret_deadline_ns =
+        now == 0U || now > UINT64_MAX - GSH_CARET_BLINK_NS
+            ? 0U : now + GSH_CARET_BLINK_NS;
 }
 
 static void signal_handler(int signo)
@@ -841,26 +884,89 @@ static void initialize_history(shell_state *state)
     state->history_persistent = true;
 }
 
+static void sanitize_prompt_component(char *text, size_t capacity)
+{
+    size_t index;
+
+    if (text == NULL || capacity == 0U) return;
+    for (index = 0U; index < capacity; index++) {
+        unsigned char byte = (unsigned char)text[index];
+
+        if (byte == '\0') return;
+        if (byte < 0x20U || byte == 0x7fU) text[index] = '?';
+    }
+    text[capacity - 1U] = '\0';
+}
+
+static bool prompt_home_suffix(const shell_state *state,
+                               const char **suffix)
+{
+    const char *home;
+    size_t home_length;
+    bool found;
+
+    if (state == NULL || suffix == NULL) return false;
+    home = gsh_variables_lookup(state->variables, "HOME", 4U, &found);
+    home_length = found ? strlen(home) : 0U;
+    while (home_length > 1U && home[home_length - 1U] == '/') home_length--;
+    if (!found || home_length == 0U || home[0] != '/' ||
+        strncmp(state->current_directory, home, home_length) != 0 ||
+        (home_length != 1U && state->current_directory[home_length] != '\0' &&
+         state->current_directory[home_length] != '/')) return false;
+    if (home_length == 1U && state->current_directory[1] != '\0')
+        *suffix = state->current_directory;
+    else
+        *suffix = state->current_directory + home_length;
+    return true;
+}
+
+static bool prompt_directory_text(const shell_state *state, char *directory,
+                                  size_t capacity)
+{
+    const char *source;
+    const char *suffix;
+    size_t length;
+
+    if (state == NULL || directory == NULL || capacity == 0U) return false;
+    if (prompt_home_suffix(state, &suffix)) {
+        length = strlen(suffix);
+        if (length + 2U > capacity) return false;
+        directory[0] = '~';
+        (void)memcpy(directory + 1U, suffix, length + 1U);
+    } else {
+        source = state->current_directory[0] == '\0'
+                     ? "?" : state->current_directory;
+        length = strlen(source);
+        if (length + 1U > capacity) return false;
+        (void)memcpy(directory, source, length + 1U);
+    }
+    sanitize_prompt_component(directory, capacity);
+    return true;
+}
+
 static size_t primary_prompt_text(const shell_state *state, char *prompt,
                                   size_t capacity, bool include_async_state)
 {
-    if (state == NULL) return 0U;
-    if (prompt == NULL) {
-        return 0U;
-    }
-    const char *text = PROMPT;
-    size_t length;
+    char directory[PATH_MAX + 2U];
+    bool busy;
+    int written;
 
-    if (include_async_state &&
-        !gsh_async_repl_prompt_settled(state->async_repl)) {
-        text = ASYNC_PENDING_PROMPT;
-    }
-    length = strlen(text);
-    if (length >= capacity) {
-        return 0;
-    }
-    (void)memcpy(prompt, text, length + 1U);
-    return length;
+    if (state == NULL || prompt == NULL || capacity == 0U ||
+        !prompt_directory_text(state, directory, sizeof(directory))) return 0U;
+    busy = include_async_state &&
+           !gsh_async_repl_prompt_settled(state->async_repl);
+    written = busy
+                  ? snprintf(prompt, capacity, "%s%s@%s%s %s%s%s %sgsh%s*%s> ",
+                             PROMPT_GREEN, state->prompt_user,
+                             state->prompt_host, PROMPT_RESET, PROMPT_BLUE,
+                             directory, PROMPT_RESET, PROMPT_MUTED,
+                             PROMPT_YELLOW, PROMPT_RESET)
+                  : snprintf(prompt, capacity, "%s%s@%s%s %s%s%s %sgsh$%s> ",
+                             PROMPT_GREEN, state->prompt_user,
+                             state->prompt_host, PROMPT_RESET, PROMPT_BLUE,
+                             directory, PROMPT_RESET, PROMPT_MUTED,
+                             PROMPT_RESET);
+    return written > 0 && (size_t)written < capacity ? (size_t)written : 0U;
 }
 
 /* ── Deferred Job Notices Precede The Next Prompt ────────────────
@@ -904,12 +1010,14 @@ static void emit_deferred_job_notifications(shell_state *state)
 static void queue_prompt(shell_state *state)
 {
     char prompt[GSH_ASYNC_PROMPT_CAP];
+    classic_editor_position position = {0U, 0U};
     size_t length;
     size_t columns;
 
     if (state == NULL) return;
     if (state->async_repl != NULL && state_async_repl(state)->enabled) {
         state_async_repl(state)->render_pending = true;
+        restart_managed_caret(state);
         return;
     }
     emit_deferred_job_notifications(state);
@@ -921,8 +1029,9 @@ static void queue_prompt(shell_state *state)
     columns = state->async_repl == NULL
                   ? 80U : state_async_repl(state)->terminal_columns;
     if (columns == 0U) columns = 1U;
-    state->classic_cursor_row = length / columns;
-    state->classic_cursor_column = length % columns;
+    advance_classic_position(prompt, length, columns, &position);
+    state->classic_cursor_row = position.row;
+    state->classic_cursor_column = position.column;
 }
 
 static void queue_redraw(shell_state *state)
@@ -945,11 +1054,6 @@ static void queue_clear_redraw(shell_state *state)
     state->classic_clear_pending = true;
     state->classic_redraw_pending = true;
 }
-
-typedef struct {
-    size_t row;
-    size_t column;
-} classic_editor_position;
 
 static size_t classic_sgr_length(const char *text, size_t length,
                                  size_t offset)
@@ -1222,6 +1326,9 @@ static void prepare_managed_render(shell_state *state)
         state_async_repl(state)->cells[focused].fullscreen_presented) {
         return;
     }
+    gsh_async_repl_configure_caret(
+        state->async_repl, state->caret_supported && focused < 0,
+        state->caret_visible && focused < 0);
     (void)active_prompt_text(state, prompt);
     if (gsh_async_repl_prepare_render_with_completion(
             state->async_repl, prompt, state->line, state->line_len,
@@ -1238,6 +1345,62 @@ static void prepare_managed_render(shell_state *state)
         return;
     }
     gsh_async_repl_rendered(state->async_repl);
+    state->caret_refresh_pending = false;
+}
+
+/* ── A Software Mark Blinks Without Repainting The Viewport ──────
+ * Terminal cursor protocols cannot express a circular shape, so the managed
+ * compositor overlays one single-column glyph and retains the covered byte.
+ * A reactor deadline alternates that glyph with the retained cell in a small
+ * absolute-position patch; command output never contains the visual marker.
+ * Input restarts the phase, while focused jobs suspend it deterministically.
+ * ─────────────────────────────────────────────────────────────── */
+static void service_managed_caret(shell_state *state)
+{
+    uint64_t now;
+    bool active;
+    int focused;
+    const char *render;
+    size_t length;
+
+    if (!managed_caret_available(state)) return;
+    focused = gsh_async_repl_focused_job(state->async_repl);
+    active = focused < 0;
+    if (!active) {
+        state->caret_deadline_ns = 0U;
+        if (state->caret_visible) state->caret_refresh_pending = true;
+        state->caret_visible = false;
+        if (state_async_repl(state)->cells[focused].fullscreen_presented)
+            return;
+    } else {
+        now = monotonic_ns();
+        if (state->caret_deadline_ns == 0U) restart_managed_caret(state);
+        else if (now != 0U && now >= state->caret_deadline_ns) {
+            state->caret_visible = !state->caret_visible;
+            state->caret_refresh_pending = true;
+            state->caret_deadline_ns =
+                now > UINT64_MAX - GSH_CARET_BLINK_NS
+                    ? 0U : now + GSH_CARET_BLINK_NS;
+        }
+    }
+    if (!state->caret_refresh_pending ||
+        state_async_repl(state)->render_pending || state->output_len != 0U)
+        return;
+    gsh_async_repl_configure_caret(state->async_repl, active,
+                                    active && state->caret_visible);
+    if (gsh_async_repl_prepare_caret_patch(
+            state->async_repl, active && state->caret_visible) == -1) {
+        state->last_status = 1;
+        state->running = false;
+        return;
+    }
+    render = gsh_async_repl_render_data(state->async_repl);
+    length = gsh_async_repl_render_length(state->async_repl);
+    if (length != 0U && !raw_output_push(state, render, length)) {
+        state->running = false;
+        return;
+    }
+    state->caret_refresh_pending = false;
 }
 
 static void make_editor_modes(shell_state *state)
@@ -1277,7 +1440,7 @@ static int enter_editor(shell_state *state)
 static void restore_terminal(shell_state *state)
 {
     if (state == NULL) return;
-    static const char disable_paste[] = "\033[?2004l";
+    static const char disable_paste[] = "\033[?2004l\033[?25h";
     size_t offset = 0U;
     unsigned int attempts;
 
@@ -1349,13 +1512,14 @@ static bool managed_repl_requested(const gsh_shell_config *config)
 static bool terminal_actions_requested(const gsh_shell_config *config,
                                        bool managed)
 {
-    const char *terminal;
+    /* ── Automatic Actions Preserve Native Selection ─────────────
+     * Automatic SGR mouse capture made ordinary drag selection impossible.
+     * No negotiated channel currently preserves both native selection and
+     * gsh-owned clicks, so auto leaves the terminal's mouse unclaimed.
+     * Explicit on retains clickable resources and managed wheel scrolling.
+     * ─────────────────────────────────────────────────────────────── */
     if (config == NULL || !managed) return false;
-    if (config->terminal_actions == GSH_TERMINAL_ACTIONS_OFF) return false;
-    if (config->terminal_actions == GSH_TERMINAL_ACTIONS_ON) return true;
-    terminal = getenv("TERM");
-    return terminal != NULL && terminal[0] != '\0' &&
-           strcmp(terminal, "dumb") != 0;
+    return config->terminal_actions == GSH_TERMINAL_ACTIONS_ON;
 }
 
 static bool terminal_feature_present(const char *features,
@@ -1595,6 +1759,9 @@ static void initialize_shell_state(shell_state *state,
     state->async_state_cell = -1;
     state->async_dispatch_cell = -1;
     state->focus_escape_cell = -1;
+    state->caret_supported = wcwidth(L'\x25cf') == 1;
+    state->caret_visible = true;
+    state->caret_refresh_pending = true;
     state->running = true;
 }
 
@@ -1654,6 +1821,7 @@ static int initialize_interactive_stores(shell_state *state,
         state->async_repl,
         terminal_actions_requested(&state->config, state->async_desired),
         state->config.path_detection);
+    restart_managed_caret(state);
     state->image_protocol = terminal_image_protocol(&state->config);
     state->variable_generation = 1;
     state->alias_generation = 1;
@@ -1663,26 +1831,56 @@ static int initialize_interactive_stores(shell_state *state,
     return 0;
 }
 
+static void initialize_prompt_identity(shell_state *state)
+{
+    struct passwd *account;
+    size_t index;
+    size_t user_length;
+
+    if (!require(state != NULL)) return;
+    account = getpwuid(geteuid());
+    user_length = account == NULL || account->pw_name == NULL ||
+                          account->pw_name[0] == '\0'
+                      ? GSH_PROMPT_IDENTITY_CAP
+                      : strnlen(account->pw_name, GSH_PROMPT_IDENTITY_CAP);
+    if (user_length < GSH_PROMPT_IDENTITY_CAP) {
+        (void)memcpy(state->prompt_user, account->pw_name, user_length + 1U);
+    } else {
+        (void)snprintf(state->prompt_user, sizeof(state->prompt_user),
+                       "uid%lu", (unsigned long)geteuid());
+    }
+    sanitize_prompt_component(state->prompt_user, sizeof(state->prompt_user));
+    if (gethostname(state->prompt_host, sizeof(state->prompt_host) - 1U) == -1)
+        state->prompt_host[0] = '\0';
+    state->prompt_host[sizeof(state->prompt_host) - 1U] = '\0';
+    for (index = 0U; index < sizeof(state->prompt_host); index++)
+        if (state->prompt_host[index] == '.' ||
+            state->prompt_host[index] == '\0') {
+            state->prompt_host[index] = '\0';
+            break;
+        }
+    if (state->prompt_host[0] == '\0')
+        (void)memcpy(state->prompt_host, "unknown", sizeof("unknown"));
+    sanitize_prompt_component(state->prompt_host, sizeof(state->prompt_host));
+}
+
 static void initialize_interactive_paths(shell_state *state)
 {
     size_t default_path_size;
 
     if (!require(state != NULL)) return;
     if (!require(state->default_path[sizeof(state->default_path) - 1U] ==
-                 '\0')) {
-        return;
-    }
+                 '\0')) return;
     default_path_size =
         confstr(_CS_PATH, state->default_path, sizeof(state->default_path));
     if (default_path_size == 0 ||
         default_path_size > sizeof(state->default_path) ||
-        state->default_path[0] == '\0') {
+        state->default_path[0] == '\0')
         (void)memcpy(state->default_path, "/bin:/usr/bin", 14U);
-    }
     if (getcwd(state->current_directory,
-               sizeof(state->current_directory)) == NULL) {
+               sizeof(state->current_directory)) == NULL)
         state->current_directory[0] = '\0';
-    }
+    initialize_prompt_identity(state);
 }
 
 static int claim_interactive_terminal(shell_state *state)
@@ -1980,6 +2178,9 @@ static int reactor_poll_timeout(const shell_state *state)
                                        timeout);
     timeout = bounded_deadline_timeout(state->editor_escape_deadline_ns,
                                        timeout);
+    if (managed_caret_available(state) &&
+        gsh_async_repl_focused_job(state->async_repl) < 0)
+        timeout = bounded_deadline_timeout(state->caret_deadline_ns, timeout);
     return bounded_deadline_timeout(state->completion_deadline_ns, timeout);
 }
 
@@ -10729,6 +10930,14 @@ static void finish_editor_sequence(shell_state *state, unsigned char byte)
         state->paste_end_match = 0U;
         state->paste_last_was_cr = false;
         state->paste_overflow_reported = false;
+    } else if (byte == '~' && strcmp(state->editor_sequence, "5") == 0 &&
+               state->async_repl != NULL) {
+        gsh_async_repl_scroll(state->async_repl,
+                              (long)state_async_repl(state)->terminal_rows);
+    } else if (byte == '~' && strcmp(state->editor_sequence, "6") == 0 &&
+               state->async_repl != NULL) {
+        gsh_async_repl_scroll(state->async_repl,
+                              -(long)state_async_repl(state)->terminal_rows);
     } else if (state->editor_sequence_length == 0U && byte == 'A') {
         if (state->history_search) search_history(state);
         else history_previous(state);
@@ -11445,6 +11654,9 @@ static void process_input(shell_state *state)
             break;
         }
     }
+    if (state->async_repl != NULL &&
+        gsh_async_repl_focused_job(state->async_repl) < 0)
+        restart_managed_caret(state);
 }
 
 static int load_managed_submission(shell_state *state, int cell_index)
@@ -11974,6 +12186,8 @@ static bool push_managed_preview_base(shell_state *state)
     const char *render;
     size_t length;
     if (state == NULL || state->async_repl == NULL) return false;
+    gsh_async_repl_configure_caret(state->async_repl,
+                                    state->caret_supported, false);
     (void)active_prompt_text(state, prompt);
     if (gsh_async_repl_prepare_render_with_completion(
             state->async_repl, prompt, state->line, state->line_len,
@@ -12023,7 +12237,7 @@ static void present_managed_fullscreen(shell_state *state, int cell_index,
     if (state == NULL) {
         return;
     }
-    static const char begin[] = "\033[0m\033[H\033[2J";
+    static const char begin[] = "\033[0m\033[?25h\033[H\033[2J";
     static const char split_begin[] =
         "\033[0m\033[?25l\033[?1000h\033[?1006h";
     char filtered[4096 + GSH_ASYNC_PASSTHROUGH_SEQUENCE_CAP];
@@ -12766,7 +12980,7 @@ static int seed_async_enabled_notice(shell_state *state)
 static void apply_async_transition(shell_state *state)
 {
     if (state == NULL) return;
-    static const char leave_screen[] = "\033[?1049l";
+    static const char leave_screen[] = "\033[?25h\033[?1049l";
 
     if (!state->async_transition_pending ||
         !async_transition_quiescent(state)) {
@@ -12816,6 +13030,7 @@ static void apply_async_transition(shell_state *state)
     }
     state->async_transition_pending = false;
     state_async_repl(state)->render_pending = true;
+    restart_managed_caret(state);
 }
 
 static bool dispatch_classic_pending(shell_state *state)
@@ -12919,6 +13134,7 @@ static void service_reactor_descriptors(
     }
     schedule_managed_submissions(state);
     apply_async_transition(state);
+    service_managed_caret(state);
     prepare_classic_redraw(state);
     prepare_managed_render(state);
     if (state->output_len > 0U) flush_output(state);
@@ -12953,6 +13169,7 @@ static int run_reactor(shell_state *state)
         expire_completion_request(state);
         schedule_managed_submissions(state);
         apply_async_transition(state);
+        service_managed_caret(state);
         prepare_classic_redraw(state);
         prepare_managed_render(state);
 
