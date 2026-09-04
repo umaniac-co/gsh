@@ -15,6 +15,25 @@
 #include <unistd.h>
 #include <wchar.h>
 
+enum { GSH_BUILTIN_SGR_CAP = 32 };
+
+static size_t resource_sgr_length(const char *text, size_t length,
+                                  size_t offset)
+{
+    size_t index;
+    size_t turn;
+    if (text == NULL || offset >= length) return 0U;
+    if ((unsigned char)text[offset] != 0x1bU || offset + 2U >= length ||
+        text[offset + 1U] != '[') return 0U;
+    index = offset + 2U;
+    for (turn = 0U; turn < GSH_BUILTIN_SGR_CAP && index < length; turn++) {
+        unsigned char byte = (unsigned char)text[index++];
+        if (byte == 'm') return index - offset;
+        if (!((byte >= '0' && byte <= '9') || byte == ';')) return 0U;
+    }
+    return 0U;
+}
+
 static size_t resource_text_width(const char *text, size_t length,
                                   size_t initial)
 {
@@ -26,7 +45,14 @@ static size_t resource_text_width(const char *text, size_t length,
     while (offset < length) {
         wchar_t character;
         size_t bytes;
+        size_t sgr;
         int columns;
+        sgr = resource_sgr_length(text, length, offset);
+        if (sgr != 0U) {
+            offset += sgr;
+            (void)memset(&state, 0, sizeof(state));
+            continue;
+        }
         if (text[offset] == '\t') {
             size_t current = initial + width;
             width += 8U - current % 8U;

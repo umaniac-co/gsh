@@ -22,8 +22,10 @@ src/builtin_umask.c gsh,fault dependency
 src/builtin_unalias.c gsh,fault dependency
 src/builtin_variables.c gsh,fault dependency
 src/command_cache.c gsh,fault,command-cache-test dependency
+src/completion.c gsh,fault dependency
 src/fault_injection_disabled.c gsh dependency
 src/fault_injection_enabled.c fault dependency
+src/git_listing.c gsh,fault,file-builtins-test dependency
 src/history_file.c gsh,fault dependency
 src/history_store.c gsh,fault dependency
 src/native_plan.c gsh,fault,fuzz dependency

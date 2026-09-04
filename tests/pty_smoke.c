@@ -1374,6 +1374,95 @@ static int exercise_editor_navigation(pty_session *session)
         send_text(session, "x\r") == -1 ||
         consume_through(session, "GSH_UTF8=<axé>\r\n",
                         TEST_TIMEOUT_MS) == -1 ||
+        consume_through(session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
+        send_text(session, "ech") == -1 ||
+        send_bytes(session, "\t", 1U) == -1 ||
+        consume_through(session, "echo ", TEST_TIMEOUT_MS) == -1 ||
+        send_text(session, "GSH_TAB_COMMAND\r") == -1 ||
+        consume_through(session, "GSH_TAB_COMMAND\r\n",
+                        TEST_TIMEOUT_MS) == -1 ||
+        consume_through(session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
+        send_text(session,
+                  "printf 'GSH_TAB_PATH=<%s>\\n' completion\\ a") == -1 ||
+        send_bytes(session, "\t", 1U) == -1 ||
+        consume_through(session, "completion\\ alpha ",
+                        TEST_TIMEOUT_MS) == -1 ||
+        send_text(session, "\r") == -1 ||
+        consume_through(session, "GSH_TAB_PATH=<completion alpha>\r\n",
+                        TEST_TIMEOUT_MS) == -1 ||
+        consume_through(session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
+        send_text(session, "printf 'GSH_TAB_LCP=<%s>\\n' am") == -1 ||
+        send_bytes(session, "\t", 1U) == -1 ||
+        consume_through(session, "amber-", TEST_TIMEOUT_MS) == -1 ||
+        send_text(session, "one\r") == -1 ||
+        consume_through(session, "GSH_TAB_LCP=<amber-one>\r\n",
+                        TEST_TIMEOUT_MS) == -1 ||
+        consume_through(session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
+        send_text(session,
+                  "printf 'GSH_TAB_DIR=<%s>\\n' completion-d") == -1 ||
+        send_bytes(session, "\t", 1U) == -1 ||
+        consume_through(session, "completion-dir/", TEST_TIMEOUT_MS) == -1 ||
+        send_text(session, "\r") == -1 ||
+        consume_through(session, "GSH_TAB_DIR=<", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(session, ">\r\n", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
+        send_text(session, "cd completion") == -1 ||
+        send_bytes(session, "\t", 1U) == -1 ||
+        consume_through(session, "cd completion-dir/",
+                        TEST_TIMEOUT_MS) == -1 ||
+        send_bytes(session, "\025", 1U) == -1 ||
+        consume_through(session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
+        send_text(session, "cd ~") == -1 ||
+        send_bytes(session, "\t", 1U) == -1 ||
+        consume_through(session, "cd ~/", TEST_TIMEOUT_MS) == -1 ||
+        send_bytes(session, "\025", 1U) == -1 ||
+        consume_through(session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
+        send_text(session, "cd ") == -1 ||
+        send_bytes(session, "\t", 1U) == -1 ||
+        consume_through(session, "completion-dir/", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(session, "cycle-alpha/", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(session, "cycle-beta\\ space/",
+                        TEST_TIMEOUT_MS) == -1 ||
+        send_bytes(session, "\t", 1U) == -1 ||
+        consume_through(session, "cd completion-dir/",
+                        TEST_TIMEOUT_MS) == -1 ||
+        consume_through(session, "\033[7mcompletion-dir/\033[0m",
+                        TEST_TIMEOUT_MS) == -1 ||
+        send_bytes(session, "\t", 1U) == -1 ||
+        consume_through(session, "cd cycle-alpha/", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(session, "\033[7mcycle-alpha/\033[0m",
+                        TEST_TIMEOUT_MS) == -1 ||
+        send_bytes(session, "\t", 1U) == -1 ||
+        consume_through(session, "cd cycle-beta\\ space/",
+                        TEST_TIMEOUT_MS) == -1 ||
+        consume_through(session, "\033[7mcycle-beta\\ space/\033[0m",
+                        TEST_TIMEOUT_MS) == -1 ||
+        send_bytes(session, "\025", 1U) == -1 ||
+        consume_through(session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
+        send_text(session, "echo $PA") == -1 ||
+        send_bytes(session, "\t", 1U) == -1 ||
+        consume_through(session, "$PAGER", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(session, "$PATH", TEST_TIMEOUT_MS) == -1 ||
+        send_bytes(session, "\t", 1U) == -1 ||
+        consume_through(session, "echo $PAGER", TEST_TIMEOUT_MS) == -1 ||
+        send_bytes(session, "\t", 1U) == -1 ||
+        consume_through(session, "echo $PATH", TEST_TIMEOUT_MS) == -1 ||
+        send_bytes(session, "\025", 1U) == -1 ||
+        consume_through(session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
+        send_text(session, "git sta") == -1 ||
+        send_bytes(session, "\t", 1U) == -1 ||
+        consume_through(session, "stash", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(session, "status", TEST_TIMEOUT_MS) == -1 ||
+        send_bytes(session, "\t", 1U) == -1 ||
+        consume_through(session, "git stash ", TEST_TIMEOUT_MS) == -1 ||
+        send_bytes(session, "\t", 1U) == -1 ||
+        consume_through(session, "git status ", TEST_TIMEOUT_MS) == -1 ||
+        send_bytes(session, "\025", 1U) == -1 ||
+        consume_through(session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
+        send_text(session, "ls -A") == -1 ||
+        send_bytes(session, "\t", 1U) == -1 ||
+        consume_through(session, "ls -A ", TEST_TIMEOUT_MS) == -1 ||
+        send_bytes(session, "\025", 1U) == -1 ||
         consume_through(session, "gsh$ ", TEST_TIMEOUT_MS) == -1) {
         return -1;
     }
@@ -1393,13 +1482,65 @@ static int exercise_editor_navigation(pty_session *session)
     return 0;
 }
 
+static void remove_editor_fixture(const char *root, const char *completion,
+                                  const char *amber_one,
+                                  const char *amber_two,
+                                  const char *completion_directory,
+                                  const char *cycle_alpha,
+                                  const char *cycle_beta)
+{
+    if (!require(root != NULL && completion != NULL)) return;
+    if (!require(amber_one != NULL && amber_two != NULL)) return;
+    if (!require(completion_directory != NULL && cycle_alpha != NULL &&
+                 cycle_beta != NULL)) return;
+    (void)unlink(completion);
+    (void)unlink(amber_one);
+    (void)unlink(amber_two);
+    (void)rmdir(completion_directory);
+    (void)rmdir(cycle_alpha);
+    (void)rmdir(cycle_beta);
+    (void)rmdir(root);
+}
+
 static int editor_navigation_flow(const char *executable)
 {
     char fixture[] = "/tmp/gsh-editor-flow-XXXXXX";
+    char completion[PATH_MAX];
+    char completion_directory[PATH_MAX];
+    char cycle_alpha[PATH_MAX];
+    char cycle_beta[PATH_MAX];
+    char amber_one[PATH_MAX];
+    char amber_two[PATH_MAX];
     pty_session session;
     int failed = 0;
 
     if (executable == NULL || mkdtemp(fixture) == NULL) return 1;
+    if (snprintf(completion, sizeof(completion), "%s/completion alpha",
+                 fixture) >= (int)sizeof(completion) ||
+        snprintf(amber_one, sizeof(amber_one), "%s/amber-one", fixture) >=
+            (int)sizeof(amber_one) ||
+        snprintf(amber_two, sizeof(amber_two), "%s/amber-two", fixture) >=
+            (int)sizeof(amber_two) ||
+        snprintf(completion_directory, sizeof(completion_directory),
+                 "%s/completion-dir", fixture) >=
+            (int)sizeof(completion_directory) ||
+        snprintf(cycle_alpha, sizeof(cycle_alpha), "%s/cycle-alpha",
+                 fixture) >= (int)sizeof(cycle_alpha) ||
+        snprintf(cycle_beta, sizeof(cycle_beta), "%s/cycle-beta space",
+                 fixture) >= (int)sizeof(cycle_beta)) {
+        (void)rmdir(fixture);
+        return 1;
+    }
+    if (write_text_file(completion, "completion\n", 0600) == -1 ||
+        write_text_file(amber_one, "one\n", 0600) == -1 ||
+        write_text_file(amber_two, "two\n", 0600) == -1 ||
+        mkdir(completion_directory, 0700) == -1 ||
+        mkdir(cycle_alpha, 0700) == -1 ||
+        mkdir(cycle_beta, 0700) == -1) {
+        remove_editor_fixture(fixture, completion, amber_one, amber_two,
+                              completion_directory, cycle_alpha, cycle_beta);
+        return 1;
+    }
     if (start_session(&session, executable, fixture, SHELL_GSH) == -1 ||
         exercise_editor_navigation(&session) == -1) {
         perror("pty editor: classic flow");
@@ -1415,7 +1556,8 @@ static int editor_navigation_flow(const char *executable)
         failed = 1;
     }
     if (session.master >= 0 && stop_session(&session) == -1) failed = 1;
-    remove_fixture(fixture);
+    remove_editor_fixture(fixture, completion, amber_one, amber_two,
+                          completion_directory, cycle_alpha, cycle_beta);
     return failed;
 }
 

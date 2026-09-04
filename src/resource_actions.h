@@ -31,6 +31,7 @@ typedef struct {
     gsh_resource_provenance provenance;
     gsh_resource_type type;
     bool navigable_root;
+    bool muted;
 } gsh_resource_candidate;
 
 size_t gsh_resource_detect(const char *command, const char *launch_directory,

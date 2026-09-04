@@ -12,6 +12,7 @@
 #endif
 
 #include "builtin_files.h"
+#include "git_listing.h"
 #include "native_viewer.h"
 #include "resource_protocol.h"
 
@@ -19,7 +20,6 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <grp.h>
-#include <limits.h>
 #include <pwd.h>
 #include <stdarg.h> /* CANON-INCLUDE: gcc */
 #include <stdio.h> /* CANON-INCLUDE: linux */
@@ -40,6 +40,8 @@ enum {
     GSH_FILE_OPERAND_CAP = 128,
     GSH_FILE_RECURSION_CAP = 512,
     GSH_FILE_LINE_CAP = PATH_MAX + 1024,
+    GSH_FILE_GIT_CODE_CAP = 48,
+    GSH_FILE_SEARCH_CAP = 32,
     GSH_VIEW_INDEX_CAP = 1048576,
 };
 
@@ -88,7 +90,15 @@ typedef struct {
     char name[PATH_MAX];
     struct stat status;
     uint64_t sequence;
+    char git_codes[GSH_FILE_GIT_CODE_CAP][2];
+    char git_object_id[GSH_GIT_OID_CAP];
+    size_t git_code_count;
     bool metadata;
+    bool git_tracked;
+    bool git_ignored;
+    bool git_synthetic;
+    bool git_mode_known;
+    bool git_size_known;
 } file_record;
 
 typedef struct {
@@ -104,8 +114,11 @@ typedef struct {
 
 typedef struct {
     file_catalog catalog;
+    file_catalog synthetic;
     recursion_item pending[GSH_FILE_RECURSION_CAP];
     size_t pending_count;
+    char git_branch[GSH_GIT_BRANCH_CAP];
+    bool git_active;
 } file_workspace;
 
 typedef struct {
@@ -113,6 +126,8 @@ typedef struct {
     const char *base_directory;
     bool navigable_root;
 } resource_scope;
+
+static bool visible_entry(const char *name, const ls_options *options);
 
 static int emit_text(const gsh_builtin_io *io, int descriptor,
                      const char *text)
@@ -243,6 +258,7 @@ static bool ls_apply_detail_option(ls_options *options,
     case 'k': options->kib_blocks = true; break;
     case 's': options->blocks = true; break;
     case 'q': options->quote_nonprintable = true; break;
+    case 'G': break;
     default: return false;
     }
     return true;
@@ -553,7 +569,6 @@ static int sort_spool(file_catalog *catalog, const ls_options *options)
 static int catalog_sort(file_catalog *catalog, const ls_options *options)
 {
     if (catalog == NULL || options == NULL) return -1;
-    if (options->sort == LS_SORT_NONE) return 0;
     if (catalog->spilled) return sort_spool(catalog, options);
     sort_memory(catalog, options);
     return 0;
@@ -568,6 +583,427 @@ static int catalog_get(const file_catalog *catalog, size_t index,
     if (catalog->spilled) return read_record(catalog->spool[0], index, record);
     *record = catalog->memory[index];
     return 0;
+}
+
+static int catalog_set(file_catalog *catalog, size_t index,
+                       const file_record *record)
+{
+    if (catalog == NULL || record == NULL || index >= catalog->count) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (catalog->spilled) return write_record(catalog->spool[0], index, record);
+    catalog->memory[index] = *record;
+    return 0;
+}
+
+static int catalog_truncate(file_catalog *catalog, size_t count)
+{
+    off_t length;
+    if (catalog == NULL || count > catalog->count) return -1;
+    if (!catalog->spilled) { catalog->count = count; return 0; }
+    length = (off_t)(count * sizeof(file_record));
+    if (ftruncate(catalog->spool[0], length) == -1) return -1;
+    catalog->count = count;
+    return 0;
+}
+
+static void workspace_initialize(file_workspace *space)
+{
+    if (space == NULL) return;
+    (void)memset(space, 0, sizeof(*space));
+    space->catalog.spool[0] = -1;
+    space->catalog.spool[1] = -1;
+    space->synthetic.spool[0] = -1;
+    space->synthetic.spool[1] = -1;
+}
+
+static void workspace_reset_catalogs(file_workspace *space)
+{
+    if (space == NULL) return;
+    catalog_reset(&space->catalog);
+    catalog_reset(&space->synthetic);
+    space->git_active = false;
+    space->git_branch[0] = '\0';
+}
+
+static int git_character_rank(char status)
+{
+    static const char order[] = "AMTDRCU?I";
+    size_t index;
+    if (status == ' ') return 9;
+    for (index = 0U; index + 1U < sizeof(order); index++) {
+        if (order[index] == status) return (int)index;
+    }
+    return 10;
+}
+
+static int git_code_group(char index_status, char worktree_status)
+{
+    if (index_status == '?' && worktree_status == '?') return 4;
+    if (index_status == 'I' && worktree_status == 'I') return 5;
+    if (index_status == 'U' || worktree_status == 'U' ||
+        (index_status == 'A' && worktree_status == 'A') ||
+        (index_status == 'D' && worktree_status == 'D')) return 0;
+    if (index_status != ' ' && worktree_status != ' ') return 1;
+    if (index_status != ' ') return 2;
+    return 3;
+}
+
+static int git_code_compare(char left_index, char left_worktree,
+                            char right_index, char right_worktree)
+{
+    int left_group = git_code_group(left_index, left_worktree);
+    int right_group = git_code_group(right_index, right_worktree);
+    int left_rank;
+    int right_rank;
+
+    if (left_group != right_group) return left_group < right_group ? -1 : 1;
+    left_rank = git_character_rank(left_index);
+    right_rank = git_character_rank(right_index);
+    if (left_rank != right_rank) return left_rank < right_rank ? -1 : 1;
+    left_rank = git_character_rank(left_worktree);
+    right_rank = git_character_rank(right_worktree);
+    return left_rank == right_rank ? 0 : (left_rank < right_rank ? -1 : 1);
+}
+
+static int record_add_git_code(file_record *record, char index_status,
+                               char worktree_status)
+{
+    size_t position;
+
+    if (record == NULL || index_status == '\0' || worktree_status == '\0')
+        return -1;
+    for (position = 0U; position < record->git_code_count; position++) {
+        int comparison = git_code_compare(
+            index_status, worktree_status,
+            record->git_codes[position][0], record->git_codes[position][1]);
+        if (comparison == 0) return 0;
+        if (comparison < 0) break;
+    }
+    if (record->git_code_count >= GSH_FILE_GIT_CODE_CAP) {
+        errno = EOVERFLOW;
+        return -1;
+    }
+    if (position < record->git_code_count) {
+        (void)memmove(&record->git_codes[position + 1U],
+                      &record->git_codes[position],
+                      (record->git_code_count - position) *
+                          sizeof(record->git_codes[0]));
+    }
+    record->git_codes[position][0] = index_status;
+    record->git_codes[position][1] = worktree_status;
+    record->git_code_count++;
+    return 0;
+}
+
+static int catalog_find_name(const file_catalog *catalog, const char *name,
+                             size_t *found)
+{
+    size_t lower = 0U;
+    size_t upper;
+    size_t turn;
+
+    if (catalog == NULL || name == NULL || found == NULL) return -1;
+    upper = catalog->count;
+    for (turn = 0U; turn < GSH_FILE_SEARCH_CAP && lower < upper; turn++) {
+        file_record record;
+        size_t middle = lower + (upper - lower) / 2U;
+        int comparison;
+        if (catalog_get(catalog, middle, &record) == -1) return -1;
+        comparison = strcoll(record.name, name);
+        if (comparison == 0) comparison = strcmp(record.name, name);
+        if (comparison == 0) { *found = middle; return 1; }
+        if (comparison < 0) lower = middle + 1U;
+        else upper = middle;
+    }
+    if (lower < upper) { errno = EOVERFLOW; return -1; }
+    return 0;
+}
+
+static int git_top_name(const char *path, char name[PATH_MAX], bool *direct)
+{
+    size_t length;
+    size_t index;
+
+    if (path == NULL || name == NULL || direct == NULL) return -1;
+    length = strlen(path);
+    if (length == 0U || length >= PATH_MAX) return -1;
+    for (index = 0U; index < length && path[index] != '/'; index++) {
+        name[index] = path[index];
+    }
+    if (index == 0U || index >= PATH_MAX) return -1;
+    name[index] = '\0';
+    *direct = index == length ||
+              (path[index] == '/' && index + 1U == length);
+    return 0;
+}
+
+static int catalog_apply_git_code(file_catalog *catalog, const char *path,
+                                  char index_status, char worktree_status)
+{
+    char name[PATH_MAX];
+    bool direct;
+    size_t index;
+    int found;
+    file_record record;
+
+    if (catalog == NULL || path == NULL) return -1;
+    if (git_top_name(path, name, &direct) == -1) return -1;
+    found = catalog_find_name(catalog, path, &index);
+    if (found < 0) return -1;
+    if (found == 0) {
+        found = catalog_find_name(catalog, name, &index);
+        if (found <= 0) return found;
+    }
+    if (catalog_get(catalog, index, &record) == -1 ||
+        record_add_git_code(&record, index_status, worktree_status) == -1)
+        return -1;
+    if (direct && index_status == 'I' && worktree_status == 'I') {
+        record.git_ignored = true;
+    }
+    return catalog_set(catalog, index, &record) == -1 ? -1 : 1;
+}
+
+static int catalog_mark_git_tracked(file_catalog *catalog,
+                                    const char *path)
+{
+    char name[PATH_MAX];
+    bool direct;
+    size_t index;
+    int found;
+    file_record record;
+
+    if (catalog == NULL || path == NULL) return -1;
+    found = catalog_find_name(catalog, path, &index);
+    if (found < 0) return -1;
+    if (found == 0) {
+        if (git_top_name(path, name, &direct) == -1) return -1;
+        (void)direct;
+        found = catalog_find_name(catalog, name, &index);
+        if (found <= 0) return found;
+    }
+    if (catalog_get(catalog, index, &record) == -1) return -1;
+    record.git_tracked = true;
+    return catalog_set(catalog, index, &record) == -1 ? -1 : 1;
+}
+
+static bool git_deleted(char index_status, char worktree_status)
+{
+    return index_status == 'D' || worktree_status == 'D';
+}
+
+static int add_synthetic_change(file_workspace *space,
+                                const gsh_git_change *change,
+                                const ls_options *options)
+{
+    file_record record;
+    bool direct;
+    char name[PATH_MAX];
+
+    if (space == NULL || change == NULL || options == NULL) return -1;
+    if (!git_deleted(change->index_status, change->worktree_status)) return 0;
+    if (git_top_name(change->path, name, &direct) == -1) return -1;
+    if (!direct || !visible_entry(name, options)) return 0;
+    (void)memset(&record, 0, sizeof(record));
+    (void)memcpy(record.name, name, strlen(name) + 1U);
+    record.sequence = UINT64_MAX;
+    record.git_synthetic = true;
+    if (record_add_git_code(&record, change->index_status,
+                            change->worktree_status) == -1)
+        return -1;
+    return catalog_add(&space->synthetic, &record);
+}
+
+static int collect_git_changes(gsh_git_snapshot *snapshot,
+                               file_workspace *space,
+                               const ls_options *options,
+                               bool include_synthetic)
+{
+    size_t turn;
+    int state = 0;
+
+    if (snapshot == NULL || space == NULL || options == NULL) return -1;
+    for (turn = 0U; turn <= GSH_FILE_ENTRY_CAP; turn++) {
+        gsh_git_change change;
+        int applied;
+        state = gsh_git_snapshot_next_change(snapshot, &change);
+        if (state <= 0) break;
+        if (turn == GSH_FILE_ENTRY_CAP) { errno = EOVERFLOW; return -1; }
+        applied = catalog_apply_git_code(&space->catalog, change.path,
+                                         change.index_status,
+                                         change.worktree_status);
+        if (applied < 0 || (applied == 0 && include_synthetic &&
+            add_synthetic_change(space, &change, options) == -1)) return -1;
+        if (change.renamed && change.original[0] != '\0' &&
+            catalog_apply_git_code(&space->catalog, change.original,
+                                   change.index_status,
+                                   change.worktree_status) < 0) return -1;
+    }
+    return state < 0 ? -1 : 0;
+}
+
+static int mark_synthetic_mode(file_catalog *catalog,
+                               const gsh_git_tracked *tracked)
+{
+    size_t index;
+    int found;
+    file_record record;
+
+    if (catalog == NULL || tracked == NULL) return -1;
+    found = catalog_find_name(catalog, tracked->path, &index);
+    if (found <= 0) return found;
+    if (catalog_get(catalog, index, &record) == -1) return -1;
+    record.status.st_mode = tracked->mode;
+    record.git_mode_known = true;
+    (void)memcpy(record.git_object_id, tracked->object_id,
+                 strlen(tracked->object_id) + 1U);
+    return catalog_set(catalog, index, &record) == -1 ? -1 : 1;
+}
+
+static int collect_git_tracked(gsh_git_snapshot *snapshot,
+                               file_workspace *space)
+{
+    size_t turn;
+    int state = 0;
+
+    if (snapshot == NULL || space == NULL) return -1;
+    for (turn = 0U; turn <= GSH_FILE_ENTRY_CAP * 3U; turn++) {
+        gsh_git_tracked tracked;
+        state = gsh_git_snapshot_next_tracked(snapshot, &tracked);
+        if (state <= 0) break;
+        if (turn == GSH_FILE_ENTRY_CAP * 3U) {
+            errno = EOVERFLOW;
+            return -1;
+        }
+        if (catalog_mark_git_tracked(&space->catalog, tracked.path) < 0 ||
+            mark_synthetic_mode(&space->synthetic, &tracked) < 0) return -1;
+    }
+    return state < 0 ? -1 : 0;
+}
+
+static int request_git_sizes(gsh_git_snapshot *snapshot,
+                             const file_catalog *catalog)
+{
+    size_t index;
+    if (snapshot == NULL || catalog == NULL) return -1;
+    for (index = 0U; index < catalog->count; index++) {
+        file_record record;
+        if (catalog_get(catalog, index, &record) == -1) return -1;
+        if (record.git_object_id[0] != '\0' &&
+            gsh_git_snapshot_request_size(snapshot,
+                                          record.git_object_id) == -1)
+            return 0;
+    }
+    return gsh_git_snapshot_begin_sizes(snapshot);
+}
+
+static void collect_git_sizes(gsh_git_snapshot *snapshot,
+                              file_catalog *catalog)
+{
+    size_t index;
+    int available;
+    if (snapshot == NULL || catalog == NULL) return;
+    available = request_git_sizes(snapshot, catalog);
+    if (available != 1) return;
+    for (index = 0U; index < catalog->count; index++) {
+        file_record record;
+        off_t size;
+        if (catalog_get(catalog, index, &record) == -1) return;
+        if (record.git_object_id[0] == '\0') continue;
+        if (gsh_git_snapshot_next_size(snapshot, &size) != 1) return;
+        record.status.st_size = size;
+        record.git_size_known = true;
+        if (catalog_set(catalog, index, &record) == -1) return;
+    }
+}
+
+static int append_synthetic(file_workspace *space)
+{
+    size_t index;
+    if (space == NULL) return -1;
+    for (index = 0U; index < space->synthetic.count; index++) {
+        file_record record;
+        if (catalog_get(&space->synthetic, index, &record) == -1 ||
+            catalog_add(&space->catalog, &record) == -1) return -1;
+    }
+    return 0;
+}
+
+static int clear_git_catalog(file_catalog *catalog)
+{
+    size_t index;
+    if (catalog == NULL) return -1;
+    for (index = 0U; index < catalog->count; index++) {
+        file_record record;
+        if (catalog_get(catalog, index, &record) == -1) return -1;
+        (void)memset(record.git_codes, 0, sizeof(record.git_codes));
+        (void)memset(record.git_object_id, 0,
+                     sizeof(record.git_object_id));
+        record.git_code_count = 0U;
+        record.git_tracked = false;
+        record.git_ignored = false;
+        record.git_synthetic = false;
+        record.git_mode_known = false;
+        record.git_size_known = false;
+        if (catalog_set(catalog, index, &record) == -1) return -1;
+    }
+    return 0;
+}
+
+/* ── Enrichment Never Owns Listing Semantics ─────────────────────
+ * Git data is useful only when a person is reading a long listing.
+ * The catalog is temporarily name-sorted so bounded binary lookups can map
+ * arbitrary NUL-delimited paths without quadratic scans. Its requested sort
+ * is restored before output, including directory order selected by -f.
+ * If the provider or parser fails, every partial annotation is discarded;
+ * the same native listing remains available with no Git header or escapes.
+ * ─────────────────────────────────────────────────────────────── */
+static int enrich_git_catalog(file_workspace *space, const char *directory,
+                              const ls_options *options,
+                              bool include_synthetic)
+{
+    gsh_git_snapshot snapshot;
+    ls_options name_options;
+    size_t original_count;
+    int active;
+    bool complete = false;
+
+    if (space == NULL || directory == NULL || options == NULL) return -1;
+    catalog_reset(&space->synthetic);
+    original_count = space->catalog.count;
+    space->git_active = false;
+    space->git_branch[0] = '\0';
+    if (options->format != LS_FORMAT_LONG || !isatty(STDOUT_FILENO))
+        return catalog_sort(&space->catalog, options);
+    active = gsh_git_snapshot_open(&snapshot, directory);
+    if (active == 1) {
+        name_options = *options;
+        name_options.sort = LS_SORT_NAME;
+        name_options.reverse = false;
+        if (catalog_sort(&space->catalog, &name_options) == 0 &&
+            collect_git_changes(&snapshot, space, options,
+                                include_synthetic) == 0 &&
+            catalog_sort(&space->synthetic, &name_options) == 0 &&
+            collect_git_tracked(&snapshot, space) == 0) {
+            collect_git_sizes(&snapshot, &space->synthetic);
+            if (append_synthetic(space) == 0) complete = true;
+        }
+    }
+    if (!complete &&
+        (catalog_truncate(&space->catalog, original_count) == -1 ||
+         clear_git_catalog(&space->catalog) == -1)) {
+        gsh_git_snapshot_close(&snapshot);
+        return -1;
+    }
+    if (complete) {
+        (void)memcpy(space->git_branch, snapshot.branch,
+                     strlen(snapshot.branch) + 1U);
+        space->git_active = true;
+    }
+    gsh_git_snapshot_close(&snapshot);
+    catalog_reset(&space->synthetic);
+    return catalog_sort(&space->catalog, options);
 }
 
 static bool visible_entry(const char *name, const ls_options *options)
@@ -764,6 +1200,16 @@ static gsh_resource_type resource_type_for_mode(mode_t mode)
     return GSH_RESOURCE_UNKNOWN;
 }
 
+static bool git_ignored_directory(const file_record *record)
+{
+    if (record == NULL) return false;
+    return record->metadata &&
+           S_ISDIR(record->status.st_mode) && !record->git_tracked &&
+           record->git_ignored && record->git_code_count == 1U &&
+           record->git_codes[0][0] == 'I' &&
+           record->git_codes[0][1] == 'I';
+}
+
 static size_t file_text_width(const char *text, size_t length)
 {
     mbstate_t state;
@@ -859,8 +1305,11 @@ static void send_resource_record(const gsh_builtin_io *io,
     header.column_begin = (uint32_t)resources->visual_column;
     header.column_end = (uint32_t)(resources->visual_column + label_columns);
     header.type = (uint32_t)type;
-    header.flags = resources->navigable_root
-                       ? GSH_RESOURCE_PROTOCOL_NAVIGABLE : 0U;
+    header.flags = 0U;
+    if (resources->navigable_root)
+        header.flags |= GSH_RESOURCE_PROTOCOL_NAVIGABLE;
+    if (git_ignored_directory(record))
+        header.flags |= GSH_RESOURCE_PROTOCOL_MUTED;
     header.path_length = (uint32_t)path_length;
     header.label_length = (uint32_t)label_length;
     (void)memcpy(message, &header, sizeof(header));
@@ -896,26 +1345,181 @@ static void leave_resource_scope(resource_scope *scope)
     sink->navigable_root = scope->navigable_root;
 }
 
+static const char git_color_green[] = "\033[38;5;114m";
+static const char git_color_yellow[] = "\033[38;5;221m";
+static const char git_color_red[] = "\033[38;5;203m";
+static const char git_color_cyan[] = "\033[38;5;81m";
+static const char git_color_magenta[] = "\033[38;5;177m";
+static const char git_color_ignored[] = "\033[2;38;5;250m";
+static const char git_color_ignored_name[] = "\033[38;5;245m";
+static const char git_color_deleted_name[] = "\033[9;38;5;203m";
+
+static const char *git_code_color(char index_status, char worktree_status)
+{
+    if (index_status == 'I' && worktree_status == 'I')
+        return git_color_ignored;
+    if (index_status == '?' && worktree_status == '?')
+        return git_color_magenta;
+    if (index_status == 'U' || worktree_status == 'U' ||
+        index_status == 'D' || worktree_status == 'D') return git_color_red;
+    if (index_status == 'R' || worktree_status == 'R' ||
+        index_status == 'C' || worktree_status == 'C') return git_color_cyan;
+    if (index_status == 'M' || worktree_status == 'M' ||
+        index_status == 'T' || worktree_status == 'T') return git_color_yellow;
+    return git_color_green;
+}
+
+static int emit_git_code(const gsh_builtin_io *io, char index_status,
+                         char worktree_status)
+{
+    const char *color;
+    const char *left = index_status == ' ' ? "·" : NULL;
+    const char *right = worktree_status == ' ' ? "·" : NULL;
+    char byte;
+
+    if (io == NULL || index_status == '\0' || worktree_status == '\0') return 1;
+    color = git_code_color(index_status, worktree_status);
+    if (emit_text(io, STDOUT_FILENO, color) != 0) return 1;
+    byte = index_status;
+    if ((left != NULL && emit_text(io, STDOUT_FILENO, left) != 0) ||
+        (left == NULL && gsh_builtin_output(io, STDOUT_FILENO, &byte, 1U) != 0))
+        return 1;
+    byte = worktree_status;
+    if ((right != NULL && emit_text(io, STDOUT_FILENO, right) != 0) ||
+        (right == NULL && gsh_builtin_output(io, STDOUT_FILENO, &byte, 1U) != 0))
+        return 1;
+    return emit_text(io, STDOUT_FILENO, "\033[0m");
+}
+
+static size_t git_status_width(const file_record *record)
+{
+    bool directory;
+    if (record == NULL) return 0U;
+    if (git_ignored_directory(record)) return 0U;
+    if (record->git_code_count == 0U) return record->git_tracked ? 1U : 0U;
+    directory = record->metadata && S_ISDIR(record->status.st_mode);
+    if (!directory && record->git_code_count == 1U) return 2U;
+    return 2U + record->git_code_count * 2U +
+           (record->git_code_count - 1U);
+}
+
+static int emit_git_status(const gsh_builtin_io *io,
+                           const file_record *record)
+{
+    bool brackets;
+    size_t index;
+
+    if (io == NULL || record == NULL) return 1;
+    if (git_ignored_directory(record)) return 0;
+    if (record->git_code_count == 0U) {
+        if (!record->git_tracked) return 0;
+        if (emit_text(io, STDOUT_FILENO, git_color_green) != 0 ||
+            emit_text(io, STDOUT_FILENO, "✓") != 0) return 1;
+        return emit_text(io, STDOUT_FILENO, "\033[0m");
+    }
+    brackets = (record->metadata && S_ISDIR(record->status.st_mode)) ||
+               record->git_code_count > 1U;
+    if (brackets && emit_text(io, STDOUT_FILENO, "[") != 0) return 1;
+    for (index = 0U; index < record->git_code_count; index++) {
+        if (index != 0U && emit_text(io, STDOUT_FILENO, " ") != 0) return 1;
+        if (emit_git_code(io, record->git_codes[index][0],
+                          record->git_codes[index][1]) != 0) return 1;
+    }
+    return !brackets || emit_text(io, STDOUT_FILENO, "]") == 0 ? 0 : 1;
+}
+
+static int emit_git_field(const gsh_builtin_io *io,
+                          const file_record *record, size_t width,
+                          size_t separator)
+{
+    size_t used;
+    size_t padding;
+    if (io == NULL || record == NULL || width > GSH_FILE_LINE_CAP) return 1;
+    used = git_status_width(record);
+    if (used > width || emit_git_status(io, record) != 0) return 1;
+    padding = width - used + separator;
+    return padding == 0U ? 0 :
+           emit_format(io, STDOUT_FILENO, "%*s", (int)padding, "");
+}
+
+static int emit_git_branch(const gsh_builtin_io *io, const char *branch)
+{
+    if (io == NULL || branch == NULL || branch[0] == '\0') return 1;
+    if (emit_text(io, STDOUT_FILENO, git_color_cyan) != 0 ||
+        emit_text(io, STDOUT_FILENO, "branch: ") != 0 ||
+        emit_text(io, STDOUT_FILENO, branch) != 0) return 1;
+    return emit_text(io, STDOUT_FILENO, "\033[0m\n");
+}
+
 static int emit_name(const gsh_builtin_io *io, const file_record *record,
                      const ls_options *options)
 {
     char name[PATH_MAX];
     char suffix[2] = {'\0', '\0'};
+    bool ignored;
     size_t length;
 
     if (io == NULL || record == NULL || options == NULL) return 1;
     length = printable_name(record->name, options->quote_nonprintable, name);
+    ignored = git_ignored_directory(record);
     suffix[0] = record->metadata
                     ? type_indicator(record->status.st_mode, options) : '\0';
+    if (ignored && emit_text(io, STDOUT_FILENO,
+                             git_color_ignored_name) != 0) return 1;
     send_resource_record(io, record, name, length);
     if (gsh_builtin_output(io, STDOUT_FILENO, name, length) != 0) return 1;
-    return suffix[0] == '\0' ? 0 :
-           gsh_builtin_output(io, STDOUT_FILENO, suffix, 1U);
+    if (suffix[0] != '\0' &&
+        gsh_builtin_output(io, STDOUT_FILENO, suffix, 1U) != 0) return 1;
+    return !ignored || emit_text(io, STDOUT_FILENO, "\033[0m") == 0 ? 0 : 1;
+}
+
+static int emit_synthetic_name(const gsh_builtin_io *io,
+                               const file_record *record,
+                               const ls_options *options)
+{
+    char name[PATH_MAX];
+    size_t length;
+    if (io == NULL || record == NULL || options == NULL) return 1;
+    length = printable_name(record->name, options->quote_nonprintable, name);
+    if (emit_text(io, STDOUT_FILENO, git_color_deleted_name) != 0 ||
+        gsh_builtin_output(io, STDOUT_FILENO, name, length) != 0) return 1;
+    return emit_text(io, STDOUT_FILENO, "\033[0m");
+}
+
+static int emit_synthetic_long(const gsh_builtin_io *io,
+                               const file_record *record,
+                               const ls_options *options)
+{
+    char mode[11];
+    const char *mode_value = "—";
+    size_t status_width;
+
+    if (io == NULL || record == NULL || options == NULL) return 1;
+    if (record->git_mode_known) {
+        mode_text(record->status.st_mode, mode);
+        mode_value = mode;
+    }
+    if (options->inode && emit_text(io, STDOUT_FILENO, "— ") != 0) return 1;
+    if (options->blocks && emit_text(io, STDOUT_FILENO, "— ") != 0) return 1;
+    if (emit_format(io, STDOUT_FILENO, "%s —", mode_value) != 0) return 1;
+    if (!options->omit_owner && emit_text(io, STDOUT_FILENO, " —") != 0)
+        return 1;
+    if (!options->omit_group && emit_text(io, STDOUT_FILENO, " —") != 0)
+        return 1;
+    if (record->git_size_known) {
+        if (emit_format(io, STDOUT_FILENO, " %jd — ",
+                        (intmax_t)record->status.st_size) != 0) return 1;
+    } else if (emit_text(io, STDOUT_FILENO, " — — ") != 0) return 1;
+    status_width = git_status_width(record);
+    if (status_width < 2U) status_width = 2U;
+    if (emit_git_field(io, record, status_width, 1U) != 0 ||
+        emit_synthetic_name(io, record, options) != 0) return 1;
+    return emit_text(io, STDOUT_FILENO, "\n");
 }
 
 static int emit_long_record(const gsh_builtin_io *io, int directory_fd,
                             const file_record *record,
-                            const ls_options *options)
+                            const ls_options *options, bool git_active)
 {
     char mode[11];
     char owner[32];
@@ -926,8 +1530,11 @@ static int emit_long_record(const gsh_builtin_io *io, int directory_fd,
     ssize_t link_length = -1;
 
     if (io == NULL || record == NULL || options == NULL) return 1;
+    if (record->git_synthetic)
+        return emit_synthetic_long(io, record, options);
     if (!record->metadata) {
         if (emit_text(io, STDOUT_FILENO, "?????????? ? ? ? ? ? ") != 0 ||
+            (git_active && emit_git_field(io, record, 2U, 1U) != 0) ||
             emit_name(io, record, options) != 0) return 1;
         return emit_text(io, STDOUT_FILENO, "\n");
     }
@@ -949,6 +1556,11 @@ static int emit_long_record(const gsh_builtin_io *io, int directory_fd,
                 (uintmax_t)minor(record->status.st_rdev), date) != 0) return 1;
     } else if (emit_format(io, STDOUT_FILENO, " %jd %s ",
                (intmax_t)record->status.st_size, date) != 0) return 1;
+    if (git_active) {
+        size_t status_width = git_status_width(record);
+        if (status_width < 2U) status_width = 2U;
+        if (emit_git_field(io, record, status_width, 1U) != 0) return 1;
+    }
     if (emit_name(io, record, options) != 0) return 1;
     if (S_ISLNK(record->status.st_mode)) {
         struct stat target;
@@ -1116,7 +1728,7 @@ static int emit_columns(const gsh_builtin_io *io,
 
 static int emit_catalog(const gsh_builtin_io *io, int directory_fd,
                         const file_catalog *catalog,
-                        const ls_options *options)
+                        const ls_options *options, bool git_active)
 {
     size_t index;
 
@@ -1125,7 +1737,8 @@ static int emit_catalog(const gsh_builtin_io *io, int directory_fd,
         for (index = 0U; index < catalog->count; index++) {
             file_record record;
             if (catalog_get(catalog, index, &record) == -1 ||
-                emit_long_record(io, directory_fd, &record, options) != 0) return 1;
+                emit_long_record(io, directory_fd, &record, options,
+                                 git_active) != 0) return 1;
         }
         return 0;
     }
@@ -1238,10 +1851,15 @@ static int list_directory(const gsh_builtin_io *io, const char *path,
     if (descriptor == -1) return file_error(io, "ls", path, errno);
     resources = enter_resource_scope(io, path, navigable_root);
     catalog_reset(&space->catalog);
+    catalog_reset(&space->synthetic);
+    space->git_active = false;
+    space->git_branch[0] = '\0';
     if (enumerate_directory(dup(descriptor), options, &space->catalog) == -1 ||
-        catalog_sort(&space->catalog, options) == -1) {
+        enrich_git_catalog(space, path, options, true) == -1) {
         result = file_error(io, "ls", path, errno);
     } else {
+        if (space->git_active &&
+            emit_git_branch(io, space->git_branch) != 0) result = 1;
         if (heading) {
             char display_path[PATH_MAX];
             (void)printable_name(path, options->quote_nonprintable,
@@ -1261,7 +1879,8 @@ static int list_directory(const gsh_builtin_io *io, const char *path,
             if (options->kib_blocks) blocks = (blocks + 1U) / 2U;
             if (result == 0 && emit_format(io, STDOUT_FILENO, "total %ju\n", blocks) != 0) result = 1;
         }
-        if (result == 0) result = emit_catalog(io, descriptor, &space->catalog, options);
+        if (result == 0) result = emit_catalog(
+            io, descriptor, &space->catalog, options, space->git_active);
         if (result == 0 && options->recursive &&
             queue_catalog_directories(space, &space->catalog, path) == -1) {
             result = file_error(io, "ls", path, errno);
@@ -1329,9 +1948,7 @@ static int run_ls(size_t argc, char *const argv[], const gsh_builtin_io *io)
     int result = 0;
 
     if (argc == 0U || argv == NULL || io == NULL) return 1;
-    (void)memset(&space, 0, sizeof(space));
-    space.catalog.spool[0] = -1;
-    space.catalog.spool[1] = -1;
+    workspace_initialize(&space);
     if (parse_ls_options(argc, argv, &options, &first) == -1) {
         return gsh_builtin_error(io, "ls", "invalid option");
     }
@@ -1356,7 +1973,14 @@ static int run_ls(size_t argc, char *const argv[], const gsh_builtin_io *io)
             catalog_add(&space.catalog, &records[argument]) == -1) result = 1;
     }
     if (space.catalog.count != 0U) {
-        if (emit_catalog(io, -1, &space.catalog, &options) != 0) result = 1;
+        if (enrich_git_catalog(&space, ".", &options, false) == -1) {
+            result = file_error(io, "ls", ".", errno);
+        } else {
+            if (space.git_active &&
+                emit_git_branch(io, space.git_branch) != 0) result = 1;
+            if (emit_catalog(io, -1, &space.catalog, &options,
+                             space.git_active) != 0) result = 1;
+        }
         wrote_group = true;
     }
     catalog_reset(&space.catalog);
@@ -1378,7 +2002,7 @@ static int run_ls(size_t argc, char *const argv[], const gsh_builtin_io *io)
                 result = 1;
         }
     }
-    catalog_reset(&space.catalog);
+    workspace_reset_catalogs(&space);
     return result;
 }
 
@@ -1415,6 +2039,7 @@ static int emit_ll_name(const gsh_builtin_io *io,
 {
     char name[PATH_MAX];
     char field[GSH_RESOURCE_PROTOCOL_LABEL_CAP];
+    bool ignored;
     size_t length;
     size_t columns;
     size_t padding;
@@ -1427,6 +2052,17 @@ static int emit_ll_name(const gsh_builtin_io *io,
     }
     columns = file_text_width(name, length);
     padding = width > columns ? width - columns : 0U;
+    ignored = git_ignored_directory(record);
+    if (record->git_synthetic) {
+        if (emit_text(io, STDOUT_FILENO, git_color_deleted_name) != 0 ||
+            gsh_builtin_output(io, STDOUT_FILENO, name, length) != 0 ||
+            emit_text(io, STDOUT_FILENO, "\033[0m") != 0 ||
+            emit_format(io, STDOUT_FILENO, "%*s  ", (int)padding, "") != 0)
+            return 1;
+        return 0;
+    }
+    if (ignored && emit_text(io, STDOUT_FILENO,
+                             git_color_ignored_name) != 0) return 1;
     if (length + padding < sizeof(field)) {
         (void)memcpy(field, name, length);
         (void)memset(field + length, ' ', padding);
@@ -1439,19 +2075,21 @@ static int emit_ll_name(const gsh_builtin_io *io,
             emit_format(io, STDOUT_FILENO, "%*s", (int)padding, "") != 0)
             return 1;
     }
+    if (ignored && emit_text(io, STDOUT_FILENO, "\033[0m") != 0) return 1;
     return emit_text(io, STDOUT_FILENO, "  ");
 }
 
 static int emit_ll_record_label(const gsh_builtin_io *io,
                                 const file_record *record,
                                 const char *label, size_t name_width,
-                                size_t columns)
+                                size_t columns, size_t git_width)
 {
     char mode[11];
     char owner[32];
     char group[32];
     char date[64];
     char size[16];
+    char missing_size[16];
     const char *owner_value;
     const char *group_value;
     bool show_type = columns >= 68U;
@@ -1460,8 +2098,30 @@ static int emit_ll_record_label(const gsh_builtin_io *io,
     bool show_links = columns >= 100U;
 
     if (io == NULL || record == NULL) return 1;
+    if (emit_ll_name(io, record, label, name_width) != 0) return 1;
+    if (git_width != 0U &&
+        emit_git_field(io, record, git_width, 2U) != 0) return 1;
     if (!record->metadata) {
-        if (emit_ll_name(io, record, label, name_width) != 0) return 1;
+        if (record->git_synthetic) {
+            if (show_type && emit_text(io, STDOUT_FILENO, "—      ") != 0)
+                return 1;
+            if (record->git_mode_known) {
+                mode_text(record->status.st_mode, mode);
+                if (emit_format(io, STDOUT_FILENO, "%s ", mode) != 0) return 1;
+            } else if (emit_text(io, STDOUT_FILENO, "— ") != 0) return 1;
+            if (show_links && emit_text(io, STDOUT_FILENO, "   — ") != 0)
+                return 1;
+            if (show_owner && emit_text(io, STDOUT_FILENO, "—          ") != 0)
+                return 1;
+            if (show_group && emit_text(io, STDOUT_FILENO, "—          ") != 0)
+                return 1;
+            if (record->git_size_known) {
+                human_size(record->status.st_size, missing_size);
+                return emit_format(io, STDOUT_FILENO, "%8s  —\n",
+                                   missing_size);
+            }
+            return emit_text(io, STDOUT_FILENO, "       —  —\n");
+        }
         return emit_text(io, STDOUT_FILENO, "?\n");
     }
     mode_text(record->status.st_mode, mode);
@@ -1469,7 +2129,6 @@ static int emit_ll_record_label(const gsh_builtin_io *io,
     { ls_options time_options; ls_defaults(&time_options); timestamp_text(record, &time_options, date); }
     owner_value = owner_text(record->status.st_uid, false, owner);
     group_value = group_text(record->status.st_gid, false, group);
-    if (emit_ll_name(io, record, label, name_width) != 0) return 1;
     if (show_type && emit_format(io, STDOUT_FILENO, "%-6s ", ll_type(record->status.st_mode)) != 0) return 1;
     if (emit_format(io, STDOUT_FILENO, "%s ", mode) != 0) return 1;
     if (show_links && emit_format(io, STDOUT_FILENO, "%4ju ", (uintmax_t)record->status.st_nlink) != 0) return 1;
@@ -1480,9 +2139,10 @@ static int emit_ll_record_label(const gsh_builtin_io *io,
 
 static int emit_ll_record(const gsh_builtin_io *io,
                           const file_record *record, size_t name_width,
-                          size_t columns)
+                          size_t columns, size_t git_width)
 {
-    return emit_ll_record_label(io, record, NULL, name_width, columns);
+    return emit_ll_record_label(io, record, NULL, name_width, columns,
+                                git_width);
 }
 
 static bool ll_back_record(const gsh_builtin_io *io, const char *path,
@@ -1524,16 +2184,32 @@ static int ll_measure_names(const file_catalog *catalog, size_t *name_width)
     return 0;
 }
 
+static int ll_measure_git(const file_catalog *catalog, size_t *git_width)
+{
+    size_t index;
+    if (catalog == NULL || git_width == NULL) return -1;
+    for (index = 0U; index < catalog->count; index++) {
+        file_record record;
+        size_t width;
+        if (catalog_get(catalog, index, &record) == -1) return -1;
+        width = git_status_width(&record);
+        if (width > *git_width) *git_width = width;
+    }
+    return 0;
+}
+
 static int ll_emit_catalog(const gsh_builtin_io *io,
                            const file_catalog *catalog,
-                           size_t name_width, size_t columns)
+                           size_t name_width, size_t columns,
+                           size_t git_width)
 {
     size_t index;
     if (io == NULL || catalog == NULL) return 1;
     for (index = 0U; index < catalog->count; index++) {
         file_record record;
         if (catalog_get(catalog, index, &record) == -1 ||
-            emit_ll_record(io, &record, name_width, columns) != 0) return 1;
+            emit_ll_record(io, &record, name_width, columns,
+                           git_width) != 0) return 1;
     }
     return 0;
 }
@@ -1546,16 +2222,16 @@ static int run_ll(size_t argc, char *const argv[], const gsh_builtin_io *io)
     size_t argument = 1U;
     int descriptor;
     size_t name_width = 4U;
+    size_t git_width = 0U;
     size_t columns;
+    size_t metadata_columns;
     resource_scope resources;
     file_record back;
     bool have_back;
     int result = 0;
 
     if (argc == 0U || argv == NULL || io == NULL) return 1;
-    (void)memset(&space, 0, sizeof(space));
-    space.catalog.spool[0] = -1;
-    space.catalog.spool[1] = -1;
+    workspace_initialize(&space);
     ls_defaults(&options);
     options.sort = LS_SORT_NATURAL;
     options.format = LS_FORMAT_LONG;
@@ -1569,20 +2245,30 @@ static int run_ll(size_t argc, char *const argv[], const gsh_builtin_io *io)
     have_back = ll_back_record(io, path, &back);
     catalog_reset(&space.catalog);
     if (enumerate_directory(dup(descriptor), &options, &space.catalog) == -1 ||
-        catalog_sort(&space.catalog, &options) == -1) {
+        enrich_git_catalog(&space, path, &options, true) == -1) {
         result = file_error(io, "ll", path, errno);
     }
     if (result == 0 && ll_measure_names(&space.catalog, &name_width) == -1)
         result = 1;
+    if (result == 0 && space.git_active) {
+        git_width = 2U;
+        if (ll_measure_git(&space.catalog, &git_width) == -1) result = 1;
+    }
     columns = terminal_columns();
     if (name_width > columns / 2U) name_width = columns / 2U;
+    metadata_columns = columns > git_width + 2U
+                           ? columns - git_width - 2U : 0U;
+    if (result == 0 && space.git_active &&
+        emit_git_branch(io, space.git_branch) != 0) result = 1;
     if (result == 0 && have_back &&
-        emit_ll_record_label(io, &back, "<-", name_width, columns) != 0)
+        emit_ll_record_label(io, &back, "<-", name_width,
+                             metadata_columns, git_width) != 0)
         result = 1;
     if (result == 0 &&
-        ll_emit_catalog(io, &space.catalog, name_width, columns) != 0)
+        ll_emit_catalog(io, &space.catalog, name_width, metadata_columns,
+                        git_width) != 0)
         result = 1;
-    catalog_reset(&space.catalog);
+    workspace_reset_catalogs(&space);
     (void)close(descriptor);
     leave_resource_scope(&resources);
     return result;

@@ -1,6 +1,6 @@
 # gsh
 
-`gsh` is a generative shell. This repository currently contains
+`gsh` or genshell is a generative shell. This repository currently contains
 a deliberately small C MVP of its soft real-time interactive core, following
 the principles in [`specs/0001.principles.md`](specs/0001.principles.md) and
 the architectures in [`specs/0002.real_time.md`](specs/0002.real_time.md) and
@@ -278,7 +278,14 @@ remain isolated. The bounded editor supports UTF-8-aware left/right cursor
 movement, insertion and backspace at the cursor, multiline input with `PS2`,
 and bracketed multiline paste that preserves every pasted line until an
 explicit Enter submits the complete buffer. It also supports history arrows,
-incremental `Ctrl-R`, `Ctrl-U`, `Ctrl-L`, `Ctrl-C`, and `Ctrl-D`. The managed
+incremental `Ctrl-R`, and context-aware completion with `Tab` for commands,
+pathnames, directory-only `cd` operands, shell variables, aliases, builtin
+options, and Git subcommands. Ambiguous matches are shown in a bounded,
+terminal-width aligned menu that remains visible in the managed editor frame;
+subsequent `Tab` presses cycle through them and highlight the active entry,
+including when the original prefix is empty (for example, `cd `). `Ctrl-U`,
+`Ctrl-L`, `Ctrl-C`, and `Ctrl-D` remain editor controls. Completion scans run in
+isolated workers, and stale results are discarded when editing resumes. The managed
 REPL retains 16 bounded cells and runs at most 8 PTY command jobs concurrently.
 A job that disables terminal echo for private input is focused automatically;
 the preserved editor remains intact and subsequent bytes are routed to that
@@ -654,20 +661,38 @@ Clicking a directory queues the equivalent of `cd -- PATH && ll` as a normal
 ordered shell operation. Resource clicks do not enter command history, and
 preview navigation does not change `$?`.
 
-`ls` is a first-party C implementation of the POSIX Issue 8 option set:
+`ls` is a first-party C implementation of the POSIX Issue 8 option set, with
+`-G` accepted for BSD/macOS command-line compatibility:
 
 ```text
--A -C -F -H -L -R -S -a -c -d -f -g -i -k -l
+-A -C -F -G -H -L -R -S -a -c -d -f -g -i -k -l
 -m -n -o -p -q -r -s -t -u -x -1
 ```
 
-Its non-terminal output contains no colors, escape sequences, or visible
-metadata. `ll [-a] [--] [PATH]` displays the filename at the left and responsive
-metadata columns at the right, while `view [--] FILE` copies bytes unchanged
-when its output is redirected or piped. Interactive managed `ll` listings begin
-with a clickable `<-` row that navigates to the parent listing; at the
-filesystem root the row is omitted. The directory change uses the same transactional path as
-`cd`, so `PWD`, `OLDPWD`, and `$?` remain coherent.
+In an interactive long listing inside a Git worktree, the first row is
+`branch: NAME`. Each tracked file then has a two-position index/worktree state
+such as `A·`, `·M`, `MM`, `·D`, `??`, or `II`; a clean tracked item uses `✓`.
+Directories aggregate the distinct recursive states, for example
+`[A· ·M ??]`. Deleted paths remain visible as red struck-through synthetic rows,
+with index mode and blob size when Git still has them and `—` for unavailable
+metadata. Clean states and `A` use green, `M`/`T` yellow, `D`/`U` red,
+`R`/`C` cyan, `??` magenta, and `II` dim gray; the branch row is cyan.
+`ls -l` places the state immediately before the filename, while `ll` uses a
+dedicated aligned column. A directory that is itself ignored omits `II` and
+uses a visible gray clickable name. A normal directory that merely contains
+ignored descendants keeps its ordinary directory color and retains `[II]`.
+
+The enrichment is part of the native C builtins: gsh collects bounded,
+NUL-delimited status and index snapshots directly from Git once per listing
+section; it is not a shell alias or support script. Outside a worktree, without
+`-l`, or when stdout is not a terminal, the snapshot is skipped. Non-terminal
+output therefore contains no colors, escape sequences, branch row, or other
+visible metadata. `ll [-a] [--] [PATH]` displays the filename at the left and
+responsive metadata columns at the right, while `view [--] FILE` copies bytes
+unchanged when its output is redirected or piped. Interactive managed `ll`
+listings begin with a clickable `<-` row that navigates to the parent listing;
+at the filesystem root the row is omitted. The directory change uses the same
+transactional path as `cd`, so `PWD`, `OLDPWD`, and `$?` remain coherent.
 
 The corresponding optional schema-version-1 settings are:
 
@@ -832,8 +857,7 @@ remaining compound commands, required builtin utility pages outside the
 protected tranche, monitor-mode terminal/notification edge cases, and dynamic
 command-name or command-substitution forms of parent-owned `wait` are also
 incomplete. The 30 atomic alias requirements are verified on macOS; native
-Linux x86-64 release evidence is still required. Command
-completion, AI requests through `?`,
+Linux x86-64 release evidence is still required. AI requests through `?`,
 journaling/rewind, and OS automation are also outside this MVP.
 
 The core deliberately has no threads. One reactor remains the sole owner of

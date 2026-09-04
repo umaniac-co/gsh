@@ -30,6 +30,7 @@ typedef enum {
 
 typedef struct {
     bool async_repl_enabled;
+    bool completion_enabled;
     bool history_enabled;
     bool history_deduplicate;
     bool history_store_failed;

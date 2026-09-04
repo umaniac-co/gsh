@@ -27,11 +27,12 @@ BUILD_DIR ?= build
 TARGET := $(BUILD_DIR)/gsh
 CORE_SOURCES := src/gsh.c src/async_repl.c src/posix_lexer.c \
 	src/posix_parser.c src/native_plan.c \
+	src/completion.c \
 	src/source_workspace.c \
 	src/history_file.c src/history_store.c src/shell_config.c \
 	src/shell_variables.c src/builtin_common.c src/builtin_registry.c \
 	src/builtin_pure.c src/builtin_stateful.c src/builtin_fc.c \
-	src/builtin_files.c \
+	src/builtin_files.c src/git_listing.c \
 	src/native_viewer.c \
 	src/resource_actions.c \
 	src/builtin_job_control.c src/command_cache.c \
@@ -141,11 +142,11 @@ $(TARGET) $(TEST_TARGET) \
 	$(SHELL_TRAPS_SANITIZE_TEST_TARGET): Makefile
 
 $(FILE_BUILTINS_TEST_TARGET): tests/file_builtins_test.c \
-		src/builtin_files.c src/native_viewer.c src/shell_config.c \
+		src/builtin_files.c src/git_listing.c src/native_viewer.c src/shell_config.c \
 		src/builtin_common.c src/async_repl.c src/resource_actions.c | $(BUILD_DIR)
-	$(call generate_dependencies,tests/file_builtins_test.c src/builtin_files.c src/native_viewer.c src/shell_config.c src/builtin_common.c src/async_repl.c src/resource_actions.c)
+	$(call generate_dependencies,tests/file_builtins_test.c src/builtin_files.c src/git_listing.c src/native_viewer.c src/shell_config.c src/builtin_common.c src/async_repl.c src/resource_actions.c)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/file_builtins_test.c \
-		src/builtin_files.c src/native_viewer.c src/shell_config.c \
+		src/builtin_files.c src/git_listing.c src/native_viewer.c src/shell_config.c \
 		src/builtin_common.c src/async_repl.c src/resource_actions.c \
 		$(LDFLAGS) $(AUDIT_LDFLAGS) -o $@
 
@@ -157,12 +158,12 @@ $(RESOURCE_ACTIONS_TEST_TARGET): tests/resource_actions_test.c \
 		$(AUDIT_LDFLAGS) -o $@
 
 $(FILE_BUILTINS_SANITIZE_TEST_TARGET): tests/file_builtins_test.c \
-		src/builtin_files.c src/native_viewer.c src/shell_config.c \
+		src/builtin_files.c src/git_listing.c src/native_viewer.c src/shell_config.c \
 		src/builtin_common.c src/async_repl.c src/resource_actions.c | $(BUILD_DIR)
-	$(call generate_dependencies,tests/file_builtins_test.c src/builtin_files.c src/native_viewer.c src/shell_config.c src/builtin_common.c src/async_repl.c src/resource_actions.c)
+	$(call generate_dependencies,tests/file_builtins_test.c src/builtin_files.c src/git_listing.c src/native_viewer.c src/shell_config.c src/builtin_common.c src/async_repl.c src/resource_actions.c)
 	clang $(CPPFLAGS) -O1 -g -std=c17 -Wall -Wextra -Wpedantic \
 		-Werror -fsanitize=address,undefined tests/file_builtins_test.c \
-		src/builtin_files.c src/native_viewer.c src/shell_config.c \
+		src/builtin_files.c src/git_listing.c src/native_viewer.c src/shell_config.c \
 		src/builtin_common.c src/async_repl.c src/resource_actions.c \
 		$(LDFLAGS) -o $@
 

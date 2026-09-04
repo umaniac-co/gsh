@@ -107,7 +107,12 @@ static int adapter_cases(void)
 
 static int compositor_cases(gsh_async_repl *repl)
 {
-    static const char row[] = "alpha.py  FILE   -rw-r--r--\n";
+    static const char row_first[] = "alpha.py  \033[38;5;";
+    static const char row_second[] =
+        "221m·M\033[0m  FILE   -rw-r--r--\n";
+    static const char styled[] =
+        "\033[4;38;5;81malpha.py\033[0m  "
+        "\033[38;5;221m·M\033[0m";
     static const char label[] = "alpha.py";
     static const char path[] = "/tmp/alpha.py";
     gsh_async_resource_action action;
@@ -121,14 +126,19 @@ static int compositor_cases(gsh_async_repl *repl)
                                  false, false, false);
     if (cell < 0) return 1;
     gsh_async_repl_starting(repl, cell);
-    if (gsh_async_repl_append(repl, cell, row, sizeof(row) - 1U) == -1 ||
+    if (gsh_async_repl_append(repl, cell, row_first,
+                              sizeof(row_first) - 1U) == -1 ||
+        gsh_async_repl_append(repl, cell, row_second,
+                              sizeof(row_second) - 1U) == -1 ||
         gsh_async_repl_add_native_resource(
             repl, cell, 0U, 0U, sizeof(label) - 1U,
             0U, sizeof(label) - 1U, label, sizeof(label) - 1U,
-            path, sizeof(path) - 1U, GSH_RESOURCE_REGULAR, true) == -1 ||
+            path, sizeof(path) - 1U, GSH_RESOURCE_REGULAR, true, false) ==
+            -1 ||
         gsh_async_repl_prepare_render(repl, "$ ", "", 0U, 0U) == -1 ||
         strstr(gsh_async_repl_render_data(repl), "\033[?1000h") == NULL ||
         strstr(gsh_async_repl_render_data(repl), "\033[4;38;5;81m") == NULL ||
+        strstr(gsh_async_repl_render_data(repl), styled) == NULL ||
         gsh_async_repl_resource_at(repl, 2U, 2U, &action) == -1 ||
         strcmp(action.path, path) != 0 ||
         strcmp(action.launch_directory, "/tmp") != 0) {
@@ -161,11 +171,13 @@ static int structured_resource_case(gsh_async_repl *repl)
             repl, cell, 0U, 0U, sizeof(label) - 1U,
             0U, sizeof(label) - 1U, label,
             sizeof(label) - 1U, path, sizeof(path) - 1U,
-            GSH_RESOURCE_REGULAR, true) == -1 ||
+            GSH_RESOURCE_DIRECTORY, true, true) == -1 ||
         gsh_async_repl_prepare_render(repl, "$ ", "", 0U, 0U) == -1 ||
+        strstr(gsh_async_repl_render_data(repl),
+               "\033[4;38;5;245mname with space\033[0m") == NULL ||
         gsh_async_repl_resource_at(repl, 2U, 2U, &action) == -1 ||
         strcmp(action.path, path) != 0 ||
-        action.type != GSH_RESOURCE_REGULAR || !action.navigable_root ||
+        action.type != GSH_RESOURCE_DIRECTORY || !action.navigable_root ||
         repl->resource_count != 1U) {
         (void)fputs("resource actions: structured record mismatch\n", stderr);
         return 1;
@@ -194,7 +206,7 @@ static int unicode_hitbox_case(gsh_async_repl *repl)
         gsh_async_repl_add_native_resource(
             repl, cell, 0U, 0U, sizeof(label) - 1U, 0U, 4U,
             label, sizeof(label) - 1U, path, sizeof(path) - 1U,
-            GSH_RESOURCE_REGULAR, true) == -1 ||
+            GSH_RESOURCE_REGULAR, true, false) == -1 ||
         gsh_async_repl_prepare_render(repl, "$ ", "", 0U, 0U) == -1 ||
         gsh_async_repl_resource_at(repl, 2U, 4U, &action) == -1 ||
         gsh_async_repl_resource_at(repl, 2U, 5U, &action) != -1) {
@@ -298,6 +310,32 @@ static int multiline_editor_case(gsh_async_repl *repl)
     return 0;
 }
 
+static int completion_menu_case(gsh_async_repl *repl)
+{
+    static const char menu[] =
+        "\033[7malpha/\033[0m      gamma/\r\n"
+        "beta/       delta/";
+    const char *render;
+
+    if (repl == NULL) return 1;
+    gsh_async_repl_initialize(repl, true);
+    gsh_async_repl_resize(repl, 8U, 40U);
+    if (gsh_async_repl_prepare_render_with_completion(
+            repl, "$ ", "cd ", 3U, 3U, menu, sizeof(menu) - 1U) == -1) {
+        return 1;
+    }
+    render = gsh_async_repl_render_data(repl);
+    if (strstr(render,
+               "$ cd \n\033[7malpha/\033[0m      gamma/\n"
+               "beta/       delta/") == NULL ||
+        strstr(render, "\033[1;6H") == NULL) {
+        (void)fputs("resource actions: completion menu mismatch\n", stderr);
+        return 1;
+    }
+    gsh_async_repl_close(repl);
+    return 0;
+}
+
 int main(void)
 {
     static gsh_async_repl repl;
@@ -308,6 +346,7 @@ int main(void)
         unicode_hitbox_case(&repl) != 0 || hostile_terminal_case(&repl) != 0;
     if (!failed) failed = compositor_scroll_case(&repl) != 0;
     if (!failed) failed = multiline_editor_case(&repl) != 0;
+    if (!failed) failed = completion_menu_case(&repl) != 0;
     if (failed) {
         (void)fputs("resource actions: failed\n", stderr);
         return 1;

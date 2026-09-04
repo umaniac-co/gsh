@@ -50,6 +50,7 @@
 #include "builtin_variables.h"
 #include "builtin_set.h"
 #include "builtin_shift.h"
+#include "completion.h"
 #include "fault_injection.h"
 #include "history_file.h"
 #include "resource_protocol.h"
@@ -249,6 +250,34 @@ typedef struct {
     unsigned int focus_escape_state;
     uint64_t focus_escape_deadline_ns;
     uint64_t editor_escape_deadline_ns;
+    uint64_t completion_deadline_ns;
+    int completion_fd;
+    pid_t completion_pid;
+    uint64_t completion_next_request_id;
+    uint64_t completion_active_request_id;
+    uint64_t completion_variable_generation;
+    uint64_t completion_alias_generation;
+    uint64_t completion_function_generation;
+    size_t completion_line_length;
+    size_t completion_cursor;
+    size_t completion_query_length;
+    size_t completion_query_cursor;
+    size_t completion_result_received;
+    uint32_t completion_selection_index;
+    gsh_completion_result completion_result;
+    char completion_line[LINE_CAP];
+    char completion_query_line[LINE_CAP];
+    char completion_directory[PATH_MAX];
+    bool completion_cycle_active;
+    size_t completion_cycle_line_length;
+    size_t completion_cycle_cursor;
+    size_t completion_cycle_begin;
+    size_t completion_cycle_end;
+    uint32_t completion_cycle_next_index;
+    uint32_t completion_cycle_candidate_count;
+    char completion_cycle_line[LINE_CAP];
+    size_t completion_menu_length;
+    char completion_menu[GSH_COMPLETION_TEXT_CAP];
     gsh_history_store *history;
     gsh_history_store *session_history;
     gsh_history_file history_file;
@@ -478,6 +507,8 @@ static volatile sig_atomic_t g_shutdown_pending = 0;
 typedef struct pipeline_expansion_scope pipeline_expansion_scope;
 
 static void reset_child_signals(void);
+static void cancel_completion_request(shell_state *state, bool terminate);
+static void receive_completion_result(shell_state *state);
 static void start_external(shell_state *state, simple_command *direct);
 static void start_async_external(shell_state *state, simple_command *direct);
 static void start_async_native_pipeline(
@@ -920,6 +951,24 @@ typedef struct {
     size_t column;
 } classic_editor_position;
 
+static size_t classic_sgr_length(const char *text, size_t length,
+                                 size_t offset)
+{
+    size_t index;
+    size_t turn;
+
+    if (text == NULL || offset + 2U >= length || text[offset] != '\033' ||
+        text[offset + 1U] != '[') return 0U;
+    index = offset + 2U;
+    for (turn = 0U; turn < 32U && index < length; turn++) {
+        unsigned char byte = (unsigned char)text[index++];
+
+        if (byte == 'm') return index - offset;
+        if (!((byte >= '0' && byte <= '9') || byte == ';')) return 0U;
+    }
+    return 0U;
+}
+
 static size_t classic_character_width(const char *text, size_t length,
                                       size_t offset, size_t column,
                                       size_t *bytes)
@@ -957,7 +1006,14 @@ static void advance_classic_position(const char *text, size_t length,
     while (offset < length) {
         size_t bytes;
         size_t width;
+        size_t sgr = classic_sgr_length(text, length, offset);
 
+        if (sgr != 0U) { offset += sgr; continue; }
+        if (text[offset] == '\r') {
+            position->column = 0U;
+            offset++;
+            continue;
+        }
         if (text[offset] == '\n') {
             position->row++;
             position->column = 0U;
@@ -978,6 +1034,22 @@ static void advance_classic_position(const char *text, size_t length,
         position->column += width;
         offset += bytes;
     }
+}
+
+static classic_editor_position append_classic_completion_menu(
+    shell_state *state, classic_editor_position end, size_t columns)
+{
+    static const char newline[] = "\r\n";
+
+    if (state == NULL || columns == 0U ||
+        state->completion_menu_length == 0U) return end;
+    (void)output_push(state, newline, sizeof(newline) - 1U);
+    (void)output_push(state, state->completion_menu,
+                      state->completion_menu_length);
+    advance_classic_position(newline, sizeof(newline) - 1U, columns, &end);
+    advance_classic_position(state->completion_menu,
+                             state->completion_menu_length, columns, &end);
+    return end;
 }
 
 static classic_editor_position classic_editor_position_at(
@@ -1057,6 +1129,7 @@ static void prepare_classic_redraw(shell_state *state)
     char prompt[GSH_ASYNC_PROMPT_CAP];
     classic_editor_position cursor;
     classic_editor_position end;
+    size_t columns;
     size_t prompt_length;
     bool clear;
 
@@ -1083,6 +1156,10 @@ static void prepare_classic_redraw(shell_state *state)
     (void)output_push(state, prompt, prompt_length);
     (void)output_push(state, state->line, state->line_len);
     end = classic_editor_position_at(state, state->line_len);
+    columns = state->async_repl == NULL
+                  ? 80U : state_async_repl(state)->terminal_columns;
+    if (columns == 0U) columns = 1U;
+    end = append_classic_completion_menu(state, end, columns);
     state->classic_cursor_row = end.row;
     state->classic_cursor_column = end.column;
     cursor = classic_editor_position_at(state, state->line_cursor);
@@ -1146,9 +1223,10 @@ static void prepare_managed_render(shell_state *state)
         return;
     }
     (void)active_prompt_text(state, prompt);
-    if (gsh_async_repl_prepare_render(state->async_repl, prompt,
-                                      state->line, state->line_len,
-                                      state->line_cursor) == -1) {
+    if (gsh_async_repl_prepare_render_with_completion(
+            state->async_repl, prompt, state->line, state->line_len,
+            state->line_cursor, state->completion_menu,
+            state->completion_menu_length) == -1) {
         state->last_status = 1;
         state->running = false;
         return;
@@ -1503,6 +1581,9 @@ static void initialize_shell_state(shell_state *state,
     state->signal_pipe[1] = -1;
     state->redirection_worker_fd = -1;
     state->redirection_worker_pid = -1;
+    state->completion_fd = -1;
+    state->completion_pid = -1;
+    state->completion_next_request_id = 1U;
     state->variable_commit_fd = -1;
     state->job_service_socket = -1;
     state->job_service_wait_reply_fd = -1;
@@ -1897,8 +1978,9 @@ static int reactor_poll_timeout(const shell_state *state)
     if (state == NULL) return -1;
     timeout = bounded_deadline_timeout(state->focus_escape_deadline_ns,
                                        timeout);
-    return bounded_deadline_timeout(state->editor_escape_deadline_ns,
-                                    timeout);
+    timeout = bounded_deadline_timeout(state->editor_escape_deadline_ns,
+                                       timeout);
+    return bounded_deadline_timeout(state->completion_deadline_ns, timeout);
 }
 
 static void reclaim_terminal(shell_state *state, bool save_job_modes)
@@ -3274,6 +3356,16 @@ static void requeue_child_signal(shell_state *state)
     (void)notified;
 }
 
+static bool reap_completion_child(shell_state *state, pid_t pid, int status)
+{
+    if (!require(state != NULL)) return false;
+    if (!require(pid > 0)) return false;
+    if (pid != state->completion_pid) return false;
+    if (WIFEXITED(status) || WIFSIGNALED(status))
+        state->completion_pid = -1;
+    return true;
+}
+
 static void reap_children(shell_state *state)
 {
     if (state == NULL) {
@@ -3297,6 +3389,7 @@ static void reap_children(shell_state *state)
 
             if (pid == state->redirection_worker_pid) {
                 reap_redirection_worker(state);
+            } else if (reap_completion_child(state, pid, status)) {
             } else if (state->current_job.active &&
                        find_job_member(&state->current_job, pid) !=
                            GSH_NATIVE_JOB_MEMBER_CAP) {
@@ -10767,6 +10860,383 @@ static bool process_history_search_input(shell_state *state,
     return true;
 }
 
+static void cancel_completion_request(shell_state *state, bool terminate)
+{
+    if (!require(state != NULL)) return;
+    if (!require(state->completion_fd >= -1)) return;
+    if (state->completion_fd >= 0) {
+        (void)close(state->completion_fd);
+        state->completion_fd = -1;
+    }
+    if (terminate && state->completion_pid > 0)
+        (void)kill(state->completion_pid, SIGKILL);
+    state->completion_active_request_id = 0U;
+    state->completion_deadline_ns = 0U;
+    state->completion_line_length = 0U;
+    state->completion_cursor = 0U;
+    state->completion_query_length = 0U;
+    state->completion_query_cursor = 0U;
+    state->completion_result_received = 0U;
+    state->completion_selection_index = GSH_COMPLETION_SELECT_MENU;
+    state->completion_line[0] = '\0';
+    state->completion_query_line[0] = '\0';
+    state->completion_directory[0] = '\0';
+}
+
+static void clear_completion_cycle(shell_state *state)
+{
+    if (!require(state != NULL)) return;
+    state->completion_cycle_active = false;
+    state->completion_cycle_line_length = 0U;
+    state->completion_cycle_cursor = 0U;
+    state->completion_cycle_begin = 0U;
+    state->completion_cycle_end = 0U;
+    state->completion_cycle_next_index = 0U;
+    state->completion_cycle_candidate_count = 0U;
+    state->completion_cycle_line[0] = '\0';
+    state->completion_menu_length = 0U;
+    state->completion_menu[0] = '\0';
+}
+
+static bool completion_context_is_current(
+    const shell_state *state, const gsh_completion_result *result)
+{
+    if (!require(state != NULL && result != NULL)) return false;
+    if (!require(state->completion_line_length < sizeof(state->line)))
+        return false;
+    return result->request_id == state->completion_active_request_id &&
+           result->end == state->completion_query_cursor &&
+           state->line_len == state->completion_line_length &&
+           state->line_cursor == state->completion_cursor &&
+           memcmp(state->line, state->completion_line,
+                  state->line_len + 1U) == 0 &&
+           strcmp(state->current_directory,
+                  state->completion_directory) == 0 &&
+           state->variable_generation ==
+               state->completion_variable_generation &&
+           state->alias_generation == state->completion_alias_generation &&
+           state->function_generation ==
+               state->completion_function_generation;
+}
+
+static bool replace_completion_text(shell_state *state, size_t begin,
+                                    size_t end, const char *text,
+                                    size_t text_length)
+{
+    size_t removed;
+    size_t completed_length;
+
+    if (!require(state != NULL && text != NULL)) return false;
+    if (!require(begin <= end && end <= state->line_len)) return false;
+    removed = end - begin;
+    completed_length = state->line_len - removed + text_length;
+    if (completed_length >= sizeof(state->line)) return false;
+    (void)memmove(state->line + begin + text_length, state->line + end,
+                  state->line_len - end + 1U);
+    (void)memcpy(state->line + begin, text, text_length);
+    state->line_len = completed_length;
+    state->line_cursor = begin + text_length;
+    if (state->async_repl != NULL)
+        state_async_repl(state)->scroll_offset = 0U;
+    queue_redraw(state);
+    return true;
+}
+
+static bool store_completion_menu(shell_state *state,
+                                  const gsh_completion_result *result)
+{
+    if (!require(state != NULL && result != NULL)) return false;
+    if (result->menu_length == 0U ||
+        result->menu_length >= sizeof(state->completion_menu)) return false;
+    state->completion_menu_length = result->menu_length;
+    (void)memcpy(state->completion_menu, result->menu,
+                 result->menu_length + 1U);
+    return true;
+}
+
+static bool begin_completion_cycle(shell_state *state,
+                                   const gsh_completion_result *result)
+{
+    if (!require(state != NULL && result != NULL)) return false;
+    if (!require(result->begin <= result->end)) return false;
+    if (result->candidate_count == 0U || result->menu_length == 0U ||
+        state->completion_query_length >= sizeof(state->completion_cycle_line))
+        return false;
+    state->completion_cycle_active = true;
+    state->completion_cycle_line_length = state->completion_query_length;
+    state->completion_cycle_cursor = state->completion_query_cursor;
+    state->completion_cycle_begin = result->begin;
+    state->completion_cycle_end = result->end;
+    state->completion_cycle_next_index = 0U;
+    state->completion_cycle_candidate_count = result->candidate_count;
+    (void)memcpy(state->completion_cycle_line,
+                 state->completion_query_line,
+                 state->completion_query_length + 1U);
+    if (!store_completion_menu(state, result)) {
+        clear_completion_cycle(state);
+        return false;
+    }
+    queue_redraw(state);
+    return true;
+}
+
+static bool apply_cycle_candidate(shell_state *state,
+                                  const gsh_completion_result *result)
+{
+    uint32_t next;
+
+    if (!require(state != NULL && result != NULL)) return false;
+    if (!state->completion_cycle_active || result->candidate_count == 0U ||
+        state->completion_cycle_begin > state->completion_cycle_end)
+        return false;
+    if (!replace_completion_text(
+            state, state->completion_cycle_begin, state->completion_cycle_end,
+            result->text, result->text_length)) return false;
+    if (!store_completion_menu(state, result)) return false;
+    state->completion_cycle_end = state->completion_cycle_begin +
+                                  result->text_length;
+    state->completion_cycle_candidate_count = result->candidate_count;
+    next = result->selected_index + 1U;
+    state->completion_cycle_next_index =
+        next < result->candidate_count ? next : 0U;
+    return true;
+}
+
+static bool apply_completion_result(shell_state *state,
+                                    const gsh_completion_result *result)
+{
+    if (!require(state != NULL && result != NULL)) return false;
+    if (!require(result->begin <= result->end)) return false;
+    if (result->status == GSH_COMPLETION_MENU)
+        return begin_completion_cycle(state, result);
+    if (result->status == GSH_COMPLETION_CYCLE)
+        return apply_cycle_candidate(state, result);
+    if (result->status != GSH_COMPLETION_EDIT ||
+        result->end > state->line_len) return false;
+    clear_completion_cycle(state);
+    return replace_completion_text(state, result->begin, result->end,
+                                   result->text, result->text_length);
+}
+
+static void receive_completion_result(shell_state *state)
+{
+    unsigned int attempts;
+    bool closed = false;
+    bool current;
+
+    if (!require(state != NULL)) return;
+    if (!require(state->completion_fd >= -1)) return;
+    if (state->completion_fd < 0) return;
+    for (attempts = 0U; attempts < 4U &&
+         state->completion_result_received < sizeof(state->completion_result);
+         attempts++) {
+        ssize_t received = recv(
+            state->completion_fd,
+            (char *)&state->completion_result +
+                state->completion_result_received,
+            sizeof(state->completion_result) -
+                state->completion_result_received,
+            0);
+
+        if (received > 0) state->completion_result_received += (size_t)received;
+        else if (received == -1 && errno == EINTR) continue;
+        else if (received == -1 &&
+                 (errno == EAGAIN || errno == EWOULDBLOCK)) break;
+        else { closed = true; break; }
+    }
+    if (state->completion_result_received < sizeof(state->completion_result) &&
+        !closed && state->completion_pid > 0) return;
+    if (state->completion_result_received == sizeof(state->completion_result) &&
+        state->completion_pid > 0) return;
+    current = state->completion_result_received ==
+                  sizeof(state->completion_result) &&
+              gsh_completion_result_valid(&state->completion_result) &&
+              completion_context_is_current(state,
+                                            &state->completion_result);
+    if (!current ||
+        !apply_completion_result(state, &state->completion_result)) {
+        clear_completion_cycle(state);
+        if (current) (void)output_text(state, "\a");
+    }
+    cancel_completion_request(state, false);
+}
+
+static bool send_completion_result(int descriptor,
+                                   const gsh_completion_result *result)
+{
+    size_t offset = 0U;
+    size_t attempts;
+
+    if (!require(descriptor >= 0)) return false;
+    if (!require(result != NULL)) return false;
+    for (attempts = 0U; attempts <= sizeof(*result) &&
+         offset < sizeof(*result); attempts++) {
+        ssize_t sent = send(descriptor, (const char *)result + offset,
+                            sizeof(*result) - offset, 0);
+
+        if (sent > 0) offset += (size_t)sent;
+        else if (!(sent == -1 && errno == EINTR)) break;
+    }
+    return offset == sizeof(*result);
+}
+
+static void close_completion_child_descriptors(shell_state *state,
+                                               int retained)
+{
+    if (!require(state != NULL)) _exit(125);
+    if (!require(retained >= 0)) _exit(125);
+    close_child_reactor_descriptors(state, retained);
+    if (state->variable_commit_fd >= 0) (void)close(state->variable_commit_fd);
+    if (state->job_service_socket >= 0) (void)close(state->job_service_socket);
+    if (state->job_service_wait_reply_fd >= 0)
+        (void)close(state->job_service_wait_reply_fd);
+    if (state->exec_outcome_fd >= 0) (void)close(state->exec_outcome_fd);
+    if (state->exec_descriptor_socket >= 0)
+        (void)close(state->exec_descriptor_socket);
+    if (state->directory_commit_socket >= 0)
+        (void)close(state->directory_commit_socket);
+    if (state->directory_commit_fd >= 0)
+        (void)close(state->directory_commit_fd);
+    (void)close(STDIN_FILENO);
+    (void)close(STDOUT_FILENO);
+    (void)close(STDERR_FILENO);
+}
+
+_Noreturn static void run_completion_child(
+    shell_state *state, int descriptor, const sigset_t *previous,
+    uint64_t request_id)
+{
+    gsh_completion_result result;
+    const char *path;
+    const char *home;
+    bool home_found = false;
+    bool delivered;
+
+    if (!require(state != NULL && previous != NULL)) _exit(125);
+    if (!require(descriptor >= 0 && request_id != 0U)) _exit(125);
+    (void)setpgid(0, 0);
+    reset_child_signals();
+    (void)sigprocmask(SIG_SETMASK, previous, NULL);
+    close_completion_child_descriptors(state, descriptor);
+    path = store_path_value(state->variables, state->default_path);
+    home = gsh_variables_lookup(state->variables, "HOME", 4U, &home_found);
+    if (gsh_completion_generate(
+            state->completion_query_line, state->completion_query_length,
+            state->completion_query_cursor, path,
+            home_found ? home : NULL, state->aliases, state->functions,
+            state->variables,
+            state_async_repl(state)->terminal_columns,
+            state->completion_selection_index, request_id, &result) == -1)
+        _exit(1);
+    delivered = send_completion_result(descriptor, &result);
+    (void)close(descriptor);
+    _exit(delivered ? 0 : 1);
+}
+
+/* ── Tab Completion Runs Outside the Editor Reactor ────────────
+ * Directory and PATH discovery can block on a slow filesystem, so Tab only
+ * snapshots its bounded editor context and forks one isolated query worker.
+ * The reactor keeps accepting keys while polling the stream result channel.
+ * Any edit cancels the query, and generation plus directory checks reject a
+ * result computed against state that changed before it was delivered.
+ * A 50 ms deadline bounds optional worker ownership without delaying typing.
+ * ─────────────────────────────────────────────────────────────── */
+static void prepare_completion_query(shell_state *state)
+{
+    if (!require(state != NULL)) return;
+    state->completion_line_length = state->line_len;
+    state->completion_cursor = state->line_cursor;
+    (void)memcpy(state->completion_line, state->line, state->line_len + 1U);
+    if (state->completion_cycle_active &&
+        state->completion_cycle_line_length <
+            sizeof(state->completion_query_line) &&
+        state->completion_cycle_cursor <=
+            state->completion_cycle_line_length) {
+        state->completion_query_length = state->completion_cycle_line_length;
+        state->completion_query_cursor = state->completion_cycle_cursor;
+        state->completion_selection_index =
+            state->completion_cycle_next_index;
+        (void)memcpy(state->completion_query_line,
+                     state->completion_cycle_line,
+                     state->completion_cycle_line_length + 1U);
+    } else {
+        clear_completion_cycle(state);
+        state->completion_query_length = state->line_len;
+        state->completion_query_cursor = state->line_cursor;
+        state->completion_selection_index = GSH_COMPLETION_SELECT_MENU;
+        (void)memcpy(state->completion_query_line, state->line,
+                     state->line_len + 1U);
+    }
+}
+
+static void start_completion_request(shell_state *state)
+{
+    int sockets[2] = {-1, -1};
+    sigset_t blocked;
+    sigset_t previous;
+    pid_t pid;
+    uint64_t request_id;
+
+    if (!require(state != NULL)) return;
+    if (!require(state->completion_fd >= -1 && state->completion_pid >= -1))
+        return;
+    if (!state->config.completion_enabled || state->completion_fd >= 0 ||
+        state->completion_pid > 0) { (void)output_text(state, "\a"); return; }
+    prepare_completion_query(state);
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == -1 ||
+        set_fd_flags(sockets[0], F_GETFL, O_NONBLOCK) == -1 ||
+        set_fd_flags(sockets[0], F_GETFD, FD_CLOEXEC) == -1 ||
+        set_fd_flags(sockets[1], F_GETFD, FD_CLOEXEC) == -1) {
+        if (sockets[0] >= 0) (void)close(sockets[0]);
+        if (sockets[1] >= 0) (void)close(sockets[1]);
+        (void)output_text(state, "\a");
+        return;
+    }
+    (void)sigemptyset(&blocked);
+    (void)sigaddset(&blocked, SIGCHLD);
+    if (sigprocmask(SIG_BLOCK, &blocked, &previous) == -1) {
+        (void)close(sockets[0]); (void)close(sockets[1]);
+        (void)output_text(state, "\a"); return;
+    }
+    request_id = state->completion_next_request_id++;
+    if (request_id == 0U) request_id = state->completion_next_request_id++;
+    pid = fork();
+    if (pid == 0) {
+        (void)close(sockets[0]);
+        run_completion_child(state, sockets[1], &previous, request_id);
+    }
+    (void)close(sockets[1]);
+    if (pid == -1) {
+        (void)close(sockets[0]);
+        (void)sigprocmask(SIG_SETMASK, &previous, NULL);
+        (void)output_text(state, "\a"); return;
+    }
+    (void)setpgid(pid, pid);
+    state->completion_fd = sockets[0];
+    state->completion_pid = pid;
+    state->completion_active_request_id = request_id;
+    state->completion_result_received = 0U;
+    state->completion_deadline_ns = monotonic_ns() + 50000000ULL;
+    (void)memcpy(state->completion_directory, state->current_directory,
+                 strlen(state->current_directory) + 1U);
+    state->completion_variable_generation = state->variable_generation;
+    state->completion_alias_generation = state->alias_generation;
+    state->completion_function_generation = state->function_generation;
+    (void)sigprocmask(SIG_SETMASK, &previous, NULL);
+}
+
+static void expire_completion_request(shell_state *state)
+{
+    if (!require(state != NULL)) return;
+    if (!require(state->completion_deadline_ns <= UINT64_MAX)) return;
+    if (state->completion_deadline_ns != 0U &&
+        monotonic_ns() >= state->completion_deadline_ns) {
+        cancel_completion_request(state, true);
+        clear_completion_cycle(state);
+        (void)output_text(state, "\a");
+    }
+}
+
 static bool process_editor_control(shell_state *state, unsigned char byte)
 {
     if (state == NULL) {
@@ -10779,6 +11249,10 @@ static bool process_editor_control(shell_state *state, unsigned char byte)
     }
     if (byte == '\r' || byte == '\n') {
         accept_line(state);
+        return true;
+    }
+    if (byte == '\t') {
+        start_completion_request(state);
         return true;
     }
     if (byte == 0x04U) {
@@ -10950,6 +11424,12 @@ static void process_input(shell_state *state)
                 state->running = false;
             }
             break;
+        }
+        if (byte != '\t' ||
+            gsh_async_repl_focused_job(state->async_repl) >= 0) {
+            if (state->completion_fd >= 0)
+                cancel_completion_request(state, true);
+            clear_completion_cycle(state);
         }
         if (!(route_focused_input(state, byte) ||
               process_managed_editor_signal(state, byte) ||
@@ -11387,7 +11867,7 @@ static void service_job_requests(shell_state *state)
     }
 }
 
-enum { GSH_REACTOR_BASE_FDS = 5 };
+enum { GSH_REACTOR_BASE_FDS = 6 };
 
 static size_t add_managed_poll_descriptors(
     shell_state *state,
@@ -11495,9 +11975,10 @@ static bool push_managed_preview_base(shell_state *state)
     size_t length;
     if (state == NULL || state->async_repl == NULL) return false;
     (void)active_prompt_text(state, prompt);
-    if (gsh_async_repl_prepare_render(state->async_repl, prompt,
-                                      state->line, state->line_len,
-                                      state->line_cursor) == -1)
+    if (gsh_async_repl_prepare_render_with_completion(
+            state->async_repl, prompt, state->line, state->line_len,
+            state->line_cursor, state->completion_menu,
+            state->completion_menu_length) == -1)
         return false;
     render = gsh_async_repl_render_data(state->async_repl);
     length = gsh_async_repl_render_length(state->async_repl);
@@ -12085,7 +12566,8 @@ static void accept_resource_datagram(shell_state *state, int cell_index,
         header.column_begin >= header.column_end ||
         header.type < GSH_RESOURCE_REGULAR ||
         header.type > GSH_RESOURCE_SYMLINK ||
-        (header.flags & ~GSH_RESOURCE_PROTOCOL_NAVIGABLE) != 0U) return;
+        (header.flags & ~(GSH_RESOURCE_PROTOCOL_NAVIGABLE |
+                          GSH_RESOURCE_PROTOCOL_MUTED)) != 0U) return;
     path = message + sizeof(header);
     label = path + header.path_length;
     if (memchr(path, '\0', header.path_length) != NULL ||
@@ -12095,7 +12577,8 @@ static void accept_resource_datagram(shell_state *state, int cell_index,
         header.byte_end, header.column_begin, header.column_end,
         label, header.label_length, path,
         header.path_length, (gsh_resource_type)header.type,
-        (header.flags & GSH_RESOURCE_PROTOCOL_NAVIGABLE) != 0U);
+        (header.flags & GSH_RESOURCE_PROTOCOL_NAVIGABLE) != 0U,
+        (header.flags & GSH_RESOURCE_PROTOCOL_MUTED) != 0U);
 }
 
 static void read_managed_resources(shell_state *state,
@@ -12378,6 +12861,9 @@ static size_t prepare_reactor_descriptors(
                                      state->job_service_socket >= 0 ? POLLIN
                                                                     : 0,
                                      0};
+    descriptors[5] = (struct pollfd){state->completion_fd,
+                                     state->completion_fd >= 0 ? POLLIN : 0,
+                                     0};
     return add_managed_poll_descriptors(state, descriptors);
 }
 
@@ -12409,6 +12895,10 @@ static void service_reactor_descriptors(
         (descriptors[1].revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
         state->running = false;
     }
+    if (state->completion_fd >= 0 &&
+        ((descriptors[5].revents &
+          (POLLIN | POLLERR | POLLHUP | POLLNVAL)) != 0 ||
+         state->completion_pid < 0)) receive_completion_result(state);
     process_managed_descriptors(state, descriptors, descriptor_count);
     if (state->redirection_worker_alive &&
         (descriptors[2].revents & POLLIN) != 0) {
@@ -12460,6 +12950,7 @@ static int run_reactor(shell_state *state)
         uint64_t service_start;
 
         complete_pending_escapes(state);
+        expire_completion_request(state);
         schedule_managed_submissions(state);
         apply_async_transition(state);
         prepare_classic_redraw(state);
@@ -12482,6 +12973,7 @@ static int run_reactor(shell_state *state)
         }
 
         complete_pending_escapes(state);
+        expire_completion_request(state);
         service_start = monotonic_ns();
         service_reactor_descriptors(state, descriptors, descriptor_count);
         record_reactor_duration(state, service_start, monotonic_ns());
@@ -12631,6 +13123,7 @@ static void cleanup(shell_state *state)
         return;
     }
     pid_t worker_pid = state->redirection_worker_pid;
+    pid_t completion_pid = state->completion_pid;
     pid_t managed_pids[GSH_ASYNC_CELL_CAP] = {0};
     pid_t managed_groups[GSH_ASYNC_CELL_CAP] = {0};
     pid_t managed_terminal_groups[GSH_ASYNC_CELL_CAP] = {0};
@@ -12667,6 +13160,7 @@ static void cleanup(shell_state *state)
     }
     state->redirection_worker_restart_pending = false;
     disable_redirection_worker(state, true);
+    cancel_completion_request(state, true);
     close_variable_commit(state);
     terminate_managed_children(managed_pids, managed_groups,
                                managed_terminal_groups);
@@ -12674,6 +13168,11 @@ static void cleanup(shell_state *state)
         while (waitpid(worker_pid, NULL, 0) == -1 && errno == EINTR) {
         }
         state->redirection_worker_pid = -1;
+    }
+    if (completion_pid > 0) {
+        while (waitpid(completion_pid, NULL, 0) == -1 && errno == EINTR) {
+        }
+        state->completion_pid = -1;
     }
     leave_managed_screen(state);
     restore_terminal(state);

@@ -19,6 +19,7 @@ enum {
     GSH_ASYNC_TERMINAL_ROW_CAP = 256,
     GSH_ASYNC_VIEW_COLUMNS = 256,
     GSH_ASYNC_VIEW_BYTES = GSH_ASYNC_VIEW_COLUMNS * 4 + 64,
+    GSH_ASYNC_ESCAPE_SEQUENCE_CAP = 64,
     GSH_ASYNC_PASSTHROUGH_SEQUENCE_CAP = 64,
     GSH_ASYNC_RESOURCE_CAP = 256,
     GSH_ASYNC_NATIVE_RESOURCE_CAP = 256,
@@ -88,6 +89,8 @@ typedef struct {
     size_t output_length;
     size_t output_line_start;
     size_t output_cursor;
+    char escape_sequence[GSH_ASYNC_ESCAPE_SEQUENCE_CAP];
+    size_t escape_sequence_length;
     char passthrough_utf8[4];
     unsigned char passthrough_utf8_length;
     unsigned char passthrough_utf8_expected;
@@ -127,6 +130,7 @@ typedef struct {
     char path[4096];
     gsh_resource_type type;
     bool navigable_root;
+    bool muted;
 } gsh_async_native_resource;
 
 typedef struct {
@@ -187,7 +191,7 @@ int gsh_async_repl_add_native_resource(
     size_t byte_begin, size_t byte_end, size_t column_begin,
     size_t column_end, const char *label,
     size_t label_length, const char *path, size_t path_length,
-    gsh_resource_type type, bool navigable_root);
+    gsh_resource_type type, bool navigable_root, bool muted);
 int gsh_async_repl_append(gsh_async_repl *repl, int cell_index,
                           const char *bytes, size_t length);
 int gsh_async_repl_queue_input(gsh_async_repl *repl, int cell_index,
@@ -219,6 +223,13 @@ int gsh_async_repl_prepare_render(gsh_async_repl *repl,
                                   const char *active_prompt,
                                   const char *editor, size_t editor_length,
                                   size_t editor_cursor);
+int gsh_async_repl_prepare_render_with_completion(
+                                  gsh_async_repl *repl,
+                                  const char *active_prompt,
+                                  const char *editor, size_t editor_length,
+                                  size_t editor_cursor,
+                                  const char *completion,
+                                  size_t completion_length);
 const char *gsh_async_repl_render_data(const gsh_async_repl *repl);
 size_t gsh_async_repl_render_length(const gsh_async_repl *repl);
 void gsh_async_repl_rendered(gsh_async_repl *repl);

@@ -15,6 +15,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdarg.h> /* CANON-INCLUDE: macos */
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -28,6 +29,7 @@ static const char initial_config[] =
     "config.version = 1\n"
     "\n"
     "shell.async_repl.enabled = true\n"
+    "shell.completion.enabled = true\n"
     "terminal.actions = auto\n"
     "terminal.actions.path_detection = safe\n"
     "terminal.images = auto\n"
@@ -43,7 +45,7 @@ typedef struct {
     size_t length;
     size_t line;
     bool version_seen;
-    bool seen[10];
+    bool seen[14];
 } config_parser;
 
 /* ── Configuration Is Parsed Before It Can Mutate State ───────
@@ -74,6 +76,7 @@ void gsh_config_defaults(gsh_shell_config *config)
     }
     (void)memset(config, 0, sizeof(*config));
     config->async_repl_enabled = true;
+    config->completion_enabled = true;
     config->history_enabled = true;
     config->history_max_entries = GSH_HISTORY_CAP;
     config->history_store_failed = true;
@@ -235,17 +238,61 @@ static int parse_count(const char *text, size_t *value)
     return 0;
 }
 
+/* ── Removed History Keys Remain Safe Upgrade Tombstones ──────
+ * Plain-text history replaced the encrypted vault, so its unlock and reminder
+ * settings no longer affect runtime behavior. Existing user files nevertheless
+ * contain those keys and must remain usable after an in-place gsh upgrade.
+ * The parser recognizes their former value grammar but discards the result.
+ * All other unknown keys stay errors, preserving strict typo detection.
+ * ─────────────────────────────────────────────────────────────── */
+static int parse_removed_duration(const char *text)
+{
+    uint64_t number = 0U;
+    uint64_t multiplier;
+    size_t index = 0U;
+
+    if (text == NULL) return -1;
+    while (index < GSH_CONFIG_FILE_CAP && text[index] >= '0' &&
+           text[index] <= '9') {
+        if (number > (UINT64_MAX - (uint64_t)(text[index] - '0')) / 10U) {
+            errno = ERANGE;
+            return -1;
+        }
+        number = number * 10U + (uint64_t)(text[index++] - '0');
+    }
+    if (number == 0U) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (strcmp(text + index, "s") == 0) multiplier = 1000000000ULL;
+    else if (strcmp(text + index, "m") == 0)
+        multiplier = 60ULL * 1000000000ULL;
+    else if (strcmp(text + index, "h") == 0)
+        multiplier = 60ULL * 60ULL * 1000000000ULL;
+    else {
+        errno = EINVAL;
+        return -1;
+    }
+    if (number > UINT64_MAX / multiplier) {
+        errno = ERANGE;
+        return -1;
+    }
+    return 0;
+}
+
 static int field_index(const char *key)
 {
     static const char *const keys[] = {
         "shell.history.enabled",       "shell.history.max_entries",
         "shell.history.deduplicate",   "shell.history.store_failed",
-        "shell.history.ignore_space",
+        "shell.history.ignore_space",  "shell.history.unlock_ttl",
+        "shell.history.reminder_min",  "shell.history.reminder_max",
         "shell.async_repl.enabled",
         "terminal.actions",
         "terminal.actions.path_detection",
         "terminal.images",
         "shell.preview.editor",
+        "shell.completion.enabled",
     };
     size_t index;
 
@@ -384,15 +431,24 @@ static int apply_config_field(gsh_shell_config *config, int field,
     case 4:
         return parse_boolean(value, &config->history_ignore_space);
     case 5:
-        return parse_boolean(value, &config->async_repl_enabled);
+        if (strcmp(value, "infinite") == 0) return 0;
+        errno = EINVAL;
+        return -1;
     case 6:
-        return parse_actions_mode(value, &config->terminal_actions);
     case 7:
-        return parse_detection_mode(value, &config->path_detection);
+        return parse_removed_duration(value);
     case 8:
-        return parse_images_mode(value, &config->terminal_images);
+        return parse_boolean(value, &config->async_repl_enabled);
     case 9:
+        return parse_actions_mode(value, &config->terminal_actions);
+    case 10:
+        return parse_detection_mode(value, &config->path_detection);
+    case 11:
+        return parse_images_mode(value, &config->terminal_images);
+    case 12:
         return parse_editor_argv(value, config);
+    case 13:
+        return parse_boolean(value, &config->completion_enabled);
     default:
         errno = EINVAL;
         return -1;
