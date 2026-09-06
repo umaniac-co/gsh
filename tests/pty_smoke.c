@@ -396,8 +396,19 @@ static const unsigned char *consume_colored_prompt_text(
     cursor += style_length;
     for (turn = 0U; turn < CAPTURE_CAP && cursor < limit; turn++) {
         if ((size_t)(limit - cursor) >= sizeof(reset) - 1U &&
-            memcmp(cursor, reset, sizeof(reset) - 1U) == 0)
-            return cursor + sizeof(reset) - 1U;
+            memcmp(cursor, reset, sizeof(reset) - 1U) == 0) {
+            const unsigned char *end = cursor + sizeof(reset) - 1U;
+            const unsigned char *next = end;
+
+            if (next < limit && *next == '\r') next++;
+            if (next < limit && *next == '\n' &&
+                (size_t)(limit - next - 1U) >= style_length &&
+                memcmp(next + 1U, style, style_length) == 0) {
+                cursor = next + 1U + style_length;
+                continue;
+            }
+            return end;
+        }
         cursor++;
     }
     return NULL;
@@ -407,27 +418,23 @@ static const unsigned char *consume_prompt_suffix(
     const unsigned char *cursor, const unsigned char *limit, bool busy)
 {
     static const char muted[] = "\033[38;5;245m";
-    static const char yellow[] = "\033[38;5;221m";
-    static const char reset[] = "\033[0m";
+    const char *visible = busy ? "gsh*> " : "gsh$> ";
+    size_t matched = 0U;
 
     if (cursor == NULL || limit == NULL || cursor > limit ||
-        (size_t)(limit - cursor) < sizeof(muted) - 1U + 4U ||
+        (size_t)(limit - cursor) < sizeof(muted) - 1U ||
         memcmp(cursor, muted, sizeof(muted) - 1U) != 0) return NULL;
     cursor += sizeof(muted) - 1U;
-    if (memcmp(cursor, "gsh", 3U) != 0) return NULL;
-    cursor += 3U;
-    if (busy) {
-        if ((size_t)(limit - cursor) < sizeof(yellow) ||
-            memcmp(cursor, yellow, sizeof(yellow) - 1U) != 0) return NULL;
-        cursor += sizeof(yellow) - 1U;
-        if (*cursor++ != '*') return NULL;
-    } else if (*cursor++ != '$') {
-        return NULL;
+    for (size_t turn = 0U; turn < 128U && cursor < limit; turn++) {
+        size_t sgr = test_sgr_length(cursor, limit);
+
+        if (sgr != 0U) { cursor += sgr; continue; }
+        if (*cursor == '\r' || *cursor == '\n') { cursor++; continue; }
+        if (*cursor++ != (unsigned char)visible[matched]) return NULL;
+        matched++;
+        if (visible[matched] == '\0') return cursor;
     }
-    if ((size_t)(limit - cursor) < sizeof(reset) - 1U + 2U ||
-        memcmp(cursor, reset, sizeof(reset) - 1U) != 0) return NULL;
-    cursor += sizeof(reset) - 1U;
-    return cursor[0] == '>' && cursor[1] == ' ' ? cursor + 2U : NULL;
+    return NULL;
 }
 
 static const unsigned char *consume_prompt_alias(
@@ -610,6 +617,34 @@ static bool terminal_output_matching_cases(void)
                                          "value!").begin == NULL) &&
            require(find_terminal_output(exact, sizeof(exact) - 2U,
                                          "value!").begin == NULL);
+}
+
+/* ── Wrapped Prompt Fields Still Form One Prompt ──────────────────
+ * Hosted runner names can force the colored identity or directory to wrap.
+ * The compositor resets and resumes that field's style across the row break.
+ * Prompt aliases must consume the resumed field before checking its suffix,
+ * which can also span rows. Busy state and following edit bytes remain exact.
+ * ─────────────────────────────────────────────────────────────── */
+static bool wrapped_prompt_matching_cases(void)
+{
+    static const unsigned char wrapped[] =
+        "DONE\r\n\033[38;5;114mrunner@long\033[0m\n"
+        "\033[38;5;114mhost\033[0m \033[38;5;75m/private/tm\033[0m\n"
+        "\033[38;5;75mp/fixture\033[0m \033[38;5;245mgsh$\033[0m> EDIT";
+    static const unsigned char suffix[] =
+        "\033[38;5;245mgs\033[0m\n\033[38;5;245mh"
+        "\033[38;5;221m*\033[0m>\r\n EDIT";
+
+    return require(find_terminal_output(wrapped, sizeof(wrapped) - 1U,
+                                         "DONE\r\ngsh$ EDIT").begin != NULL) &&
+           require(find_terminal_output(wrapped, sizeof(wrapped) - 1U,
+                                         "DONE\r\ngsh* EDIT").begin == NULL) &&
+           require(find_terminal_output(wrapped, sizeof(wrapped) - 1U,
+                                         "DONE\r\ngsh$ EDIX").begin == NULL) &&
+           require(find_terminal_output(suffix, sizeof(suffix) - 1U,
+                                         "gsh* EDIT").begin != NULL) &&
+           require(find_terminal_output(suffix, sizeof(suffix) - 1U,
+                                         "gsh$ EDIT").begin == NULL);
 }
 
 static bool capture_ordered(const pty_session *session, const char *first,
@@ -3554,17 +3589,25 @@ static int managed_repl_rewrites_progress(pty_session *session)
     return 0;
 }
 
+/* ── Resize Preservation Is Checked After a Narrow Viewport ───────
+ * A long host name can split the edit text across rows at either test width.
+ * Matching one contiguous string in that narrow frame confused wrapping
+ * with lost editor state. Observe the narrow redraw, then restore enough
+ * columns to compare every preserved byte before returning to normal width.
+ * ─────────────────────────────────────────────────────────────── */
 static int managed_repl_resize(pty_session *session)
 {
-    if (send_text(session, "RESIZE_KEEP") == -1 ||
+    if (resize_session(session, 24U, 512U) == -1 ||
+        send_text(session, "RESIZE_KEEP") == -1 ||
         consume_through(session, "gsh$ RESIZE_KEEP",
                         TEST_TIMEOUT_MS) == -1 ||
         resize_session(session, 12, 40) == -1 ||
+        consume_through(session, "\033[H\033[2J",
+                        TEST_TIMEOUT_MS) == -1 ||
+        resize_session(session, 24U, 512U) == -1 ||
         consume_through(session, "gsh$ RESIZE_KEEP",
                         TEST_TIMEOUT_MS) == -1 ||
         resize_session(session, 24, 80) == -1 ||
-        consume_through(session, "gsh$ RESIZE_KEEP",
-                        TEST_TIMEOUT_MS) == -1 ||
         send_bytes(session, "\025", 1) == -1) {
         return -1;
     }
@@ -3575,6 +3618,7 @@ static int managed_repl_saturation(pty_session *session)
 {
     unsigned int submission;
 
+    if (resize_session(session, 24U, 512U) == -1) return -1;
     for (submission = 0; submission < 15U; submission++) {
         if (send_text(session, "/bin/sleep 30\r") == -1 ||
             consume_through(session, "/bin/sleep 30\r\n",
@@ -8741,7 +8785,8 @@ int main(int argc, char **argv)
 {
     char executable[4096];
 
-    if (!terminal_output_matching_cases()) return 1;
+    if (!terminal_output_matching_cases() || !wrapped_prompt_matching_cases())
+        return 1;
     if (close_inherited_descriptors() == -1) {
         perror("pty harness: inherited descriptors");
         return 1;
