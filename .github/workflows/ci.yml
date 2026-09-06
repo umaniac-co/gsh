@@ -43,18 +43,18 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libsodium-dev pkg-config zsh
+          sudo apt-get install -y libcurl4-openssl-dev zsh
 
       - name: Install dependencies on macOS
         if: runner.os == 'macOS'
-        run: brew install bash libsodium zsh
+        run: brew install bash zsh
 
       - name: Strict build and black-box gates
         run: |
           set -o pipefail
           make clean
           mkdir -p build/evidence
-          make CC=${{ matrix.cc }} policy conformance check check-variables check-positionals check-background check-config check-aliases check-functions check-fault check-resource 2>&1 | tee build/evidence/gates.txt
+          make CC=${{ matrix.cc }} policy quality-dependencies quality-includes quality-maps conformance check check-variables check-command-cache check-positionals check-background check-config check-llm check-source-workspaces check-traps check-benchmark-report check-aliases check-functions check-fault check-resource 2>&1 | tee build/evidence/gates.txt
           make CC=${{ matrix.cc }} fuzz-smoke FUZZ_CASES=250000 2>&1 | tee -a build/evidence/gates.txt
           make CC=${{ matrix.cc }} fuzz-pty PTY_FUZZ_CASES=5000 2>&1 | tee -a build/evidence/gates.txt
 
@@ -102,6 +102,7 @@ jobs:
           bash --version >> build/evidence/platform.txt
           zsh --version >> build/evidence/platform.txt
           make CC=${{ matrix.cc }} bench | tee build/evidence/latency.txt
+          cp dev/performance/current.csv build/evidence/benchmark.csv
 
       - name: Upload verification evidence
         if: always()

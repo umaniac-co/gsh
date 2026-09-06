@@ -1,5 +1,7 @@
 # source target root-or-role
 src/gsh.c gsh,fault main
+src/llm_repl.c gsh,fault,llm-worker dependency
+src/llm_command_policy.c llm-worker,llm-worker-test dependency
 src/alias_expansion.c gsh,fault,fuzz dependency
 src/async_repl.c gsh,fault,fuzz,file-builtins-test,resource-actions-test dependency
 src/background_jobs.c gsh,fault dependency
@@ -31,11 +33,16 @@ src/history_store.c gsh,fault dependency
 src/native_plan.c gsh,fault,fuzz dependency
 src/native_viewer.c gsh,fault,file-builtins-test dependency
 src/positional_parameters.c gsh,fault,positional-test dependency
-src/posix_lexer.c gsh,fault,fuzz dependency
-src/posix_parser.c gsh,fault,fuzz dependency
+src/posix_lexer.c gsh,fault,fuzz,llm-worker,llm-worker-test dependency
+src/posix_parser.c gsh,fault,fuzz,llm-worker,llm-worker-test dependency
 src/resource_actions.c gsh,fault,fuzz,file-builtins-test,resource-actions-test dependency
 src/shell_aliases.c gsh,fault,fuzz,alias-test dependency
-src/shell_config.c gsh,fault,config-test,file-builtins-test dependency
+src/shell_config.c gsh,fault,config-test,file-builtins-test,llm-worker,setup dependency
+src/llm_json.c llm-worker,setup,llm-json-test,llm-worker-test dependency
+src/llm_journal.c gsh,fault,llm-worker,llm-journal-test dependency
+src/llm_hardware.c setup,llm-hardware-test dependency
+src/llm_worker.c llm-worker main
+src/gsh_setup.c setup main
 src/shell_functions.c gsh,fault,fuzz,function-test dependency
 src/shell_options.c gsh,fault dependency
 src/shell_invocation.c gsh,fault dependency
@@ -58,6 +65,10 @@ tests/pty_smoke.c pty main
 tests/resource_actions_test.c resource-actions-test main
 tests/shell_aliases_test.c alias-test main
 tests/shell_config_test.c config-test main
+tests/llm_json_test.c llm-json-test main
+tests/llm_journal_test.c llm-journal-test main
+tests/llm_hardware_test.c llm-hardware-test main
+tests/llm_worker_test.c llm-worker-test main
 tests/shell_functions_test.c function-test main
 tests/shell_traps_test.c trap-test main
 tests/shell_variables_test.c variable-test main

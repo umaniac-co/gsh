@@ -13,7 +13,6 @@
 #include "builtin_registry.h"
 
 #include <dirent.h>
-#include <errno.h>
 #include <stdio.h>
 #include <sys/stat.h>
 #include <string.h>
@@ -77,20 +76,17 @@ typedef struct {
 
 static bool word_boundary(unsigned char byte)
 {
-    if (!require(byte <= 0xffU)) return true;
     return byte == ' ' || byte == '\t' || byte == '\r' || byte == '\n';
 }
 
 static bool command_boundary(unsigned char byte)
 {
-    if (!require(byte <= 0xffU)) return true;
     return byte == ';' || byte == '|' || byte == '&' || byte == '(' ||
            byte == ')';
 }
 
 static bool variable_name_byte(unsigned char byte, bool first)
 {
-    if (!require(byte <= 0xffU)) return false;
     if ((byte >= 'a' && byte <= 'z') ||
         (byte >= 'A' && byte <= 'Z') || byte == '_') return true;
     return !first && byte >= '0' && byte <= '9';

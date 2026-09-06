@@ -17,7 +17,6 @@
 #include <dirent.h> /* CANON-INCLUDE: linux */
 #include <errno.h>
 #include <fcntl.h>
-#include <limits.h> /* CANON-INCLUDE: linux */
 #include <locale.h>
 #include <poll.h>
 #include <pwd.h>
@@ -473,6 +472,12 @@ static bool output_start_possible(unsigned char byte, const char *needle)
             memcmp(needle, "gsh* ", 5U) == 0);
 }
 
+/* ── Terminal Evidence Must Match Every Visible Byte ───────────
+ * Styled diagnostics need an ANSI-aware comparison after raw matching fails.
+ * Advancing the expected offset before comparing the final byte once accepted
+ * a wrong counter value as success and could release a PTY wait too early.
+ * Only a verified byte advances the match; truncated or unequal tails fail.
+ * ─────────────────────────────────────────────────────────────── */
 static output_match find_output(const unsigned char *haystack,
                                 size_t haystack_length,
                                 const char *needle)
@@ -509,8 +514,10 @@ static output_match find_output(const unsigned char *haystack,
             }
             sgr = test_sgr_length(cursor, limit);
             if (sgr != 0U) { cursor += sgr; continue; }
-            if (cursor >= limit || *cursor++ != (unsigned char)needle[wanted++])
+            if (cursor >= limit || *cursor != (unsigned char)needle[wanted])
                 break;
+            cursor++;
+            wanted++;
         }
         if (wanted == needle_length) {
             match.begin = haystack + start;
@@ -590,6 +597,19 @@ static bool capture_contains(const pty_session *session, const char *text)
     }
     return find_terminal_output(session->capture, session->capture_length,
                                 text).begin != NULL;
+}
+
+static bool terminal_output_matching_cases(void)
+{
+    static const unsigned char exact[] = "v\033[31malue\033[0m!";
+    static const unsigned char mismatch[] = "v\033[31malue\033[0mX";
+
+    return require(find_terminal_output(exact, sizeof(exact) - 1U,
+                                         "value!").begin != NULL) &&
+           require(find_terminal_output(mismatch, sizeof(mismatch) - 1U,
+                                         "value!").begin == NULL) &&
+           require(find_terminal_output(exact, sizeof(exact) - 2U,
+                                         "value!").begin == NULL);
 }
 
 static bool capture_ordered(const pty_session *session, const char *first,
@@ -1336,7 +1356,7 @@ static int start_managed_actions_session(pty_session *session,
     static const char configuration[] =
         "config.version = 1\n"
         "shell.history.enabled = false\n"
-        "terminal.actions = on\n";
+        "terminal.actions = auto\n";
     char path[PATH_MAX];
     int result;
 
@@ -2743,14 +2763,15 @@ static int managed_repl_launch_state_fence(pty_session *session)
 
 static int managed_repl_native_resources(pty_session *session)
 {
-    static const char filename[] = "name with space.py";
+    static const char styled[] =
+        "\033[4;38;5;81mname with space.py\033[0m";
     static const char mouse_capture[] = "\033[?1000h";
     if (session == NULL) return -1;
     session->capture_length = 0U;
     if (send_text(session, "ls -1\r") == -1 ||
-        wait_for_output(session, filename, TEST_TIMEOUT_MS) == -1 ||
+        wait_for_output(session, styled, TEST_TIMEOUT_MS) == -1 ||
         wait_for_output(session, "gsh$", TEST_TIMEOUT_MS) == -1 ||
-        capture_contains(session, mouse_capture)) return -1;
+        !capture_contains(session, mouse_capture)) return -1;
     return 0;
 }
 
@@ -2778,6 +2799,9 @@ static void cleanup_resource_action_fixture(resource_action_fixture *fixture)
 static int setup_resource_action_fixture(resource_action_fixture *fixture,
                                          const char *executable)
 {
+    static const char first_source[] =
+        "\tABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwx\n"
+        "print('resource')\n";
     char test_path[PATH_MAX * 2U];
     if (fixture == NULL || executable == NULL) return -1;
     (void)memset(fixture, 0, sizeof(*fixture));
@@ -2787,7 +2811,7 @@ static int setup_resource_action_fixture(resource_action_fixture *fixture,
         snprintf(fixture->first, sizeof(fixture->first), "%s/%s",
                  fixture->directory, "name with space.py") >=
             (int)sizeof(fixture->first) ||
-        write_text_file(fixture->first, "print('resource')\n", 0600) == -1 ||
+        write_text_file(fixture->first, first_source, 0600) == -1 ||
         snprintf(fixture->second, sizeof(fixture->second), "%s/%s",
                  fixture->directory, "second.py") >=
             (int)sizeof(fixture->second) ||
@@ -2819,6 +2843,9 @@ static int open_and_replace_resource_preview(pty_session *session, int *stage)
     static const char click[] = "\033[<0;2;2M";
     static const char replacement_click[] = "\033[<0;2;4M";
     static const char split_origin[] = "\033[1;50H";
+    static const char wheel_down[] = "\033[<65;80;2M";
+    static const char bounded_tab_row[] =
+        "    ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstu\033[K";
     if (session == NULL || stage == NULL) return -1;
     if (resize_session(session, 24U, 110U) == -1 ||
         consume_through(session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
@@ -2833,6 +2860,11 @@ static int open_and_replace_resource_preview(pty_session *session, int *stage)
         wait_for_output(session, "-rw-------", TEST_TIMEOUT_MS) == -1)
         return -1;
     *stage = 6;
+    session->capture_length = 0U;
+    if (send_text(session, wheel_down) == -1 ||
+        wait_for_output(session, bounded_tab_row, TEST_TIMEOUT_MS) == -1)
+        return -1;
+    *stage = 61;
     session->capture_length = 0U;
     if (send_text(session, replacement_click) == -1 ||
         wait_for_output(session, "SECOND_PREVIEW", TEST_TIMEOUT_MS) == -1)
@@ -2996,7 +3028,6 @@ static int managed_scroll_flow(const char *executable)
         "SCROLL_08\\nSCROLL_09\\nSCROLL_10\\n'\r";
     static const char page_up[] = "\033[5~";
     static const char page_down[] = "\033[6~";
-    static const char mouse_capture[] = "\033[?1000h";
     char fixture[] = "/tmp/gsh-scroll-action-XXXXXX";
     pty_session session;
     int failed = 0;
@@ -3010,8 +3041,7 @@ static int managed_scroll_flow(const char *executable)
     if (resize_session(&session, 6U, 80U) == -1 ||
         consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, output) == -1 ||
-        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
-        capture_contains(&session, mouse_capture)) {
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1) {
         failed = 1;
     }
     session.capture_length = 0U;
@@ -3657,47 +3687,6 @@ static int managed_async_repl_flow(const char *executable)
     return failed;
 }
 
-static int managed_caret_flow(const char *executable)
-{
-    static const char mark[] = "\342\227\217";
-    char fixture[] = "/tmp/gsh-pty-caret-XXXXXX";
-    pty_session session = {0};
-    uint64_t start;
-    uint64_t elapsed;
-    int failed = 0;
-
-    if (executable == NULL || mkdtemp(fixture) == NULL ||
-        start_managed_session(&session, executable, fixture) == -1 ||
-        consume_through(&session, mark, TEST_TIMEOUT_MS) == -1) {
-        perror("pty caret: setup");
-        failed = 1;
-    }
-    start = monotonic_ns();
-    if (!failed && wait_for_output(&session, mark, 1600) == -1) failed = 1;
-    elapsed = monotonic_ns() - start;
-    if (!failed && (elapsed < 700000000ULL || elapsed > 1500000000ULL))
-        failed = 1;
-    session.capture_length = 0U;
-    if (!failed &&
-        (send_text(&session, "abc") == -1 ||
-         wait_for_output(&session, "abc", TEST_TIMEOUT_MS) == -1 ||
-         wait_for_output(&session, mark, TEST_TIMEOUT_MS) == -1 ||
-         !capture_contains(&session, "\033[?25l") ||
-         send_bytes(&session, "\025", 1U) == -1 ||
-         consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1))
-        failed = 1;
-    if (!failed) {
-        session.capture_length = 0U;
-        if (send_text(&session, "exit 0\r") == -1 ||
-            wait_session_exit(&session, 0, TEST_TIMEOUT_MS) == -1 ||
-            !capture_contains(&session, "\033[?25h")) failed = 1;
-    }
-    if (failed && session.pid > 0) dump_capture(&session);
-    if (session.pid > 0 && stop_session(&session) == -1) failed = 1;
-    (void)rmdir(fixture);
-    return failed;
-}
-
 static int variable_builtin_flow(const char *executable)
 {
     char fixture[] = "/tmp/gsh-pty-variables-XXXXXX";
@@ -4152,12 +4141,19 @@ static int interactive_exec_overlay_case(
     const char *setup, const char *command, int expected_status)
 {
     pty_session session;
+    pid_t children[256];
+    int child_count;
 
     if ((managed ? start_managed_session(&session, executable, fixture)
                  : start_session(&session, executable, fixture, SHELL_GSH)) ==
             -1 ||
-        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
-        (setup != NULL &&
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1) {
+        if (session.master >= 0) (void)stop_session(&session);
+        return 1;
+    }
+    child_count = process_child_pids(session.pid, children,
+                                    sizeof(children) / sizeof(children[0]));
+    if ((setup != NULL &&
          (send_text(&session, setup) == -1 ||
           consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1)) ||
         send_text(&session, command) == -1 ||
@@ -4168,7 +4164,7 @@ static int interactive_exec_overlay_case(
         }
         return 1;
     }
-    return 0;
+    return wait_for_session_children(children, child_count) ? 0 : 1;
 }
 
 static int managed_exec_descriptor_case(const char *executable,
@@ -5020,7 +5016,8 @@ static int command_fault_case(const char *executable, const char *fault,
     int failed = 0;
 
     if (mkdtemp(fixture) == NULL || setenv("GSH_FAULT", fault, 1) == -1 ||
-        (managed ? start_managed_session(&session, executable, fixture)
+        (managed ? start_managed_actions_session(&session, executable,
+                                                 fixture)
                  : start_session(&session, executable, fixture, SHELL_GSH)) ==
             -1) {
         perror("pty fault: command setup");
@@ -5043,6 +5040,7 @@ static int command_fault_case(const char *executable, const char *fault,
         (void)fprintf(stderr, "pty fault: command cleanup failed: %s\n", fault);
         failed = 1;
     }
+    if (managed) remove_managed_actions_config(fixture);
     (void)rmdir(fixture);
     return failed;
 }
@@ -5860,6 +5858,25 @@ static int descriptor_exhaustion_case(const char *executable)
     return failed;
 }
 
+static void discard_ready_output(pty_session *session);
+
+/* ── Resize Frames Cannot Acknowledge Later Editor Input ─────────
+ * A signal storm can leave many valid copies of the same prompt in the PTY.
+ * Matching one of those after Ctrl-U falsely acknowledged the new edit and
+ * let retained redraws exhaust the capture during the following here-doc.
+ * First verify the preserved draft, then drain those already observed frames
+ * before testing a fresh edit; the existing bounded drain caps harness work.
+ * ─────────────────────────────────────────────────────────────── */
+static bool recover_resize_storm(pty_session *session)
+{
+    if (session == NULL) return false;
+    if (consume_through(session, "\033[2K", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(session, "kept", TEST_TIMEOUT_MS) == -1) return false;
+    discard_ready_output(session);
+    return send_bytes(session, "\025", 1) == 0 &&
+           consume_through(session, "gsh$ ", TEST_TIMEOUT_MS) == 0;
+}
+
 static int bounded_input_case(const char *executable)
 {
     char fixture[] = "/tmp/gsh-resource-input-XXXXXX";
@@ -5909,10 +5926,7 @@ static int bounded_input_case(const char *executable)
             return finish_session_directory(&session, fixture, 1);
         }
     }
-    if (consume_through(&session, "\033[2K", TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "kept", TEST_TIMEOUT_MS) == -1 ||
-        send_bytes(&session, "\025", 1) == -1 ||
-        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1) {
+    if (!recover_resize_storm(&session)) {
         (void)fprintf(stderr, "pty resource: signal storm corrupted the editor\n");
         failed = 1;
     }
@@ -8584,9 +8598,6 @@ static int run_primary_smoke_flows(const char *executable)
     if (editor_navigation_flow(executable) != 0) {
         return smoke_flow_failure("editor navigation/paste");
     }
-    if (managed_caret_flow(executable) != 0) {
-        return smoke_flow_failure("managed software caret");
-    }
     if (managed_async_repl_flow(executable) != 0) {
         return smoke_flow_failure("managed async REPL");
     }
@@ -8660,6 +8671,7 @@ int main(int argc, char **argv)
 {
     char executable[4096];
 
+    if (!terminal_output_matching_cases()) return 1;
     if (close_inherited_descriptors() == -1) {
         perror("pty harness: inherited descriptors");
         return 1;

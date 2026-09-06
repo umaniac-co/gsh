@@ -6,6 +6,20 @@ the principles in [`specs/0001.principles.md`](specs/0001.principles.md) and
 the architectures in [`specs/0002.real_time.md`](specs/0002.real_time.md) and
 [`specs/0008.async_repl.md`](specs/0008.async_repl.md).
 
+## At a glance
+
+**Development preview.** Snapshot: 2026-09-06; macOS arm64, Apple Clang 21.
+
+| Metric | Latest evidence |
+| --- | --- |
+| Native POSIX.1-2024 implementation | **~80%** estimated progress |
+| Average benchmark speedup vs competitors | **Bash: +108.1% (2.08×)** · **Zsh: +139.7% (2.40×)** |
+
+POSIX progress is the 2026-09-03 unweighted estimate across 19 shell-language
+areas, not a conformance score. Speedup is the geometric mean of p50 latency
+ratios across 37 workloads, in classic mode with AI and history disabled. See the
+[benchmark snapshot and methodology](#benchmark-snapshot-2026-09-06).
+
 ## Project quality criteria
 
 `gsh` is also a coding project whose implementation should remain remarkably
@@ -277,11 +291,7 @@ evaluators rebase their counters on the owning shell, while true subshells
 remain isolated. The bounded editor supports UTF-8-aware left/right cursor
 movement, insertion and backspace at the cursor, multiline input with `PS2`,
 and bracketed multiline paste that preserves every pasted line until an
-explicit Enter submits the complete buffer. In the default managed REPL, a
-blinking `●` overlays the current single-column character without entering or
-shifting the command; its hidden phase restores that character. A locale that
-cannot render the mark in one column falls back to the terminal cursor, as does
-classic mode. The editor also supports history arrows,
+explicit Enter submits the complete buffer. It also supports history arrows,
 incremental `Ctrl-R`, and context-aware completion with `Tab` for commands,
 pathnames, directory-only `cd` operands, shell variables, aliases, builtin
 options, and Git subcommands. Ambiguous matches are shown in a bounded,
@@ -307,6 +317,11 @@ internal workers as jobs.
 - macOS or Linux
 - a C17 compiler with POSIX APIs (`cc`, Clang, or GCC)
 - `make`
+- libcurl development files and `curl-config`
+
+The optional local-runtime recipes also use `git`; the llama.cpp recipe uses
+`cmake`. DS4 model downloads are very large and are offered only after an
+explicit confirmation.
 
 The source requests the POSIX.1-2024 feature-test baseline with
 `_POSIX_C_SOURCE=202405L`. Current platform SDKs may still report an older
@@ -326,6 +341,34 @@ make clean
 ```
 
 `build/` contains only local artifacts and is ignored by Git.
+
+For a user install, run:
+
+```sh
+./install.sh
+```
+
+This installs `gsh`, `gsh-llm-worker`, and `gsh-setup` under
+`${PREFIX:-$HOME/.local}/bin`, then opens the inference-server wizard when the
+terminal is interactive. `make install` provides the same path directly.
+For a system-wide installation, keep the privileged file copy separate from
+the per-user configuration:
+
+```sh
+sudo make install PREFIX=/usr/local
+/usr/local/bin/gsh-setup
+```
+
+The first command deliberately does not run the wizard as root; the second
+stores the inference configuration in the invoking user's `~/.gshrc`.
+
+Oh My Zsh's `git` plugin already defines `gsh` as an alias for `git show`.
+Because shell aliases take precedence over executables in `PATH`, users of
+that plugin can select the installed shell explicitly after loading Oh My Zsh:
+
+```sh
+alias gsh=/usr/local/bin/gsh
+```
 
 Run the black-box PTY smoke test with:
 
@@ -419,13 +462,14 @@ separate GNU GCC installation or the Linux matrix is required for independent
 GCC evidence. `quality-linux` supplies that matrix reproducibly with Docker:
 it builds the pinned Debian toolchain image in
 `dev/quality-linux.Dockerfile`, verifies that the container is Linux `x86_64`,
-then runs policy, all non-sanitized linker-map builds, and conformance with both
+then runs policy, all non-sanitized linker-map builds, conformance, and the AI
+integration tests with both
 GNU GCC and Clang. Docker Desktop must be running; the source tree is mounted
 read-only and all Linux build products stay in the disposable container.
 
 `policy` has no accepted debt baseline: every violation count must remain
 zero. Source ownership lives in `dev/target-manifest.tsv`: every C source must
-belong to one or more of the 20
+belong to one or more of the 25
 closed, supported targets, and every target must have an explicit `main` or
 fuzzer root. Unknown targets, unknown roles, duplicate sources, unowned files,
 and dependency-only targets fail `policy`; embedded positive and negative
@@ -459,7 +503,7 @@ The native Issue 8 lexer, parser, and static execution planner share a
 deterministic C fuzz driver. Valid function definitions additionally exercise
 store construction, clone, segmented snapshot transfer, hostile headers, and
 arbitrary snapshot mutations; `check-sanitize` also runs the structural
-function-store test under ASan/UBSan. A separate black-box PTY profile feeds bounded
+function-store and AI integration tests under ASan/UBSan. A separate black-box PTY profile feeds bounded
 random editor/control-byte streams, resize events, invalid UTF-8 and NUL bytes,
 then checks prompt recovery, child count, descriptor count, and terminal
 restoration. Override its default with `PTY_FUZZ_CASES=number`. On a Clang
@@ -538,6 +582,37 @@ results are comparable between shells on the same host, not across operating
 systems. Final same-revision matrices and their raw output belong in
 the ignored local `dev/performance/` directory, separately from `build/`.
 
+### Benchmark snapshot: 2026-09-06
+
+The overview records the local `3bc427c215ab-dirty` candidate measured at
+2026-09-06 16:25:55 UTC on Darwin 25.6.0 arm64 (18 CPUs), Apple Clang 21.0.0,
+Bash 5.3.3 and Zsh 5.9. It covers all 37 latency workloads, including startup,
+idle input, external execution, direct builtins, mutations and pathname
+expansion, plus 26 command-memory workloads and idle memory. The harness uses
+classic mode, disables AI and history, and runs Bash and Zsh without startup
+files. These figures do not measure managed-mode rendering or AI workloads.
+
+For each comparison shell, average speedup is
+`100 × (exp(mean(log(peer_p50 / gsh_p50))) - 1)` across all 37 workloads;
+it is not the arithmetic mean of individual percentages. The corresponding
+geometric-mean latency reductions are 51.9% against Bash and 58.3% against Zsh.
+gsh has a lower p50 in 30/37 workloads against Bash and 33/37 against Zsh.
+Startup p50 is 11.910 ms versus Bash's 9.400 ms and Zsh's 9.489 ms;
+pathname-expansion p50 is 1.925 ms versus 0.191 ms and 0.210 ms respectively.
+The direct-builtin paired gate passes at 894/900 wins against each shell.
+
+The complete 509-row CSV, including every raw sample, is retained locally as
+`dev/performance/2026-09-06-publication.csv`. Reproduce it with
+`make bench BENCH_OUTPUT=dev/performance/2026-09-06-publication.csv`.
+The source fingerprint is SHA-256
+`00c0581b283aebc17c743d233c2de6e8cca5b497e7ef572c60ff610a59c41b50`,
+over sorted paths and contents of `Makefile`, `src/*.[ch]`,
+`tests/pty_smoke.c`, and `tests/benchmark_report.[ch]`, each path and content
+followed by a NUL byte. Any implementation change requires a fresh benchmark
+before updating the overview; this local snapshot is not release evidence.
+
+### Earlier benchmark snapshot: 2026-09-03
+
 The `6917664` code candidate below is evidence for this machine, not a release
 or cross-platform performance claim. It was measured on 2026-09-03 with
 Darwin 25.6.0 arm64 (18 CPUs), Apple Clang 21.0.0, Bash 5.3.3, and Zsh 5.9.
@@ -600,10 +675,11 @@ reset before `>` leaves that marker in the terminal's default color. In managed
 mode only the busy `*` is yellow. Classic mode uses the same settled prompt.
 
 Enter freezes the submitted prompt and command into a cell. Output adds rows
-only when bytes arrive, so a silent command does not leave a blank row. The
-fresh editor at the bottom accepts input immediately while independent cells
-run and finish in any order. Shell-state mutations and `$?` dependencies remain
-ordered. A
+only when bytes arrive, so a silent command does not leave a blank row. Logical
+output longer than the terminal width wraps into retained physical rows without
+splitting UTF-8 or ANSI style tokens. The fresh editor at the bottom accepts
+input immediately while independent cells run and finish in any order.
+Shell-state mutations and `$?` dependencies remain ordered. A
 private-input program such as `sudo` receives focus automatically when its PTY
 disables echo; the preserved editor remains unchanged and normal editing
 resumes when the job settles. Non-canonical applications such as `htop`,
@@ -640,8 +716,8 @@ processes are still live, the requested transition remains pending; entering
 
 ### Clickable files and native preview
 
-With `terminal.actions = on`, the managed REPL recognizes file and directory
-references without inserting terminal hyperlinks into command output. Native
+The managed REPL recognizes file and directory references without inserting
+terminal hyperlinks into command output. Native
 `ls` and `ll` send typed
 metadata over a private close-on-exec channel; adapters recognize the output of
 `/bin/ls`, `find`, `tree`, `fd`, `rg --files`, `git status`, `grep`, and `rg`;
@@ -650,14 +726,11 @@ bare words. Pathname cells are styled and clickable; in `ll`, the underline
 and hitbox extend through the complete left-hand name field, including its
 alignment padding. Output-carried
 OSC, DCS, CSI, SOS, PM, and APC sequences cannot manufacture an action.
-The managed REPL leaves mouse reporting off by default, so ordinary dragging
-creates a native terminal selection that can be copied normally. `Page Up` and
-`Page Down` scroll its 10,240-line bounded viewport. With
-`terminal.actions = on`, mouse-wheel events scroll that viewport directly,
+Mouse-wheel events scroll its 10,240-line bounded viewport directly,
 including when the active prompt is on the last terminal row; this also handles
-SGR wheel reports emitted by iTerm2. While actions are enabled, use the
-terminal's mouse-reporting override (commonly Shift or Option) for a native
-selection.
+SGR wheel reports emitted by iTerm2. Use the terminal's mouse-reporting override
+(commonly Shift or Option) for a native selection, or set
+`terminal.actions = off`; Page Up and Page Down remain available in that mode.
 
 Clicking a regular file opens the native `view` builtin. At 100 columns or
 more it opens beside a 45-percent REPL pane whose minimum width is 48 columns;
@@ -720,10 +793,9 @@ shell.preview.editor = auto
 shell.preview.editor = ["nvim", "--", "{file}"]
 ```
 
-`terminal.actions` accepts `auto`, `on`, or `off`. `auto` is the selection-safe
-default and enables actions only when they do not require capturing ordinary
-mouse input; the current SGR mouse channel therefore requires an explicit
-`on`. Path detection accepts
+`terminal.actions` accepts `auto`, `on`, or `off`. `auto` is the default and
+enables actions in the managed REPL on a usable terminal; `on` requests them
+explicitly, and `off` disables them. Path detection accepts
 `off` (only native structured references), `known` (plus adapters), or `safe`
 (plus conservative universal detection). Editor auto-discovery tries `nvim`,
 then `vim`, then `nano`; automatic Vim/Neovim sessions show absolute line
@@ -742,8 +814,152 @@ protocol is absent, the same layout is retained as a bordered placeholder.
 PDF files return to the existing generic, content-based text/hex viewer;
 source, plain-text, and other binary previews are unchanged.
 
-The future `?` steering and `??` AI queue described by specification 0008 are
-not implemented yet; ordinary shell operation does not depend on an LLM.
+### Native LLM integration
+
+`gsh-setup` presents an arrow-key menu for
+[antirez/ds4](https://github.com/antirez/ds4),
+[llama.cpp](https://github.com/ggml-org/llama.cpp), a custom Responses API
+endpoint, or disabled AI. DS4 defaults to `127.0.0.1:8000` and llama.cpp to
+`127.0.0.1:8080`. The wizard first probes `GET /v1/models`; an already running
+server is attached without reinstalling it. Otherwise it can clone a pinned
+revision and build the selected local runtime.
+
+Before recommending a local model, setup detects the OS, architecture, total
+RAM, logical CPUs, free disk, and Metal, NVIDIA CUDA, or AMD ROCm acceleration.
+CUDA and ROCm are considered buildable only when their compiler toolchain is
+also present. llama.cpp is built with the detected backend (`GGML_METAL`,
+`GGML_CUDA`, or `GGML_HIP`) and falls back to CPU when acceleration cannot be
+compiled. Its model budget reserves 25 percent of unified/system memory, 10
+percent of discrete VRAM, and caps CPU-only recommendations at a 10 GiB working
+set. Disk fit is checked separately.
+
+The llama.cpp picker contains an automatic choice, a custom Hugging Face
+`repository[:quant]`, and this curated ten-model catalog (the highest-ranked
+model that fits is selected automatically):
+
+```text
+Qwen3 Coder Next 80B Q8             coding and tool use       ~96 GiB
+Qwen3.8 27B Q4_K_M                  general reasoning         ~24 GiB
+Qwen3.6 35B-A3B Q4_K_M             fast MoE reasoning        ~26 GiB
+GLM-4.7 Flash Q8                    agentic coding            ~40 GiB
+gpt-oss 20B MXFP4                   tool use and reasoning    ~16 GiB
+Nemotron 3.5 Lightning 30B-A3B Q8  efficient reasoning       ~40 GiB
+Gemma 4 12B IT Q8                  balanced assistant        ~16 GiB
+Gemma 3 12B IT Q4_K_M              compact assistant         ~10 GiB
+Gemma 3 4B IT Q4_K_M               low-memory assistant       ~6 GiB
+Qwen3.5 0.8B Q8                    minimal-memory assistant   ~3 GiB
+```
+
+These are conservative working-set estimates, not just GGUF download sizes.
+Each entry is labelled `fits` or `oversized` for the detected machine, but the
+user may override the recommendation. llama.cpp downloads the selected GGUF
+from its `ggml-org` Hugging Face repository on first managed start.
+
+DS4 uses its own supported-model matrix: automatic selection chooses
+`ds4f-q4` at 256 GiB or more and `ds4f-q2` otherwise. Below 96 GiB it adds
+`--ssd-streaming`; `ds4f-q2-q4` and manual Q2/Q4 overrides remain available.
+Its build target is selected as Metal, `cuda-spark`, `cuda-generic`,
+`strix-halo`, or the diagnostic CPU fallback. Large downloads always require
+explicit confirmation. A managed runtime starts outside the shell core on the
+first AI request, with diagnostics in `~/.genshell/runtime.log`. DS4 and
+llama.cpp use the same lifecycle supervisor: every active request holds a
+shared lease, and the owned server process group is terminated after 5
+minutes without requests. `runtime.idle_timeout` accepts `s`, `m`, or `h` up
+to 24 hours; `off` preserves an always-on managed server.
+
+All persistent inference configuration lives in `~/.gshrc`. A custom HTTPS
+provider looks like this:
+
+```text
+llm.enabled = true
+llm.default_provider = "custom"
+llm.streaming = true
+llm.auto_help = true
+llm.context.recent_exchanges = 5
+llm.request_timeout = 120s
+llm.providers.custom.type = responses
+llm.providers.custom.base_url = "https://example.test/v1"
+llm.providers.custom.model = "model-name"
+llm.providers.custom.credential = "env:EXAMPLE_API_KEY"
+llm.providers.custom.runtime.managed = false
+llm.providers.custom.runtime.idle_timeout = off
+llm.providers.custom.runtime.command = ""
+```
+
+At most eight named providers are loaded. Credentials are references to
+environment variables, never literal keys. Authenticated or remote endpoints
+must use HTTPS; plaintext HTTP is accepted only for loopback. TLS certificate
+verification is enabled and redirects are rejected.
+
+The interactive forms are:
+
+```text
+gsh$ ? explain the last failure
+gsh$ ?? queue this after the active AI request
+gsh$ git diff | ? show only potentially dangerous changes
+```
+
+In the managed REPL, `?` cancels the active AI generation before starting the
+new one and `??` retains FIFO order. Responses stream into their own
+REPL cells. The pipeline form recognizes only an unquoted final `| ?`, executes
+the left side once, and sends its bounded combined output, exit status, command,
+and instruction to the model; execution tools are disabled for that request.
+An AI request started in classic mode enters the managed view for command
+blocks; `/async` returns to classic mode. This never changes configuration.
+
+Every conversational block has a `gsh ai>` header. A small green Braille
+spinner follows it during generation, including streaming, with no activity
+label. Startup adds muted `Starting...`; confirmation replaces the spinner
+with muted `Awaiting confirmation`. Animation stops during command execution,
+on cancellation, and when the response finishes. These decorations belong to
+the compositor, never command output, model context, or history. The reactor
+advances the spinner at most every 100 ms and has no animation timer when idle.
+
+Each request replays up to the last five prompt/answer pairs through the
+stateless [OpenAI Responses API](https://developers.openai.com/api/reference/resources/responses/methods/create)
+contract with `store: false`. The model can call two standard function tools:
+`history_search` searches the bounded local command/output/conversation journal,
+and `run_cli` submits every generated script as a new ordinary REPL command
+block. A small `[AI]` tag after the prompt identifies its origin; the tag is
+not part of the command or its recallable history. The normal shell executor
+owns builtins, external commands, pipelines and compound scripts, so `cd`,
+variables and other session changes have the same semantics as typed commands.
+The exact script is always shown in its command block. Only removal commands
+require an explicit `y` confirmation before submission. Navigation, writes,
+builds, installation, compound commands and unfamiliar tools run automatically.
+The removal classifier inspects parsed command words, including literal shell
+wrappers and command substitutions, rather than matching words in printed text,
+comments or quoted heredocs. It recognizes `rm`, `rmdir`, `unlink`, trash tools,
+`find -delete`/`-exec`, Git removals, and removal verbs of common package and
+container CLIs; supported help and dry-run forms do not prompt. This is a CLI
+syntax policy, not an analysis of arbitrary program effects. The assistant is
+instructed to express removals as explicit CLI commands rather than custom code.
+Each generated block waits for earlier ordinary commands, and
+later commands respect its state dependency. Conversational AI cells do not
+block their own tool commands or replace the previous shell command's status.
+The model receives the block's status, bounded output and actual session
+directory after execution, state commit and output closure. Its response then
+continues in a subsequent `gsh ai>` block. If the user has submitted another
+command or the directory has changed since the request's context was captured,
+an unstarted proposal is rejected explicitly instead of acting in a different
+context. Cancelling the request cancels its outstanding command; completed
+effects remain. A worker without an owning REPL cannot execute generated scripts.
+A non-zero top-level job also queues
+an immediate diagnostic request when `llm.auto_help` is enabled.
+
+The owner-only binary journal is `~/.genshell/journal`. It uses checksummed,
+versioned records, rotates at 1024 prompts, 8192 records, or 4 MiB, retains at
+most 64 KiB per record, and keeps one previous file. A dedicated writer drains
+a 256 KiB queue; the reactor transfers at most 8 KiB per turn and never waits
+for journal locks, writes, or synchronization. Saturation or writer failure
+reports skipped records while commands and ordinary `~/.gsh_history` continue.
+Clean exit allows at most 250 ms to drain the writer before terminating it and
+reporting any pending loss. Torn records trigger rotation before another
+append. Commands using the existing
+leading-and-trailing-space privacy convention are excluded from both histories.
+AI-disabled, unavailable, malformed, timed-out, or cancelled providers do not
+affect normal command execution; HTTP and model work always runs in isolated
+processes rather than the editor reactor.
 
 Interactive command history retains at most 1024 accepted commands. Use the
 left and right arrows to move through the current command, the up and down
@@ -875,8 +1091,9 @@ remaining compound commands, required builtin utility pages outside the
 protected tranche, monitor-mode terminal/notification edge cases, and dynamic
 command-name or command-substitution forms of parent-owned `wait` are also
 incomplete. The 30 atomic alias requirements are verified on macOS; native
-Linux x86-64 release evidence is still required. AI requests through `?`,
-journaling/rewind, and OS automation are also outside this MVP.
+Linux x86-64 release evidence is still required. AI requests through `?` and
+the local journal are experimental; rewind and OS automation remain outside
+this MVP.
 
 The core deliberately has no threads. One reactor remains the sole owner of
 terminal, editor, environment, and job state, so there are no locks on the
@@ -897,11 +1114,29 @@ The repository has executable conformance tranches, bounded fuzz/property
 checks, sanitizer builds, 89 deterministic fault cases, resource-pressure
 scenarios, and a configurable soak runner. The current native tranche contains
 640 execution cases, 30 syntax cases, and 18 deterministic limit cases with
-one explicitly unsupported case and no delegated cases. The current same-source
-tranche passes the local macOS matrix and the pinned Linux x86-64 GCC/Clang
-quality/conformance container. It does not gain same-revision release evidence
-until the macOS arm64 and Ubuntu x86-64 GCC/Clang jobs run after publication.
-Present coverage is also not yet complete.
+one explicitly unsupported case and no delegated cases. The 2026-09-06 local
+snapshot passes macOS behavioral, AI integration, conformance, sanitizer,
+fault and resource checks, one million lexer/property cases in both normal
+and sanitized builds, and 2,000 PTY fuzz cases in each build. A 120-second
+PTY soak completed 2,607 iterations with constant memory, seven descriptors
+and one internal child. Linux libFuzzer completed 245,896 executions without
+a finding. Present coverage is not yet complete; release evidence still
+requires the complete macOS arm64 and Ubuntu x86-64 CI jobs on the published
+revision.
+
+The pinned Debian Linux x86-64 container also passes strict GCC/Clang builds,
+native conformance and AI integration checks. Dependency, include-ownership
+and linker-map checks cover the declared target matrix. The container ran
+under translation on this arm64 host, so it supplies portability evidence
+rather than native Linux performance measurements.
+
+The journal's lock-contention, full-record rotation, bounded-queue and small
+output-buffer regressions are covered by `check-llm` and `check-sanitize`.
+The PTY suite also verifies that a direct interactive `exec` reaps internal
+workers and that a failed overlay restores the editor and its services.
+Pipeline launch accepts an already established process group after Darwin's
+benign `setpgid()` race; the fix also passed 280 soak iterations with that
+race forced on every successful group assignment.
 
 The normative checklist and evidence-state rules live in
 [`specs/0007.verification.md`](specs/0007.verification.md). CI defines macOS Clang

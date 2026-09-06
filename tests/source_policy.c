@@ -47,8 +47,11 @@ static const char *const MANIFEST_TARGETS[] = {
     "alias-test", "background-test", "benchmark-report-test",
     "command-cache-test", "config-test", "conformance", "fault", "function-test",
     "file-builtins-test", "fuzz", "gsh", "job-probe",
-    "positional-test", "pty", "resource-actions-test", "source-policy",
-    "source-workspace-test", "trap-test", "variable-test",
+    "llm-hardware-test", "llm-json-test", "llm-journal-test", "llm-worker",
+    "llm-worker-test",
+    "positional-test",
+    "pty", "resource-actions-test", "source-policy",
+    "setup", "source-workspace-test", "trap-test", "variable-test",
 };
 
 typedef struct {

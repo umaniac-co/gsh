@@ -8,6 +8,7 @@
 #include <sys/types.h>
 
 #include "resource_actions.h"
+#include "llm_repl.h"
 
 enum {
     GSH_ASYNC_CELL_CAP = 16,
@@ -22,7 +23,6 @@ enum {
     GSH_ASYNC_VIEW_BYTES = GSH_ASYNC_VIEW_COLUMNS * 4 + 64,
     GSH_ASYNC_ESCAPE_SEQUENCE_CAP = 64,
     GSH_ASYNC_PASSTHROUGH_SEQUENCE_CAP = 64,
-    GSH_ASYNC_CARET_UNDERLAY_CAP = 4,
     GSH_ASYNC_RESOURCE_CAP = 256,
     GSH_ASYNC_NATIVE_RESOURCE_CAP = 256,
     GSH_ASYNC_RENDER_CAP =
@@ -46,6 +46,10 @@ typedef struct {
     bool blocks_independent;
     bool status_dependency;
     bool control;
+    bool ai;
+    bool ai_pipeline;
+    bool ai_result_pending;
+    bool ai_private;
     bool output_closed;
     bool output_truncated;
     bool focused;
@@ -62,7 +66,11 @@ typedef struct {
     unsigned char escape_state;
     unsigned char passthrough_state;
     uint64_t id;
+    uint64_t ai_request_id;
+    uint64_t ai_context_id;
+    uint64_t ai_directory_generation;
     uint64_t output_generation;
+    gsh_llm_activity ai_activity;
     gsh_async_cell_state state;
     pid_t pid;
     pid_t pgid;
@@ -91,6 +99,9 @@ typedef struct {
     size_t output_length;
     size_t output_line_start;
     size_t output_cursor;
+    char output_utf8[4];
+    unsigned char output_utf8_length;
+    unsigned char output_utf8_expected;
     char escape_sequence[GSH_ASYNC_ESCAPE_SEQUENCE_CAP];
     size_t escape_sequence_length;
     char passthrough_utf8[4];
@@ -141,11 +152,11 @@ typedef struct {
     bool render_pending;
     bool actions_enabled;
     bool mouse_enabled;
-    bool caret_enabled;
-    bool caret_visible;
-    bool caret_valid;
     gsh_path_detection_mode path_detection;
     uint64_t next_id;
+    uint64_t last_command_id;
+    uint64_t ai_animation_deadline_ns;
+    size_t ai_animation_frame;
     size_t terminal_rows;
     size_t terminal_columns;
     size_t view_columns;
@@ -155,10 +166,6 @@ typedef struct {
     size_t view_start;
     size_t view_count;
     size_t scroll_offset;
-    size_t caret_screen_row;
-    size_t caret_screen_column;
-    size_t caret_underlay_length;
-    char caret_underlay[GSH_ASYNC_CARET_UNDERLAY_CAP];
     size_t screen_row_by_view[GSH_ASYNC_VIEW_ROWS];
     gsh_async_resource_action resources[GSH_ASYNC_RESOURCE_CAP];
     size_t resource_count;
@@ -171,16 +178,22 @@ typedef struct {
 void gsh_async_repl_initialize(gsh_async_repl *repl, bool enabled);
 void gsh_async_repl_configure_actions(gsh_async_repl *repl, bool enabled,
                                       gsh_path_detection_mode detection);
-void gsh_async_repl_configure_caret(gsh_async_repl *repl, bool enabled,
-                                    bool visible);
 void gsh_async_repl_resize(gsh_async_repl *repl, size_t rows,
                            size_t columns);
 void gsh_async_repl_scroll(gsh_async_repl *repl, long rows);
+void gsh_async_repl_tick(gsh_async_repl *repl, uint64_t now_ns);
 int gsh_async_repl_accept(gsh_async_repl *repl, const char *prompt,
                           const char *command, size_t command_length,
                           const char *launch_directory,
                           bool barrier, bool blocks_independent,
                           bool status_dependency, bool control);
+int gsh_async_repl_accept_ai(gsh_async_repl *repl, const char *prompt,
+                             const char *command, size_t command_length,
+                             const char *launch_directory);
+int gsh_async_repl_accept_ai_pipeline(
+    gsh_async_repl *repl, const char *prompt, const char *command,
+    size_t command_length, const char *launch_directory);
+bool gsh_async_repl_cancel_active_ai(gsh_async_repl *repl);
 int gsh_async_repl_next(gsh_async_repl *repl, bool state_lane_busy);
 void gsh_async_repl_starting(gsh_async_repl *repl, int cell_index);
 int gsh_async_repl_attach(gsh_async_repl *repl, int cell_index, pid_t pid,
@@ -244,8 +257,6 @@ int gsh_async_repl_prepare_render_with_completion(
                                   size_t editor_cursor,
                                   const char *completion,
                                   size_t completion_length);
-int gsh_async_repl_prepare_caret_patch(gsh_async_repl *repl,
-                                       bool visible);
 const char *gsh_async_repl_render_data(const gsh_async_repl *repl);
 size_t gsh_async_repl_render_length(const gsh_async_repl *repl);
 void gsh_async_repl_rendered(gsh_async_repl *repl);

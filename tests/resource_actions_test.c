@@ -12,6 +12,8 @@ static int detector_cases(void)
     static const char grep_row[] = "src/a.c:12:3:error";
     static const char url[] = "https://example/x";
     static const char assignment[] = "ORDER_STATE=/";
+    static const char worker_error[] =
+        "gsh: ./build/gsh-llm-worker: command not found";
     gsh_resource_candidate found[8];
     size_t count;
 
@@ -53,6 +55,15 @@ static int detector_cases(void)
     if (count != 1U || strcmp(found[0].path, "/") != 0 ||
         found[0].begin != sizeof("ORDER_STATE=") - 1U) {
         (void)fprintf(stderr, "resource actions: assignment path mismatch\n");
+        return 1;
+    }
+    count = gsh_resource_detect("printf", "/tmp", worker_error,
+                                sizeof(worker_error) - 1U,
+                                GSH_PATH_DETECTION_SAFE, found, 8U);
+    if (count != 1U ||
+        strcmp(found[0].path, "./build/gsh-llm-worker") != 0) {
+        (void)fprintf(stderr,
+                      "resource actions: trailing punctuation mismatch\n");
         return 1;
     }
     return 0;
@@ -337,35 +348,135 @@ static int completion_menu_case(gsh_async_repl *repl)
     return 0;
 }
 
-static int software_caret_case(gsh_async_repl *repl)
+static int long_output_wrap_case(gsh_async_repl *repl)
 {
-    static const char editor[] = "abc";
-    static const char mark[] = "\342\227\217";
+    static const char output[] =
+        "12345678abcdefgh\n\033[31m123456\xc3\xa9\xc3\xa9"
+        "AB\033[0m\nOK \xf0\x9f\x8e\x89\n";
+    static const char first_wrap[] = "12345678\nabcdefgh";
+    static const char styled_wrap[] =
+        "123456\xc3\xa9\xc3\xa9\033[0m\n\033[31mAB\033[0m";
     const char *render;
+    int cell;
 
     if (repl == NULL) return 1;
     gsh_async_repl_initialize(repl, true);
-    gsh_async_repl_resize(repl, 6U, 40U);
-    gsh_async_repl_configure_caret(repl, true, true);
-    if (gsh_async_repl_prepare_render(
-            repl, "$ ", editor, sizeof(editor) - 1U, 1U) == -1) return 1;
+    gsh_async_repl_configure_actions(repl, false, GSH_PATH_DETECTION_OFF);
+    gsh_async_repl_resize(repl, 10U, 8U);
+    cell = gsh_async_repl_accept_ai(repl, "$ ", "? long", 6U, "/tmp");
+    if (cell < 0) return 1;
+    gsh_async_repl_starting(repl, cell);
+    if (gsh_async_repl_append(repl, cell, output,
+                              sizeof(output) - 1U) == -1 ||
+        gsh_async_repl_prepare_render(repl, "$ ", "", 0U, 0U) == -1)
+        return 1;
     render = gsh_async_repl_render_data(repl);
-    if (strstr(render, "$ abc") == NULL || strstr(render, "\033[?25l") == NULL ||
-        strstr(render, mark) == NULL ||
-        gsh_async_repl_prepare_caret_patch(repl, false) == -1 ||
-        strstr(gsh_async_repl_render_data(repl), "\033[1;4Hb\033[1;4H") == NULL ||
-        gsh_async_repl_prepare_caret_patch(repl, true) == -1 ||
-        strstr(gsh_async_repl_render_data(repl), mark) == NULL) {
-        (void)fputs("resource actions: software caret mismatch\n", stderr);
+    if (strstr(render, first_wrap) == NULL ||
+        strstr(render, styled_wrap) == NULL ||
+        strstr(render, "OK \xf0\x9f\x8e\x89") == NULL) {
+        (void)fputs("resource actions: long output wrap mismatch\n", stderr);
         return 1;
     }
-    gsh_async_repl_configure_caret(repl, false, false);
-    if (gsh_async_repl_prepare_caret_patch(repl, false) == -1 ||
-        strstr(gsh_async_repl_render_data(repl), "\033[?25h") == NULL) {
-        (void)fputs("resource actions: native caret fallback mismatch\n",
-                    stderr);
+    gsh_async_repl_close(repl);
+    return 0;
+}
+
+static int ai_animation_case(gsh_async_repl *repl)
+{
+    const char *render;
+    int cell;
+
+    if (repl == NULL) return 1;
+    gsh_async_repl_initialize(repl, true);
+    cell = gsh_async_repl_accept_ai(repl, "$ ", "? explain", 9U, "/tmp");
+    if (cell < 0) return 1;
+    gsh_async_repl_starting(repl, cell);
+    gsh_async_repl_tick(repl, 100U);
+    if (gsh_async_repl_prepare_render(repl, "$ ", "draft", 5U, 2U) == -1)
         return 1;
+    render = gsh_async_repl_render_data(repl);
+    if (strstr(render, "$ ? explain\ngsh ai> \033[32m⠋\033[0m") == NULL ||
+        strstr(render, "\033[38;5;245m Starting...\033[0m") == NULL)
+        return 1;
+    repl->cells[cell].ai_activity = GSH_LLM_GENERATING;
+    if (gsh_async_repl_append(repl, cell, "partial", 7U) == -1) return 1;
+    gsh_async_repl_rendered(repl);
+    gsh_async_repl_tick(repl, 100000099U);
+    if (repl->render_pending || repl->ai_animation_frame != 0U) return 1;
+    gsh_async_repl_tick(repl, 100000100U);
+    if (!repl->render_pending || repl->ai_animation_frame != 1U ||
+        gsh_async_repl_prepare_render(repl, "$ ", "draft", 5U, 2U) == -1)
+        return 1;
+    render = gsh_async_repl_render_data(repl);
+    if (strstr(render, "gsh ai> \033[32m⠙\033[0m\npartial\n$ draft") == NULL ||
+        strstr(render, "Starting") != NULL ||
+        strcmp(repl->cells[cell].command, "? explain") != 0 ||
+        repl->cells[cell].output_length != 7U ||
+        memcmp(repl->cells[cell].output, "partial", 7U) != 0) return 1;
+    gsh_async_repl_close(repl);
+    return 0;
+}
+
+static int ai_inactive_case(gsh_async_repl *repl)
+{
+    static const gsh_async_cell_state states[] = {
+        GSH_ASYNC_QUEUED, GSH_ASYNC_STOPPED, GSH_ASYNC_DONE,
+        GSH_ASYNC_FAILED, GSH_ASYNC_CANCELLED, GSH_ASYNC_REJECTED
+    };
+    int cell;
+    size_t index;
+
+    if (repl == NULL) return 1;
+    gsh_async_repl_initialize(repl, true);
+    cell = gsh_async_repl_accept_ai(repl, "gsh ai> ", "", 0U, "/tmp");
+    if (cell < 0) return 1;
+    gsh_async_repl_starting(repl, cell);
+    repl->cells[cell].ai_activity = GSH_LLM_CONFIRMATION;
+    gsh_async_repl_tick(repl, 100U);
+    if (repl->ai_animation_deadline_ns != 0U ||
+        gsh_async_repl_prepare_render(repl, "$ ", "", 0U, 0U) == -1 ||
+        strstr(gsh_async_repl_render_data(repl),
+            "gsh ai> \033[38;5;245mAwaiting confirmation\033[0m") == NULL ||
+        strstr(gsh_async_repl_render_data(repl), "\033[32m") != NULL)
+        return 1;
+    repl->cells[cell].ai_activity = GSH_LLM_IDLE;
+    gsh_async_repl_tick(repl, 200U);
+    if (repl->ai_animation_deadline_ns != 0U) return 1;
+    repl->cells[cell].ai_activity = GSH_LLM_GENERATING;
+    for (index = 0U; index < sizeof(states) / sizeof(states[0]); index++) {
+        repl->cells[cell].state = states[index];
+        gsh_async_repl_tick(repl, 300U);
+        if (repl->ai_animation_deadline_ns != 0U ||
+            gsh_async_repl_prepare_render(repl, "$ ", "", 0U, 0U) == -1 ||
+            strstr(gsh_async_repl_render_data(repl), "\033[32m") != NULL)
+            return 1;
     }
+    gsh_async_repl_close(repl);
+    return 0;
+}
+
+static int ai_narrow_header_case(gsh_async_repl *repl)
+{
+    const char *render;
+    const char *header;
+    int cell;
+
+    if (repl == NULL) return 1;
+    gsh_async_repl_initialize(repl, true);
+    gsh_async_repl_resize(repl, 6U, 9U);
+    cell = gsh_async_repl_accept_ai(repl, "gsh ai> ", "", 0U, "/tmp");
+    if (cell < 0) return 1;
+    gsh_async_repl_starting(repl, cell);
+    repl->cells[cell].ai_activity = GSH_LLM_GENERATING;
+    gsh_async_repl_tick(repl, 100U);
+    if (gsh_async_repl_prepare_render(repl, "$ ", "", 0U, 0U) == -1)
+        return 1;
+    render = gsh_async_repl_render_data(repl);
+    header = strstr(render, "gsh ai> \033[32m⠋\033[0m");
+    if (header == NULL || strstr(header + 1U, "gsh ai>") != NULL) return 1;
+    repl->enabled = false;
+    gsh_async_repl_tick(repl, 200U);
+    if (repl->ai_animation_deadline_ns != 0U) return 1;
     gsh_async_repl_close(repl);
     return 0;
 }
@@ -381,7 +492,10 @@ int main(void)
     if (!failed) failed = compositor_scroll_case(&repl) != 0;
     if (!failed) failed = multiline_editor_case(&repl) != 0;
     if (!failed) failed = completion_menu_case(&repl) != 0;
-    if (!failed) failed = software_caret_case(&repl) != 0;
+    if (!failed) failed = long_output_wrap_case(&repl) != 0;
+    if (!failed) failed = ai_animation_case(&repl) != 0;
+    if (!failed) failed = ai_inactive_case(&repl) != 0;
+    if (!failed) failed = ai_narrow_header_case(&repl) != 0;
     if (failed) {
         (void)fputs("resource actions: failed\n", stderr);
         return 1;

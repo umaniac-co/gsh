@@ -4,12 +4,14 @@
 #ifndef _POSIX_C_SOURCE
 #define _POSIX_C_SOURCE 202405L
 #endif
+#ifndef _XOPEN_SOURCE
+#define _XOPEN_SOURCE 700
+#endif
 
 #include "../src/builtin_files.h"
 
 #include <errno.h>
 #include <fcntl.h>
-#include <limits.h>
 #include <locale.h>
 #include <stdio.h>
 #include <stdlib.h> /* CANON-INCLUDE: linux */

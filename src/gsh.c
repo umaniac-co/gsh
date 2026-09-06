@@ -14,12 +14,11 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <fnmatch.h>
-#include <limits.h>
 #include <locale.h>
 #include <poll.h>
 #include <pwd.h>
 #include <signal.h> /* CANON-INCLUDE: macos */
-#include <stdarg.h> /* CANON-INCLUDE: linux */
+#include <stdarg.h> /* CANON-INCLUDE: gcc */
 #include <stdio.h> /* CANON-INCLUDE: linux */
 #include <stdlib.h>
 #include <string.h>
@@ -31,9 +30,6 @@
 #include <time.h> /* CANON-INCLUDE: linux */
 #include <unistd.h>
 #include <wchar.h>
-
-#if defined(__APPLE__)
-#endif
 
 #include "builtin_cd.h"
 #include "builtin_alias.h"
@@ -54,6 +50,7 @@
 #include "completion.h"
 #include "fault_injection.h"
 #include "history_file.h"
+#include "llm_journal.h"
 #include "resource_protocol.h"
 #include "shell_invocation.h"
 #include "source_workspace.h"
@@ -79,7 +76,6 @@ enum {
     EVALUATOR_WAIT_RETRY_CAP = 1024,
     AST_WALK_STEP_CAP = GSH_PARSE_NODE_CAP + 1,
     GSH_PROMPT_IDENTITY_CAP = 256,
-    GSH_CARET_BLINK_NS = 500U * 1000U * 1000U,
 };
 
 _Static_assert((unsigned int)GSH_POSITIONAL_CAP ==
@@ -291,6 +287,16 @@ typedef struct {
     gsh_history_store *session_history;
     gsh_history_file history_file;
     gsh_shell_config config;
+    gsh_llm_journal_queue journal;
+    pid_t journal_pid;
+    bool journal_warning;
+    bool current_job_llm;
+    gsh_llm_repl_channel llm_repl;
+    int llm_repl_peer;
+    int llm_owner_cell;
+    int llm_command_cell;
+    bool auto_help_eligible;
+    bool auto_help_pending;
     gsh_terminal_image_protocol image_protocol;
     bool config_error;
     bool history_persistent;
@@ -306,10 +312,6 @@ typedef struct {
     size_t history_search_draft_length;
     bool classic_redraw_pending;
     bool classic_clear_pending;
-    bool caret_supported;
-    bool caret_visible;
-    bool caret_refresh_pending;
-    uint64_t caret_deadline_ns;
     size_t classic_cursor_row;
     size_t classic_cursor_column;
     char pending_line[LINE_CAP];
@@ -531,6 +533,13 @@ static void cancel_completion_request(shell_state *state, bool terminate);
 static void receive_completion_result(shell_state *state);
 static void start_external(shell_state *state, simple_command *direct);
 static void start_async_external(shell_state *state, simple_command *direct);
+static void start_async_llm(shell_state *state, int cell_index);
+static void close_worker_child_descriptors(shell_state *state, int retained);
+static void finish_journal_worker(shell_state *state);
+static void service_llm_repl(shell_state *state);
+static bool llm_command_context_current(const shell_state *state);
+static void start_classic_llm(shell_state *state, const char *prompt_text,
+                              size_t prompt_length);
 static void start_async_native_pipeline(
     shell_state *state, const gsh_native_pipeline *pipeline,
     const pipeline_expansion_scope *scope);
@@ -650,26 +659,6 @@ static uint64_t monotonic_ns(void)
         return 0;
     }
     return (uint64_t)now.tv_sec * 1000000000ULL + (uint64_t)now.tv_nsec;
-}
-
-static bool managed_caret_available(const shell_state *state)
-{
-    if (state == NULL) return false;
-    return state->caret_supported && state->async_repl != NULL &&
-           state_async_repl(state)->enabled;
-}
-
-static void restart_managed_caret(shell_state *state)
-{
-    uint64_t now;
-
-    if (!managed_caret_available(state)) return;
-    now = monotonic_ns();
-    state->caret_visible = true;
-    state->caret_refresh_pending = true;
-    state->caret_deadline_ns =
-        now == 0U || now > UINT64_MAX - GSH_CARET_BLINK_NS
-            ? 0U : now + GSH_CARET_BLINK_NS;
 }
 
 static void signal_handler(int signo)
@@ -1007,6 +996,17 @@ static void emit_deferred_job_notifications(shell_state *state)
     }
 }
 
+static bool defer_classic_auto_help(shell_state *state)
+{
+    if (state == NULL || !state->auto_help_eligible) return false;
+    state->auto_help_eligible = false;
+    if (!state->config.llm_enabled || !state->config.llm_auto_help ||
+        state->last_status == 0 || state->mode != MODE_EDITOR ||
+        state->pending_line[0] == '\0') return false;
+    state->auto_help_pending = true;
+    return true;
+}
+
 static void queue_prompt(shell_state *state)
 {
     char prompt[GSH_ASYNC_PROMPT_CAP];
@@ -1017,9 +1017,9 @@ static void queue_prompt(shell_state *state)
     if (state == NULL) return;
     if (state->async_repl != NULL && state_async_repl(state)->enabled) {
         state_async_repl(state)->render_pending = true;
-        restart_managed_caret(state);
         return;
     }
+    if (defer_classic_auto_help(state)) return;
     emit_deferred_job_notifications(state);
     (void)output_text(state, "\033[?2004h");
     state->classic_redraw_pending = false;
@@ -1317,6 +1317,8 @@ static void prepare_managed_render(shell_state *state)
     size_t length;
     int focused;
 
+    if (state->async_repl != NULL && state_async_repl(state)->enabled)
+        gsh_async_repl_tick(state->async_repl, monotonic_ns());
     if (state->async_repl == NULL || !state_async_repl(state)->enabled ||
         !state_async_repl(state)->render_pending || state->output_len != 0) {
         return;
@@ -1326,9 +1328,6 @@ static void prepare_managed_render(shell_state *state)
         state_async_repl(state)->cells[focused].fullscreen_presented) {
         return;
     }
-    gsh_async_repl_configure_caret(
-        state->async_repl, state->caret_supported && focused < 0,
-        state->caret_visible && focused < 0);
     (void)active_prompt_text(state, prompt);
     if (gsh_async_repl_prepare_render_with_completion(
             state->async_repl, prompt, state->line, state->line_len,
@@ -1345,62 +1344,6 @@ static void prepare_managed_render(shell_state *state)
         return;
     }
     gsh_async_repl_rendered(state->async_repl);
-    state->caret_refresh_pending = false;
-}
-
-/* ── A Software Mark Blinks Without Repainting The Viewport ──────
- * Terminal cursor protocols cannot express a circular shape, so the managed
- * compositor overlays one single-column glyph and retains the covered byte.
- * A reactor deadline alternates that glyph with the retained cell in a small
- * absolute-position patch; command output never contains the visual marker.
- * Input restarts the phase, while focused jobs suspend it deterministically.
- * ─────────────────────────────────────────────────────────────── */
-static void service_managed_caret(shell_state *state)
-{
-    uint64_t now;
-    bool active;
-    int focused;
-    const char *render;
-    size_t length;
-
-    if (!managed_caret_available(state)) return;
-    focused = gsh_async_repl_focused_job(state->async_repl);
-    active = focused < 0;
-    if (!active) {
-        state->caret_deadline_ns = 0U;
-        if (state->caret_visible) state->caret_refresh_pending = true;
-        state->caret_visible = false;
-        if (state_async_repl(state)->cells[focused].fullscreen_presented)
-            return;
-    } else {
-        now = monotonic_ns();
-        if (state->caret_deadline_ns == 0U) restart_managed_caret(state);
-        else if (now != 0U && now >= state->caret_deadline_ns) {
-            state->caret_visible = !state->caret_visible;
-            state->caret_refresh_pending = true;
-            state->caret_deadline_ns =
-                now > UINT64_MAX - GSH_CARET_BLINK_NS
-                    ? 0U : now + GSH_CARET_BLINK_NS;
-        }
-    }
-    if (!state->caret_refresh_pending ||
-        state_async_repl(state)->render_pending || state->output_len != 0U)
-        return;
-    gsh_async_repl_configure_caret(state->async_repl, active,
-                                    active && state->caret_visible);
-    if (gsh_async_repl_prepare_caret_patch(
-            state->async_repl, active && state->caret_visible) == -1) {
-        state->last_status = 1;
-        state->running = false;
-        return;
-    }
-    render = gsh_async_repl_render_data(state->async_repl);
-    length = gsh_async_repl_render_length(state->async_repl);
-    if (length != 0U && !raw_output_push(state, render, length)) {
-        state->running = false;
-        return;
-    }
-    state->caret_refresh_pending = false;
 }
 
 static void make_editor_modes(shell_state *state)
@@ -1440,7 +1383,7 @@ static int enter_editor(shell_state *state)
 static void restore_terminal(shell_state *state)
 {
     if (state == NULL) return;
-    static const char disable_paste[] = "\033[?2004l\033[?25h";
+    static const char disable_paste[] = "\033[?2004l";
     size_t offset = 0U;
     unsigned int attempts;
 
@@ -1512,14 +1455,19 @@ static bool managed_repl_requested(const gsh_shell_config *config)
 static bool terminal_actions_requested(const gsh_shell_config *config,
                                        bool managed)
 {
-    /* ── Automatic Actions Preserve Native Selection ─────────────
-     * Automatic SGR mouse capture made ordinary drag selection impossible.
-     * No negotiated channel currently preserves both native selection and
-     * gsh-owned clicks, so auto leaves the terminal's mouse unclaimed.
-     * Explicit on retains clickable resources and managed wheel scrolling.
+    /* ── Automatic Actions Restore Direct File Navigation ───────
+     * Automatic mode originally made managed resources directly clickable.
+     * Disabling its SGR channel also removed the underline and preview hitbox.
+     * A usable terminal can carry those bounded mouse reports, while dumb
+     * terminals degrade safely and explicit off remains the selection opt-out.
      * ─────────────────────────────────────────────────────────────── */
+    const char *terminal;
     if (config == NULL || !managed) return false;
-    return config->terminal_actions == GSH_TERMINAL_ACTIONS_ON;
+    if (config->terminal_actions == GSH_TERMINAL_ACTIONS_OFF) return false;
+    if (config->terminal_actions == GSH_TERMINAL_ACTIONS_ON) return true;
+    terminal = getenv("TERM");
+    return terminal != NULL && terminal[0] != '\0' &&
+           strcmp(terminal, "dumb") != 0;
 }
 
 static bool terminal_feature_present(const char *features,
@@ -1746,6 +1694,12 @@ static void initialize_shell_state(shell_state *state,
     state->redirection_worker_fd = -1;
     state->redirection_worker_pid = -1;
     state->completion_fd = -1;
+    state->llm_repl.fd = -1;
+    state->journal.descriptor = -1;
+    state->journal_pid = -1;
+    state->llm_repl_peer = -1;
+    state->llm_owner_cell = -1;
+    state->llm_command_cell = -1;
     state->completion_pid = -1;
     state->completion_next_request_id = 1U;
     state->variable_commit_fd = -1;
@@ -1759,9 +1713,6 @@ static void initialize_shell_state(shell_state *state,
     state->async_state_cell = -1;
     state->async_dispatch_cell = -1;
     state->focus_escape_cell = -1;
-    state->caret_supported = wcwidth(L'\x25cf') == 1;
-    state->caret_visible = true;
-    state->caret_refresh_pending = true;
     state->running = true;
 }
 
@@ -1821,7 +1772,6 @@ static int initialize_interactive_stores(shell_state *state,
         state->async_repl,
         terminal_actions_requested(&state->config, state->async_desired),
         state->config.path_detection);
-    restart_managed_caret(state);
     state->image_protocol = terminal_image_protocol(&state->config);
     state->variable_generation = 1;
     state->alias_generation = 1;
@@ -2108,6 +2058,79 @@ static int start_redirection_worker(shell_state *state)
     return 0;
 }
 
+static void report_journal_failure(shell_state *state)
+{
+    if (state == NULL || state->journal_warning) return;
+    state->journal_warning = true;
+    (void)output_text(state,
+        "gsh: AI journal unavailable or full; some records were not saved\r\n");
+}
+
+static void close_journal_pipe(shell_state *state)
+{
+    if (state == NULL) return;
+    if (state->journal.descriptor >= 0)
+        (void)close(state->journal.descriptor);
+    state->journal.descriptor = -1;
+    state->journal.used = state->journal.sent = 0U;
+}
+
+static void service_journal_descriptor(shell_state *state,
+                                        const struct pollfd *descriptor)
+{
+    if (state == NULL || descriptor == NULL || state->journal.descriptor < 0 ||
+        descriptor->fd != state->journal.descriptor) return;
+    if ((descriptor->revents & (POLLOUT | POLLERR | POLLHUP | POLLNVAL)) != 0 &&
+        (gsh_llm_journal_flush(&state->journal) == -1 ||
+         (descriptor->revents & (POLLERR | POLLHUP | POLLNVAL)) != 0)) {
+        close_journal_pipe(state);
+        report_journal_failure(state);
+    }
+}
+
+static void start_journal_worker(shell_state *state)
+{
+    int descriptors[2];
+    pid_t pid;
+
+    if (state == NULL || !state->config.llm_enabled) return;
+    if (pipe(descriptors) == -1) { report_journal_failure(state); return; }
+    if (set_fd_flags(descriptors[0], F_GETFD, FD_CLOEXEC) == -1 ||
+        set_fd_flags(descriptors[1], F_GETFD, FD_CLOEXEC) == -1 ||
+        set_fd_flags(descriptors[1], F_GETFL, O_NONBLOCK) == -1) {
+        (void)close(descriptors[0]);
+        (void)close(descriptors[1]);
+        report_journal_failure(state);
+        return;
+    }
+    pid = fork();
+    if (pid == 0) {
+        (void)close(descriptors[1]);
+        (void)setpgid(0, 0);
+        reset_child_signals();
+        close_worker_child_descriptors(state, descriptors[0]);
+        _exit(gsh_llm_journal_worker(descriptors[0]));
+    }
+    (void)close(descriptors[0]);
+    if (pid < 0) {
+        (void)close(descriptors[1]);
+        report_journal_failure(state);
+        return;
+    }
+    (void)setpgid(pid, pid);
+    state->journal.descriptor = descriptors[1];
+    state->journal_pid = pid;
+}
+
+static void enqueue_journal_record(shell_state *state, unsigned int kind,
+                                    const char *text, size_t length)
+{
+    if (state == NULL || text == NULL) return;
+    if (gsh_llm_journal_enqueue(&state->journal, getenv("HOME"), kind,
+                                text, length) == -1)
+        report_journal_failure(state);
+}
+
 static void receive_redirection_result(shell_state *state)
 {
     if (state == NULL) {
@@ -2178,9 +2201,9 @@ static int reactor_poll_timeout(const shell_state *state)
                                        timeout);
     timeout = bounded_deadline_timeout(state->editor_escape_deadline_ns,
                                        timeout);
-    if (managed_caret_available(state) &&
-        gsh_async_repl_focused_job(state->async_repl) < 0)
-        timeout = bounded_deadline_timeout(state->caret_deadline_ns, timeout);
+    if (state->async_repl != NULL)
+        timeout = bounded_deadline_timeout(
+            state_async_repl(state)->ai_animation_deadline_ns, timeout);
     return bounded_deadline_timeout(state->completion_deadline_ns, timeout);
 }
 
@@ -3098,6 +3121,9 @@ static int protect_exec_owner_descriptors(
         &state->variable_commit_fd, &state->exec_outcome_fd,
         &state->exec_descriptor_socket, &state->directory_commit_socket,
         &state->directory_commit_fd,
+        &state->completion_fd, &state->job_service_socket,
+        &state->job_service_wait_reply_fd, &state->llm_repl.fd,
+        &state->llm_repl_peer, &state->journal.descriptor,
     };
     int minimum = STDERR_FILENO + 1;
     size_t index;
@@ -3333,6 +3359,15 @@ static int receive_exec_descriptor_commit(shell_state *state)
     return apply_exec_descriptor_commit(state, &commit, descriptors);
 }
 
+static void finish_job_auto_help(shell_state *state, bool completed_llm,
+                                 bool status_known, int wait_status)
+{
+    if (state == NULL) return;
+    state->current_job_llm = false;
+    if (completed_llm || !status_known || !WIFEXITED(wait_status))
+        state->auto_help_eligible = false;
+}
+
 static void finish_job(shell_state *state)
 {
     if (state == NULL) {
@@ -3345,6 +3380,7 @@ static void finish_job(shell_state *state)
         &state->current_job.pipeline_status, &wait_status);
     int status = pipeline_status_known ? wait_status_value(wait_status) : 1;
     bool silent = state->current_job.silent;
+    bool completed_llm = state->current_job_llm;
     int exec_outcome = finish_exec_outcome(state);
     bool overlaid = exec_outcome == GSH_EXEC_OUTCOME_OVERLAID;
     bool current_environment_exit = false;
@@ -3377,6 +3413,8 @@ static void finish_job(shell_state *state)
     state->current_job.active = false;
     state->current_job.foreground = false;
     state->current_job.stopped = false;
+    finish_job_auto_help(state, completed_llm, pipeline_status_known,
+                         wait_status);
     if (state->current_job.negated && !current_environment_exit) {
         status = status == 0 ? 1 : 0;
     }
@@ -3389,7 +3427,8 @@ static void finish_job(shell_state *state)
     if (state->async_repl != NULL && state_async_repl(state)->enabled &&
         state->async_state_cell >= 0) {
         leave_managed_fullscreen(state, state->async_state_cell);
-        (void)gsh_async_repl_reap(state->async_repl, pid, wait_status);
+        (void)gsh_async_repl_reap(state->async_repl, pid,
+            status == wait_status_value(wait_status) ? wait_status : status << 8);
     }
 
     if (overlaid || current_environment_exit) {
@@ -3567,6 +3606,106 @@ static bool reap_completion_child(shell_state *state, pid_t pid, int status)
     return true;
 }
 
+static void capture_llm_context(shell_state *state, int cell_index)
+{
+    gsh_async_cell *cell;
+
+    if (state == NULL || cell_index < 0 ||
+        cell_index >= GSH_ASYNC_CELL_CAP) return;
+    cell = &state_async_repl(state)->cells[cell_index];
+    cell->ai_context_id = cell->id;
+    cell->ai_directory_generation =
+        gsh_variables_value_generation(state->variables, "PWD", 3U);
+}
+
+static void enqueue_managed_error_help(shell_state *state, int cell_index,
+                                       int status)
+{
+    char active_prompt[GSH_ASYNC_PROMPT_CAP];
+    char prompt[GSH_ASYNC_COMMAND_CAP];
+    const gsh_async_cell *cell;
+    size_t output_begin;
+    int length;
+
+    if (state == NULL || cell_index < 0 || cell_index >= GSH_ASYNC_CELL_CAP ||
+        status == 0 || !state->config.llm_enabled ||
+        !state->config.llm_auto_help) return;
+    cell = &state_async_repl(state)->cells[cell_index];
+    if (cell->ai || cell->ai_request_id != 0U ||
+        cell->state == GSH_ASYNC_CANCELLED ||
+        (cell->command_length >= 2U && cell->command[0] == ' ' &&
+         cell->command[cell->command_length - 1U] == ' ')) return;
+    output_begin = cell->output_length > 2048U
+                       ? cell->output_length - 2048U : 0U;
+    length = snprintf(
+        prompt, sizeof(prompt),
+        "? A top-level gsh command failed with exit status %d. Diagnose it and "
+        "suggest the smallest safe fix. Do not run commands unless needed.\n\n"
+        "Command:\n%.*s\n\nLast output:\n%.*s",
+        status, (int)cell->command_length, cell->command,
+        (int)(cell->output_length - output_begin), cell->output + output_begin);
+    if (length <= 0 || (size_t)length >= sizeof(prompt)) return;
+    (void)active_prompt_text(state, active_prompt);
+    capture_llm_context(state, gsh_async_repl_accept_ai(
+        state->async_repl, active_prompt, prompt, (size_t)length,
+        cell->launch_directory));
+}
+
+static void record_managed_journal_output(shell_state *state, int cell_index,
+                                          bool ai)
+{
+    const gsh_async_cell *cell;
+    bool private;
+
+    if (state == NULL || cell_index < 0 || cell_index >= GSH_ASYNC_CELL_CAP ||
+        ai || !state->config.llm_enabled) return;
+    cell = &state_async_repl(state)->cells[cell_index];
+    private = cell->ai_private || (state->config.history_ignore_space &&
+              cell->command_length >= 2U && cell->command[0] == ' ' &&
+              cell->command[cell->command_length - 1U] == ' ');
+    if (!private && cell->output_length != 0U)
+        enqueue_journal_record(
+            state, GSH_LLM_JOURNAL_COMMAND_OUTPUT,
+            cell->output, cell->output_length);
+}
+
+static void reap_finished_managed_cell(shell_state *state, int cell_index,
+                                       pid_t pid, int status,
+                                       uint32_t tracked_job_id)
+{
+    bool cancelled;
+    bool ai;
+    int exit_status;
+
+    if (state == NULL || cell_index < 0 ||
+        cell_index >= GSH_ASYNC_CELL_CAP) return;
+    cancelled = state_async_repl(state)->cells[cell_index].state ==
+                GSH_ASYNC_CANCELLED;
+    ai = state_async_repl(state)->cells[cell_index].ai;
+    exit_status = WIFEXITED(status) ? WEXITSTATUS(status) : 0;
+    leave_managed_fullscreen(state, cell_index);
+    (void)gsh_async_repl_reap(state->async_repl, pid, status);
+    record_managed_journal_output(state, cell_index, ai);
+    if (!cancelled && !ai && WIFEXITED(status) && exit_status != 0)
+        enqueue_managed_error_help(state, cell_index, exit_status);
+    if (tracked_job_id != 0U)
+        (void)gsh_background_mark_notified(&state->background_jobs,
+                                           tracked_job_id);
+}
+
+static bool reap_journal_worker(shell_state *state, pid_t pid, int status)
+{
+    if (state == NULL || pid <= 0 || pid != state->journal_pid) return false;
+    if (WIFEXITED(status) || WIFSIGNALED(status)) {
+        state->journal_pid = -1;
+        close_journal_pipe(state);
+        report_journal_failure(state);
+    } else if (WIFSTOPPED(status)) {
+        (void)kill(pid, SIGCONT);
+    }
+    return true;
+}
+
 static void reap_children(shell_state *state)
 {
     if (state == NULL) {
@@ -3588,7 +3727,8 @@ static void reap_children(shell_state *state)
                                  : gsh_async_repl_cell_for_pid(
                                        state->async_repl, pid);
 
-            if (pid == state->redirection_worker_pid) {
+            if (reap_journal_worker(state, pid, status)) {
+            } else if (pid == state->redirection_worker_pid) {
                 reap_redirection_worker(state);
             } else if (reap_completion_child(state, pid, status)) {
             } else if (state->current_job.active &&
@@ -3616,13 +3756,8 @@ static void reap_children(shell_state *state)
                                                 async_cell);
 #endif
                 } else if (WIFEXITED(status) || WIFSIGNALED(status)) {
-                    leave_managed_fullscreen(state, async_cell);
-                    (void)gsh_async_repl_reap(state->async_repl, pid,
-                                              status);
-                    if (tracked_job_id != 0U) {
-                        (void)gsh_background_mark_notified(
-                            &state->background_jobs, tracked_job_id);
-                    }
+                    reap_finished_managed_cell(state, async_cell, pid, status,
+                                               tracked_job_id);
                 }
             } else if (gsh_background_update_member(
                            &state->background_jobs, pid, status)) {
@@ -6297,6 +6432,7 @@ static int prepare_interactive_exec(shell_state *owner)
 {
     static const char leave_managed_screen[] =
         "\033[0m\033[?25h\033[?1049l";
+    pid_t worker_pid;
 
     if (owner == NULL) {
         return 0;
@@ -6312,6 +6448,20 @@ static int prepare_interactive_exec(shell_state *owner)
                                sizeof(leave_managed_screen) - 1U);
     }
     owner->terminal_changed = false;
+    /* ── An Exec Overlay Must Not Abandon Internal Workers ───────
+     * A datagram peer does not receive EOF when exec closes its owner socket.
+     * The old redirection worker therefore outlived the replacement utility.
+     * Reap internal persistence workers before overlay; a failed exec restores
+     * fresh workers with the editor, preserving both PID identity and recovery.
+     * ─────────────────────────────────────────────────────────────── */
+    worker_pid = owner->redirection_worker_pid;
+    owner->redirection_worker_restart_pending = false;
+    disable_redirection_worker(owner, true);
+    if (worker_pid > 0)
+        while (waitpid(worker_pid, NULL, 0) == -1 && errno == EINTR) {
+        }
+    owner->redirection_worker_pid = -1;
+    finish_journal_worker(owner);
     reset_child_signals();
     return 0;
 }
@@ -6327,6 +6477,9 @@ static int restore_interactive_exec(shell_state *owner)
         return -1;
     }
     owner->terminal_changed = true;
+    if (start_redirection_worker(owner) == -1)
+        owner->redirection_worker_failures++;
+    start_journal_worker(owner);
     if (owner->async_repl != NULL && state_async_repl(owner)->enabled) {
         state_async_repl(owner)->render_pending = true;
     }
@@ -7700,6 +7853,12 @@ static void reject_native_pipeline_fork(
     queue_prompt(state);
 }
 
+/* ── Pipeline Group Assignment Accepts An Already Completed Handoff ──
+ * Parent and child both establish the job's group before its launch gate opens.
+ * Darwin can return EPERM to the second caller even when membership is correct.
+ * Killing that child discarded pipeline output or a here-document at random.
+ * Confirm the requested group after EPERM; a different group still fails closed.
+ * ─────────────────────────────────────────────────────────────── */
 static bool launch_native_pipeline_commands(
     shell_state *state, const gsh_native_pipeline *pipeline,
     const pipeline_expansion_scope *scope,
@@ -7728,7 +7887,8 @@ static bool launch_native_pipeline_commands(
         }
         launch->members[launch->launched++] = pid;
         if (setpgid(pid, launch->pgid) == -1 && errno != EACCES &&
-            errno != ESRCH) {
+            errno != ESRCH &&
+            !(errno == EPERM && getpgid(pid) == launch->pgid)) {
             (void)kill(pid, SIGKILL);
         }
     }
@@ -7785,7 +7945,8 @@ static bool launch_pipeline_heredoc_writers(
         }
         launch->members[launch->launched++] = pid;
         if (setpgid(pid, launch->pgid) == -1 && errno != EACCES &&
-            errno != ESRCH) {
+            errno != ESRCH &&
+            !(errno == EPERM && getpgid(pid) == launch->pgid)) {
             (void)kill(pid, SIGKILL);
         }
     }
@@ -7924,6 +8085,9 @@ static void close_child_reactor_descriptors(shell_state *state,
 {
     if (state == NULL) return;
     int index;
+
+    gsh_llm_repl_close(&state->llm_repl);
+    close_journal_pipe(state);
 
     if (state->tty_fd >= 0 && state->tty_fd != retained) {
         (void)close(state->tty_fd);
@@ -8311,6 +8475,379 @@ static void start_external(shell_state *state, simple_command *direct)
         return;
     }
     (void)handoff_external_job(state, pid, gate[1], &previous);
+}
+
+/* ── Model Latency Never Enters The Reactor ─────────────────────
+ * A network client inside the editor would let DNS, TLS, or inference stall
+ * terminal input and job control. Each AI cell instead owns one worker process
+ * and PTY, while a private inherited descriptor carries the prompt off argv.
+ * The same boundary contains generated commands and lets normal job signals
+ * cancel a request without giving the provider access to shell-owned state.
+ * ─────────────────────────────────────────────────────────────── */
+static int llm_worker_path(char *output, size_t capacity)
+{
+    const shell_executable_identity *identity = shell_executable_storage();
+    const char *override = getenv("GSH_LLM_WORKER");
+    const char *slash;
+    size_t directory_length;
+    int length;
+
+    if (identity == NULL || output == NULL || capacity == 0U) return -1;
+    if (override != NULL && override[0] != '\0') {
+        length = snprintf(output, capacity, "%s", override);
+        return length >= 0 && (size_t)length < capacity ? 0 : -1;
+    }
+    slash = strrchr(identity->path, '/');
+    if (slash == NULL) {
+        length = snprintf(output, capacity, "gsh-llm-worker");
+        return length >= 0 && (size_t)length < capacity ? 0 : -1;
+    }
+    directory_length = (size_t)(slash - identity->path + 1);
+    if (directory_length + sizeof("gsh-llm-worker") > capacity) return -1;
+    (void)memcpy(output, identity->path, directory_length);
+    (void)memcpy(output + directory_length, "gsh-llm-worker",
+                 sizeof("gsh-llm-worker"));
+    return 0;
+}
+
+static int prepare_llm_prompt_fd(int descriptor)
+{
+    int flags;
+
+    if (descriptor <= STDERR_FILENO) return -1;
+    flags = fcntl(descriptor, F_GETFD);
+    if (flags == -1 || fcntl(descriptor, F_SETFD,
+                             flags & ~FD_CLOEXEC) == -1) return -1;
+    return 0;
+}
+
+static bool prepare_llm_repl_environment(shell_state *state)
+{
+    char descriptor[32];
+
+    if (state == NULL) return false;
+    if (state->llm_repl_peer < 0) return unsetenv("GSH_LLM_REPL_FD") == 0;
+    if (prepare_llm_prompt_fd(state->llm_repl_peer) == -1 ||
+        snprintf(descriptor, sizeof(descriptor), "%d", state->llm_repl_peer)
+            >= (int)sizeof(descriptor)) return false;
+    return setenv("GSH_LLM_REPL_FD", descriptor, 1) == 0;
+}
+
+_Noreturn static void exec_llm_worker(shell_state *state, int prompt_fd,
+                                       const char *directory, bool pipeline,
+                                       bool private)
+{
+    char worker[PATH_MAX];
+    char descriptor[32];
+
+    if (state == NULL || directory == NULL ||
+        !prepare_llm_repl_environment(state) ||
+        prepare_llm_prompt_fd(prompt_fd) == -1 ||
+        llm_worker_path(worker, sizeof(worker)) == -1 ||
+        snprintf(descriptor, sizeof(descriptor), "%d", prompt_fd) >=
+            (int)sizeof(descriptor) || chdir(directory) == -1 ||
+        (private ? setenv("GSH_LLM_PRIVATE", "1", 1)
+                 : unsetenv("GSH_LLM_PRIVATE")) == -1) _exit(125);
+    if (strchr(worker, '/') == NULL)
+        execlp(worker, "gsh-llm-worker",
+               pipeline ? "--pipeline-fd" : "--prompt-fd", descriptor,
+               (char *)NULL);
+    else
+        execl(worker, "gsh-llm-worker",
+              pipeline ? "--pipeline-fd" : "--prompt-fd", descriptor,
+              (char *)NULL);
+    child_exec_error(worker, errno);
+}
+
+static bool send_llm_prompt(int descriptor, const char *prompt,
+                            size_t length)
+{
+    size_t offset = 0U;
+
+    if (descriptor < 0 || prompt == NULL) return false;
+    while (offset < length) {
+        ssize_t count = write(descriptor, prompt + offset, length - offset);
+
+        if (count > 0) offset += (size_t)count;
+        else if (count == -1 && errno == EINTR) continue;
+        else break;
+    }
+    return close(descriptor) == 0 && offset == length;
+}
+
+static bool llm_pipeline_parts(const char *line, size_t length,
+                               size_t *command_length,
+                               size_t *instruction_offset,
+                               size_t *instruction_length)
+{
+    unsigned char quote = 0U;
+    bool escaped = false;
+    size_t pipe_offset = length;
+    size_t index;
+    size_t end;
+
+    if (line == NULL || command_length == NULL ||
+        instruction_offset == NULL || instruction_length == NULL)
+        return false;
+    for (index = 0U; index < length; index++) {
+        unsigned char byte = (unsigned char)line[index];
+
+        if (escaped) { escaped = false; continue; }
+        if (quote == '\'') { if (byte == '\'') quote = 0U; continue; }
+        if (byte == '\\') { escaped = true; continue; }
+        if (quote == '"') { if (byte == '"') quote = 0U; continue; }
+        if (byte == '\'' || byte == '"') { quote = byte; continue; }
+        if (byte == '|' && (index == 0U || line[index - 1U] != '|') &&
+            (index + 1U >= length || line[index + 1U] != '|'))
+            pipe_offset = index;
+    }
+    if (quote != 0U || escaped || pipe_offset == length) return false;
+    index = pipe_offset + 1U;
+    while (index < length && (line[index] == ' ' || line[index] == '\t'))
+        index++;
+    if (index >= length || line[index] != '?' ||
+        (index + 1U < length && line[index + 1U] == '?')) return false;
+    index++;
+    while (index < length && (line[index] == ' ' || line[index] == '\t'))
+        index++;
+    end = length;
+    while (end > index && (line[end - 1U] == ' ' || line[end - 1U] == '\t'))
+        end--;
+    while (pipe_offset > 0U &&
+           (line[pipe_offset - 1U] == ' ' || line[pipe_offset - 1U] == '\t'))
+        pipe_offset--;
+    if (pipe_offset == 0U || index == end) return false;
+    *command_length = pipe_offset;
+    *instruction_offset = index;
+    *instruction_length = end - index;
+    return true;
+}
+
+static bool build_llm_pipeline_payload(const char *line, size_t length,
+                                       char *payload, size_t capacity,
+                                       size_t *payload_length)
+{
+    size_t command_length;
+    size_t instruction_offset;
+    size_t instruction_length;
+
+    if (payload == NULL || payload_length == NULL ||
+        !llm_pipeline_parts(line, length, &command_length,
+                            &instruction_offset, &instruction_length) ||
+        command_length + 1U + instruction_length > capacity) return false;
+    (void)memcpy(payload, line, command_length);
+    payload[command_length] = '\0';
+    (void)memcpy(payload + command_length + 1U,
+                 line + instruction_offset, instruction_length);
+    *payload_length = command_length + 1U + instruction_length;
+    return true;
+}
+
+static void managed_llm_child(shell_state *state, managed_pty *pty,
+                              int prompt_read, int prompt_write,
+                              const sigset_t *previous,
+                              const char *directory, bool pipeline,
+                              bool private)
+{
+    if (state == NULL || pty == NULL || previous == NULL ||
+        directory == NULL) _exit(125);
+    (void)close(prompt_write);
+    (void)close(pty->master);
+    reset_child_signals();
+    if (attach_child_pty(state, pty) == -1) _exit(125);
+    (void)sigprocmask(SIG_SETMASK, previous, NULL);
+    close_child_reactor_descriptors(state, prompt_read);
+    exec_llm_worker(state, prompt_read, directory, pipeline, private);
+}
+
+static void reject_managed_llm(shell_state *state, managed_pty *pty,
+                               int prompt_read, int prompt_write,
+                               const sigset_t *previous, int saved_errno)
+{
+    if (pty != NULL && pty->master >= 0) (void)close(pty->master);
+    if (pty != NULL && pty->slave_hold >= 0) (void)close(pty->slave_hold);
+    if (prompt_read >= 0) (void)close(prompt_read);
+    if (prompt_write >= 0) (void)close(prompt_write);
+    if (previous != NULL) (void)sigprocmask(SIG_SETMASK, previous, NULL);
+    if (state == NULL) return;
+    gsh_llm_repl_close(&state->llm_repl);
+    if (state->llm_repl_peer >= 0) (void)close(state->llm_repl_peer);
+    state->llm_repl_peer = -1;
+    state->llm_owner_cell = -1;
+    output_format(state, "gsh: LLM launch: %s\r\n", strerror(saved_errno));
+    gsh_async_repl_finish(state->async_repl, state->async_dispatch_cell,
+                          125 << 8, false);
+    state->mode = MODE_EDITOR;
+}
+
+static bool managed_llm_payload(const gsh_async_cell *cell, char *payload,
+                                size_t capacity, const char **text,
+                                size_t *length)
+{
+    size_t offset;
+
+    if (cell == NULL || payload == NULL || text == NULL || length == NULL)
+        return false;
+    if (cell->ai_pipeline) {
+        *text = payload;
+        return build_llm_pipeline_payload(
+            cell->command, cell->command_length, payload, capacity, length);
+    }
+    offset = cell->command_length > 1U && cell->command[1] == '?' ? 2U : 1U;
+    while (offset < cell->command_length &&
+           (cell->command[offset] == ' ' || cell->command[offset] == '\t'))
+        offset++;
+    *text = cell->command + offset;
+    *length = cell->command_length - offset;
+    return true;
+}
+
+static void start_async_llm(shell_state *state, int cell_index)
+{
+    managed_pty pty = {.master = -1, .slave_hold = -1};
+    int prompt[2] = {-1, -1};
+    sigset_t blocked;
+    sigset_t previous;
+    pid_t pid;
+    gsh_async_cell *cell;
+    char payload[GSH_ASYNC_COMMAND_CAP];
+    const char *prompt_text;
+    size_t prompt_length;
+    bool private;
+
+    if (state == NULL || cell_index < 0 ||
+        cell_index >= GSH_ASYNC_CELL_CAP) return;
+    cell = &state_async_repl(state)->cells[cell_index];
+    private = state->config.history_ignore_space &&
+              cell->command_length >= 2U && cell->command[0] == ' ' &&
+              cell->command[cell->command_length - 1U] == ' ';
+    if (!managed_llm_payload(cell, payload, sizeof(payload), &prompt_text,
+                             &prompt_length)) {
+        (void)output_text(state, "gsh: invalid LLM pipeline\r\n");
+        gsh_async_repl_finish(state->async_repl, cell_index, 2 << 8, false);
+        state->mode = MODE_EDITOR;
+        queue_prompt(state);
+        return;
+    }
+    gsh_llm_repl_close(&state->llm_repl);
+    state->llm_owner_cell = cell_index;
+    state->llm_command_cell = -1;
+    if (gsh_llm_repl_open(&state->llm_repl, &state->llm_repl_peer) == -1 ||
+        open_managed_pty(&pty) == -1 ||
+        make_pipe(prompt, false, GSH_FAULT_JOB_PIPE) == -1) {
+        reject_managed_llm(state, &pty, prompt[0], prompt[1], NULL, errno);
+        return;
+    }
+    (void)sigemptyset(&blocked);
+    (void)sigaddset(&blocked, SIGCHLD);
+    if (sigprocmask(SIG_BLOCK, &blocked, &previous) == -1) {
+        reject_managed_llm(state, &pty, prompt[0], prompt[1], NULL, errno);
+        return;
+    }
+    pid = fork();
+    if (pid == 0)
+        managed_llm_child(state, &pty, prompt[0], prompt[1], &previous,
+                          cell->launch_directory, cell->ai_pipeline, private);
+    if (state->llm_repl_peer >= 0) (void)close(state->llm_repl_peer);
+    state->llm_repl_peer = -1;
+    (void)close(pty.slave_hold);
+    (void)close(prompt[0]);
+    if (pid < 0 || gsh_async_repl_attach(state->async_repl, cell_index, pid,
+                                         pid, pty.master, -1) == -1 ||
+        register_managed_job(state, cell_index, pid, pid) == -1 ||
+        !send_llm_prompt(prompt[1], prompt_text, prompt_length)) {
+        int saved_errno = errno;
+        if (pid > 0) (void)kill(pid, SIGKILL);
+        reject_managed_llm(state, &pty, -1, -1, &previous, saved_errno);
+        return;
+    }
+    (void)sigprocmask(SIG_SETMASK, &previous, NULL);
+    state->mode = MODE_EDITOR;
+    queue_prompt(state);
+}
+
+/* ── AI Execution Uses Cells In Every Interactive Session ───────
+ * A foreground provider occupied the classic job slot, forcing its tools
+ * into disposable child shells. Entering the existing managed view gives
+ * every generated command a normal REPL cell and leaves the reactor free
+ * to execute it. This changes only the current view, never configuration;
+ * /async remains the explicit way to return to classic terminal handoff.
+ * ─────────────────────────────────────────────────────────────── */
+static void start_classic_llm_request(shell_state *state,
+                                      const char *prompt_text,
+                                      size_t prompt_length, bool pipeline,
+                                      bool private)
+{
+    char command[GSH_ASYNC_COMMAND_CAP];
+    char prompt[GSH_ASYNC_PROMPT_CAP];
+    int cell;
+    int length;
+
+    if (state == NULL || prompt_text == NULL ||
+        prompt_length >= sizeof(command) - 8U) return;
+    if (pipeline) {
+        const char *separator = memchr(prompt_text, '\0', prompt_length);
+        if (separator == NULL || separator + 1U >= prompt_text + prompt_length)
+            return;
+        length = snprintf(command, sizeof(command), "%s%.*s | ? %s%s",
+                           private ? " " : "", (int)(separator - prompt_text),
+                           prompt_text, separator + 1U, private ? " " : "");
+    } else {
+        length = snprintf(command, sizeof(command), "? %.*s",
+                           (int)prompt_length, prompt_text);
+    }
+    if (length <= 0 || (size_t)length >= sizeof(command)) return;
+    gsh_async_repl_initialize(state->async_repl, true);
+    gsh_async_repl_configure_actions(state->async_repl,
+        terminal_actions_requested(&state->config, true),
+        state->config.path_detection);
+    state->async_desired = true;
+    state->async_transition_pending = false;
+    initialize_repl_size(state);
+    make_editor_modes(state);
+    if (enter_editor(state) == -1) { state->running = false; return; }
+    (void)active_prompt_text(state, prompt);
+    cell = pipeline
+        ? gsh_async_repl_accept_ai_pipeline(state->async_repl, prompt, command,
+                                            (size_t)length,
+                                            state->current_directory)
+        : gsh_async_repl_accept_ai(state->async_repl, prompt, command,
+                                   (size_t)length, state->current_directory);
+    capture_llm_context(state, cell);
+    state->mode = MODE_EDITOR;
+    queue_prompt(state);
+}
+
+static void start_classic_llm(shell_state *state, const char *prompt_text,
+                              size_t prompt_length)
+{
+    start_classic_llm_request(state, prompt_text, prompt_length, false,
+                              false);
+}
+
+static bool dispatch_classic_auto_help(shell_state *state)
+{
+    char prompt[LINE_CAP];
+    int length;
+
+    if (state == NULL || !state->auto_help_pending) return false;
+    if (state->output_len > 0U) {
+        flush_output(state);
+        if (state->output_len > 0U) return true;
+    }
+    state->auto_help_pending = false;
+    length = snprintf(
+        prompt, sizeof(prompt),
+        "The following top-level command failed with exit status %d. "
+        "Diagnose it and suggest the smallest safe fix. Do not run commands "
+        "unless needed.\n\nCommand:\n%s", state->last_status,
+        state->pending_line);
+    if (length <= 0 || (size_t)length >= sizeof(prompt)) {
+        queue_prompt(state);
+        return true;
+    }
+    start_classic_llm(state, prompt, (size_t)length);
+    return true;
 }
 
 static char *trim_command(char *command)
@@ -10347,26 +10884,44 @@ static bool history_submission_is_private(const shell_state *state,
            state->pending_line[length - 1U] == ' ';
 }
 
-static void record_history_submission(shell_state *state, size_t length,
-                                      gsh_parse_status parse_status)
+static void record_history_text(shell_state *state, const char *text,
+                                size_t length, gsh_parse_status parse_status)
 {
-    if (state == NULL) return;
+    if (state == NULL || text == NULL) return;
     int added;
 
+    if (length == 0 || length >= GSH_HISTORY_ENTRY_CAP ||
+        (state->config.history_ignore_space && length >= 2U &&
+         text[0] == ' ' && text[length - 1U] == ' ')) return;
+    if (state->config.llm_enabled)
+        enqueue_journal_record(state, GSH_LLM_JOURNAL_COMMAND, text, length);
     if (state->history == NULL ||
-        length == 0 || length >= GSH_HISTORY_ENTRY_CAP ||
-        history_submission_is_private(state, length) ||
         (!state->config.history_store_failed &&
          parse_status != GSH_PARSE_OK)) {
         return;
     }
-    added = gsh_history_add(state->history, state->pending_line, length,
+    added = gsh_history_add(state->history, text, length,
                             state->config.history_deduplicate);
     if (added > 0 && state->session_history != NULL &&
-        gsh_history_add(state->session_history, state->pending_line,
+        gsh_history_add(state->session_history, text,
                         length, false) == -1) {
         state->history_persistent = false;
     }
+}
+
+static void record_history_submission(shell_state *state, size_t length,
+                                      gsh_parse_status parse_status)
+{
+    if (state == NULL) return;
+    record_history_text(state, state->pending_line, length, parse_status);
+}
+
+static void record_classic_submission(shell_state *state, size_t length,
+                                      gsh_parse_status parse_status)
+{
+    if (state == NULL) return;
+    state->auto_help_eligible = !history_submission_is_private(state, length);
+    record_history_submission(state, length, parse_status);
 }
 
 static gsh_parse_result parse_pending_line(shell_state *state,
@@ -10434,6 +10989,147 @@ static bool accept_managed_line(shell_state *state, size_t length,
     return true;
 }
 
+static size_t llm_prompt_offset(const char *line, size_t length,
+                                bool *queued)
+{
+    size_t offset;
+
+    if (line == NULL || queued == NULL || length == 0U || line[0] != '?')
+        return 0U;
+    *queued = length > 1U && line[1] == '?';
+    offset = *queued ? 2U : 1U;
+    while (offset < length && (line[offset] == ' ' || line[offset] == '\t'))
+        offset++;
+    return offset;
+}
+
+static bool accept_llm_line(shell_state *state, size_t length)
+{
+    bool queued = false;
+    size_t prompt_offset;
+    char prompt[GSH_ASYNC_PROMPT_CAP];
+    int cell;
+
+    if (state == NULL || length == 0U || state->pending_line[0] != '?')
+        return false;
+    prompt_offset = llm_prompt_offset(state->pending_line, length, &queued);
+    state->line_len = 0U;
+    state->line_cursor = 0U;
+    state->line[0] = '\0';
+    state->pending_len = 0U;
+    state->continuation_prompt = false;
+    reset_history_editor(state);
+    (void)output_text(state, "\r\n");
+    if (!state->config.llm_enabled) {
+        (void)output_text(state,
+                          "gsh: LLM is not configured; run gsh-setup\r\n");
+        state->last_status = 2;
+        state->mode = MODE_EDITOR;
+        state->pending_line[0] = '\0';
+        reset_pending_input(state);
+        queue_prompt(state);
+        return true;
+    }
+    if (prompt_offset >= length) {
+        (void)output_text(state, "gsh: '?' requires a prompt\r\n");
+        state->last_status = 2;
+        state->mode = MODE_EDITOR;
+        state->pending_line[0] = '\0';
+        reset_pending_input(state);
+        queue_prompt(state);
+        return true;
+    }
+    if (state->async_repl == NULL || !state_async_repl(state)->enabled) {
+        start_classic_llm(state, state->pending_line + prompt_offset,
+                          length - prompt_offset);
+        state->pending_line[0] = '\0';
+        reset_pending_input(state);
+        return true;
+    }
+    (void)active_prompt_text(state, prompt);
+    if (!queued) (void)gsh_async_repl_cancel_active_ai(state->async_repl);
+    cell = gsh_async_repl_accept_ai(
+        state->async_repl, prompt, state->pending_line, length,
+        state->current_directory);
+    capture_llm_context(state, cell);
+    if (cell < 0) {
+        state->overloads++;
+        state->last_status = 125;
+        (void)raw_output_push(state, "\a", 1U);
+    }
+    state->pending_line[0] = '\0';
+    reset_pending_input(state);
+    queue_prompt(state);
+    return true;
+}
+
+static bool accept_llm_pipeline_line(shell_state *state, size_t length)
+{
+    char payload[GSH_ASYNC_COMMAND_CAP];
+    char prompt[GSH_ASYNC_PROMPT_CAP];
+    size_t payload_length;
+    int cell;
+
+    if (state == NULL ||
+        !build_llm_pipeline_payload(state->pending_line, length, payload,
+                                    sizeof(payload), &payload_length))
+        return false;
+    state->line_len = 0U;
+    state->line_cursor = 0U;
+    state->line[0] = '\0';
+    state->pending_len = 0U;
+    state->continuation_prompt = false;
+    reset_history_editor(state);
+    (void)output_text(state, "\r\n");
+    if (!state->config.llm_enabled) {
+        (void)output_text(state,
+                          "gsh: LLM is not configured; run gsh-setup\r\n");
+        state->last_status = 2;
+        state->mode = MODE_EDITOR;
+        state->pending_line[0] = '\0';
+        reset_pending_input(state);
+        queue_prompt(state);
+        return true;
+    }
+    if (state->async_repl == NULL || !state_async_repl(state)->enabled) {
+        start_classic_llm_request(
+            state, payload, payload_length, true,
+            state->config.history_ignore_space && length >= 2U &&
+                state->pending_line[0] == ' ' &&
+                state->pending_line[length - 1U] == ' ');
+        state->pending_line[0] = '\0';
+        reset_pending_input(state);
+        return true;
+    }
+    (void)active_prompt_text(state, prompt);
+    (void)gsh_async_repl_cancel_active_ai(state->async_repl);
+    cell = gsh_async_repl_accept_ai_pipeline(
+        state->async_repl, prompt, state->pending_line, length,
+        state->current_directory);
+    if (cell < 0) {
+        state->overloads++;
+        state->last_status = 125;
+        (void)raw_output_push(state, "\a", 1U);
+    }
+    state->pending_line[0] = '\0';
+    reset_pending_input(state);
+    queue_prompt(state);
+    return true;
+}
+
+static bool copy_and_accept_llm_line(shell_state *state,
+                                     size_t candidate_length)
+{
+    if (state == NULL || candidate_length >= sizeof(state->pending_line))
+        return false;
+    (void)memcpy(state->pending_line + state->pending_len, state->line,
+                 state->line_len);
+    state->pending_line[candidate_length] = '\0';
+    return state->pending_len == 0U &&
+           (accept_llm_line(state, candidate_length) ||
+            accept_llm_pipeline_line(state, candidate_length));
+}
+
 static void accept_line(shell_state *state)
 {
     if (state == NULL) {
@@ -10460,9 +11156,7 @@ static void accept_line(shell_state *state)
         queue_prompt(state);
         return;
     }
-    (void)memcpy(state->pending_line + state->pending_len, state->line,
-           state->line_len);
-    state->pending_line[candidate_length] = '\0';
+    if (copy_and_accept_llm_line(state, candidate_length)) return;
     parsed = parse_pending_line(state, candidate_length);
     if (parsed.status == GSH_PARSE_OK &&
         input_line_continues(state->pending_line, candidate_length)) {
@@ -10503,7 +11197,7 @@ static void accept_line(shell_state *state)
     state->pending_len = 0;
     state->continuation_prompt = false;
     if (accept_managed_line(state, candidate_length, parsed.status)) return;
-    record_history_submission(state, candidate_length, parsed.status);
+    record_classic_submission(state, candidate_length, parsed.status);
     state->mode = MODE_DISPATCH;
 }
 
@@ -11289,7 +11983,7 @@ static bool send_completion_result(int descriptor,
     return offset == sizeof(*result);
 }
 
-static void close_completion_child_descriptors(shell_state *state,
+static void close_worker_child_descriptors(shell_state *state,
                                                int retained)
 {
     if (!require(state != NULL)) _exit(125);
@@ -11326,7 +12020,7 @@ _Noreturn static void run_completion_child(
     (void)setpgid(0, 0);
     reset_child_signals();
     (void)sigprocmask(SIG_SETMASK, previous, NULL);
-    close_completion_child_descriptors(state, descriptor);
+    close_worker_child_descriptors(state, descriptor);
     path = store_path_value(state->variables, state->default_path);
     home = gsh_variables_lookup(state->variables, "HOME", 4U, &home_found);
     if (gsh_completion_generate(
@@ -11654,9 +12348,6 @@ static void process_input(shell_state *state)
             break;
         }
     }
-    if (state->async_repl != NULL &&
-        gsh_async_repl_focused_job(state->async_repl) < 0)
-        restart_managed_caret(state);
 }
 
 static int load_managed_submission(shell_state *state, int cell_index)
@@ -11771,6 +12462,7 @@ static void finalize_managed_dispatch(shell_state *state, int cell_index)
     if (state->mode == MODE_EDITOR && !state->current_job.active) {
         gsh_async_repl_finish(state->async_repl, cell_index,
                               state->last_status << 8, true);
+        enqueue_managed_error_help(state, cell_index, state->last_status);
         state->async_capture_cell = -1;
         state->async_dispatch_cell = -1;
         return;
@@ -11790,6 +12482,19 @@ static void dispatch_managed_cell(shell_state *state, int cell_index)
     gsh_async_repl_starting(state->async_repl, cell_index);
     state->async_dispatch_cell = cell_index;
     state->async_capture_cell = cell_index;
+    if (cell_index == state->llm_command_cell &&
+        !llm_command_context_current(state)) {
+        (void)output_text(state,
+            "Not executed: session context changed. Request the command again.\n");
+        gsh_async_repl_finish(state->async_repl, cell_index, 125 << 8, false);
+        finalize_managed_dispatch(state, cell_index);
+        return;
+    }
+    if (state_async_repl(state)->cells[cell_index].ai) {
+        start_async_llm(state, cell_index);
+        finalize_managed_dispatch(state, cell_index);
+        return;
+    }
     if (state_async_repl(state)->cells[cell_index].status_dependency &&
         gsh_async_repl_previous_status(state->async_repl, cell_index,
                                        &previous_status) == 0) {
@@ -11834,7 +12539,223 @@ static void schedule_managed_submissions(shell_state *state)
             break;
         }
         dispatch_managed_cell(state, cell_index);
+        service_llm_repl(state);
     }
+}
+
+/* ── Provider Work Cannot Become A Shell Execution Shortcut ─────
+ * The worker submits exactly the approved script to a new ordinary cell.
+ * Its barrier orders execution against other commands, while conversational
+ * AI cells are excluded from shell dependencies to avoid waiting on their
+ * own tool calls. A receipt requires terminal state and closed output, so
+ * directory and variable commits finish before the model can claim success.
+ * ─────────────────────────────────────────────────────────────── */
+static bool llm_command_context_current(const shell_state *state)
+{
+    const gsh_async_cell *owner;
+
+    if (state == NULL || state->llm_owner_cell < 0 ||
+        state->llm_owner_cell >= GSH_ASYNC_CELL_CAP ||
+        state->pending_len != 0U) return false;
+    owner = &state_async_repl(state)->cells[state->llm_owner_cell];
+    if (owner->state != GSH_ASYNC_RUNNING || owner->pid <= 0 ||
+        owner->ai_directory_generation !=
+            gsh_variables_value_generation(state->variables, "PWD", 3U))
+        return false;
+    if (state->llm_command_cell < 0 &&
+        state_async_repl(state)->last_command_id > owner->ai_context_id)
+        return false;
+    return strcmp(owner->launch_directory, state->current_directory) == 0;
+}
+
+static void close_llm_repl(shell_state *state)
+{
+    if (state == NULL) return;
+    if (state->llm_owner_cell >= 0 &&
+        state->llm_owner_cell < GSH_ASYNC_CELL_CAP) {
+        state_async_repl(state)->cells[state->llm_owner_cell].ai_activity =
+            GSH_LLM_IDLE;
+        state_async_repl(state)->render_pending = true;
+    }
+    if (state->llm_command_cell >= 0 &&
+        state->llm_command_cell < GSH_ASYNC_CELL_CAP) {
+        gsh_async_cell *cell =
+            &state_async_repl(state)->cells[state->llm_command_cell];
+        cell->ai_result_pending = false;
+        if (!managed_cell_terminal(cell)) {
+            if (cell->pgid > 0) (void)kill(-cell->pgid, SIGTERM);
+            gsh_async_repl_finish(state->async_repl, state->llm_command_cell,
+                                  125 << 8, false);
+        }
+    }
+    gsh_llm_repl_close(&state->llm_repl);
+    state->llm_owner_cell = -1;
+    state->llm_command_cell = -1;
+}
+
+static void llm_repl_reject(shell_state *state, const char *reason)
+{
+    gsh_llm_repl_result *result;
+
+    if (state == NULL || reason == NULL) return;
+    result = &state->llm_repl.result;
+    (void)memset(result, 0, sizeof(*result));
+    result->version = GSH_LLM_REPL_VERSION;
+    result->status = 125;
+    (void)snprintf(result->directory, sizeof(result->directory), "%s",
+                   state->current_directory);
+    (void)snprintf(result->output, sizeof(result->output),
+                   "Not executed: %s", reason);
+    state->llm_repl.replying = true;
+}
+
+static void accept_llm_command(shell_state *state)
+{
+    char prompt[GSH_ASYNC_PROMPT_CAP];
+    const gsh_llm_repl_request *request;
+    gsh_async_cell *cell;
+    int index;
+
+    if (state == NULL || state->llm_owner_cell < 0) return;
+    state_async_repl(state)->cells[state->llm_owner_cell].ai_activity =
+        GSH_LLM_IDLE;
+    state_async_repl(state)->render_pending = true;
+    if (state_async_repl(state)->cells[state->llm_owner_cell].ai_pipeline) {
+        llm_repl_reject(state, "execution tools are disabled for pipeline requests.");
+        return;
+    }
+    if (!llm_command_context_current(state)) {
+        llm_repl_reject(state,
+            "session context changed. Ask the user to request the command again.");
+        return;
+    }
+    request = &state->llm_repl.request;
+    (void)active_prompt_text(state, prompt);
+    {
+        size_t used = strlen(prompt);
+        if (used + sizeof("[AI] ") > sizeof(prompt)) {
+            llm_repl_reject(state, "prompt exceeds the REPL limit.");
+            return;
+        }
+        (void)memcpy(prompt + used, "[AI] ", sizeof("[AI] "));
+    }
+    index = gsh_async_repl_accept(state->async_repl, prompt, request->script,
+        request->length, state->current_directory, true, true, true, false);
+    if (index < 0) {
+        llm_repl_reject(state, "REPL queue is full.");
+        return;
+    }
+    state->llm_command_cell = index;
+    cell = &state_async_repl(state)->cells[index];
+    cell->ai_result_pending = true;
+    cell->ai_request_id =
+        state_async_repl(state)->cells[state->llm_owner_cell].ai_request_id;
+    if (cell->ai_request_id == 0U)
+        cell->ai_request_id = state_async_repl(state)->cells[state->llm_owner_cell].id;
+    cell->ai_private =
+        state_async_repl(state)->cells[state->llm_owner_cell].ai_private;
+    if (!cell->ai_private)
+        record_history_text(state, request->script, request->length,
+                             GSH_PARSE_OK);
+    queue_prompt(state);
+}
+
+static bool continue_llm_cell(shell_state *state)
+{
+    gsh_async_cell *previous;
+    gsh_async_cell *next;
+    int index;
+
+    if (state == NULL || state->llm_owner_cell < 0) return false;
+    previous = &state_async_repl(state)->cells[state->llm_owner_cell];
+    index = gsh_async_repl_accept_ai(state->async_repl, "gsh ai> ", "", 0U,
+                                     state->current_directory);
+    if (index < 0) return false;
+    next = &state_async_repl(state)->cells[index];
+    next->ai_activity = GSH_LLM_GENERATING;
+    next->ai_private = previous->ai_private;
+    next->ai_request_id = previous->ai_request_id != 0U
+        ? previous->ai_request_id : previous->id;
+    gsh_async_repl_starting(state->async_repl, index);
+    if (gsh_async_repl_attach(state->async_repl, index, previous->pid,
+                              previous->pgid, previous->pty_fd, -1) == -1)
+        return false;
+    next->ai_context_id = state->llm_command_cell < 0
+        ? previous->ai_context_id
+        : state_async_repl(state)->cells[state->llm_command_cell].id;
+    next->ai_directory_generation =
+        gsh_variables_value_generation(state->variables, "PWD", 3U);
+    previous->pid = 0;
+    previous->pgid = 0;
+    previous->pty_fd = -1;
+    previous->focused = false;
+    previous->input_requested = false;
+    gsh_async_repl_finish(state->async_repl, state->llm_owner_cell, 0, true);
+    state->llm_owner_cell = index;
+    return true;
+}
+
+static void finish_llm_command(shell_state *state)
+{
+    const gsh_async_cell *cell;
+    gsh_llm_repl_result *result;
+
+    if (state == NULL || state->llm_command_cell < 0 ||
+        state->llm_repl.replying) return;
+    cell = &state_async_repl(state)->cells[state->llm_command_cell];
+    if (!managed_cell_terminal(cell) || !cell->output_closed ||
+        cell->pty_fd >= 0 || state->async_state_cell == state->llm_command_cell)
+        return;
+    result = &state->llm_repl.result;
+    (void)memset(result, 0, sizeof(*result));
+    result->version = GSH_LLM_REPL_VERSION;
+    result->status = wait_status_value(cell->wait_status);
+    result->cell_id = cell->id;
+    (void)snprintf(result->directory, sizeof(result->directory), "%s",
+                   state->current_directory);
+    (void)snprintf(result->output, sizeof(result->output), "%.*s%s",
+        60000, cell->output,
+        cell->output_truncated || cell->output_length > 60000U
+            ? "\n[output truncated]" : "");
+    if (!continue_llm_cell(state)) {
+        close_llm_repl(state);
+        return;
+    }
+    state->llm_repl.replying = true;
+}
+
+static void service_llm_repl(shell_state *state)
+{
+    int received;
+
+    if (state == NULL || state->llm_repl.fd < 0) return;
+    if (state->llm_owner_cell < 0 ||
+        managed_cell_terminal(
+            &state_async_repl(state)->cells[state->llm_owner_cell])) {
+        close_llm_repl(state);
+        return;
+    }
+    if (state->llm_repl.replying) {
+        int sent = gsh_llm_repl_flush(&state->llm_repl);
+        if (sent < 0) close_llm_repl(state);
+        else if (sent > 0 && state->llm_command_cell >= 0) {
+            state_async_repl(state)->cells[state->llm_command_cell]
+                .ai_result_pending = false;
+            state->llm_command_cell = -1;
+        }
+        return;
+    }
+    received = gsh_llm_repl_receive(&state->llm_repl);
+    if (received < 0) { close_llm_repl(state); return; }
+    if (received > 0 && state->llm_repl.request.length == 0U) {
+        state_async_repl(state)->cells[state->llm_owner_cell].ai_activity =
+            (gsh_llm_activity)state->llm_repl.request.activity;
+        state_async_repl(state)->render_pending = true;
+        state->llm_repl.received = 0U;
+        return;
+    }
+    if (received > 0) accept_llm_command(state);
+    finish_llm_command(state);
 }
 
 static size_t receive_job_service_rights(
@@ -12084,7 +13005,7 @@ enum { GSH_REACTOR_BASE_FDS = 6 };
 static size_t add_managed_poll_descriptors(
     shell_state *state,
     struct pollfd descriptors[
-        GSH_REACTOR_BASE_FDS + 2U * GSH_ASYNC_CELL_CAP])
+        GSH_REACTOR_BASE_FDS + 2U * GSH_ASYNC_CELL_CAP + 2U])
 {
     if (state == NULL) return 0U;
     if (descriptors == NULL) {
@@ -12186,8 +13107,6 @@ static bool push_managed_preview_base(shell_state *state)
     const char *render;
     size_t length;
     if (state == NULL || state->async_repl == NULL) return false;
-    gsh_async_repl_configure_caret(state->async_repl,
-                                    state->caret_supported, false);
     (void)active_prompt_text(state, prompt);
     if (gsh_async_repl_prepare_render_with_completion(
             state->async_repl, prompt, state->line, state->line_len,
@@ -12237,7 +13156,7 @@ static void present_managed_fullscreen(shell_state *state, int cell_index,
     if (state == NULL) {
         return;
     }
-    static const char begin[] = "\033[0m\033[?25h\033[H\033[2J";
+    static const char begin[] = "\033[0m\033[H\033[2J";
     static const char split_begin[] =
         "\033[0m\033[?25l\033[?1000h\033[?1006h";
     char filtered[4096 + GSH_ASYNC_PASSTHROUGH_SEQUENCE_CAP];
@@ -12267,7 +13186,7 @@ static void present_managed_fullscreen(shell_state *state, int cell_index,
 static void preflight_managed_input_focus(
     shell_state *state,
     struct pollfd descriptors[
-        GSH_REACTOR_BASE_FDS + 2U * GSH_ASYNC_CELL_CAP],
+        GSH_REACTOR_BASE_FDS + 2U * GSH_ASYNC_CELL_CAP + 2U],
     size_t count)
 {
     if (state == NULL) return;
@@ -12830,7 +13749,7 @@ static void read_managed_resources(shell_state *state,
 static void process_managed_descriptors(
     shell_state *state,
     struct pollfd descriptors[
-        GSH_REACTOR_BASE_FDS + 2U * GSH_ASYNC_CELL_CAP],
+        GSH_REACTOR_BASE_FDS + 2U * GSH_ASYNC_CELL_CAP + 2U],
     size_t count)
 {
     if (state == NULL) return;
@@ -12980,7 +13899,7 @@ static int seed_async_enabled_notice(shell_state *state)
 static void apply_async_transition(shell_state *state)
 {
     if (state == NULL) return;
-    static const char leave_screen[] = "\033[?25h\033[?1049l";
+    static const char leave_screen[] = "\033[?1049l";
 
     if (!state->async_transition_pending ||
         !async_transition_quiescent(state)) {
@@ -13030,7 +13949,6 @@ static void apply_async_transition(shell_state *state)
     }
     state->async_transition_pending = false;
     state_async_repl(state)->render_pending = true;
-    restart_managed_caret(state);
 }
 
 static bool dispatch_classic_pending(shell_state *state)
@@ -13058,7 +13976,7 @@ static bool dispatch_classic_pending(shell_state *state)
 static size_t prepare_reactor_descriptors(
     shell_state *state,
     struct pollfd descriptors[
-        GSH_REACTOR_BASE_FDS + 2U * GSH_ASYNC_CELL_CAP])
+        GSH_REACTOR_BASE_FDS + 2U * GSH_ASYNC_CELL_CAP + 2U])
 {
     if (!require(state != NULL)) return 0U;
     if (!require(descriptors != NULL)) return 0U;
@@ -13079,7 +13997,17 @@ static size_t prepare_reactor_descriptors(
     descriptors[5] = (struct pollfd){state->completion_fd,
                                      state->completion_fd >= 0 ? POLLIN : 0,
                                      0};
-    return add_managed_poll_descriptors(state, descriptors);
+    size_t count = add_managed_poll_descriptors(state, descriptors);
+    if (state->llm_repl.fd >= 0) {
+        descriptors[count++] = (struct pollfd){state->llm_repl.fd,
+            state->llm_repl.replying ? POLLOUT :
+            state->llm_repl.received < sizeof(state->llm_repl.request)
+                ? POLLIN : 0, 0};
+    }
+    if (state->journal.descriptor >= 0)
+        descriptors[count++] = (struct pollfd){state->journal.descriptor,
+            state->journal.used > state->journal.sent ? POLLOUT : 0, 0};
+    return count;
 }
 
 static void service_reactor_descriptors(
@@ -13115,6 +14043,8 @@ static void service_reactor_descriptors(
           (POLLIN | POLLERR | POLLHUP | POLLNVAL)) != 0 ||
          state->completion_pid < 0)) receive_completion_result(state);
     process_managed_descriptors(state, descriptors, descriptor_count);
+    service_llm_repl(state);
+    service_journal_descriptor(state, &descriptors[descriptor_count - 1U]);
     if (state->redirection_worker_alive &&
         (descriptors[2].revents & POLLIN) != 0) {
         receive_redirection_result(state);
@@ -13134,7 +14064,6 @@ static void service_reactor_descriptors(
     }
     schedule_managed_submissions(state);
     apply_async_transition(state);
-    service_managed_caret(state);
     prepare_classic_redraw(state);
     prepare_managed_render(state);
     if (state->output_len > 0U) flush_output(state);
@@ -13160,19 +14089,20 @@ static int run_reactor(shell_state *state)
 
     while (state->running) {
         struct pollfd descriptors[
-            GSH_REACTOR_BASE_FDS + 2U * GSH_ASYNC_CELL_CAP];
+            GSH_REACTOR_BASE_FDS + 2U * GSH_ASYNC_CELL_CAP + 2U];
         size_t descriptor_count;
         int result;
         uint64_t service_start;
 
         complete_pending_escapes(state);
         expire_completion_request(state);
+        service_llm_repl(state);
         schedule_managed_submissions(state);
         apply_async_transition(state);
-        service_managed_caret(state);
         prepare_classic_redraw(state);
         prepare_managed_render(state);
 
+        if (dispatch_classic_auto_help(state)) continue;
         if (dispatch_classic_pending(state)) continue;
         descriptor_count = prepare_reactor_descriptors(state, descriptors);
 
@@ -13334,6 +14264,45 @@ static void persist_history(shell_state *state)
     gsh_history_clear(state->history);
 }
 
+/* ── Journal Shutdown Has A Finite Drain Budget ─────────────────
+ * Closing a shell must not wait forever for another session's journal lock.
+ * Once terminal ownership is restored, at most 250 ms drains queued frames
+ * and lets the writer finish its durability work. A stalled writer is killed
+ * and reaped; unfinished records are reported without changing shell status.
+ * ─────────────────────────────────────────────────────────────── */
+static void finish_journal_worker(shell_state *state)
+{
+    unsigned int attempt;
+
+    if (state == NULL || state->journal_pid <= 0) return;
+    for (attempt = 0U; attempt < 50U; attempt++) {
+        int status = 0;
+        pid_t result;
+        struct pollfd ready = {state->journal.descriptor, POLLOUT, 0};
+
+        if (state->journal.descriptor >= 0 &&
+            (gsh_llm_journal_flush(&state->journal) == -1 ||
+             state->journal.used == 0U)) close_journal_pipe(state);
+        result = waitpid(state->journal_pid, &status, WNOHANG);
+        if (result == state->journal_pid || (result < 0 && errno == ECHILD)) {
+            state->journal_pid = -1;
+            close_journal_pipe(state);
+            if (result > 0 && (!WIFEXITED(status) || WEXITSTATUS(status) != 0))
+                (void)fputs("gsh: AI journal writer failed\n", stderr);
+            return;
+        }
+        ready.fd = state->journal.descriptor;
+        (void)poll(&ready, 1U, 5);
+    }
+    close_journal_pipe(state);
+    (void)kill(state->journal_pid, SIGKILL);
+    while (waitpid(state->journal_pid, NULL, 0) == -1 && errno == EINTR) {
+    }
+    state->journal_pid = -1;
+    (void)fputs("gsh: AI journal shutdown incomplete; pending records lost\n",
+                 stderr);
+}
+
 static void cleanup(shell_state *state)
 {
     if (state == NULL) {
@@ -13378,6 +14347,7 @@ static void cleanup(shell_state *state)
     state->redirection_worker_restart_pending = false;
     disable_redirection_worker(state, true);
     cancel_completion_request(state, true);
+    close_llm_repl(state);
     close_variable_commit(state);
     terminate_managed_children(managed_pids, managed_groups,
                                managed_terminal_groups);
@@ -13393,6 +14363,7 @@ static void cleanup(shell_state *state)
     }
     leave_managed_screen(state);
     restore_terminal(state);
+    finish_journal_worker(state);
     g_signal_write_fd = -1;
     if (state->signal_pipe[0] >= 0) {
         (void)close(state->signal_pipe[0]);
@@ -23622,6 +24593,7 @@ int main(int argc, char **argv)
     if (start_redirection_worker(&state) == -1) {
         state.redirection_worker_failures++;
     }
+    start_journal_worker(&state);
 
     status = run_reactor(&state);
     cleanup(&state);

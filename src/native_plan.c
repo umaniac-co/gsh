@@ -13,7 +13,6 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fnmatch.h>
-#include <limits.h>
 #include <stdlib.h>
 #include <sys/stat.h>
 #include <string.h>

@@ -8,7 +8,25 @@ enum {
     GSH_CONFIG_DIAGNOSTIC_CAP = 256,
     GSH_CONFIG_EDITOR_ARG_CAP = 16,
     GSH_CONFIG_EDITOR_STORAGE_CAP = 4096,
+    GSH_LLM_PROVIDER_CAP = 8,
+    GSH_LLM_PROVIDER_NAME_CAP = 32,
+    GSH_LLM_BASE_URL_CAP = 1024,
+    GSH_LLM_MODEL_CAP = 256,
+    GSH_LLM_CREDENTIAL_CAP = 128,
+    GSH_LLM_RUNTIME_COMMAND_CAP = 1024,
 };
+
+typedef struct {
+    bool occupied;
+    bool managed;
+    unsigned int seen_fields;
+    unsigned int idle_timeout_seconds;
+    char name[GSH_LLM_PROVIDER_NAME_CAP];
+    char base_url[GSH_LLM_BASE_URL_CAP];
+    char model[GSH_LLM_MODEL_CAP];
+    char credential[GSH_LLM_CREDENTIAL_CAP];
+    char runtime_command[GSH_LLM_RUNTIME_COMMAND_CAP];
+} gsh_llm_provider_config;
 
 typedef enum {
     GSH_TERMINAL_ACTIONS_AUTO = 0,
@@ -40,6 +58,13 @@ typedef struct {
     gsh_terminal_images_mode terminal_images;
     gsh_path_detection_mode path_detection;
     bool preview_editor_auto;
+    bool llm_enabled;
+    bool llm_streaming;
+    bool llm_auto_help;
+    size_t llm_recent_exchanges;
+    unsigned int llm_request_timeout_seconds;
+    char llm_default_provider[GSH_LLM_PROVIDER_NAME_CAP];
+    gsh_llm_provider_config llm_providers[GSH_LLM_PROVIDER_CAP];
     size_t preview_editor_argc;
     size_t preview_editor_offsets[GSH_CONFIG_EDITOR_ARG_CAP];
     char preview_editor_storage[GSH_CONFIG_EDITOR_STORAGE_CAP];
@@ -52,5 +77,7 @@ int gsh_config_load(gsh_shell_config *config, const char *home,
                     bool create_missing);
 const char *gsh_config_editor_argument(const gsh_shell_config *config,
                                        size_t index);
+const gsh_llm_provider_config *gsh_config_llm_provider(
+    const gsh_shell_config *config, const char *name);
 
 #endif
