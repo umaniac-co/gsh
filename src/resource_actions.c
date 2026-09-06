@@ -187,7 +187,7 @@ static void trim_candidate(const char *text, size_t length,
                            size_t *begin, size_t *end)
 {
     static const char opening[] = "'\"`([{<";
-    static const char closing[] = "'\"`)]}>,;.";
+    static const char closing[] = "'\"`)]}>,;.:";
     if (text == NULL || begin == NULL || end == NULL) return;
     while (*begin < *end && *begin < length &&
            strchr(opening, text[*begin]) != NULL) (*begin)++;

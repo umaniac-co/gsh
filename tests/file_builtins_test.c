@@ -4,12 +4,14 @@
 #ifndef _POSIX_C_SOURCE
 #define _POSIX_C_SOURCE 202405L
 #endif
+#ifndef _XOPEN_SOURCE
+#define _XOPEN_SOURCE 700
+#endif
 
 #include "../src/builtin_files.h"
 
 #include <errno.h>
 #include <fcntl.h>
-#include <limits.h>
 #include <locale.h>
 #include <stdio.h>
 #include <stdlib.h> /* CANON-INCLUDE: linux */
@@ -776,7 +778,7 @@ int main(void)
     (void)rmdir("siblings");
     (void)rmdir("subdir/deep");
     (void)rmdir("subdir");
-    (void)chdir(original);
+    if (chdir(original) == -1) failed = 1;
     (void)rmdir(fixture);
     if (failed) { (void)fputs("file builtins: failed\n", stderr); return 1; }
     (void)puts("file builtins: native ls, ll, and view cases passed");

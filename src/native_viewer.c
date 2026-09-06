@@ -17,7 +17,6 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <grp.h>
-#include <limits.h>
 #include <poll.h>
 #include <pwd.h>
 #include <stdio.h>
@@ -643,7 +642,7 @@ static int render_safe_text(char output[VIEW_RENDER_CAP], size_t *used,
     while (offset < length) {
         size_t sequence;
         if ((unsigned char)text[offset] == '\t') {
-            if (render_append(output, used, "    ", 4U) == -1) return -1;
+            if (render_append(output, used, " ", 1U) == -1) return -1;
             offset++;
             continue;
         }
@@ -659,6 +658,36 @@ static int render_safe_text(char output[VIEW_RENDER_CAP], size_t *used,
         }
     }
     return 0;
+}
+
+/* ── Source Tabs Spend Their Display Cells Before Output ───────────────
+ * The source viewer once expanded a tab to four cells after clipping had
+ * charged only one. Long split-pane lines then wrapped three tail cells
+ * through the terminal edge and overwrote the REPL pane.
+ * Source indentation keeps four spaces, capped by the remaining row budget;
+ * tabs inside bounded spans normalize to the single cell their callers debit.
+ * One existing rendering pass gains neither allocation nor an extra scan.
+ * ─────────────────────────────────────────────── */
+static int render_source_character(const char *text, size_t remaining,
+                                   char output[VIEW_RENDER_CAP], size_t *used)
+{
+    unsigned char byte;
+    size_t columns = 1U;
+
+    if (text == NULL || output == NULL || used == NULL || remaining == 0U)
+        return -1;
+    byte = (unsigned char)text[0];
+    if (byte == '\t') {
+        columns = remaining < 4U ? remaining : 4U;
+        return render_append(output, used, "    ", columns) == -1
+                   ? -1 : (int)columns;
+    }
+    if (byte >= '0' && byte <= '9' &&
+        render_append(output, used, "\033[38;5;215m", 11U) == -1) return -1;
+    if (render_safe_text(output, used, text, 1U) == -1) return -1;
+    if (byte >= '0' && byte <= '9' &&
+        render_append(output, used, "\033[0m", 4U) == -1) return -1;
+    return (int)columns;
 }
 
 static int highlight_line(view_language language, const char *text,
@@ -722,12 +751,14 @@ static int highlight_line(view_language language, const char *text,
                 continue;
             }
         }
-        if ((byte >= '0' && byte <= '9') &&
-            render_append(output, used, "\033[38;5;215m", 11U) == -1) return -1;
-        if (render_safe_text(output, used, text + offset, 1U) == -1) return -1;
-        if (byte >= '0' && byte <= '9' && render_append(output, used, "\033[0m", 4U) == -1) return -1;
-        offset++;
-        columns++;
+        {
+            int rendered = render_source_character(
+                text + offset, width - columns, output, used);
+
+            if (rendered < 0) return -1;
+            offset++;
+            columns += (size_t)rendered;
+        }
     }
     return 0;
 }

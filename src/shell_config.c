@@ -15,7 +15,6 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdarg.h> /* CANON-INCLUDE: macos */
-#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -38,14 +37,21 @@ static const char initial_config[] =
     "shell.history.max_entries = 1024\n"
     "shell.history.deduplicate = false\n"
     "shell.history.store_failed = true\n"
-    "shell.history.ignore_space = true\n";
+    "shell.history.ignore_space = true\n"
+    "\n"
+    "llm.enabled = false\n"
+    "llm.default_provider = ds4\n"
+    "llm.streaming = true\n"
+    "llm.auto_help = true\n"
+    "llm.context.recent_exchanges = 5\n"
+    "llm.request_timeout = 120s\n";
 
 typedef struct {
     char *text;
     size_t length;
     size_t line;
     bool version_seen;
-    bool seen[14];
+    bool seen[20];
 } config_parser;
 
 /* ── Configuration Is Parsed Before It Can Mutate State ───────
@@ -85,6 +91,11 @@ void gsh_config_defaults(gsh_shell_config *config)
     config->terminal_images = GSH_TERMINAL_IMAGES_AUTO;
     config->path_detection = GSH_PATH_DETECTION_SAFE;
     config->preview_editor_auto = true;
+    config->llm_streaming = true;
+    config->llm_auto_help = true;
+    config->llm_recent_exchanges = 5U;
+    config->llm_request_timeout_seconds = 120U;
+    (void)memcpy(config->llm_default_provider, "ds4", sizeof("ds4"));
 }
 
 static int write_all(int descriptor, const char *text, size_t length)
@@ -293,6 +304,12 @@ static int field_index(const char *key)
         "terminal.images",
         "shell.preview.editor",
         "shell.completion.enabled",
+        "llm.enabled",
+        "llm.default_provider",
+        "llm.streaming",
+        "llm.auto_help",
+        "llm.context.recent_exchanges",
+        "llm.request_timeout",
     };
     size_t index;
 
@@ -302,6 +319,218 @@ static int field_index(const char *key)
         }
     }
     return -1;
+}
+
+static bool llm_name_is_valid(const char *name, size_t length)
+{
+    size_t index;
+
+    if (name == NULL || length == 0U || length >= GSH_LLM_PROVIDER_NAME_CAP)
+        return false;
+    for (index = 0U; index < length; index++) {
+        unsigned char byte = (unsigned char)name[index];
+
+        if (!((byte >= 'a' && byte <= 'z') ||
+              (byte >= '0' && byte <= '9') || byte == '-' || byte == '_'))
+            return false;
+    }
+    return true;
+}
+
+static int parse_config_string(const char *value, char *output,
+                               size_t capacity)
+{
+    size_t source = 0U;
+    size_t used = 0U;
+    bool quoted;
+
+    if (value == NULL || output == NULL || capacity == 0U) return -1;
+    quoted = value[0] == '"';
+    if (quoted) source++;
+    while (value[source] != '\0' && (!quoted || value[source] != '"')) {
+        char byte = value[source++];
+
+        if (quoted && byte == '\\') {
+            byte = value[source++];
+            if (byte != '\\' && byte != '"') return -1;
+        }
+        if ((unsigned char)byte < 0x20U || used + 1U >= capacity) {
+            errno = used + 1U >= capacity ? E2BIG : EINVAL;
+            return -1;
+        }
+        output[used++] = byte;
+    }
+    if ((quoted && (value[source++] != '"' || value[source] != '\0')) ||
+        (!quoted && used == 0U)) {
+        errno = EINVAL;
+        return -1;
+    }
+    output[used] = '\0';
+    return 0;
+}
+
+static int parse_llm_count(const char *value, size_t *output)
+{
+    size_t parsed = 0U;
+    size_t index;
+
+    if (value == NULL || output == NULL || value[0] == '\0') return -1;
+    for (index = 0U; value[index] != '\0'; index++) {
+        if (value[index] < '0' || value[index] > '9' || parsed > 10U) {
+            errno = ERANGE;
+            return -1;
+        }
+        parsed = parsed * 10U + (size_t)(value[index] - '0');
+    }
+    if (parsed > 5U) { errno = ERANGE; return -1; }
+    *output = parsed;
+    return 0;
+}
+
+static int parse_llm_timeout(const char *value, unsigned int *output)
+{
+    unsigned int parsed = 0U;
+    size_t index = 0U;
+
+    if (value == NULL || output == NULL) return -1;
+    while (value[index] >= '0' && value[index] <= '9') {
+        if (parsed > (3600U - (unsigned int)(value[index] - '0')) / 10U) {
+            errno = ERANGE;
+            return -1;
+        }
+        parsed = parsed * 10U + (unsigned int)(value[index++] - '0');
+    }
+    if (parsed == 0U || parsed > 3600U || strcmp(value + index, "s") != 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    *output = parsed;
+    return 0;
+}
+
+static int parse_runtime_idle_timeout(const char *value,
+                                      unsigned int *output)
+{
+    unsigned int parsed = 0U;
+    unsigned int multiplier;
+    size_t index = 0U;
+
+    if (value == NULL || output == NULL) return -1;
+    if (strcmp(value, "off") == 0) { *output = 0U; return 0; }
+    while (value[index] >= '0' && value[index] <= '9') {
+        if (parsed > 86400U / 10U) { errno = ERANGE; return -1; }
+        parsed = parsed * 10U + (unsigned int)(value[index++] - '0');
+    }
+    if (strcmp(value + index, "s") == 0) multiplier = 1U;
+    else if (strcmp(value + index, "m") == 0) multiplier = 60U;
+    else if (strcmp(value + index, "h") == 0) multiplier = 3600U;
+    else { errno = EINVAL; return -1; }
+    if (parsed == 0U || parsed > 86400U / multiplier) {
+        errno = ERANGE;
+        return -1;
+    }
+    *output = parsed * multiplier;
+    return 0;
+}
+
+const gsh_llm_provider_config *gsh_config_llm_provider(
+    const gsh_shell_config *config, const char *name)
+{
+    size_t index;
+
+    if (config == NULL || name == NULL) return NULL;
+    for (index = 0U; index < GSH_LLM_PROVIDER_CAP; index++) {
+        if (config->llm_providers[index].occupied &&
+            strcmp(config->llm_providers[index].name, name) == 0)
+            return &config->llm_providers[index];
+    }
+    return NULL;
+}
+
+static gsh_llm_provider_config *find_or_add_provider(
+    gsh_shell_config *config, const char *name, size_t name_length)
+{
+    size_t index;
+    gsh_llm_provider_config *empty = NULL;
+
+    if (config == NULL || !llm_name_is_valid(name, name_length)) return NULL;
+    for (index = 0U; index < GSH_LLM_PROVIDER_CAP; index++) {
+        gsh_llm_provider_config *provider = &config->llm_providers[index];
+
+        if (!provider->occupied && empty == NULL) empty = provider;
+        if (provider->occupied && strlen(provider->name) == name_length &&
+            memcmp(provider->name, name, name_length) == 0) return provider;
+    }
+    if (empty == NULL) { errno = ENOSPC; return NULL; }
+    empty->occupied = true;
+    empty->idle_timeout_seconds = 300U;
+    (void)memcpy(empty->name, name, name_length);
+    empty->name[name_length] = '\0';
+    (void)memcpy(empty->credential, "none", sizeof("none"));
+    return empty;
+}
+
+static int provider_field_index(const char *name)
+{
+    static const char *const fields[] = {
+        "type", "base_url", "model", "credential", "runtime.managed",
+        "runtime.command", "runtime.idle_timeout",
+    };
+    size_t index;
+
+    for (index = 0U; index < sizeof(fields) / sizeof(fields[0]); index++) {
+        if (strcmp(name, fields[index]) == 0) return (int)index;
+    }
+    return -1;
+}
+
+static int apply_provider_field(gsh_llm_provider_config *provider, int field,
+                                const char *value)
+{
+    unsigned int bit;
+
+    if (provider == NULL || value == NULL || field < 0 || field >= 7)
+        return -1;
+    bit = 1U << (unsigned int)field;
+    if ((provider->seen_fields & bit) != 0U) { errno = EINVAL; return -1; }
+    provider->seen_fields |= bit;
+    if (field == 0) {
+        if (strcmp(value, "responses") != 0) { errno = EINVAL; return -1; }
+        return 0;
+    }
+    if (field == 1)
+        return parse_config_string(value, provider->base_url,
+                                   sizeof(provider->base_url));
+    if (field == 2)
+        return parse_config_string(value, provider->model,
+                                   sizeof(provider->model));
+    if (field == 3)
+        return parse_config_string(value, provider->credential,
+                                   sizeof(provider->credential));
+    if (field == 4) return parse_boolean(value, &provider->managed);
+    if (field == 5)
+        return parse_config_string(value, provider->runtime_command,
+                                   sizeof(provider->runtime_command));
+    return parse_runtime_idle_timeout(value,
+                                      &provider->idle_timeout_seconds);
+}
+
+static int parse_provider_assignment(gsh_shell_config *config,
+                                     const char *key, const char *value)
+{
+    static const char prefix[] = "llm.providers.";
+    const char *field;
+    const char *dot;
+    gsh_llm_provider_config *provider;
+
+    if (strncmp(key, prefix, sizeof(prefix) - 1U) != 0) return 1;
+    field = key + sizeof(prefix) - 1U;
+    dot = strchr(field, '.');
+    if (dot == NULL) { errno = EINVAL; return -1; }
+    provider = find_or_add_provider(config, field, (size_t)(dot - field));
+    if (provider == NULL) return -1;
+    return apply_provider_field(provider, provider_field_index(dot + 1U),
+                                value);
 }
 
 static int parse_actions_mode(const char *value,
@@ -449,6 +678,26 @@ static int apply_config_field(gsh_shell_config *config, int field,
         return parse_editor_argv(value, config);
     case 13:
         return parse_boolean(value, &config->completion_enabled);
+    case 14:
+        return parse_boolean(value, &config->llm_enabled);
+    case 15:
+        if (parse_config_string(value, config->llm_default_provider,
+                                sizeof(config->llm_default_provider)) == -1)
+            return -1;
+        if (!llm_name_is_valid(config->llm_default_provider,
+                               strlen(config->llm_default_provider))) {
+            errno = EINVAL;
+            return -1;
+        }
+        return 0;
+    case 16:
+        return parse_boolean(value, &config->llm_streaming);
+    case 17:
+        return parse_boolean(value, &config->llm_auto_help);
+    case 18:
+        return parse_llm_count(value, &config->llm_recent_exchanges);
+    case 19:
+        return parse_llm_timeout(value, &config->llm_request_timeout_seconds);
     default:
         errno = EINVAL;
         return -1;
@@ -494,6 +743,8 @@ static int parse_assignment(config_parser *parser,
         parser->version_seen = true;
         return 0;
     }
+    field = parse_provider_assignment(config, key, value);
+    if (field <= 0) return field;
     field = field_index(key);
     if (field < 0 || parser->seen[field]) {
         errno = EINVAL;

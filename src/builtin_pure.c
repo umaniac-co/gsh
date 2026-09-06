@@ -9,7 +9,6 @@
 
 #include <errno.h>
 #include <inttypes.h>
-#include <limits.h>
 #include <stdio.h> /* CANON-INCLUDE: linux */
 #include <stdlib.h>
 #include <string.h>

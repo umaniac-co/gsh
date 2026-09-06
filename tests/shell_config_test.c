@@ -147,6 +147,52 @@ static int removed_history_configuration_cases(const char *home,
     return 0;
 }
 
+static int llm_configuration_cases(const char *home,
+                                   gsh_shell_config *config)
+{
+    static const char valid[] =
+        "config.version = 1\n"
+        "llm.enabled = true\n"
+        "llm.default_provider = ds4\n"
+        "llm.streaming = true\n"
+        "llm.auto_help = false\n"
+        "llm.context.recent_exchanges = 5\n"
+        "llm.request_timeout = 90s\n"
+        "llm.providers.ds4.type = responses\n"
+        "llm.providers.ds4.base_url = \"http://127.0.0.1:8080/v1\"\n"
+        "llm.providers.ds4.model = \"deepseek-v4-flash\"\n"
+        "llm.providers.ds4.credential = none\n"
+        "llm.providers.ds4.runtime.managed = false\n"
+        "llm.providers.ds4.runtime.idle_timeout = 15m\n";
+    static const char duplicate[] =
+        "config.version = 1\n"
+        "llm.providers.local.model = one\n"
+        "llm.providers.local.model = two\n";
+    static const char default_idle[] =
+        "config.version = 1\n"
+        "llm.providers.llama.type = responses\n";
+    const gsh_llm_provider_config *provider;
+
+    if (home == NULL || config == NULL) return 1;
+    if (write_configuration(home, valid) == -1 ||
+        gsh_config_load(config, home, false) == -1) return 1;
+    provider = gsh_config_llm_provider(config, "ds4");
+    if (!config->llm_enabled || !config->llm_streaming ||
+        config->llm_auto_help || config->llm_recent_exchanges != 5U ||
+        config->llm_request_timeout_seconds != 90U || provider == NULL ||
+        strcmp(provider->base_url, "http://127.0.0.1:8080/v1") != 0 ||
+        strcmp(provider->model, "deepseek-v4-flash") != 0 ||
+        strcmp(provider->credential, "none") != 0 ||
+        provider->idle_timeout_seconds != 900U) return 1;
+    if (write_configuration(home, default_idle) == -1 ||
+        gsh_config_load(config, home, false) == -1 ||
+        (provider = gsh_config_llm_provider(config, "llama")) == NULL ||
+        provider->idle_timeout_seconds != 300U) return 1;
+    if (write_configuration(home, duplicate) == -1 ||
+        gsh_config_load(config, home, false) != -1) return 1;
+    return 0;
+}
+
 int main(void)
 {
     static const char absent[] =
@@ -216,6 +262,7 @@ int main(void)
     if (!failed && action_configuration_cases(home, &config) != 0) failed = 1;
     if (!failed &&
         removed_history_configuration_cases(home, &config) != 0) failed = 1;
+    if (!failed && llm_configuration_cases(home, &config) != 0) failed = 1;
     if (snprintf(path, sizeof(path), "%s/.gshrc", home) <
         (int)sizeof(path)) {
         (void)unlink(path);

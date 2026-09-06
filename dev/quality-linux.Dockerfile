@@ -5,6 +5,7 @@ RUN apt-get update \
         build-essential \
         clang \
         libclang-rt-dev \
+        libcurl4-openssl-dev \
         make \
         procps \
     && rm -rf /var/lib/apt/lists/*

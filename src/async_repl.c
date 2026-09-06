@@ -44,6 +44,50 @@ static bool cell_index_valid(int cell_index)
     return cell_index >= 0 && cell_index < GSH_ASYNC_CELL_CAP;
 }
 
+static bool ai_cell_animated(const gsh_async_cell *cell)
+{
+    if (cell == NULL) return false;
+    return cell->occupied && cell->ai &&
+        (cell->state == GSH_ASYNC_STARTING ||
+         cell->state == GSH_ASYNC_RUNNING) &&
+        (cell->ai_activity == GSH_LLM_STARTING ||
+         cell->ai_activity == GSH_LLM_GENERATING);
+}
+
+/* ── Only Live Inference Schedules Animation ──────────────────────
+ * A worker-written spinner would pollute output and compete with streaming
+ * and editor redraws. The compositor instead advances one shared frame at
+ * most every 100 ms, using the reactor's monotonic clock and poll deadline.
+ * No animation deadline survives confirmation, execution, completion, or
+ * a fullscreen handoff, so an idle shell does not wake for decoration.
+ * ─────────────────────────────────────────────────────────────── */
+void gsh_async_repl_tick(gsh_async_repl *repl, uint64_t now_ns)
+{
+    bool active = false;
+    int focused;
+    int index;
+
+    if (repl == NULL) return;
+    focused = gsh_async_repl_focused_job(repl);
+    if (repl->enabled && !(focused >= 0 &&
+            repl->cells[focused].fullscreen)) {
+        for (index = 0; index < GSH_ASYNC_CELL_CAP; index++)
+            active = active || ai_cell_animated(&repl->cells[index]);
+    }
+    if (!active) {
+        repl->ai_animation_deadline_ns = 0U;
+        repl->ai_animation_frame = 0U;
+        return;
+    }
+    if (repl->ai_animation_deadline_ns != 0U &&
+        now_ns < repl->ai_animation_deadline_ns) return;
+    if (repl->ai_animation_deadline_ns != 0U)
+        repl->ai_animation_frame = (repl->ai_animation_frame + 1U) % 10U;
+    repl->ai_animation_deadline_ns = now_ns > UINT64_MAX - 100000000U
+        ? UINT64_MAX : now_ns + 100000000U;
+    repl->render_pending = true;
+}
+
 static int oldest_reusable_cell(const gsh_async_repl *repl, bool control)
 {
     uint64_t oldest = UINT64_MAX;
@@ -64,7 +108,8 @@ static int oldest_reusable_cell(const gsh_async_repl *repl, bool control)
                 unused = index;
             }
         }
-        if (cell_terminal(cell) && cell->output_closed) {
+        if (cell_terminal(cell) && cell->output_closed &&
+            !cell->ai_result_pending) {
             available++;
             if (cell->id < oldest) {
                 oldest = cell->id;
@@ -124,14 +169,6 @@ void gsh_async_repl_configure_actions(gsh_async_repl *repl, bool enabled,
     repl->actions_enabled = enabled;
     repl->path_detection = detection;
     repl->render_pending = repl->enabled;
-}
-
-void gsh_async_repl_configure_caret(gsh_async_repl *repl, bool enabled,
-                                    bool visible)
-{
-    if (repl == NULL) return;
-    repl->caret_enabled = enabled;
-    repl->caret_visible = visible;
 }
 
 void gsh_async_repl_resize(gsh_async_repl *repl, size_t rows,
@@ -232,10 +269,68 @@ int gsh_async_repl_accept(gsh_async_repl *repl, const char *prompt,
     cell->status_dependency = status_dependency;
     cell->control = control;
     cell->id = repl->next_id++;
+    repl->last_command_id = cell->id;
     cell->output_generation = 1U;
     cell->state = GSH_ASYNC_QUEUED;
     repl->render_pending = true;
     return cell_index;
+}
+
+int gsh_async_repl_accept_ai(gsh_async_repl *repl, const char *prompt,
+                             const char *command, size_t command_length,
+                             const char *launch_directory)
+{
+    int cell;
+    uint64_t previous_command;
+
+    if (repl == NULL || prompt == NULL || command == NULL ||
+        launch_directory == NULL) return -1;
+    previous_command = repl->last_command_id;
+    cell = gsh_async_repl_accept(repl, prompt, command, command_length,
+                                 launch_directory, false, false, false,
+                                 false);
+    if (cell >= 0) {
+        repl->cells[cell].ai = true;
+        repl->cells[cell].ai_activity = GSH_LLM_STARTING;
+        repl->cells[cell].ai_private = command_length >= 2U &&
+            command[0] == ' ' && command[command_length - 1U] == ' ';
+        repl->last_command_id = previous_command;
+    }
+    return cell;
+}
+
+int gsh_async_repl_accept_ai_pipeline(
+    gsh_async_repl *repl, const char *prompt, const char *command,
+    size_t command_length, const char *launch_directory)
+{
+    int cell;
+
+    if (repl == NULL || prompt == NULL || command == NULL ||
+        launch_directory == NULL) return -1;
+    cell = gsh_async_repl_accept_ai(repl, prompt, command, command_length,
+                                    launch_directory);
+    if (cell >= 0) repl->cells[cell].ai_pipeline = true;
+    return cell;
+}
+
+bool gsh_async_repl_cancel_active_ai(gsh_async_repl *repl)
+{
+    int index;
+
+    if (repl == NULL) return false;
+    for (index = 0; index < GSH_ASYNC_CELL_CAP; index++) {
+        gsh_async_cell *cell = &repl->cells[index];
+
+        if (!cell->occupied || !cell->ai || cell->pid <= 0 ||
+            (cell->state != GSH_ASYNC_RUNNING &&
+             cell->state != GSH_ASYNC_STOPPED)) continue;
+        if (cell->pgid > 0) (void)kill(-cell->pgid, SIGTERM);
+        else (void)kill(cell->pid, SIGTERM);
+        cell->state = GSH_ASYNC_CANCELLED;
+        repl->render_pending = true;
+        return true;
+    }
+    return false;
 }
 
 static int previous_cell(const gsh_async_repl *repl, uint64_t id)
@@ -250,7 +345,8 @@ static int previous_cell(const gsh_async_repl *repl, uint64_t id)
     for (index = 0; index < GSH_ASYNC_CELL_CAP; index++) {
         const gsh_async_cell *cell = &repl->cells[index];
 
-        if (cell->occupied && cell->id < id && cell->id > previous) {
+        if (cell->occupied && !cell->ai &&
+            cell->id < id && cell->id > previous) {
             previous = cell->id;
             selected = index;
         }
@@ -303,7 +399,8 @@ static bool earlier_cell_unsettled(const gsh_async_repl *repl, uint64_t id)
     for (index = 0; index < GSH_ASYNC_CELL_CAP; index++) {
         const gsh_async_cell *cell = &repl->cells[index];
 
-        if (cell->occupied && cell->id < id && !cell_terminal(cell)) {
+        if (cell->occupied && !cell->ai &&
+            cell->id < id && !cell_terminal(cell)) {
             return true;
         }
     }
@@ -375,6 +472,19 @@ bool gsh_async_repl_prompt_settled(const gsh_async_repl *repl)
     return true;
 }
 
+static bool ai_lane_busy(const gsh_async_repl *repl)
+{
+    int index;
+
+    if (repl == NULL) return false;
+    for (index = 0; index < GSH_ASYNC_CELL_CAP; index++) {
+        const gsh_async_cell *cell = &repl->cells[index];
+
+        if (cell->occupied && cell->ai && cell->pid > 0) return true;
+    }
+    return false;
+}
+
 int gsh_async_repl_next(gsh_async_repl *repl, bool state_lane_busy)
 {
     uint64_t selected_id = UINT64_MAX;
@@ -388,7 +498,7 @@ int gsh_async_repl_next(gsh_async_repl *repl, bool state_lane_busy)
         gsh_async_cell *cell = &repl->cells[index];
 
         if (!cell->occupied || cell->state != GSH_ASYNC_QUEUED ||
-            cell->id >= selected_id ||
+            cell->id >= selected_id || (cell->ai && ai_lane_busy(repl)) ||
             (!cell->control &&
              (gsh_async_repl_job_count(repl) >= GSH_ASYNC_JOB_CAP ||
               !cell_dependency_ready(repl, index) ||
@@ -618,9 +728,10 @@ int gsh_async_repl_reap(gsh_async_repl *repl, pid_t pid, int wait_status)
     }
     cell = &repl->cells[cell_index];
     cell->wait_status = wait_status;
-    cell->state = WIFEXITED(wait_status) && WEXITSTATUS(wait_status) == 0
-                      ? GSH_ASYNC_DONE
-                      : GSH_ASYNC_FAILED;
+    if (cell->state != GSH_ASYNC_CANCELLED)
+        cell->state = WIFEXITED(wait_status) && WEXITSTATUS(wait_status) == 0
+                          ? GSH_ASYNC_DONE
+                          : GSH_ASYNC_FAILED;
     cell->focused = false;
     cell->input_requested = false;
     cell->input_probe_pending = false;
@@ -795,9 +906,95 @@ static bool consume_active_escape(gsh_async_cell *cell,
     return true;
 }
 
+static unsigned char utf8_expected(unsigned char byte)
+{
+    if (byte >= 0xc2U && byte <= 0xdfU) return 2U;
+    if (byte >= 0xe0U && byte <= 0xefU) return 3U;
+    if (byte >= 0xf0U && byte <= 0xf4U) return 4U;
+    return 0U;
+}
+
+static bool utf8_continuation(const char bytes[4], unsigned char length,
+                              unsigned char byte)
+{
+    unsigned char lead;
+
+    if (bytes == NULL || length == 0U || (byte & 0xc0U) != 0x80U)
+        return false;
+    if (length != 1U) return true;
+    lead = (unsigned char)bytes[0];
+    return !((lead == 0xe0U && byte < 0xa0U) ||
+             (lead == 0xedU && byte > 0x9fU) ||
+             (lead == 0xf0U && byte < 0x90U) ||
+             (lead == 0xf4U && byte > 0x8fU));
+}
+
+static void reset_output_utf8(gsh_async_cell *cell)
+{
+    if (cell == NULL) return;
+    (void)memset(cell->output_utf8, 0, sizeof(cell->output_utf8));
+    cell->output_utf8_length = 0U;
+    cell->output_utf8_expected = 0U;
+}
+
+static void write_replacement_character(gsh_async_cell *cell)
+{
+    static const unsigned char replacement[] = {0xefU, 0xbfU, 0xbdU};
+
+    if (cell == NULL) return;
+    for (size_t index = 0U; index < sizeof(replacement); index++)
+        write_visible_byte(cell, replacement[index]);
+}
+
+/* ── UTF-8 Is Atomic Before C1 Control Filtering ──────────────
+ * A valid emoji contains continuation bytes in the raw C1 control range.
+ * Filtering one byte at a time therefore mistook its second byte for APC,
+ * discarded the suffix, and left terminals to render the lead as U+FFFD.
+ * A four-byte bounded accumulator now validates a complete scalar first.
+ * Encoded C1 controls remain hidden; malformed scalars become one replacement.
+ * Complete text then enters the existing retained-row writer unchanged.
+ * ─────────────────────────────────────────────── */
+static bool consume_output_utf8(gsh_async_cell *cell, unsigned char byte)
+{
+    unsigned char expected;
+
+    if (cell == NULL) return false;
+    if (cell->output_utf8_length != 0U) {
+        if (!utf8_continuation(cell->output_utf8,
+                               cell->output_utf8_length, byte)) {
+            write_replacement_character(cell);
+            reset_output_utf8(cell);
+            return false;
+        }
+        cell->output_utf8[cell->output_utf8_length++] = (char)byte;
+        if (cell->output_utf8_length == cell->output_utf8_expected) {
+            bool c1 = (unsigned char)cell->output_utf8[0] == 0xc2U &&
+                      (unsigned char)cell->output_utf8[1] <= 0x9fU;
+
+            if (!c1)
+                for (size_t index = 0U; index < sizeof(cell->output_utf8) &&
+                     index < cell->output_utf8_length; index++)
+                    write_visible_byte(
+                        cell, (unsigned char)cell->output_utf8[index]);
+            reset_output_utf8(cell);
+        }
+        return true;
+    }
+    expected = utf8_expected(byte);
+    if (expected == 0U) return false;
+    cell->output_utf8[0] = (char)byte;
+    cell->output_utf8_length = 1U;
+    cell->output_utf8_expected = expected;
+    return true;
+}
+
 static void append_terminal_byte(gsh_async_cell *cell, unsigned char byte)
 {
-    if (cell == NULL || consume_active_escape(cell, byte)) return;
+    if (cell == NULL) return;
+    if (cell->output_utf8_length != 0U &&
+        consume_output_utf8(cell, byte)) return;
+    if (consume_active_escape(cell, byte) ||
+        consume_output_utf8(cell, byte)) return;
     if (byte == 0x1bU) {
         cell->escape_state = 1U;
         cell->escape_sequence[0] = '\033';
@@ -931,6 +1128,10 @@ void gsh_async_repl_close_output(gsh_async_repl *repl, int cell_index)
         return;
     }
     cell = &repl->cells[cell_index];
+    if (cell->output_utf8_length != 0U) {
+        write_replacement_character(cell);
+        reset_output_utf8(cell);
+    }
     if (cell->pty_fd >= 0) {
         (void)close(cell->pty_fd);
         cell->pty_fd = -1;
@@ -1123,39 +1324,6 @@ static int fullscreen_emit(char *output, size_t output_capacity,
     return 0;
 }
 
-static unsigned char fullscreen_utf8_expected(unsigned char byte)
-{
-    if (byte >= 0xc2U && byte <= 0xdfU) {
-        return 2U;
-    }
-    if (byte >= 0xe0U && byte <= 0xefU) {
-        return 3U;
-    }
-    if (byte >= 0xf0U && byte <= 0xf4U) {
-        return 4U;
-    }
-    return 0U;
-}
-
-static bool fullscreen_utf8_continuation(const gsh_async_cell *cell,
-                                         unsigned char byte)
-{
-    unsigned char lead;
-
-    if (cell == NULL || cell->passthrough_utf8_length == 0U ||
-        (byte & 0xc0U) != 0x80U) {
-        return false;
-    }
-    if (cell->passthrough_utf8_length != 1U) {
-        return true;
-    }
-    lead = (unsigned char)cell->passthrough_utf8[0];
-    return !((lead == 0xe0U && byte < 0xa0U) ||
-             (lead == 0xedU && byte > 0x9fU) ||
-             (lead == 0xf0U && byte < 0x90U) ||
-             (lead == 0xf4U && byte > 0x8fU));
-}
-
 static int fullscreen_consume_utf8(gsh_async_cell *cell,
                                    unsigned char byte, char *output,
                                    size_t output_capacity, size_t *used,
@@ -1174,7 +1342,8 @@ static int fullscreen_consume_utf8(gsh_async_cell *cell,
         return -1;
     }
     if (cell->passthrough_utf8_length != 0U) {
-        if (fullscreen_utf8_continuation(cell, byte)) {
+        if (utf8_continuation(cell->passthrough_utf8,
+                              cell->passthrough_utf8_length, byte)) {
             cell->passthrough_utf8[cell->passthrough_utf8_length++] =
                 (char)byte;
             if (cell->passthrough_utf8_length ==
@@ -1194,7 +1363,7 @@ static int fullscreen_consume_utf8(gsh_async_cell *cell,
         cell->passthrough_utf8_length = 0;
         cell->passthrough_utf8_expected = 0;
     }
-    expected = fullscreen_utf8_expected(byte);
+    expected = utf8_expected(byte);
     if (expected == 0U) {
         return 0;
     }
@@ -1623,6 +1792,24 @@ static size_t push_view_row(gsh_async_repl *repl, const char *text,
     return row;
 }
 
+static size_t push_styled_view_row(
+    gsh_async_repl *repl, const char *text, size_t length,
+    const char active_style[GSH_ASYNC_ESCAPE_SEQUENCE_CAP],
+    size_t active_style_length)
+{
+    char styled[GSH_ASYNC_VIEW_BYTES * 4U +
+                GSH_ASYNC_ESCAPE_SEQUENCE_CAP];
+
+    if (repl == NULL || text == NULL || active_style == NULL ||
+        active_style_length > GSH_ASYNC_ESCAPE_SEQUENCE_CAP ||
+        length > sizeof(styled) - active_style_length) return SIZE_MAX;
+    if (active_style_length == 0U) return push_view_row(repl, text, length);
+    (void)memcpy(styled, active_style, active_style_length);
+    if (length != 0U)
+        (void)memcpy(styled + active_style_length, text, length);
+    return push_view_row(repl, styled, active_style_length + length);
+}
+
 static const char *resource_style(const gsh_resource_candidate *candidate)
 {
     if (candidate == NULL) return "\033[4m";
@@ -1759,7 +1946,10 @@ static size_t style_resource_row(gsh_async_repl *repl, int cell_index,
 
 static void push_resource_row(gsh_async_repl *repl, int cell_index,
                               size_t output_row, const char *text,
-                              size_t length)
+                              size_t length,
+                              const char active_style[
+                                  GSH_ASYNC_ESCAPE_SEQUENCE_CAP],
+                              size_t active_style_length)
 {
     char styled[GSH_ASYNC_VIEW_BYTES * 4U];
     gsh_resource_candidate candidates[16];
@@ -1768,17 +1958,19 @@ static void push_resource_row(gsh_async_repl *repl, int cell_index,
     size_t row;
     size_t index;
 
-    if (repl == NULL || text == NULL) return;
+    if (repl == NULL || text == NULL || active_style == NULL) return;
     if (!repl->actions_enabled) {
-        (void)push_view_row(repl, text, length);
+        (void)push_styled_view_row(repl, text, length, active_style,
+                                   active_style_length);
         return;
     }
     styled_length = style_resource_row(repl, cell_index, output_row,
                                        text, length,
                                        styled, sizeof(styled), candidates,
                                        &count);
-    row = push_view_row(repl, count == 0U ? text : styled,
-                        count == 0U ? length : styled_length);
+    row = push_styled_view_row(repl, count == 0U ? text : styled,
+                               count == 0U ? length : styled_length,
+                               active_style, active_style_length);
     if (row == SIZE_MAX) return;
     for (index = 0U; index < count; index++) {
         if (candidates[index].begin < repl->view_columns) {
@@ -1819,23 +2011,6 @@ static size_t editor_token_length(
         *active_style_length = token;
     }
     return token;
-}
-
-static size_t push_styled_editor_row(
-    gsh_async_repl *repl, const char *text, size_t length,
-    const char active_style[GSH_ASYNC_ESCAPE_SEQUENCE_CAP],
-    size_t active_style_length)
-{
-    char styled[GSH_ASYNC_VIEW_BYTES + GSH_ASYNC_ESCAPE_SEQUENCE_CAP];
-
-    if (repl == NULL || text == NULL || active_style == NULL ||
-        active_style_length > GSH_ASYNC_ESCAPE_SEQUENCE_CAP ||
-        length > sizeof(styled) - active_style_length) return SIZE_MAX;
-    if (active_style_length == 0U) return push_view_row(repl, text, length);
-    (void)memcpy(styled, active_style, active_style_length);
-    if (length != 0U)
-        (void)memcpy(styled + active_style_length, text, length);
-    return push_view_row(repl, styled, active_style_length + length);
 }
 
 static void record_editor_cursor(const gsh_async_repl *repl,
@@ -1931,14 +2106,84 @@ static int push_editor_rows(gsh_async_repl *repl, const char *prefix,
         if (!newline && source == total && columns >= repl->view_columns &&
             source == wanted_cursor)
             cursor_column = SIZE_MAX;
-        row = push_styled_editor_row(repl, combined + begin, source - begin,
-                                     row_style, row_style_length);
+        row = push_styled_view_row(repl, combined + begin, source - begin,
+                                   row_style, row_style_length);
         if (row == SIZE_MAX) return -1;
         record_editor_cursor(repl, cursor, row, cursor_column,
                              &cursor_recorded);
         if (newline) source++;
     } while (source < total || !cursor_recorded);
     return cursor_recorded ? 0 : -1;
+}
+
+static size_t output_segment_length(
+    const gsh_async_repl *repl, const char *text, size_t length,
+    char active_style[GSH_ASYNC_ESCAPE_SEQUENCE_CAP],
+    size_t *active_style_length)
+{
+    size_t source = 0U;
+    size_t columns = 0U;
+
+    if (repl == NULL || text == NULL || active_style == NULL ||
+        active_style_length == NULL) return 0U;
+    for (size_t tokens = 0U;
+         source < length && tokens < GSH_ASYNC_VIEW_BYTES; tokens++) {
+        size_t width;
+        size_t token;
+
+        if (source >= GSH_ASYNC_VIEW_BYTES - 1U) break;
+        token = editor_token_length(text, length, source, columns, &width,
+                                    active_style, active_style_length);
+        if (token == 0U || token > GSH_ASYNC_VIEW_BYTES - 1U - source)
+            break;
+        if (width > repl->view_columns) width = repl->view_columns;
+        if (columns != 0U && columns + width > repl->view_columns) break;
+        source += token;
+        columns += width;
+        if (columns >= repl->view_columns) break;
+    }
+    return source;
+}
+
+/* ── Logical Output Lines Become Retained Physical Rows ────────
+ * Captured PTYs retain logical lines so carriage return can rewrite them.
+ * The compositor once clipped each such line to one terminal width, losing
+ * every later byte from AI prose and ordinary command output. Rendering now
+ * divides the immutable line at UTF-8 and ANSI token boundaries. The active
+ * SGR style is replayed on continuation rows and the source remains unchanged.
+ * A fixed byte bound guarantees progress even for zero-width escape traffic.
+ * ─────────────────────────────────────────────── */
+static void push_output_line_rows(gsh_async_repl *repl,
+                                  const gsh_async_cell *cell,
+                                  int cell_index, size_t output_row,
+                                  const char *text, size_t length)
+{
+    char active_style[GSH_ASYNC_ESCAPE_SEQUENCE_CAP] = {0};
+    size_t active_style_length = 0U;
+    size_t source = 0U;
+
+    if (repl == NULL || cell == NULL || text == NULL) return;
+    if (length == 0U) {
+        push_resource_row(repl, cell_index, output_row, text, 0U,
+                          active_style, active_style_length);
+        return;
+    }
+    for (size_t row = 0U;
+         row < GSH_ASYNC_CELL_OUTPUT_CAP && source < length; row++) {
+        char row_style[GSH_ASYNC_ESCAPE_SEQUENCE_CAP] = {0};
+        size_t row_style_length = active_style_length;
+        size_t accepted;
+
+        if (row_style_length != 0U)
+            (void)memcpy(row_style, active_style, row_style_length);
+        accepted = output_segment_length(
+            repl, text + source, length - source, active_style,
+            &active_style_length);
+        if (accepted == 0U) break;
+        push_resource_row(repl, cell_index, output_row, text + source,
+                          accepted, row_style, row_style_length);
+        source += accepted;
+    }
 }
 
 static void push_output_rows(gsh_async_repl *repl,
@@ -1953,18 +2198,44 @@ static void push_output_rows(gsh_async_repl *repl,
 
     for (offset = 0; offset < cell->output_length; offset++) {
         if (cell->output[offset] == '\n') {
-            push_resource_row(repl, cell_index, output_row,
-                              cell->output + start,
-                              offset - start);
+            push_output_line_rows(repl, cell, cell_index, output_row,
+                                  cell->output + start, offset - start);
             start = offset + 1U;
             output_row++;
         }
     }
     if (start < cell->output_length) {
-        push_resource_row(repl, cell_index, output_row,
-                          cell->output + start,
-                          cell->output_length - start);
+        push_output_line_rows(repl, cell, cell_index, output_row,
+                              cell->output + start,
+                              cell->output_length - start);
     }
+}
+
+static void push_ai_header(gsh_async_repl *repl, const gsh_async_cell *cell)
+{
+    static const char frames[10][4] = {
+        "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"
+    };
+    char header[128];
+    editor_render_cursor ignored;
+    const char *label = "";
+    bool animated;
+    int length;
+
+    if (repl == NULL || cell == NULL) return;
+    animated = ai_cell_animated(cell);
+    if (!cell_terminal(cell) && cell->state != GSH_ASYNC_STOPPED) {
+        if (cell->ai_activity == GSH_LLM_STARTING && animated)
+            label = "\033[38;5;245m Starting...\033[0m";
+        else if (cell->ai_activity == GSH_LLM_CONFIRMATION)
+            label = "\033[38;5;245mAwaiting confirmation\033[0m";
+    }
+    length = snprintf(header, sizeof(header), "gsh ai> %s%s%s%s",
+        animated ? "\033[32m" : "",
+        animated ? frames[repl->ai_animation_frame % 10U] : "",
+        animated ? "\033[0m" : "", label);
+    if (length < 0 || (size_t)length >= sizeof(header)) return;
+    (void)push_editor_rows(repl, header, "", 0U, 0U, &ignored);
 }
 
 static void push_cell(gsh_async_repl *repl, const gsh_async_cell *cell,
@@ -1975,9 +2246,11 @@ static void push_cell(gsh_async_repl *repl, const gsh_async_cell *cell,
     if (cell == NULL || repl == NULL) {
         return;
     }
-    (void)push_editor_rows(repl, cell->prompt, cell->command,
-                           cell->command_length, cell->command_length,
-                           &ignored);
+    if (!cell->ai || cell->command_length != 0U)
+        (void)push_editor_rows(repl, cell->prompt, cell->command,
+                               cell->command_length, cell->command_length,
+                               &ignored);
+    if (cell->ai) push_ai_header(repl, cell);
     push_output_rows(repl, cell, cell_index);
     if (cell->output_truncated) {
         (void)push_view_row(repl, "[output truncated]", 18);
@@ -2039,77 +2312,6 @@ static int render_cursor(gsh_async_repl *repl, size_t row, size_t column)
     return render_append(repl, sequence, (size_t)length);
 }
 
-static int render_caret_mark(gsh_async_repl *repl, bool visible)
-{
-    static const char begin[] = "\033[0m\033[?25l";
-    static const char mark[] = "\342\227\217";
-    const char *text;
-    size_t length;
-
-    if (repl == NULL || !repl->caret_valid ||
-        repl->caret_screen_row == 0U || repl->caret_screen_column == 0U)
-        return -1;
-    text = visible ? mark : repl->caret_underlay;
-    length = visible ? sizeof(mark) - 1U : repl->caret_underlay_length;
-    if (render_append(repl, begin, sizeof(begin) - 1U) == -1 ||
-        render_cursor(repl, repl->caret_screen_row,
-                      repl->caret_screen_column) == -1 ||
-        render_append(repl, text, length) == -1 ||
-        render_cursor(repl, repl->caret_screen_row,
-                      repl->caret_screen_column) == -1) return -1;
-    return 0;
-}
-
-static void cache_editor_caret(gsh_async_repl *repl, const char *editor,
-                               size_t length, size_t offset,
-                               size_t column)
-{
-    size_t token;
-    size_t width;
-
-    if (repl == NULL || editor == NULL) return;
-    repl->caret_valid = false;
-    repl->caret_underlay_length = 0U;
-    if (!repl->caret_enabled || offset > length) return;
-    if (offset == length || editor[offset] == '\n' || editor[offset] == '\t') {
-        repl->caret_underlay[0] = ' ';
-        repl->caret_underlay_length = 1U;
-        repl->caret_valid = true;
-        return;
-    }
-    token = utf8_token_length(editor, length, offset);
-    width = display_token_width(editor, length, offset, column, token);
-    if (token == 0U || token > sizeof(repl->caret_underlay) || width != 1U)
-        return;
-    (void)memcpy(repl->caret_underlay, editor + offset, token);
-    repl->caret_underlay_length = token;
-    repl->caret_valid = true;
-}
-
-static int render_editor_caret(
-    gsh_async_repl *repl, const editor_render_cursor *editor_cursor)
-{
-    size_t screen_row;
-
-    if (repl == NULL || editor_cursor == NULL) return -1;
-    screen_row = repl->screen_row_by_view[editor_cursor->view_row];
-    repl->caret_screen_row = screen_row;
-    repl->caret_screen_column = editor_cursor->column + 1U;
-    if (!repl->caret_enabled || !repl->caret_valid) {
-        if (render_append(repl, "\033[?25h", 6U) == -1) return -1;
-        return screen_row == 0U
-                   ? 0 : render_cursor(repl, screen_row,
-                                       repl->caret_screen_column);
-    }
-    if (screen_row == 0U)
-        return render_append(repl, "\033[?25l", 6U);
-    if (!repl->caret_visible) {
-        if (render_append(repl, "\033[?25l", 6U) == -1) return -1;
-        return render_cursor(repl, screen_row, repl->caret_screen_column);
-    }
-    return render_caret_mark(repl, true);
-}
-
 static int render_clear_split(gsh_async_repl *repl,
                               size_t separator_column)
 {
@@ -2163,9 +2365,9 @@ static int compose_render(gsh_async_repl *repl,
      * Captured bytes become bounded logical rows before they reach this path.
      * Each refresh rebuilds one viewport from cells plus the mutable editor.
      * Alternate-screen ownership makes that redraw atomic to terminal users.
-     * Mouse reports prevent the terminal from creating native selections, so
-     * only an explicit actions setting may capture them.  With actions off,
-     * Page Up and Page Down retain access to the compositor's scrollback.
+     * Mouse reports prevent the terminal from creating native selections.
+     * Terminals commonly provide Shift or Option as a selection override;
+     * with actions off, Page Up and Page Down still expose the scrollback.
      * Unsupported child control sequences degrade to contained plain text.
      * ─────────────────────────────────────────────────────────────── */
     repl->render_length = 0;
@@ -2220,8 +2422,14 @@ static int compose_render(gsh_async_repl *repl,
             return -1;
         }
     }
-    return editor_cursor == NULL ? 0
-                                 : render_editor_caret(repl, editor_cursor);
+    if (editor_cursor != NULL) {
+        size_t screen_row = repl->screen_row_by_view[editor_cursor->view_row];
+
+        if (screen_row != 0U &&
+            render_cursor(repl, screen_row, editor_cursor->column + 1U) ==
+                -1) return -1;
+    }
+    return 0;
 }
 
 static int push_completion_rows(gsh_async_repl *repl,
@@ -2280,33 +2488,12 @@ int gsh_async_repl_prepare_render_with_completion(
     }
     if (push_editor_rows(repl, active_prompt, editor, editor_length,
                          editor_cursor, &cursor) == -1 ||
-        push_completion_rows(repl, completion, completion_length) == -1) {
+        push_completion_rows(repl, completion, completion_length) == -1 ||
+        compose_render(repl, &cursor) == -1) {
         return -1;
     }
-    cache_editor_caret(repl, editor, editor_length, editor_cursor,
-                       cursor.column);
-    if (compose_render(repl, &cursor) == -1) return -1;
     repl->alternate_screen_entered = true;
     return 0;
-}
-
-int gsh_async_repl_prepare_caret_patch(gsh_async_repl *repl,
-                                       bool visible)
-{
-    if (repl == NULL || !repl->enabled) {
-        errno = EINVAL;
-        return -1;
-    }
-    repl->render_length = 0U;
-    repl->caret_visible = visible;
-    if (!repl->caret_enabled) {
-        if (render_append(repl, "\033[?25h", 6U) == -1) return -1;
-        return repl->caret_screen_row == 0U
-                   ? 0 : render_cursor(repl, repl->caret_screen_row,
-                                       repl->caret_screen_column);
-    }
-    if (!repl->caret_valid || repl->caret_screen_row == 0U) return 0;
-    return render_caret_mark(repl, visible);
 }
 
 int gsh_async_repl_prepare_render(gsh_async_repl *repl,

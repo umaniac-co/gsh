@@ -25,11 +25,16 @@ endif
 
 BUILD_DIR ?= build
 TARGET := $(BUILD_DIR)/gsh
+LLM_WORKER_TARGET := $(BUILD_DIR)/gsh-llm-worker
+SETUP_TARGET := $(BUILD_DIR)/gsh-setup
+CURL_CFLAGS ?= $(shell curl-config --cflags 2>/dev/null)
+CURL_LIBS ?= $(shell curl-config --libs 2>/dev/null)
 CORE_SOURCES := src/gsh.c src/async_repl.c src/posix_lexer.c \
 	src/posix_parser.c src/native_plan.c \
 	src/completion.c \
 	src/source_workspace.c \
 	src/history_file.c src/history_store.c src/shell_config.c \
+	src/llm_journal.c src/llm_repl.c \
 	src/shell_variables.c src/builtin_common.c src/builtin_registry.c \
 	src/builtin_pure.c src/builtin_stateful.c src/builtin_fc.c \
 	src/builtin_files.c src/git_listing.c \
@@ -69,6 +74,10 @@ ALIAS_TEST_TARGET := $(BUILD_DIR)/shell-aliases-test
 FUNCTION_TEST_TARGET := $(BUILD_DIR)/shell-functions-test
 FUNCTION_SANITIZE_TEST_TARGET := $(BUILD_DIR)/shell-functions-test-sanitize
 CONFIG_TEST_TARGET := $(BUILD_DIR)/shell-config-test
+LLM_JSON_TEST_TARGET := $(BUILD_DIR)/llm-json-test
+LLM_JOURNAL_TEST_TARGET := $(BUILD_DIR)/llm-journal-test
+LLM_HARDWARE_TEST_TARGET := $(BUILD_DIR)/llm-hardware-test
+LLM_WORKER_TEST_TARGET := $(BUILD_DIR)/llm-worker-test
 FILE_BUILTINS_TEST_TARGET := $(BUILD_DIR)/file-builtins-test
 FILE_BUILTINS_SANITIZE_TEST_TARGET := $(BUILD_DIR)/file-builtins-test-sanitize
 RESOURCE_ACTIONS_TEST_TARGET := $(BUILD_DIR)/resource-actions-test
@@ -76,12 +85,15 @@ RESOURCE_ACTIONS_SANITIZE_TEST_TARGET := $(BUILD_DIR)/resource-actions-test-sani
 SOURCE_WORKSPACE_TEST_TARGET := $(BUILD_DIR)/source-workspace-test
 SHELL_TRAPS_TEST_TARGET := $(BUILD_DIR)/shell-traps-test
 SHELL_TRAPS_SANITIZE_TEST_TARGET := $(BUILD_DIR)/shell-traps-test-sanitize
-QUALITY_TARGETS := $(TARGET) $(TEST_TARGET) \
+QUALITY_TARGETS := $(TARGET) $(LLM_WORKER_TARGET) $(SETUP_TARGET) $(TEST_TARGET) \
 	$(BENCHMARK_REPORT_TEST_TARGET) $(PROBE_TARGET) $(FAULT_TARGET) \
 	$(FUZZ_SMOKE_TARGET) $(POLICY_TARGET) $(CONFORMANCE_TARGET) \
 	$(VARIABLE_TEST_TARGET) $(COMMAND_CACHE_TEST_TARGET) \
 	$(POSITIONAL_TEST_TARGET) $(BACKGROUND_TEST_TARGET) \
 	$(ALIAS_TEST_TARGET) $(FUNCTION_TEST_TARGET) $(CONFIG_TEST_TARGET) \
+	$(LLM_JSON_TEST_TARGET) $(LLM_JOURNAL_TEST_TARGET) \
+	$(LLM_HARDWARE_TEST_TARGET) \
+	$(LLM_WORKER_TEST_TARGET) \
 	$(FILE_BUILTINS_TEST_TARGET) $(RESOURCE_ACTIONS_TEST_TARGET) \
 	$(SOURCE_WORKSPACE_TEST_TARGET) $(SHELL_TRAPS_TEST_TARGET)
 QUALITY_MAPS := $(addsuffix .map,$(QUALITY_TARGETS))
@@ -112,12 +124,12 @@ BENCH_REVISION := $(shell revision=$$(git rev-parse --short=12 HEAD \
 	--untracked-files=normal -- Makefile README.md CODE.md src tests \
 	2>/dev/null)"; then printf '%s-dirty' "$$revision"; else \
 	printf '%s' "$$revision"; fi)
-.PHONY: all analyze bench bench-record bench-alias bench-alias-record check check-benchmark-report check-fault check-resource check-sanitize clean
-.PHONY: check-aliases check-background check-command-cache check-config check-file-builtins check-functions check-positionals check-resource-actions check-source-workspaces check-traps check-variables conformance fuzz-libfuzzer fuzz-pty fuzz-pty-sanitize fuzz-sanitize
+.PHONY: all analyze bench bench-record bench-alias bench-alias-record check check-benchmark-report check-fault check-resource check-sanitize clean install
+.PHONY: check-aliases check-background check-command-cache check-config check-file-builtins check-functions check-llm check-positionals check-resource-actions check-source-workspaces check-traps check-variables conformance fuzz-libfuzzer fuzz-pty fuzz-pty-sanitize fuzz-sanitize
 .PHONY: fuzz-smoke fuzz-libfuzzer-linux policy quality quality-callgraph quality-compilers quality-dependencies quality-includes quality-linux quality-maps soak
 .PHONY: verify-fast
 
-all: $(TARGET)
+all: $(TARGET) $(LLM_WORKER_TARGET) $(SETUP_TARGET)
 
 define generate_dependencies
 	@$(CC) $(CPPFLAGS) $(CFLAGS) $(2) -MM -MP -MT '$@' $(1) \
@@ -127,7 +139,7 @@ endef
 
 -include $(wildcard $(DEPENDENCY_FILES))
 
-$(TARGET) $(TEST_TARGET) \
+$(TARGET) $(LLM_WORKER_TARGET) $(SETUP_TARGET) $(TEST_TARGET) \
 	$(BENCHMARK_REPORT_TEST_TARGET) $(PROBE_TARGET) $(FAULT_TARGET) \
 	$(SANITIZE_TARGET) $(FUZZ_SMOKE_TARGET) $(FUZZ_TARGET) \
 	$(POLICY_TARGET) $(CONFORMANCE_TARGET) $(VARIABLE_TEST_TARGET) \
@@ -135,6 +147,9 @@ $(TARGET) $(TEST_TARGET) \
 	$(POSITIONAL_TEST_TARGET) $(BACKGROUND_TEST_TARGET) \
 	$(ALIAS_TEST_TARGET) $(FUNCTION_TEST_TARGET) \
 		$(FUNCTION_SANITIZE_TEST_TARGET) $(CONFIG_TEST_TARGET) \
+		$(LLM_JSON_TEST_TARGET) $(LLM_JOURNAL_TEST_TARGET) \
+		$(LLM_HARDWARE_TEST_TARGET) \
+		$(LLM_WORKER_TEST_TARGET) \
 		$(FILE_BUILTINS_TEST_TARGET) $(RESOURCE_ACTIONS_TEST_TARGET) \
 		$(FILE_BUILTINS_SANITIZE_TEST_TARGET) \
 		$(RESOURCE_ACTIONS_SANITIZE_TEST_TARGET) \
@@ -177,6 +192,22 @@ $(RESOURCE_ACTIONS_SANITIZE_TEST_TARGET): tests/resource_actions_test.c \
 $(TARGET): $(SOURCES) | $(BUILD_DIR)
 	$(call generate_dependencies,$(SOURCES))
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(SOURCES) $(LDFLAGS) \
+		$(AUDIT_LDFLAGS) -o $@
+
+$(LLM_WORKER_TARGET): src/llm_worker.c src/llm_json.c src/llm_journal.c src/llm_repl.c \
+		src/llm_command_policy.c src/posix_lexer.c src/posix_parser.c src/shell_config.c | $(BUILD_DIR)
+	$(call generate_dependencies,src/llm_worker.c src/llm_json.c src/llm_journal.c src/llm_repl.c src/llm_command_policy.c src/posix_lexer.c src/posix_parser.c src/shell_config.c,$(CURL_CFLAGS))
+	$(CC) $(CPPFLAGS) $(CURL_CFLAGS) $(CFLAGS) src/llm_worker.c \
+		src/llm_json.c src/llm_journal.c src/llm_repl.c src/shell_config.c \
+		src/llm_command_policy.c src/posix_lexer.c src/posix_parser.c \
+		$(LDFLAGS) $(CURL_LIBS) $(AUDIT_LDFLAGS) -o $@
+
+$(SETUP_TARGET): src/gsh_setup.c src/llm_hardware.c src/llm_json.c \
+		src/shell_config.c | $(BUILD_DIR)
+	$(call generate_dependencies,src/gsh_setup.c src/llm_hardware.c src/llm_json.c src/shell_config.c,$(CURL_CFLAGS))
+	$(CC) $(CPPFLAGS) $(CURL_CFLAGS) $(CFLAGS) src/gsh_setup.c \
+		src/llm_hardware.c src/llm_json.c src/shell_config.c \
+		$(LDFLAGS) $(CURL_LIBS) \
 		$(AUDIT_LDFLAGS) -o $@
 
 $(TEST_TARGET): $(TEST_SOURCES) tests/benchmark_report.h | $(BUILD_DIR)
@@ -294,6 +325,30 @@ $(CONFIG_TEST_TARGET): tests/shell_config_test.c src/shell_config.c | $(BUILD_DI
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/shell_config_test.c \
 		src/shell_config.c $(LDFLAGS) $(AUDIT_LDFLAGS) -o $@
 
+$(LLM_JSON_TEST_TARGET): tests/llm_json_test.c src/llm_json.c | $(BUILD_DIR)
+	$(call generate_dependencies,tests/llm_json_test.c src/llm_json.c)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/llm_json_test.c src/llm_json.c \
+		$(LDFLAGS) $(AUDIT_LDFLAGS) -o $@
+
+$(LLM_JOURNAL_TEST_TARGET): tests/llm_journal_test.c \
+		src/llm_journal.c | $(BUILD_DIR)
+	$(call generate_dependencies,tests/llm_journal_test.c src/llm_journal.c)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/llm_journal_test.c \
+		src/llm_journal.c $(LDFLAGS) $(AUDIT_LDFLAGS) -o $@
+
+$(LLM_HARDWARE_TEST_TARGET): tests/llm_hardware_test.c \
+		src/llm_hardware.c | $(BUILD_DIR)
+	$(call generate_dependencies,tests/llm_hardware_test.c src/llm_hardware.c)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/llm_hardware_test.c \
+		src/llm_hardware.c $(LDFLAGS) $(AUDIT_LDFLAGS) -o $@
+
+$(LLM_WORKER_TEST_TARGET): tests/llm_worker_test.c src/llm_json.c \
+		src/llm_command_policy.c src/posix_lexer.c src/posix_parser.c | $(BUILD_DIR)
+	$(call generate_dependencies,tests/llm_worker_test.c src/llm_json.c src/llm_command_policy.c src/posix_lexer.c src/posix_parser.c)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/llm_worker_test.c src/llm_json.c \
+		src/llm_command_policy.c src/posix_lexer.c src/posix_parser.c \
+		$(LDFLAGS) $(AUDIT_LDFLAGS) -o $@
+
 $(SOURCE_WORKSPACE_TEST_TARGET): tests/source_workspace_test.c \
 		src/source_workspace.c src/shell_aliases.c \
 		src/shell_functions.c | $(BUILD_DIR)
@@ -346,6 +401,9 @@ check-sanitize: $(SANITIZE_TARGET) \
 		$(abspath $(FILE_BUILTINS_SANITIZE_TEST_TARGET))
 	ASAN_OPTIONS=abort_on_error=1 UBSAN_OPTIONS=halt_on_error=1 \
 		$(abspath $(RESOURCE_ACTIONS_SANITIZE_TEST_TARGET))
+	ASAN_OPTIONS=abort_on_error=1 UBSAN_OPTIONS=halt_on_error=1 \
+		$(MAKE) -j1 CC=$(FUZZ_CC) BUILD_DIR=$(BUILD_DIR)/llm-sanitize \
+		CFLAGS='$(CFLAGS) -O1 -g -fsanitize=address,undefined' check-llm
 
 fuzz-smoke: $(FUZZ_SMOKE_TARGET)
 	$(abspath $(FUZZ_SMOKE_TARGET)) $(FUZZ_CASES)
@@ -417,10 +475,10 @@ quality-linux:
 		test "$$(uname -m)" = x86_64; \
 		make -j1 CC=gcc BUILD_DIR=/tmp/gsh-gcc \
 			policy quality-dependencies quality-includes quality-maps \
-			conformance; \
+			conformance check-llm; \
 		make -j1 CC=clang BUILD_DIR=/tmp/gsh-clang \
 			policy quality-dependencies quality-includes quality-maps \
-			conformance'
+			conformance check-llm'
 
 quality-dependencies: $(QUALITY_TARGETS)
 	@failed=0; checked=0; \
@@ -550,6 +608,15 @@ check-functions: $(FUNCTION_TEST_TARGET)
 check-config: $(CONFIG_TEST_TARGET)
 	$(abspath $(CONFIG_TEST_TARGET))
 
+check-llm: $(TARGET) $(LLM_WORKER_TARGET) $(LLM_JSON_TEST_TARGET) \
+		$(LLM_JOURNAL_TEST_TARGET) $(LLM_HARDWARE_TEST_TARGET) \
+		$(LLM_WORKER_TEST_TARGET)
+	$(abspath $(LLM_JSON_TEST_TARGET))
+	$(abspath $(LLM_JOURNAL_TEST_TARGET))
+	$(abspath $(LLM_HARDWARE_TEST_TARGET))
+	$(abspath $(LLM_WORKER_TEST_TARGET)) $(abspath $(LLM_WORKER_TARGET)) \
+		$(abspath $(TARGET))
+
 check-file-builtins: $(FILE_BUILTINS_TEST_TARGET)
 	$(abspath $(FILE_BUILTINS_TEST_TARGET))
 
@@ -577,6 +644,7 @@ verify-fast:
 	$(MAKE) -j1 check-positionals
 	$(MAKE) -j1 check-background
 	$(MAKE) -j1 check-config
+	$(MAKE) -j1 check-llm
 	$(MAKE) -j1 check-source-workspaces
 	$(MAKE) -j1 check-traps
 	$(MAKE) -j1 check-benchmark-report
@@ -615,8 +683,25 @@ $(PERFORMANCE_DIR):
 $(BUILD_DIR):
 	mkdir -p $@
 
+PREFIX ?= $(HOME)/.local
+BINDIR ?= $(PREFIX)/bin
+
+install: all
+	install -d "$(DESTDIR)$(BINDIR)"
+	install -m 0755 $(TARGET) "$(DESTDIR)$(BINDIR)/gsh"
+	install -m 0755 $(LLM_WORKER_TARGET) \
+		"$(DESTDIR)$(BINDIR)/gsh-llm-worker"
+	install -m 0755 $(SETUP_TARGET) "$(DESTDIR)$(BINDIR)/gsh-setup"
+	@if test -n "$(DESTDIR)" || ! test -t 0 || ! test -t 1; then \
+		printf '%s\n' 'Run $(BINDIR)/gsh-setup to configure an inference server.'; \
+	elif test "$$(id -u)" -eq 0; then \
+		printf '%s\n' 'Installation complete. Run $(BINDIR)/gsh-setup without sudo to configure your user account.'; \
+	else \
+		"$(BINDIR)/gsh-setup"; \
+	fi
+
 clean:
-	rm -f $(TARGET) $(TEST_TARGET) $(PROBE_TARGET) $(FAULT_TARGET)
+	rm -f $(TARGET) $(LLM_WORKER_TARGET) $(SETUP_TARGET) $(TEST_TARGET) $(PROBE_TARGET) $(FAULT_TARGET)
 	rm -f $(SANITIZE_TARGET) $(FUZZ_SMOKE_TARGET) $(FUZZ_TARGET) $(POLICY_TARGET)
 	rm -f $(CONFORMANCE_TARGET)
 	rm -f $(VARIABLE_TEST_TARGET)
@@ -626,6 +711,10 @@ clean:
 	rm -f $(POSITIONAL_TEST_TARGET)
 	rm -f $(BACKGROUND_TEST_TARGET)
 	rm -f $(CONFIG_TEST_TARGET)
+	rm -f $(LLM_JSON_TEST_TARGET)
+	rm -f $(LLM_JOURNAL_TEST_TARGET)
+	rm -f $(LLM_HARDWARE_TEST_TARGET)
+	rm -f $(LLM_WORKER_TEST_TARGET)
 	rm -f $(SOURCE_WORKSPACE_TEST_TARGET)
 	rm -f $(SHELL_TRAPS_TEST_TARGET)
 	rm -f $(SHELL_TRAPS_SANITIZE_TEST_TARGET)

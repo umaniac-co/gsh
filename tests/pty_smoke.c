@@ -17,7 +17,6 @@
 #include <dirent.h> /* CANON-INCLUDE: linux */
 #include <errno.h>
 #include <fcntl.h>
-#include <limits.h> /* CANON-INCLUDE: linux */
 #include <locale.h>
 #include <poll.h>
 #include <pwd.h>
@@ -397,8 +396,19 @@ static const unsigned char *consume_colored_prompt_text(
     cursor += style_length;
     for (turn = 0U; turn < CAPTURE_CAP && cursor < limit; turn++) {
         if ((size_t)(limit - cursor) >= sizeof(reset) - 1U &&
-            memcmp(cursor, reset, sizeof(reset) - 1U) == 0)
-            return cursor + sizeof(reset) - 1U;
+            memcmp(cursor, reset, sizeof(reset) - 1U) == 0) {
+            const unsigned char *end = cursor + sizeof(reset) - 1U;
+            const unsigned char *next = end;
+
+            if (next < limit && *next == '\r') next++;
+            if (next < limit && *next == '\n' &&
+                (size_t)(limit - next - 1U) >= style_length &&
+                memcmp(next + 1U, style, style_length) == 0) {
+                cursor = next + 1U + style_length;
+                continue;
+            }
+            return end;
+        }
         cursor++;
     }
     return NULL;
@@ -408,27 +418,23 @@ static const unsigned char *consume_prompt_suffix(
     const unsigned char *cursor, const unsigned char *limit, bool busy)
 {
     static const char muted[] = "\033[38;5;245m";
-    static const char yellow[] = "\033[38;5;221m";
-    static const char reset[] = "\033[0m";
+    const char *visible = busy ? "gsh*> " : "gsh$> ";
+    size_t matched = 0U;
 
     if (cursor == NULL || limit == NULL || cursor > limit ||
-        (size_t)(limit - cursor) < sizeof(muted) - 1U + 4U ||
+        (size_t)(limit - cursor) < sizeof(muted) - 1U ||
         memcmp(cursor, muted, sizeof(muted) - 1U) != 0) return NULL;
     cursor += sizeof(muted) - 1U;
-    if (memcmp(cursor, "gsh", 3U) != 0) return NULL;
-    cursor += 3U;
-    if (busy) {
-        if ((size_t)(limit - cursor) < sizeof(yellow) ||
-            memcmp(cursor, yellow, sizeof(yellow) - 1U) != 0) return NULL;
-        cursor += sizeof(yellow) - 1U;
-        if (*cursor++ != '*') return NULL;
-    } else if (*cursor++ != '$') {
-        return NULL;
+    for (size_t turn = 0U; turn < 128U && cursor < limit; turn++) {
+        size_t sgr = test_sgr_length(cursor, limit);
+
+        if (sgr != 0U) { cursor += sgr; continue; }
+        if (*cursor == '\r' || *cursor == '\n') { cursor++; continue; }
+        if (*cursor++ != (unsigned char)visible[matched]) return NULL;
+        matched++;
+        if (visible[matched] == '\0') return cursor;
     }
-    if ((size_t)(limit - cursor) < sizeof(reset) - 1U + 2U ||
-        memcmp(cursor, reset, sizeof(reset) - 1U) != 0) return NULL;
-    cursor += sizeof(reset) - 1U;
-    return cursor[0] == '>' && cursor[1] == ' ' ? cursor + 2U : NULL;
+    return NULL;
 }
 
 static const unsigned char *consume_prompt_alias(
@@ -473,6 +479,12 @@ static bool output_start_possible(unsigned char byte, const char *needle)
             memcmp(needle, "gsh* ", 5U) == 0);
 }
 
+/* ── Terminal Evidence Must Match Every Visible Byte ───────────
+ * Styled diagnostics need an ANSI-aware comparison after raw matching fails.
+ * Advancing the expected offset before comparing the final byte once accepted
+ * a wrong counter value as success and could release a PTY wait too early.
+ * Only a verified byte advances the match; truncated or unequal tails fail.
+ * ─────────────────────────────────────────────────────────────── */
 static output_match find_output(const unsigned char *haystack,
                                 size_t haystack_length,
                                 const char *needle)
@@ -509,8 +521,10 @@ static output_match find_output(const unsigned char *haystack,
             }
             sgr = test_sgr_length(cursor, limit);
             if (sgr != 0U) { cursor += sgr; continue; }
-            if (cursor >= limit || *cursor++ != (unsigned char)needle[wanted++])
+            if (cursor >= limit || *cursor != (unsigned char)needle[wanted])
                 break;
+            cursor++;
+            wanted++;
         }
         if (wanted == needle_length) {
             match.begin = haystack + start;
@@ -590,6 +604,47 @@ static bool capture_contains(const pty_session *session, const char *text)
     }
     return find_terminal_output(session->capture, session->capture_length,
                                 text).begin != NULL;
+}
+
+static bool terminal_output_matching_cases(void)
+{
+    static const unsigned char exact[] = "v\033[31malue\033[0m!";
+    static const unsigned char mismatch[] = "v\033[31malue\033[0mX";
+
+    return require(find_terminal_output(exact, sizeof(exact) - 1U,
+                                         "value!").begin != NULL) &&
+           require(find_terminal_output(mismatch, sizeof(mismatch) - 1U,
+                                         "value!").begin == NULL) &&
+           require(find_terminal_output(exact, sizeof(exact) - 2U,
+                                         "value!").begin == NULL);
+}
+
+/* ── Wrapped Prompt Fields Still Form One Prompt ──────────────────
+ * Hosted runner names can force the colored identity or directory to wrap.
+ * The compositor resets and resumes that field's style across the row break.
+ * Prompt aliases must consume the resumed field before checking its suffix,
+ * which can also span rows. Busy state and following edit bytes remain exact.
+ * ─────────────────────────────────────────────────────────────── */
+static bool wrapped_prompt_matching_cases(void)
+{
+    static const unsigned char wrapped[] =
+        "DONE\r\n\033[38;5;114mrunner@long\033[0m\n"
+        "\033[38;5;114mhost\033[0m \033[38;5;75m/private/tm\033[0m\n"
+        "\033[38;5;75mp/fixture\033[0m \033[38;5;245mgsh$\033[0m> EDIT";
+    static const unsigned char suffix[] =
+        "\033[38;5;245mgs\033[0m\n\033[38;5;245mh"
+        "\033[38;5;221m*\033[0m>\r\n EDIT";
+
+    return require(find_terminal_output(wrapped, sizeof(wrapped) - 1U,
+                                         "DONE\r\ngsh$ EDIT").begin != NULL) &&
+           require(find_terminal_output(wrapped, sizeof(wrapped) - 1U,
+                                         "DONE\r\ngsh* EDIT").begin == NULL) &&
+           require(find_terminal_output(wrapped, sizeof(wrapped) - 1U,
+                                         "DONE\r\ngsh$ EDIX").begin == NULL) &&
+           require(find_terminal_output(suffix, sizeof(suffix) - 1U,
+                                         "gsh* EDIT").begin != NULL) &&
+           require(find_terminal_output(suffix, sizeof(suffix) - 1U,
+                                         "gsh$ EDIT").begin == NULL);
 }
 
 static bool capture_ordered(const pty_session *session, const char *first,
@@ -1336,7 +1391,7 @@ static int start_managed_actions_session(pty_session *session,
     static const char configuration[] =
         "config.version = 1\n"
         "shell.history.enabled = false\n"
-        "terminal.actions = on\n";
+        "terminal.actions = auto\n";
     char path[PATH_MAX];
     int result;
 
@@ -1860,14 +1915,19 @@ static int exercise_editor_navigation(pty_session *session,
         return -1;
     }
     if (extended_completion &&
-        (send_text(session, "echo $PA") == -1 ||
+        (send_text(session,
+                   "GSH_TAB_VAR_ALPHA=one GSH_TAB_VAR_BETA=two\r") == -1 ||
+         consume_through(session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
+         send_text(session, "echo $GSH_TAB_VAR_") == -1 ||
          send_bytes(session, "\t", 1U) == -1 ||
-         consume_through(session, "$PAGER", TEST_TIMEOUT_MS) == -1 ||
-         consume_through(session, "$PATH", TEST_TIMEOUT_MS) == -1 ||
+         consume_through(session, "$GSH_TAB_VAR_ALPHA", TEST_TIMEOUT_MS) == -1 ||
+         consume_through(session, "$GSH_TAB_VAR_BETA", TEST_TIMEOUT_MS) == -1 ||
          send_bytes(session, "\t", 1U) == -1 ||
-         consume_through(session, "echo $PAGER", TEST_TIMEOUT_MS) == -1 ||
+         consume_through(session, "echo $GSH_TAB_VAR_ALPHA",
+                         TEST_TIMEOUT_MS) == -1 ||
          send_bytes(session, "\t", 1U) == -1 ||
-         consume_through(session, "echo $PATH", TEST_TIMEOUT_MS) == -1 ||
+         consume_through(session, "echo $GSH_TAB_VAR_BETA",
+                         TEST_TIMEOUT_MS) == -1 ||
          send_bytes(session, "\025", 1U) == -1 ||
          consume_through(session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
          send_text(session, "git sta") == -1 ||
@@ -2743,14 +2803,15 @@ static int managed_repl_launch_state_fence(pty_session *session)
 
 static int managed_repl_native_resources(pty_session *session)
 {
-    static const char filename[] = "name with space.py";
+    static const char styled[] =
+        "\033[4;38;5;81mname with space.py\033[0m";
     static const char mouse_capture[] = "\033[?1000h";
     if (session == NULL) return -1;
     session->capture_length = 0U;
     if (send_text(session, "ls -1\r") == -1 ||
-        wait_for_output(session, filename, TEST_TIMEOUT_MS) == -1 ||
+        wait_for_output(session, styled, TEST_TIMEOUT_MS) == -1 ||
         wait_for_output(session, "gsh$", TEST_TIMEOUT_MS) == -1 ||
-        capture_contains(session, mouse_capture)) return -1;
+        !capture_contains(session, mouse_capture)) return -1;
     return 0;
 }
 
@@ -2778,6 +2839,9 @@ static void cleanup_resource_action_fixture(resource_action_fixture *fixture)
 static int setup_resource_action_fixture(resource_action_fixture *fixture,
                                          const char *executable)
 {
+    static const char first_source[] =
+        "\tABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwx\n"
+        "print('resource')\n";
     char test_path[PATH_MAX * 2U];
     if (fixture == NULL || executable == NULL) return -1;
     (void)memset(fixture, 0, sizeof(*fixture));
@@ -2787,7 +2851,7 @@ static int setup_resource_action_fixture(resource_action_fixture *fixture,
         snprintf(fixture->first, sizeof(fixture->first), "%s/%s",
                  fixture->directory, "name with space.py") >=
             (int)sizeof(fixture->first) ||
-        write_text_file(fixture->first, "print('resource')\n", 0600) == -1 ||
+        write_text_file(fixture->first, first_source, 0600) == -1 ||
         snprintf(fixture->second, sizeof(fixture->second), "%s/%s",
                  fixture->directory, "second.py") >=
             (int)sizeof(fixture->second) ||
@@ -2812,27 +2876,104 @@ static int setup_resource_action_fixture(resource_action_fixture *fixture,
     return 0;
 }
 
+static size_t captured_cursor_sequence(const unsigned char *text,
+                                       size_t length, size_t *row)
+{
+    size_t number = 0U;
+    bool first = true;
+
+    if (text == NULL || row == NULL || length < 3U) return 0U;
+    if (text[0] != 0x1bU || text[1] != '[') return 0U;
+    for (size_t index = 2U; index < length && index < 64U; index++) {
+        unsigned char byte = text[index];
+
+        if (byte >= 0x40U && byte <= 0x7eU) {
+            if (byte == 'H' || byte == 'f') *row = number == 0U ? 1U : number;
+            return index + 1U;
+        }
+        if (first && byte >= '0' && byte <= '9') {
+            if (number > 999U) return 0U;
+            number = number * 10U + (size_t)(byte - '0');
+        } else first = false;
+    }
+    return 0U;
+}
+
+/* ── Resource Clicks Follow the Rendered Rows ─────────────────────
+ * Host and account names change prompt wrapping when a preview narrows it.
+ * Fixed mouse coordinates therefore selected empty rows on Linux runners.
+ * The compositor emits explicit rows and cursor positions in each frame;
+ * read that evidence to locate the styled resource in the latest redraw.
+ * This keeps the test independent of both host identity and prompt width.
+ * ─────────────────────────────────────────────────────────────── */
+static int format_resource_click(const pty_session *session,
+                                  const char *marker, char output[64])
+{
+    size_t row = 1U;
+    size_t found = 0U;
+    size_t length;
+    int written;
+
+    if (session == NULL || marker == NULL || output == NULL) return -1;
+    if (session->capture_length > CAPTURE_CAP) return -1;
+    length = strlen(marker);
+    if (length == 0U || length > session->capture_length) return -1;
+    for (size_t offset = 0U; offset < session->capture_length; offset++) {
+        const unsigned char *text = session->capture + offset;
+        size_t remaining = session->capture_length - offset;
+        size_t sequence;
+
+        if (remaining >= 4U && memcmp(text, "\033[2J", 4U) == 0) found = 0U;
+        if (remaining >= length && memcmp(text, marker, length) == 0)
+            found = row;
+        sequence = captured_cursor_sequence(text, remaining, &row);
+        if (sequence != 0U) offset += sequence - 1U;
+        else if (*text == '\n') row++;
+    }
+    if (found == 0U || found > 9999U) return -1;
+    written = snprintf(output, 64U, "\033[<0;2;%zuM", found);
+    return written > 0 && written < 64 ? 0 : -1;
+}
+
+static int click_rendered_resource(pty_session *session, const char *marker)
+{
+    char click[64];
+
+    if (session == NULL || marker == NULL) return -1;
+    if (format_resource_click(session, marker, click) == -1) return -1;
+    return send_text(session, click);
+}
+
 static int open_and_replace_resource_preview(pty_session *session, int *stage)
 {
     static const char styled[] =
         "\033[4;38;5;81mname with space.py\033[0m";
-    static const char click[] = "\033[<0;2;2M";
-    static const char replacement_click[] = "\033[<0;2;4M";
+    static const char replacement[] = "\033[4;38;5;81msecond.py\033[0m";
+    char replacement_click[64];
     static const char split_origin[] = "\033[1;50H";
+    static const char wheel_down[] = "\033[<65;80;2M";
+    static const char bounded_tab_row[] =
+        "    ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstu\033[K";
     if (session == NULL || stage == NULL) return -1;
     if (resize_session(session, 24U, 110U) == -1 ||
         consume_through(session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(session, "ls -1\r") == -1 ||
         wait_for_output(session, styled, TEST_TIMEOUT_MS) == -1) return -1;
     *stage = 1;
-    if (send_text(session, click) == -1 ||
+    if (click_rendered_resource(session, styled) == -1 ||
         wait_for_output(session, split_origin, TEST_TIMEOUT_MS) == -1 ||
         wait_for_output(session, "Esc: panel", TEST_TIMEOUT_MS) == -1 ||
         wait_for_output(session, "print", TEST_TIMEOUT_MS) == -1 ||
         wait_for_output(session, "\033[38;5;114m", TEST_TIMEOUT_MS) == -1 ||
-        wait_for_output(session, "-rw-------", TEST_TIMEOUT_MS) == -1)
+        wait_for_output(session, "-rw-------", TEST_TIMEOUT_MS) == -1 ||
+        format_resource_click(session, replacement, replacement_click) == -1)
         return -1;
     *stage = 6;
+    session->capture_length = 0U;
+    if (send_text(session, wheel_down) == -1 ||
+        wait_for_output(session, bounded_tab_row, TEST_TIMEOUT_MS) == -1)
+        return -1;
+    *stage = 61;
     session->capture_length = 0U;
     if (send_text(session, replacement_click) == -1 ||
         wait_for_output(session, "SECOND_PREVIEW", TEST_TIMEOUT_MS) == -1)
@@ -2921,9 +3062,6 @@ static int managed_directory_action_flow(const char *executable)
         "\033[4;38;5;75mperformance\033[0m";
     static const char nested_back_styled[] =
         "\033[4;38;5;75m<-  \033[0m";
-    static const char first_click[] = "\033[<0;2;3M";
-    static const char second_click[] = "\033[<0;2;7M";
-    static const char back_click[] = "\033[<0;2;10M";
     char fixture[] = "/tmp/gsh-directory-action-XXXXXX";
     char child[PATH_MAX] = {0};
     char nested[PATH_MAX] = {0};
@@ -2961,14 +3099,14 @@ static int managed_directory_action_flow(const char *executable)
         send_text(&session, "ll\r") == -1 ||
         wait_for_output(&session, back_styled, TEST_TIMEOUT_MS) == -1 ||
         wait_for_output(&session, styled, TEST_TIMEOUT_MS) == -1 ||
-        send_text(&session, first_click) == -1 ||
+        click_rendered_resource(&session, styled) == -1 ||
         wait_for_output(&session, nested_styled, TEST_TIMEOUT_MS) == -1 ||
-        send_text(&session, second_click) == -1 ||
+        click_rendered_resource(&session, nested_styled) == -1 ||
         wait_for_output(&session, "/child/performance",
                         TEST_TIMEOUT_MS) == -1 ||
         wait_for_output(&session, nested_back_styled,
                         TEST_TIMEOUT_MS) == -1 ||
-        send_text(&session, back_click) == -1 ||
+        click_rendered_resource(&session, nested_back_styled) == -1 ||
         consume_through(&session, "gsh* ", TEST_TIMEOUT_MS) == -1 ||
         consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, probe) == -1 ||
@@ -2996,7 +3134,6 @@ static int managed_scroll_flow(const char *executable)
         "SCROLL_08\\nSCROLL_09\\nSCROLL_10\\n'\r";
     static const char page_up[] = "\033[5~";
     static const char page_down[] = "\033[6~";
-    static const char mouse_capture[] = "\033[?1000h";
     char fixture[] = "/tmp/gsh-scroll-action-XXXXXX";
     pty_session session;
     int failed = 0;
@@ -3010,8 +3147,7 @@ static int managed_scroll_flow(const char *executable)
     if (resize_session(&session, 6U, 80U) == -1 ||
         consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, output) == -1 ||
-        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
-        capture_contains(&session, mouse_capture)) {
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1) {
         failed = 1;
     }
     session.capture_length = 0U;
@@ -3037,7 +3173,6 @@ static int managed_detected_action_flow(const char *executable)
 {
     static const char styled[] =
         "\033[4;38;5;81m./detected.py\033[0m:2:3";
-    static const char click[] = "\033[<0;2;3M";
     char fixture[] = "/tmp/gsh-detected-action-XXXXXX";
     char path[PATH_MAX] = {0};
     pty_session session;
@@ -3057,7 +3192,7 @@ static int managed_detected_action_flow(const char *executable)
         send_text(&session,
                   "/usr/bin/printf './detected.py:2:3\\n'\r") == -1 ||
         wait_for_output(&session, styled, TEST_TIMEOUT_MS) == -1 ||
-        send_text(&session, click) == -1 ||
+        click_rendered_resource(&session, styled) == -1 ||
         wait_for_output(&session, "Esc: switch panel", TEST_TIMEOUT_MS) == -1 ||
         wait_for_output(&session, "print", TEST_TIMEOUT_MS) == -1 ||
         wait_for_output(&session, "2/2", TEST_TIMEOUT_MS) == -1) {
@@ -3454,17 +3589,25 @@ static int managed_repl_rewrites_progress(pty_session *session)
     return 0;
 }
 
+/* ── Resize Preservation Is Checked After a Narrow Viewport ───────
+ * A long host name can split the edit text across rows at either test width.
+ * Matching one contiguous string in that narrow frame confused wrapping
+ * with lost editor state. Observe the narrow redraw, then restore enough
+ * columns to compare every preserved byte before returning to normal width.
+ * ─────────────────────────────────────────────────────────────── */
 static int managed_repl_resize(pty_session *session)
 {
-    if (send_text(session, "RESIZE_KEEP") == -1 ||
+    if (resize_session(session, 24U, 512U) == -1 ||
+        send_text(session, "RESIZE_KEEP") == -1 ||
         consume_through(session, "gsh$ RESIZE_KEEP",
                         TEST_TIMEOUT_MS) == -1 ||
         resize_session(session, 12, 40) == -1 ||
+        consume_through(session, "\033[H\033[2J",
+                        TEST_TIMEOUT_MS) == -1 ||
+        resize_session(session, 24U, 512U) == -1 ||
         consume_through(session, "gsh$ RESIZE_KEEP",
                         TEST_TIMEOUT_MS) == -1 ||
         resize_session(session, 24, 80) == -1 ||
-        consume_through(session, "gsh$ RESIZE_KEEP",
-                        TEST_TIMEOUT_MS) == -1 ||
         send_bytes(session, "\025", 1) == -1) {
         return -1;
     }
@@ -3475,6 +3618,7 @@ static int managed_repl_saturation(pty_session *session)
 {
     unsigned int submission;
 
+    if (resize_session(session, 24U, 512U) == -1) return -1;
     for (submission = 0; submission < 15U; submission++) {
         if (send_text(session, "/bin/sleep 30\r") == -1 ||
             consume_through(session, "/bin/sleep 30\r\n",
@@ -3653,47 +3797,6 @@ static int managed_async_repl_flow(const char *executable)
         }
     }
     (void)unlink(resource_path);
-    (void)rmdir(fixture);
-    return failed;
-}
-
-static int managed_caret_flow(const char *executable)
-{
-    static const char mark[] = "\342\227\217";
-    char fixture[] = "/tmp/gsh-pty-caret-XXXXXX";
-    pty_session session = {0};
-    uint64_t start;
-    uint64_t elapsed;
-    int failed = 0;
-
-    if (executable == NULL || mkdtemp(fixture) == NULL ||
-        start_managed_session(&session, executable, fixture) == -1 ||
-        consume_through(&session, mark, TEST_TIMEOUT_MS) == -1) {
-        perror("pty caret: setup");
-        failed = 1;
-    }
-    start = monotonic_ns();
-    if (!failed && wait_for_output(&session, mark, 1600) == -1) failed = 1;
-    elapsed = monotonic_ns() - start;
-    if (!failed && (elapsed < 700000000ULL || elapsed > 1500000000ULL))
-        failed = 1;
-    session.capture_length = 0U;
-    if (!failed &&
-        (send_text(&session, "abc") == -1 ||
-         wait_for_output(&session, "abc", TEST_TIMEOUT_MS) == -1 ||
-         wait_for_output(&session, mark, TEST_TIMEOUT_MS) == -1 ||
-         !capture_contains(&session, "\033[?25l") ||
-         send_bytes(&session, "\025", 1U) == -1 ||
-         consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1))
-        failed = 1;
-    if (!failed) {
-        session.capture_length = 0U;
-        if (send_text(&session, "exit 0\r") == -1 ||
-            wait_session_exit(&session, 0, TEST_TIMEOUT_MS) == -1 ||
-            !capture_contains(&session, "\033[?25h")) failed = 1;
-    }
-    if (failed && session.pid > 0) dump_capture(&session);
-    if (session.pid > 0 && stop_session(&session) == -1) failed = 1;
     (void)rmdir(fixture);
     return failed;
 }
@@ -4152,12 +4255,19 @@ static int interactive_exec_overlay_case(
     const char *setup, const char *command, int expected_status)
 {
     pty_session session;
+    pid_t children[256];
+    int child_count;
 
     if ((managed ? start_managed_session(&session, executable, fixture)
                  : start_session(&session, executable, fixture, SHELL_GSH)) ==
             -1 ||
-        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
-        (setup != NULL &&
+        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1) {
+        if (session.master >= 0) (void)stop_session(&session);
+        return 1;
+    }
+    child_count = process_child_pids(session.pid, children,
+                                    sizeof(children) / sizeof(children[0]));
+    if ((setup != NULL &&
          (send_text(&session, setup) == -1 ||
           consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1)) ||
         send_text(&session, command) == -1 ||
@@ -4168,7 +4278,7 @@ static int interactive_exec_overlay_case(
         }
         return 1;
     }
-    return 0;
+    return wait_for_session_children(children, child_count) ? 0 : 1;
 }
 
 static int managed_exec_descriptor_case(const char *executable,
@@ -5020,7 +5130,8 @@ static int command_fault_case(const char *executable, const char *fault,
     int failed = 0;
 
     if (mkdtemp(fixture) == NULL || setenv("GSH_FAULT", fault, 1) == -1 ||
-        (managed ? start_managed_session(&session, executable, fixture)
+        (managed ? start_managed_actions_session(&session, executable,
+                                                 fixture)
                  : start_session(&session, executable, fixture, SHELL_GSH)) ==
             -1) {
         perror("pty fault: command setup");
@@ -5043,6 +5154,7 @@ static int command_fault_case(const char *executable, const char *fault,
         (void)fprintf(stderr, "pty fault: command cleanup failed: %s\n", fault);
         failed = 1;
     }
+    if (managed) remove_managed_actions_config(fixture);
     (void)rmdir(fixture);
     return failed;
 }
@@ -5860,6 +5972,25 @@ static int descriptor_exhaustion_case(const char *executable)
     return failed;
 }
 
+static void discard_ready_output(pty_session *session);
+
+/* ── Resize Frames Cannot Acknowledge Later Editor Input ─────────
+ * A signal storm can leave many valid copies of the same prompt in the PTY.
+ * Matching one of those after Ctrl-U falsely acknowledged the new edit and
+ * let retained redraws exhaust the capture during the following here-doc.
+ * First verify the preserved draft, then drain those already observed frames
+ * before testing a fresh edit; the existing bounded drain caps harness work.
+ * ─────────────────────────────────────────────────────────────── */
+static bool recover_resize_storm(pty_session *session)
+{
+    if (session == NULL) return false;
+    if (consume_through(session, "\033[2K", TEST_TIMEOUT_MS) == -1 ||
+        consume_through(session, "kept", TEST_TIMEOUT_MS) == -1) return false;
+    discard_ready_output(session);
+    return send_bytes(session, "\025", 1) == 0 &&
+           consume_through(session, "gsh$ ", TEST_TIMEOUT_MS) == 0;
+}
+
 static int bounded_input_case(const char *executable)
 {
     char fixture[] = "/tmp/gsh-resource-input-XXXXXX";
@@ -5909,10 +6040,7 @@ static int bounded_input_case(const char *executable)
             return finish_session_directory(&session, fixture, 1);
         }
     }
-    if (consume_through(&session, "\033[2K", TEST_TIMEOUT_MS) == -1 ||
-        consume_through(&session, "kept", TEST_TIMEOUT_MS) == -1 ||
-        send_bytes(&session, "\025", 1) == -1 ||
-        consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1) {
+    if (!recover_resize_storm(&session)) {
         (void)fprintf(stderr, "pty resource: signal storm corrupted the editor\n");
         failed = 1;
     }
@@ -8584,9 +8712,6 @@ static int run_primary_smoke_flows(const char *executable)
     if (editor_navigation_flow(executable) != 0) {
         return smoke_flow_failure("editor navigation/paste");
     }
-    if (managed_caret_flow(executable) != 0) {
-        return smoke_flow_failure("managed software caret");
-    }
     if (managed_async_repl_flow(executable) != 0) {
         return smoke_flow_failure("managed async REPL");
     }
@@ -8660,6 +8785,8 @@ int main(int argc, char **argv)
 {
     char executable[4096];
 
+    if (!terminal_output_matching_cases() || !wrapped_prompt_matching_cases())
+        return 1;
     if (close_inherited_descriptors() == -1) {
         perror("pty harness: inherited descriptors");
         return 1;

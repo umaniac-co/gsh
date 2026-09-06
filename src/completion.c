@@ -13,7 +13,6 @@
 #include "builtin_registry.h"
 
 #include <dirent.h>
-#include <errno.h>
 #include <stdio.h>
 #include <sys/stat.h>
 #include <string.h>
@@ -77,20 +76,17 @@ typedef struct {
 
 static bool word_boundary(unsigned char byte)
 {
-    if (!require(byte <= 0xffU)) return true;
     return byte == ' ' || byte == '\t' || byte == '\r' || byte == '\n';
 }
 
 static bool command_boundary(unsigned char byte)
 {
-    if (!require(byte <= 0xffU)) return true;
     return byte == ';' || byte == '|' || byte == '&' || byte == '(' ||
            byte == ')';
 }
 
 static bool variable_name_byte(unsigned char byte, bool first)
 {
-    if (!require(byte <= 0xffU)) return false;
     if ((byte >= 'a' && byte <= 'z') ||
         (byte >= 'A' && byte <= 'Z') || byte == '_') return true;
     return !first && byte >= '0' && byte <= '9';
@@ -391,6 +387,13 @@ static bool executable_candidate(const char *directory, const char *name)
            access(path, X_OK) == 0;
 }
 
+/* ── Reject Unrelated Names Before Filesystem Probes ──────────────
+ * Probing every executable made a short prefix pay for the entire PATH.
+ * Large tool installations could exhaust the worker's deadline before a
+ * single matching command was returned. Directory entries already carry
+ * the name, so only matching prefixes need metadata and permission checks.
+ * The entry cap still bounds discovery, including rejected names.
+ * ─────────────────────────────────────────────────────────────── */
 static void scan_command_directory(const char *directory,
                                    const completion_word *word,
                                    completion_matches *matches)
@@ -414,7 +417,10 @@ static void scan_command_directory(const char *directory,
         matches->entries++;
         if (entry->d_name[0] == '.' && word->prefix[0] != '.') continue;
         length = strnlen(entry->d_name, GSH_COMPLETION_TEXT_CAP);
-        if (length == GSH_COMPLETION_TEXT_CAP) continue;
+        if (length == GSH_COMPLETION_TEXT_CAP ||
+            length < word->prefix_length ||
+            memcmp(entry->d_name, word->prefix, word->prefix_length) != 0)
+            continue;
         if (executable_candidate(directory, entry->d_name))
             offer_candidate(matches, word, entry->d_name, length, false);
     }
