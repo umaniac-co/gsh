@@ -1880,14 +1880,19 @@ static int exercise_editor_navigation(pty_session *session,
         return -1;
     }
     if (extended_completion &&
-        (send_text(session, "echo $PA") == -1 ||
+        (send_text(session,
+                   "GSH_TAB_VAR_ALPHA=one GSH_TAB_VAR_BETA=two\r") == -1 ||
+         consume_through(session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
+         send_text(session, "echo $GSH_TAB_VAR_") == -1 ||
          send_bytes(session, "\t", 1U) == -1 ||
-         consume_through(session, "$PAGER", TEST_TIMEOUT_MS) == -1 ||
-         consume_through(session, "$PATH", TEST_TIMEOUT_MS) == -1 ||
+         consume_through(session, "$GSH_TAB_VAR_ALPHA", TEST_TIMEOUT_MS) == -1 ||
+         consume_through(session, "$GSH_TAB_VAR_BETA", TEST_TIMEOUT_MS) == -1 ||
          send_bytes(session, "\t", 1U) == -1 ||
-         consume_through(session, "echo $PAGER", TEST_TIMEOUT_MS) == -1 ||
+         consume_through(session, "echo $GSH_TAB_VAR_ALPHA",
+                         TEST_TIMEOUT_MS) == -1 ||
          send_bytes(session, "\t", 1U) == -1 ||
-         consume_through(session, "echo $PATH", TEST_TIMEOUT_MS) == -1 ||
+         consume_through(session, "echo $GSH_TAB_VAR_BETA",
+                         TEST_TIMEOUT_MS) == -1 ||
          send_bytes(session, "\025", 1U) == -1 ||
          consume_through(session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
          send_text(session, "git sta") == -1 ||
@@ -2836,12 +2841,80 @@ static int setup_resource_action_fixture(resource_action_fixture *fixture,
     return 0;
 }
 
+static size_t captured_cursor_sequence(const unsigned char *text,
+                                       size_t length, size_t *row)
+{
+    size_t number = 0U;
+    bool first = true;
+
+    if (text == NULL || row == NULL || length < 3U) return 0U;
+    if (text[0] != 0x1bU || text[1] != '[') return 0U;
+    for (size_t index = 2U; index < length && index < 64U; index++) {
+        unsigned char byte = text[index];
+
+        if (byte >= 0x40U && byte <= 0x7eU) {
+            if (byte == 'H' || byte == 'f') *row = number == 0U ? 1U : number;
+            return index + 1U;
+        }
+        if (first && byte >= '0' && byte <= '9') {
+            if (number > 999U) return 0U;
+            number = number * 10U + (size_t)(byte - '0');
+        } else first = false;
+    }
+    return 0U;
+}
+
+/* ── Resource Clicks Follow the Rendered Rows ─────────────────────
+ * Host and account names change prompt wrapping when a preview narrows it.
+ * Fixed mouse coordinates therefore selected empty rows on Linux runners.
+ * The compositor emits explicit rows and cursor positions in each frame;
+ * read that evidence to locate the styled resource in the latest redraw.
+ * This keeps the test independent of both host identity and prompt width.
+ * ─────────────────────────────────────────────────────────────── */
+static int format_resource_click(const pty_session *session,
+                                  const char *marker, char output[64])
+{
+    size_t row = 1U;
+    size_t found = 0U;
+    size_t length;
+    int written;
+
+    if (session == NULL || marker == NULL || output == NULL) return -1;
+    if (session->capture_length > CAPTURE_CAP) return -1;
+    length = strlen(marker);
+    if (length == 0U || length > session->capture_length) return -1;
+    for (size_t offset = 0U; offset < session->capture_length; offset++) {
+        const unsigned char *text = session->capture + offset;
+        size_t remaining = session->capture_length - offset;
+        size_t sequence;
+
+        if (remaining >= 4U && memcmp(text, "\033[2J", 4U) == 0) found = 0U;
+        if (remaining >= length && memcmp(text, marker, length) == 0)
+            found = row;
+        sequence = captured_cursor_sequence(text, remaining, &row);
+        if (sequence != 0U) offset += sequence - 1U;
+        else if (*text == '\n') row++;
+    }
+    if (found == 0U || found > 9999U) return -1;
+    written = snprintf(output, 64U, "\033[<0;2;%zuM", found);
+    return written > 0 && written < 64 ? 0 : -1;
+}
+
+static int click_rendered_resource(pty_session *session, const char *marker)
+{
+    char click[64];
+
+    if (session == NULL || marker == NULL) return -1;
+    if (format_resource_click(session, marker, click) == -1) return -1;
+    return send_text(session, click);
+}
+
 static int open_and_replace_resource_preview(pty_session *session, int *stage)
 {
     static const char styled[] =
         "\033[4;38;5;81mname with space.py\033[0m";
-    static const char click[] = "\033[<0;2;2M";
-    static const char replacement_click[] = "\033[<0;2;4M";
+    static const char replacement[] = "\033[4;38;5;81msecond.py\033[0m";
+    char replacement_click[64];
     static const char split_origin[] = "\033[1;50H";
     static const char wheel_down[] = "\033[<65;80;2M";
     static const char bounded_tab_row[] =
@@ -2852,12 +2925,13 @@ static int open_and_replace_resource_preview(pty_session *session, int *stage)
         send_text(session, "ls -1\r") == -1 ||
         wait_for_output(session, styled, TEST_TIMEOUT_MS) == -1) return -1;
     *stage = 1;
-    if (send_text(session, click) == -1 ||
+    if (click_rendered_resource(session, styled) == -1 ||
         wait_for_output(session, split_origin, TEST_TIMEOUT_MS) == -1 ||
         wait_for_output(session, "Esc: panel", TEST_TIMEOUT_MS) == -1 ||
         wait_for_output(session, "print", TEST_TIMEOUT_MS) == -1 ||
         wait_for_output(session, "\033[38;5;114m", TEST_TIMEOUT_MS) == -1 ||
-        wait_for_output(session, "-rw-------", TEST_TIMEOUT_MS) == -1)
+        wait_for_output(session, "-rw-------", TEST_TIMEOUT_MS) == -1 ||
+        format_resource_click(session, replacement, replacement_click) == -1)
         return -1;
     *stage = 6;
     session->capture_length = 0U;
@@ -2953,9 +3027,6 @@ static int managed_directory_action_flow(const char *executable)
         "\033[4;38;5;75mperformance\033[0m";
     static const char nested_back_styled[] =
         "\033[4;38;5;75m<-  \033[0m";
-    static const char first_click[] = "\033[<0;2;3M";
-    static const char second_click[] = "\033[<0;2;7M";
-    static const char back_click[] = "\033[<0;2;10M";
     char fixture[] = "/tmp/gsh-directory-action-XXXXXX";
     char child[PATH_MAX] = {0};
     char nested[PATH_MAX] = {0};
@@ -2993,14 +3064,14 @@ static int managed_directory_action_flow(const char *executable)
         send_text(&session, "ll\r") == -1 ||
         wait_for_output(&session, back_styled, TEST_TIMEOUT_MS) == -1 ||
         wait_for_output(&session, styled, TEST_TIMEOUT_MS) == -1 ||
-        send_text(&session, first_click) == -1 ||
+        click_rendered_resource(&session, styled) == -1 ||
         wait_for_output(&session, nested_styled, TEST_TIMEOUT_MS) == -1 ||
-        send_text(&session, second_click) == -1 ||
+        click_rendered_resource(&session, nested_styled) == -1 ||
         wait_for_output(&session, "/child/performance",
                         TEST_TIMEOUT_MS) == -1 ||
         wait_for_output(&session, nested_back_styled,
                         TEST_TIMEOUT_MS) == -1 ||
-        send_text(&session, back_click) == -1 ||
+        click_rendered_resource(&session, nested_back_styled) == -1 ||
         consume_through(&session, "gsh* ", TEST_TIMEOUT_MS) == -1 ||
         consume_through(&session, "gsh$ ", TEST_TIMEOUT_MS) == -1 ||
         send_text(&session, probe) == -1 ||
@@ -3067,7 +3138,6 @@ static int managed_detected_action_flow(const char *executable)
 {
     static const char styled[] =
         "\033[4;38;5;81m./detected.py\033[0m:2:3";
-    static const char click[] = "\033[<0;2;3M";
     char fixture[] = "/tmp/gsh-detected-action-XXXXXX";
     char path[PATH_MAX] = {0};
     pty_session session;
@@ -3087,7 +3157,7 @@ static int managed_detected_action_flow(const char *executable)
         send_text(&session,
                   "/usr/bin/printf './detected.py:2:3\\n'\r") == -1 ||
         wait_for_output(&session, styled, TEST_TIMEOUT_MS) == -1 ||
-        send_text(&session, click) == -1 ||
+        click_rendered_resource(&session, styled) == -1 ||
         wait_for_output(&session, "Esc: switch panel", TEST_TIMEOUT_MS) == -1 ||
         wait_for_output(&session, "print", TEST_TIMEOUT_MS) == -1 ||
         wait_for_output(&session, "2/2", TEST_TIMEOUT_MS) == -1) {

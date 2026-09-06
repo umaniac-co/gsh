@@ -12,7 +12,6 @@
 #endif
 
 #include <errno.h>
-#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h> /* CANON-INCLUDE: linux */
 #include <string.h>
@@ -21,20 +20,22 @@
 
 #include "../src/command_cache.h"
 
-static int make_path(char output[PATH_MAX], const char *directory,
+static int make_path(char output[GSH_COMMAND_PATH_CAP], const char *directory,
                      const char *leaf)
 {
     if (directory == NULL || leaf == NULL || output == NULL) {
         return -1;
     }
-    int length = snprintf(output, PATH_MAX, "%s/%s", directory, leaf);
+    int length = snprintf(output, GSH_COMMAND_PATH_CAP, "%s/%s", directory, leaf);
 
-    return length < 0 || length >= PATH_MAX ? -1 : 0;
+    return length < 0 || length >= GSH_COMMAND_PATH_CAP ? -1 : 0;
 }
 
-static int prepare_fixture(char root[PATH_MAX], char first[PATH_MAX],
-                           char second[PATH_MAX], char first_probe[PATH_MAX],
-                           char second_probe[PATH_MAX],
+static int prepare_fixture(char root[GSH_COMMAND_PATH_CAP],
+                           char first[GSH_COMMAND_PATH_CAP],
+                           char second[GSH_COMMAND_PATH_CAP],
+                           char first_probe[GSH_COMMAND_PATH_CAP],
+                           char second_probe[GSH_COMMAND_PATH_CAP],
                            char search_path[GSH_COMMAND_PATH_CAP])
 {
     if (search_path == NULL) {
@@ -42,8 +43,8 @@ static int prepare_fixture(char root[PATH_MAX], char first[PATH_MAX],
     }
     int length;
 
-    if (snprintf(root, PATH_MAX, "%s", "/tmp/gsh-command-cache-XXXXXX") <
-            0 ||
+    if (snprintf(root, GSH_COMMAND_PATH_CAP, "%s",
+                 "/tmp/gsh-command-cache-XXXXXX") < 0 ||
         mkdtemp(root) == NULL || make_path(first, root, "first") == -1 ||
         make_path(second, root, "second") == -1 ||
         mkdir(first, 0700) == -1 || mkdir(second, 0700) == -1 ||
@@ -84,7 +85,7 @@ static int finish_fixture(const char *root, const char *first,
     if (root[0] == '/') {
         for (index = 0; index <= GSH_COMMAND_CACHE_CAP; index++) {
             char name[16];
-            char candidate[PATH_MAX];
+            char candidate[GSH_COMMAND_PATH_CAP];
 
             if (snprintf(name, sizeof(name), "tool%03zu", index) > 0 &&
                 make_path(candidate, first, name) == 0) {
@@ -107,11 +108,11 @@ int main(void)
     static gsh_command_cache scratch_storage;
     gsh_command_cache *cache = &cache_storage;
     gsh_command_cache *scratch = &scratch_storage;
-    char root[PATH_MAX] = {0};
-    char first[PATH_MAX] = {0};
-    char second[PATH_MAX] = {0};
-    char first_probe[PATH_MAX] = {0};
-    char second_probe[PATH_MAX] = {0};
+    char root[GSH_COMMAND_PATH_CAP] = {0};
+    char first[GSH_COMMAND_PATH_CAP] = {0};
+    char second[GSH_COMMAND_PATH_CAP] = {0};
+    char first_probe[GSH_COMMAND_PATH_CAP] = {0};
+    char second_probe[GSH_COMMAND_PATH_CAP] = {0};
     char search_path[GSH_COMMAND_PATH_CAP];
     char resolved[GSH_COMMAND_PATH_CAP];
     bool changed = false;
@@ -177,7 +178,7 @@ int main(void)
     }
     for (index = 0; index <= GSH_COMMAND_CACHE_CAP; index++) {
         char name[16];
-        char candidate[PATH_MAX];
+        char candidate[GSH_COMMAND_PATH_CAP];
         int length = snprintf(name, sizeof(name), "tool%03zu", index);
         int result;
 

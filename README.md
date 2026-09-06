@@ -13,7 +13,7 @@ the architectures in [`specs/0002.real_time.md`](specs/0002.real_time.md) and
 | Metric | Latest evidence |
 | --- | --- |
 | Native POSIX.1-2024 implementation | **~80%** estimated progress |
-| Average benchmark speedup vs competitors | **Bash: +108.1% (2.08×)** · **Zsh: +139.7% (2.40×)** |
+| Average benchmark speedup vs competitors | **Bash: +108.3% (2.08×)** · **Zsh: +136.4% (2.36×)** |
 
 POSIX progress is the 2026-09-03 unweighted estimate across 19 shell-language
 areas, not a conformance score. Speedup is the geometric mean of p50 latency
@@ -584,8 +584,8 @@ the ignored local `dev/performance/` directory, separately from `build/`.
 
 ### Benchmark snapshot: 2026-09-06
 
-The overview records the local `3bc427c215ab-dirty` candidate measured at
-2026-09-06 16:25:55 UTC on Darwin 25.6.0 arm64 (18 CPUs), Apple Clang 21.0.0,
+The overview records the local `8d0bdc50fe5c-dirty` candidate measured at
+2026-09-06 16:50:02 UTC on Darwin 25.6.0 arm64 (18 CPUs), Apple Clang 21.0.0,
 Bash 5.3.3 and Zsh 5.9. It covers all 37 latency workloads, including startup,
 idle input, external execution, direct builtins, mutations and pathname
 expansion, plus 26 command-memory workloads and idle memory. The harness uses
@@ -595,17 +595,18 @@ files. These figures do not measure managed-mode rendering or AI workloads.
 For each comparison shell, average speedup is
 `100 × (exp(mean(log(peer_p50 / gsh_p50))) - 1)` across all 37 workloads;
 it is not the arithmetic mean of individual percentages. The corresponding
-geometric-mean latency reductions are 51.9% against Bash and 58.3% against Zsh.
-gsh has a lower p50 in 30/37 workloads against Bash and 33/37 against Zsh.
-Startup p50 is 11.910 ms versus Bash's 9.400 ms and Zsh's 9.489 ms;
-pathname-expansion p50 is 1.925 ms versus 0.191 ms and 0.210 ms respectively.
-The direct-builtin paired gate passes at 894/900 wins against each shell.
+geometric-mean latency reductions are 52.0% against Bash and 57.7% against Zsh.
+gsh has a lower p50 in 31/37 workloads against Bash and 34/37 against Zsh.
+Startup p50 is 9.743 ms versus Bash's 7.303 ms and Zsh's 7.646 ms;
+pathname-expansion p50 is 1.560 ms versus 0.182 ms and 0.196 ms respectively.
+The direct-builtin paired gate passes at 899/900 wins against Bash and
+900/900 against Zsh.
 
 The complete 509-row CSV, including every raw sample, is retained locally as
-`dev/performance/2026-09-06-publication.csv`. Reproduce it with
-`make bench BENCH_OUTPUT=dev/performance/2026-09-06-publication.csv`.
+`dev/performance/2026-09-06-ci-fix.csv`. Reproduce it with
+`make bench BENCH_OUTPUT=dev/performance/2026-09-06-ci-fix.csv`.
 The source fingerprint is SHA-256
-`00c0581b283aebc17c743d233c2de6e8cca5b497e7ef572c60ff610a59c41b50`,
+`5d80a5e3e6809e2c910c2d37683adb233dfa2130a30e6f2fa814ca081bd1e1a7`,
 over sorted paths and contents of `Makefile`, `src/*.[ch]`,
 `tests/pty_smoke.c`, and `tests/benchmark_report.[ch]`, each path and content
 followed by a NUL byte. Any implementation change requires a fresh benchmark

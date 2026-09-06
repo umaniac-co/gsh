@@ -778,7 +778,7 @@ int main(void)
     (void)rmdir("siblings");
     (void)rmdir("subdir/deep");
     (void)rmdir("subdir");
-    (void)chdir(original);
+    if (chdir(original) == -1) failed = 1;
     (void)rmdir(fixture);
     if (failed) { (void)fputs("file builtins: failed\n", stderr); return 1; }
     (void)puts("file builtins: native ls, ll, and view cases passed");

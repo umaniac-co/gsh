@@ -15,7 +15,6 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -76,7 +75,7 @@ typedef struct {
 } canon_counts;
 
 typedef struct {
-    char paths[POLICY_DIRECTORY_CAP][PATH_MAX];
+    char paths[POLICY_DIRECTORY_CAP][GSH_CANON_PATH_CAP];
     size_t count;
 } directory_stack;
 
@@ -1590,8 +1589,8 @@ static int push_directory(directory_stack *stack, const char *path)
         errno = ENOSPC;
         return -1;
     }
-    length = strnlen(path, PATH_MAX);
-    if (length == PATH_MAX) {
+    length = strnlen(path, GSH_CANON_PATH_CAP);
+    if (length == GSH_CANON_PATH_CAP) {
         errno = ENAMETOOLONG;
         return -1;
     }
@@ -1670,7 +1669,7 @@ static int scan_directory(const char *path, canon_counts *counts,
     for (iterations = 0;
          stack.count > 0U && iterations < POLICY_DIRECTORY_CAP;
          iterations++) {
-        char current[PATH_MAX];
+        char current[GSH_CANON_PATH_CAP];
         struct dirent *entry;
         DIR *directory;
 
@@ -1684,7 +1683,7 @@ static int scan_directory(const char *path, canon_counts *counts,
             continue;
         }
         while ((entry = readdir(directory)) != NULL) {
-            char child[PATH_MAX];
+            char child[GSH_CANON_PATH_CAP];
             struct stat information;
             int length;
 
@@ -1788,7 +1787,7 @@ int main(int argc, char **argv)
 {
     static gsh_canon_call_graph graph;
     static gsh_canon_symbol_inventory symbols;
-    char path[PATH_MAX];
+    char path[GSH_CANON_PATH_CAP];
     static const char *const directories[] = {"src", "tests", "tools",
                                                "bench"};
     canon_counts actual = {0};
